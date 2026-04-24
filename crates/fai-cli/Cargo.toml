@@ -1,0 +1,33 @@
+[package]
+name = "fai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fai_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forai"
+path = "src/main.rs"
+
+[[bin]]
+name = "fai"
+path = "src/fai.rs"
+
+[dependencies]
+fai-core = { path = "../fai-core" }
+fai-checker = { path = "../fai-checker" }
+fai-compiler = { path = "../fai-compiler" }
+fai-parser = { path = "../fai-parser" }
+fai-codegen-wasm = { path = "../fai-codegen-wasm" }
+fai-ffi = { path = "../fai-ffi" }
+wasmtime = "29"
+ureq = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["http-client"]
+http-client = ["ureq"]

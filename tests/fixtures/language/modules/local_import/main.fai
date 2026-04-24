@@ -1,0 +1,10 @@
+use { double } from mathlib
+
+# expect: ok
+# stdout:
+#   42
+def main
+    @return Void
+do
+  print(double(21))
+end

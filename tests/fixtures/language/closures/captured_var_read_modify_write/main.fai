@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   15
+# Block.
+
+type def Block
+    @return Void
+end
+
+# Call block.
+def call
+    @param b Block
+    @return Void
+do
+  b()
+end
+
+test call
+it 'calls'
+  call do
+
+  end
+  assert.isTrue(true)
+end
+end
+
+def main
+    @return Void
+do
+  var n = 5
+  call do
+      n = n * 3
+  end
+  print(n)
+end

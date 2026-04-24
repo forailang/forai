@@ -1,0 +1,9 @@
+# expect: ok
+# stdout:
+#   123
+def main
+    @return Void
+do
+  let myInt Int = 123
+  print(myInt)
+end

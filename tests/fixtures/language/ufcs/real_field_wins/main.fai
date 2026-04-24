@@ -1,0 +1,25 @@
+type Box
+  value Int
+end
+
+# Value.
+def value
+    @param b Box
+    @return Int
+do
+  99
+end
+
+test value
+it 'returns 99'
+  let b = Box(value: 1)
+  assert.equal(value(b), 99)
+end
+end
+
+def main
+    @return Void
+do
+  let b = Box(value: 42)
+  print(b.value)
+end

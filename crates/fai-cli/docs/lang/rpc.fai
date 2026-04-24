@@ -1,0 +1,129 @@
+# Full RPC example: server defines remote functions, client calls them automatically.
+# The `fai build` pipeline generates a Server proxy module for the client.
+# No manual HTTP wiring needed — just mark functions `remote def` on the server.
+def doc_rpc_full_example
+    @return Void
+do
+  # ── SERVER: src/server/main.fai ─────────────────────────────────────
+  # use std.http.server
+  # use { handleRpcRequest } from Forui.rpc    # required
+  # use std.array
+  #
+  # remote type Task                            # exported to client proxy
+  #   id Int
+  #   text String
+  #   done Bool
+  # end
+  #
+  # var tasks Task[] = []
+  # var nextId = 1
+  #
+  # remote def getTasks                         # exported to client proxy
+  #     @return Task[]
+  # do
+  #   tasks
+  # end
+  #
+  # remote def addTask
+  #     @param text String
+  #     @return Task
+  # do
+  #   let t = Task(id: nextId, text: text, done: false)
+  #   nextId = nextId + 1
+  #   tasks = array.append(tasks, t)
+  #   t
+  # end
+  #
+  # remote def toggleTask
+  #     @param id Int
+  #     @return Task
+  # do
+  #   var result Task? = null
+  #   var updated Task[] = []
+  #   for t in tasks
+  #     if t.id == id
+  #       let toggled = Task(id: t.id, text: t.text, done: !t.done)
+  #       result = toggled
+  #       updated = array.append(updated, toggled)
+  #     else
+  #       updated = array.append(updated, t)
+  #     end
+  #   end
+  #   tasks = updated
+  #   result!
+  # end
+  #
+  # def main
+  #     @return Void
+  # do
+  #   var r = server.router()
+  #   addRpcRoutes(r)                           # auto-generated — do NOT define
+  #   server.listen(r, 3040)
+  # end
+
+  # ── CLIENT: src/client/pages/tasks.fai ──────────────────────────────
+  # use { Task, getTasks, addTask, toggleTask } from Server
+  # use { useSignal, isLoading, isError, reload } from Forui.signal
+  # use { ViewNode, VStack, Label, Button } from Forui.view
+  #
+  # def TasksPage
+  #     @return ViewNode
+  # do
+  #   var tasks = useSignal([]) do
+  #     getTasks()
+  #   end
+  #   VStack do
+  #     if tasks.isLoading()
+  #       Label('Loading…')
+  #     else if tasks.isError()
+  #       Label('Error: ' + tasks.error!)
+  #     else
+  #       for t in tasks.value
+  #         Button(t.text, onClick: do
+  #           toggleTask(t.id)
+  #           tasks.reload()
+  #         end)
+  #       end
+  #     end
+  #   end
+  # end
+end
+
+# Rules and gotchas for RPC functions.
+# All rules that must be followed for RPC to work correctly.
+def doc_rpc_rules
+    @return Void
+do
+  # 1. Mark server functions with `remote def` — not just `def`
+  # 2. Mark server types with `remote type` — not just `type`
+  # 3. Add `use { handleRpcRequest } from Forui.rpc` to server/main.fai
+  # 4. Call `addRpcRoutes(r)` in the server's main — do NOT define this function
+  # 5. Build with `fai build` (no target) to generate the Server proxy for the client
+  # 6. Run `fai doc Server` after build to see what the proxy exports
+  # 7. Remote types must be in the server entry file (main.fai) to be discovered
+  # 8. The Server module is auto-generated — never edit it manually
+  # 9. fai build must succeed for the Server proxy to be up to date
+end
+
+# RPC with authentication: pass a token from client signals to server functions.
+def doc_rpc_with_auth
+    @return Void
+do
+  # SERVER:
+  # remote def getMyData
+  #     @param token String          # client passes the auth token as a param
+  #     @return MyData
+  # do
+  #   let user = requireSession(token)   # validate on server
+  #   fetchDataForUser(user.id)
+  # end
+  #
+  # CLIENT:
+  # use { getMyData, MyData } from Server
+  # use { useSignal } from Forui.signal
+  #
+  # let token = sessionToken()         # from client.state
+  # var data = useSignal(MyData(...)) do
+  #   getMyData(token)                 # token passed as argument
+  # end
+end

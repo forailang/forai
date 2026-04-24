@@ -1,0 +1,120 @@
+# Tests live in the same file as the function they test.
+# Every named function must be covered by at least one test or `fai test` fails.
+# Structure: `test <fnName>` block containing `it '...'` cases.
+def doc_test_structure
+    @return Void
+do
+  # def add
+  #     @param a Int
+  #     @param b Int
+  #     @return Int
+  # do
+  #   a + b
+  # end
+  #
+  # test add
+  # it 'adds positive numbers'
+  #   assert.equals(add(1, 2), 3)
+  # end
+  # it 'handles negatives'
+  #   assert.equals(add(-1, 1), 0)
+  # end
+  # end
+end
+
+# assert.equals(actual, expected) — the primary assertion. Other helpers:
+# assert.isTrue(value), assert.isFalse(value), assert.isNull(value), assert.isNotNull(value)
+def doc_assertions
+    @return Void
+do
+  assert.equals(1 + 1, 2)
+  assert.isTrue(true)
+  assert.isFalse(false)
+  let x Int? = null
+  assert.isNull(x)
+  let y Int? = 42
+  assert.isNotNull(y)
+end
+
+test doc_assertions
+it 'assertions do not throw on success'
+  assert.equals(42, 42)
+  assert.isTrue(1 < 2)
+end
+end
+
+# Private helper functions covered by a tested caller do NOT need their own test block.
+def doc_coverage
+    @return Void
+do
+  # private:
+  # def helper
+  #     @param x Int
+  #     @return Int
+  # do
+  #   x * 2
+  # end
+  #
+  # # The public function's test covers `helper` transitively — no separate test needed.
+  # def double
+  #     @param x Int
+  #     @return Int
+  # do
+  #   helper(x)
+  # end
+  #
+  # test double
+  # it 'doubles the value'
+  #   assert.equals(double(5), 10)
+  # end
+  # end
+end
+
+# Test UI components with testMount from Forui. Renders the component to a
+# ViewNode tree without a browser. Use childCount, getChild, getProp, findByKind,
+# findByProp (all from Forui.view) to inspect. Every UI function still needs a test.
+def doc_ui_testing
+    @return Void
+do
+  # use { testMount, testMountAt } from Forui
+  # use { childCount, getChild, getProp, findByKind, findByProp } from Forui.view
+  #
+  # def WelcomePage
+  #     @return ViewNode
+  # do
+  #   VStack do
+  #     Label('Welcome').fontSize(24)
+  #     Button('Sign In', onClick: do navigate('/login') end)
+  #   end
+  # end
+  #
+  # test WelcomePage
+  # it 'renders a VStack at root'
+  #   let tree = testMount(WelcomePage)
+  #   assert.equals(tree.kind, 'VStack')
+  # end
+  # it 'has 2 children'
+  #   let tree = testMount(WelcomePage)
+  #   assert.equals(childCount(tree), 2)
+  # end
+  # it 'first child is a Label'
+  #   let tree = testMount(WelcomePage)
+  #   let label = getChild(tree, 0)
+  #   assert.equals(label.kind, 'Label')
+  #   assert.equals(unwrap(getProp(label, 'text'), ''), 'Welcome')
+  # end
+  # it 'has a Sign In button'
+  #   let tree = testMount(WelcomePage)
+  #   let btn = findByKind(tree, 'Button')
+  #   assert.isNotNull(btn)
+  # end
+  # it 'can find a node by prop value'
+  #   let tree = testMount(WelcomePage)
+  #   let label = findByProp(tree, 'text', 'Welcome')
+  #   assert.isNotNull(label)
+  # end
+  # end
+  #
+  # For route-specific pages:
+  # let tree = testMountAt(MyPage, '/team/42')
+end

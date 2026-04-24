@@ -1,0 +1,27 @@
+# Enums declare a fixed set of named values. Access members with EnumName.member.
+def doc_enum
+    @return Void
+do
+  # enum Status
+  #   active
+  #   loading
+  #   error
+  # end
+  #
+  # let s = Status.active
+  # let t = Status.loading
+end
+
+# case / when / default — match an enum (or any value) against literal patterns.
+def doc_case_enum
+    @return Void
+do
+  # case status
+  # when Status.active
+  #   print('running')
+  # when Status.loading
+  #   print('please wait')
+  # default
+  #   print('error state')
+  # end
+end

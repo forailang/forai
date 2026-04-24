@@ -1,0 +1,130 @@
+# std.storage — key/value persistence backed by the host platform.
+#
+# In the browser (wasm-html target) it routes to `window.localStorage`.
+# On native targets it's a process-scoped in-memory HashMap — useful for
+# tests and short-lived CLI runs but does NOT survive restarts. Future
+# platforms (iOS, etc.) plug their own backing into the same four
+# imports, so forai code stays identical across platforms.
+#
+# API
+#   storageGet(key: String) → String?    # null when the key is absent
+#   storageSet(key: String, value: String) → Void
+#   storageRemove(key: String) → Void
+#   storageClear() → Void                # wipe the whole store
+#
+# Values are strings. Serialize structured data with std.json.
+def doc_storage_api
+    @return Void
+do
+  # use std.storage
+  #
+  # storage.storageSet('theme', 'dark')
+  # let theme = unwrap(storage.storageGet('theme'), 'light')
+  # storage.storageRemove('theme')
+end
+
+# Typical pattern for small persistent state — wrap `storage.storageGet`
+# + `storage.storageSet` behind a module-level accessor so callers don't
+# repeat the key name or the unwrap dance. This is what the partners
+# example does for its API key.
+def doc_storage_state_module
+    @return Void
+do
+  # use std.storage
+  #
+  # # Module-scope constant so a rename is one edit.
+  # def apiKeyStorageKey
+  #     @return String
+  # do
+  #   'partners.apiKey'
+  # end
+  #
+  # # Returns the stored key, or the empty string if not set.
+  # # Reading through `storage` means a fresh page load (deep link)
+  # # sees the key the user previously saved.
+  # def apiKey
+  #     @return String
+  # do
+  #   unwrap(storage.storageGet(apiKeyStorageKey()), '')
+  # end
+  #
+  # def setApiKey
+  #     @param k String
+  #     @return Void
+  # do
+  #   storage.storageSet(apiKeyStorageKey(), k)
+  # end
+  #
+  # def clearApiKey
+  #     @return Void
+  # do
+  #   storage.storageRemove(apiKeyStorageKey())
+  # end
+end
+
+# Serialize larger shapes via std.json — storage is string-valued.
+def doc_storage_structured_values
+    @return Void
+do
+  # use std.json
+  # use std.storage
+  #
+  # type Prefs
+  #   theme String
+  #   lastTeamId Int
+  # end
+  #
+  # def savePrefs
+  #     @param p Prefs
+  #     @return Void
+  # do
+  #   storage.storageSet('prefs', json.stringify(p))
+  # end
+  #
+  # def loadPrefs
+  #     @return Prefs?
+  # do
+  #   let raw = storage.storageGet('prefs')
+  #   if raw?
+  #     # json.parse returns a Dictionary; reconstruct the typed value.
+  #     let d = json.parse(raw!)
+  #     Prefs(
+  #       theme: unwrap(getString(d, 'theme'), 'light'),
+  #       lastTeamId: unwrap(getInt(d, 'lastTeamId'), 0),
+  #     )
+  #   else
+  #     null
+  #   end
+  # end
+end
+
+# Tests for storage-backed state should clear between cases so one
+# test doesn't leak state into the next — `fai test` reuses the VM
+# for all tests in a suite, so the process-scoped map persists.
+def doc_storage_testing
+    @return Void
+do
+  # test setApiKey
+  # it 'overwrites a previously stored key'
+  #   storage.storageClear()
+  #   setApiKey('first')
+  #   setApiKey('second')
+  #   assert.equals(apiKey(), 'second')
+  #   storage.storageClear()
+  # end
+  # end
+end
+
+# Keys are flat strings — namespace them yourself to avoid collisions
+# with other apps on the same origin (localStorage is shared per-host
+# in browsers). A `<app>.<name>` convention works well.
+def doc_storage_key_namespacing
+    @return Void
+do
+  # Good: distinctive prefix.
+  #   'partners.apiKey'
+  #   'partners.prefs'
+  # Avoid:
+  #   'apiKey'            # collides with any other forui app on the host
+  #   'user'              # too generic
+end

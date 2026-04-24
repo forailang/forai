@@ -1,0 +1,12 @@
+use std.math
+
+# expect: ok
+# stdout:
+#   1
+#   5
+def main
+    @return Void
+do
+  print(math.min(1.0, 5.0))
+  print(math.max(1.0, 5.0))
+end

@@ -1,0 +1,40 @@
+# expect: ok
+# stdout:
+#   3
+# Block.
+
+type def Block
+    @return Void
+end
+
+# Call the block n times.
+def repeatN
+    @param n Int
+    @param b Block
+    @return Void
+do
+  var i = 0
+  while i < n
+    b()
+    i = i + 1
+  end
+end
+
+test repeatN
+it 'invokes'
+  repeatN(2) do
+
+  end
+  assert.isTrue(true)
+end
+end
+
+def main
+    @return Void
+do
+  var count = 0
+  repeatN(3) do
+      count = count + 1
+  end
+  print(count)
+end

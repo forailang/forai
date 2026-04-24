@@ -1,0 +1,12 @@
+type Point
+  x Int
+  y Int
+end
+
+def main
+    @return Void
+do
+  let p = Point(x: 1, y: 2)
+  print(p.x)
+  print(p.y)
+end

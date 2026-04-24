@@ -1,0 +1,17 @@
+# expect: ok
+# stdout:
+#   Alice
+#   30
+#   true
+def main
+    @return Void
+do
+  let d = {
+    name: 'Alice'
+    age: 30
+    admin: true
+  }
+  print(getString(d, 'name'))
+  print(getInt(d, 'age'))
+  print(getBool(d, 'admin'))
+end

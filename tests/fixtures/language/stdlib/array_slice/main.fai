@@ -1,0 +1,22 @@
+use std.array
+
+# expect: ok
+# stdout:
+#   2
+#   20
+#   30
+def main
+    @return Void
+do
+  let s = array.slice([
+    10
+    20
+    30
+    40
+    50
+  ], 1, 3)
+  print(length(s))
+  for x in s
+    print(x)
+  end
+end

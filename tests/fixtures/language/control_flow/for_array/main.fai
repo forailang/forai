@@ -1,0 +1,17 @@
+# expect: ok
+# stdout:
+#   a
+#   b
+#   c
+def main
+    @return Void
+do
+  let xs = [
+    'a'
+    'b'
+    'c'
+  ]
+  for x in xs
+    print(x)
+  end
+end

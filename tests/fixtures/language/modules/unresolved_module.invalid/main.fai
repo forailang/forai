@@ -1,0 +1,10 @@
+# expect: check_error
+# error: nonexistent
+
+use { something } from nonexistent
+
+def main
+    @return Void
+do
+  print(something())
+end

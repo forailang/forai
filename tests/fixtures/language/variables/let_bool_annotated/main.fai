@@ -1,0 +1,9 @@
+# expect: ok
+# stdout:
+#   false
+def main
+    @return Void
+do
+  let myBool Bool = false
+  print(myBool)
+end

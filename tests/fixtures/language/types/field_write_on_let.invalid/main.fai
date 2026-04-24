@@ -1,0 +1,13 @@
+# expect: check_error
+# error: immutable
+def main
+    @return Void
+do
+  let p = Point(x: 1, y: 2)
+  p.x = 99
+end
+
+type Point
+  x Int
+  y Int
+end

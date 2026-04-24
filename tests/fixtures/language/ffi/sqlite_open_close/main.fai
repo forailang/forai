@@ -1,0 +1,19 @@
+# expect: ok
+# stdout:
+#   open_rc=0
+#   close_rc=0
+
+extern sqlite3
+  def sqlite3_open(path: String, out db: Ptr) -> Int
+  def sqlite3_close(db: Ptr) -> Int
+end
+
+def main
+    @return Void
+do
+  let db Ptr? = null
+  let open_rc = sqlite3_open(':memory:', db)
+  print("open_rc={{open_rc}}")
+  let close_rc = sqlite3_close(db)
+  print("close_rc={{close_rc}}")
+end

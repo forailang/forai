@@ -1,0 +1,78 @@
+# Arrays are ordered lists. Literal uses commas. Index with [n]. Length with length().
+# Index mutation requires a `var` binding. Use std.array for manipulation functions.
+def doc_arrays
+    @return Void
+do
+  let nums = [1, 2, 3]
+  let first = nums[0]          # 1
+  let count = length(nums)     # 3
+
+  var list = [1, 2, 3]
+  list[0] = 99                 # index mutation (var only)
+
+  # std.array functions (use { append, length, ... } from std.array):
+  # array.append(list, 4)      # returns new array with 4 appended
+  # array.length(list)         # length
+  # array.contains(list, 99)   # Bool
+  # array.slice(list, 0, 2)    # subarray
+end
+
+test doc_arrays
+it 'array index access'
+  let nums = [10, 20, 30]
+  assert.equals(nums[1], 20)
+end
+it 'array length'
+  assert.equals(length([1, 2, 3]), 3)
+end
+end
+
+# Dictionaries are key-value maps. Use builtins getString/getInt/set/getKeys/hasKey.
+# Dictionary literals use `{}`. Field access via dot is also supported for dynamic keys.
+def doc_dictionaries
+    @return Void
+do
+  let d = {}
+  let d2 = set(d, 'name', 'Alice')   # returns new dict
+  let name = getString(d2, 'name')    # String? (optional)
+  let n = getInt(d2, 'age')           # Int? (optional)
+  let keys = getKeys(d2)              # String[]
+  let has = hasKey(d2, 'name')        # Bool
+  let val = d2.name                   # dynamic field access → Unknown type
+end
+
+test doc_dictionaries
+it 'set and getString roundtrip'
+  let d = set({}, 'key', 'value')
+  let v = getString(d, 'key')
+  assert.equals(v?, true)
+  assert.equals(v!, 'value')
+end
+end
+
+# Optional types hold either a value or null. `?` checks non-null, `!` force-unwraps.
+# `unwrap(opt, fallback)` returns the value or a fallback if null.
+def doc_optionals
+    @return Void
+do
+  let x Int? = null
+  let y Int? = 42
+
+  if y?                  # check: is it non-null?
+    print(y!)            # force-unwrap: extract value (panics if null)
+  end
+
+  let safe = unwrap(y, 0)    # returns 42 (y is non-null)
+  let def_ = unwrap(x, 0)   # returns 0 (x is null)
+end
+
+test doc_optionals
+it 'optional check and unwrap'
+  let y Int? = 42
+  assert.equals(y?, true)
+  assert.equals(unwrap(y, 0), 42)
+  let x Int? = null
+  assert.equals(x?, false)
+  assert.equals(unwrap(x, 99), 99)
+end
+end

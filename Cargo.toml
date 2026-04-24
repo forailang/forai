@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fai-core",
+    "crates/fai-parser",
+    "crates/fai-compiler",
+    "crates/fai-checker",
+    "crates/fai-cli",
+    "crates/fai-codegen-wasm",
+    "crates/fai-ffi",
+    "crates/fai-feature-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"

@@ -1,0 +1,140 @@
+# Filter an array to only items matching a condition.
+# The predicate closure receives each item and returns Bool.
+def doc_filter
+    @return Void
+do
+  let numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  let evens = array.filter(numbers, do with n Int
+    n % 2 == 0
+  end)
+  # evens = [2, 4, 6, 8, 10]
+end
+
+test doc_filter
+it 'keeps only matching items'
+  let nums = [1, 2, 3, 4, 5]
+  let evens = array.filter(nums, do with n Int
+    n % 2 == 0
+  end)
+  assert.equals(array.length(evens), 2)
+  assert.equals(evens[0], 2)
+  assert.equals(evens[1], 4)
+end
+end
+
+# Transform each item in an array with map.
+# The closure receives each item and returns the new value.
+def doc_map
+    @return Void
+do
+  let names = ['alice', 'bob', 'carol']
+  let upper = array.map(names, do with name String
+    string.toUpper(name)
+  end)
+  # upper = ['ALICE', 'BOB', 'CAROL']
+
+  let numbers = [1, 2, 3, 4, 5]
+  let doubled = array.map(numbers, do with n Int
+    n * 2
+  end)
+  # doubled = [2, 4, 6, 8, 10]
+end
+
+test doc_map
+it 'transforms each item'
+  let nums = [1, 2, 3]
+  let result = array.map(nums, do with n Int
+    n * 10
+  end)
+  assert.equals(result[0], 10)
+  assert.equals(result[2], 30)
+end
+end
+
+# Find the first item matching a condition, returns optional (null if not found).
+def doc_find
+    @return Void
+do
+  let scores = [42, 91, 17, 88, 55]
+  let first_passing = array.find(scores, do with s Int
+    s >= 80
+  end)
+  if first_passing?
+    print(first_passing!)   # 91
+  end
+
+  # Check all or any items:
+  let all_positive = array.isAll(scores, do with s Int
+    s > 0
+  end)  # true
+  let has_perfect = array.isAny(scores, do with s Int
+    s == 100
+  end)  # false
+end
+
+test doc_find
+it 'returns first match'
+  let nums = [3, 7, 2, 9, 1]
+  let found = array.find(nums, do with n Int
+    n > 5
+  end)
+  assert.isNotNull(found)
+  assert.equals(found!, 7)
+end
+it 'returns null when not found'
+  let nums = [1, 2, 3]
+  let found = array.find(nums, do with n Int
+    n > 99
+  end)
+  assert.isNull(found)
+end
+end
+
+# Filter an array of structs by a field value.
+def doc_filter_structs
+    @return Void
+do
+  # type Task
+  #   id Int
+  #   text String
+  #   done Bool
+  # end
+  #
+  # let tasks = [
+  #   Task(id: 1, text: 'Buy milk', done: true),
+  #   Task(id: 2, text: 'Write code', done: false),
+  #   Task(id: 3, text: 'Review PR', done: false),
+  # ]
+  #
+  # let pending = array.filter(tasks, do with t Task
+  #   !t.done
+  # end)
+  # # pending has 2 items: 'Write code', 'Review PR'
+  #
+  # let done_ids = array.map(
+  #   array.filter(tasks, do with t Task t.done end),
+  #   do with t Task t.id end
+  # )
+  # # done_ids = [1]
+end
+
+# Sort an array of primitives, or by extracted key for structs.
+def doc_sort
+    @return Void
+do
+  let nums = [3, 1, 4, 1, 5, 9, 2, 6]
+  let sorted = array.sort(nums)
+  # sorted = [1, 1, 2, 3, 4, 5, 6, 9]
+
+  # For struct sorting, extract a comparable field first using map:
+  # let tasks_by_id = array.sort(array.map(tasks, do with t Task t.id end))
+end
+
+test doc_sort
+it 'sorts ascending'
+  let nums = [3, 1, 4, 1, 5]
+  let sorted = array.sort(nums)
+  assert.equals(sorted[0], 1)
+  assert.equals(sorted[4], 5)
+end
+end

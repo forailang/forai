@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   6
+
+type def Producer
+    @return Int
+end
+
+# Call.
+def call
+    @param p Producer
+    @return Int
+do
+  p()
+end
+
+test call
+it 'captures outer value'
+  let x = 5
+  let r = call do
+      x + 1
+  end
+  assert.equal(r, 6)
+end
+end
+
+def main
+    @return Void
+do
+  let x = 5
+  let r = call do
+      x + 1
+  end
+  print(r)
+end

@@ -1,0 +1,33 @@
+# expect: ok
+# stdout:
+#   positive
+def describe
+    @param n Int
+    @return String
+do
+  if n < 0
+    return 'negative'
+  end
+  if n == 0
+    return 'zero'
+  end
+  'positive'
+end
+
+test describe
+it 'handles negative'
+  assert.equals(describe(-3), 'negative')
+end
+it 'handles zero'
+  assert.equals(describe(0), 'zero')
+end
+it 'handles positive'
+  assert.equals(describe(5), 'positive')
+end
+end
+
+def main
+    @return Void
+do
+  print(describe(5))
+end

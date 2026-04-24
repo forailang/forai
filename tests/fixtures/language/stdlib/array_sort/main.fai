@@ -1,0 +1,19 @@
+use std.array
+
+# expect: ok
+# stdout:
+#   1
+#   2
+#   3
+def main
+    @return Void
+do
+  let sorted = array.sort([
+    3
+    1
+    2
+  ])
+  for x in sorted
+    print(x)
+  end
+end

@@ -1,0 +1,93 @@
+# Create a signal with useSignal. On first render it returns a new signal;
+# on re-renders it returns the same signal (hook ordering matters — never
+# call useSignal conditionally or inside a loop).
+def doc_use_signal
+    @return Void
+do
+  # use { useSignal } from Forui.signal
+  #
+  # # Simple value signal:
+  # var count = useSignal(0)
+  # count.value                  # read the value
+  # count.setValue(count.value + 1)   # mutate — triggers re-render
+  #
+  # # String signal:
+  # var name = useSignal('')
+  # name.setValue('Alice')
+end
+
+# Load async data with useSignal + a loader closure.
+# The loader runs automatically on first render in the background (nowait).
+# Check state with isLoading(), isLoaded(), isError() before reading .value.
+def doc_signal_loader
+    @return Void
+do
+  # use { useSignal, isLoading, isLoaded, isError, reload } from Forui.signal
+  # use { getTasks } from Server
+  #
+  # var tasks = useSignal([]) do
+  #   getTasks(token)              # loader: called automatically on first render
+  # end
+  #
+  # if tasks.isLoading()
+  #   Label('Loading…')
+  # else if tasks.isError()
+  #   Label('Error: ' + tasks.error!)
+  # else
+  #   # tasks.value is now Task[]
+  #   for t in tasks.value
+  #     Label(t.text)
+  #   end
+  # end
+  #
+  # # Refresh the data (re-runs the loader):
+  # Button('Refresh', onClick: do
+  #   tasks.reload()
+  # end)
+end
+
+# Mutate a signal from a button or event handler.
+# The signal must be declared var and passed as mutable to setValue.
+# Mutations trigger a re-render automatically.
+def doc_signal_mutation
+    @return Void
+do
+  # use { useSignal, setValue, isLoading } from Forui.signal
+  # use { addTask } from Server
+  #
+  # var input = useSignal('')
+  # var tasks = useSignal([]) do getTasks(token) end
+  # var error = useSignal('')
+  #
+  # Button('Add', onClick: do
+  #   if input.value != ''
+  #     try
+  #       addTask(token, input.value)
+  #       input.setValue('')          # clear input
+  #       tasks.reload()              # refresh list
+  #     catch e
+  #       error.setValue(e.message)   # show error
+  #     end
+  #   end
+  # end)
+end
+
+# Signals must be declared `var` to be passed to mutable param functions
+# (setValue, setLoading, setLoaded, setError, reload).
+# Signal helpers must be explicitly imported per file — there is no global namespace.
+def doc_signal_rules
+    @return Void
+do
+  # CORRECT — var allows mutation:
+  # var count = useSignal(0)
+  # count.setValue(1)           # OK
+  # count.reload()              # OK
+  #
+  # WRONG — let cannot be mutated:
+  # let count = useSignal(0)
+  # count.setValue(1)           # ERROR: cannot pass let binding to mutable param
+  #
+  # IMPORTS REQUIRED PER FILE:
+  # use { useSignal, isLoading, isLoaded, isError, reload, setValue } from Forui.signal
+  # Missing any of these gives: 'isLoading' is not in scope — add it to your import
+end

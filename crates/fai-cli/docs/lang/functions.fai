@@ -1,0 +1,116 @@
+# Named functions use @param / @return / do...end. A doc comment is required
+# on every named function except `main`. `@type`, `@param`, `@return` must
+# appear in that order. Default values are declared inline on @param.
+def doc_definition
+    @return Void
+do
+  # Basic function
+  # Add two integers.
+  # def add
+  #     @param a Int
+  #     @param b Int
+  #     @return Int
+  # do
+  #   a + b
+  # end
+
+  # With default value
+  # def greet
+  #     @param name String
+  #     @param greeting String, default: 'hello'
+  #     @return String
+  # do
+  #   "{{greeting}}, {{name}}"
+  # end
+end
+
+# Functions can be called with positional or named arguments, or mixed.
+# Named arguments can appear in any order after any positional arguments.
+def doc_calling
+    @return Void
+do
+  # add(1, 2)                          # positional
+  # greet(name: 'Alice')               # named (uses default greeting)
+  # greet('Alice', greeting: 'hey')    # mixed
+end
+
+# UFCS: any function can be called as a method on its first argument.
+# Every UFCS function must be explicitly imported in the file that uses it.
+def doc_ufcs
+    @return Void
+do
+  # These are identical:
+  # add(5, 3)      ↔   5.add(3)
+  # double(x)      ↔   x.double()
+  # fontSize(node, 14)  ↔  node.fontSize(14)   # must import fontSize!
+end
+
+# By default parameters are immutable copies. Mark `mutable` to let the
+# function mutate the caller's binding in place. Only `var` bindings can
+# be passed to mutable parameters.
+def doc_mutable_params
+    @return Void
+do
+  # def increment
+  #     @param c Counter, mutable
+  #     @return Void
+  # do
+  #   c.value = c.value + 1
+  # end
+  #
+  # var c = Counter(value: 0)
+  # increment(c)   # c.value is now 1
+  #
+  # let frozen = Counter(value: 0)
+  # increment(frozen)   # ERROR — cannot pass let binding to mutable param
+end
+
+# Generic functions use @type to declare type parameters, inferred at call site.
+def doc_generics
+    @return Void
+do
+  # def echo
+  #     @type T
+  #     @param value T
+  #     @return T
+  # do
+  #   value
+  # end
+  #
+  # echo(42)       # T = Int
+  # echo('hello')  # T = String
+end
+
+# Anonymous closures use do...end. Parameter types and return type are inferred
+# from the type def they are matched against. Closures capture outer variables.
+# The last function parameter can be passed as a trailing block.
+def doc_closures
+    @return Void
+do
+  # Inline block:
+  # run(do
+  #   print('hello')
+  # end)
+  #
+  # With explicit parameter:
+  # apply(5, do with n Int
+  #   n * 2
+  # end)
+  #
+  # Trailing block (last param is a type def):
+  # Button('Click', onClick: do
+  #   print('clicked')
+  # end)
+end
+
+test doc_closures
+it 'closure captures outer variable'
+  var total = 0
+  let add = do with n Int
+    total = total + n
+  end
+  add(5)
+  add(3)
+  assert.equals(total, 8)
+end
+end

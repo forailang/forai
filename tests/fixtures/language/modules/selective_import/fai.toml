@@ -1,0 +1,4 @@
+[project]
+name = "selective_import"
+version = "0.1.0"
+source_root = "."

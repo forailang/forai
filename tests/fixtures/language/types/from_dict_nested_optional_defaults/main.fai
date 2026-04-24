@@ -1,0 +1,29 @@
+# expect: ok
+# stdout:
+#   Bob
+#   Paris
+#   friend
+#   true
+def main
+    @return Void
+do
+  let d = {
+    name: 'Bob'
+  }
+  let p Person = from_dict(d)
+  print(p.name)
+  print(p.address.city)
+  print(p.nickname)
+  print(p.note == null)
+end
+
+type Person
+  name String
+  address Address = Address()
+  nickname String? = 'friend'
+  note String?
+end
+
+type Address
+  city String = 'Paris'
+end

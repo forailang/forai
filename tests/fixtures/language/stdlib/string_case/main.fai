@@ -1,0 +1,13 @@
+use std.string
+
+# expect: ok
+# stdout:
+#   HELLO
+#   hello
+def main
+    @return Void
+do
+  let s = 'Hello'
+  print(string.toUpper(s))
+  print(string.toLower(s))
+end

@@ -1,0 +1,20 @@
+# expect: ok
+# stdout:
+#   2
+#   4
+#   6
+def main
+    @return Void
+do
+  var xs = [
+    1
+    2
+    3
+  ]
+  for i in 0..3
+    xs[i] = xs[i] * 2
+  end
+  for x in xs
+    print(x)
+  end
+end

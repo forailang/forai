@@ -1,0 +1,27 @@
+# Double.
+def double
+    @param n Int
+    @return Int
+do
+  n * 2
+end
+
+# Triple.
+def triple
+    @param n Int
+    @return Int
+do
+  n * 3
+end
+
+test double
+  it 'works'
+    assert.equal(double(2), 4)
+  end
+end
+
+test triple
+  it 'works'
+    assert.equal(triple(2), 6)
+  end
+end

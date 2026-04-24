@@ -1,0 +1,8 @@
+# expect: check_error
+# error: break
+def main
+    @return Void
+do
+  break
+  print('unreachable')
+end

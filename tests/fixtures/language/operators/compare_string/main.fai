@@ -1,0 +1,10 @@
+# expect: ok
+# stdout:
+#   true
+#   false
+def main
+    @return Void
+do
+  print('a' == 'a')
+  print('a' == 'b')
+end

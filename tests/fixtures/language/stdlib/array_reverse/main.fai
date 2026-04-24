@@ -1,0 +1,19 @@
+use std.array
+
+# expect: ok
+# stdout:
+#   3
+#   2
+#   1
+def main
+    @return Void
+do
+  let r = array.reverse([
+    1
+    2
+    3
+  ])
+  for x in r
+    print(x)
+  end
+end

@@ -1,0 +1,55 @@
+# `let` declares an immutable binding. No reassignment and no field mutation.
+def doc_let
+    @return Void
+do
+  let x = 42
+  let name String = 'Alice'  # optional explicit type annotation
+  let maybe Int? = null      # optional type — can be null
+end
+
+test doc_let
+it 'let binding holds its initial value'
+  let x = 42
+  assert.equals(x, 42)
+end
+end
+
+# `var` declares a mutable binding. Reassignment and field mutation both allowed.
+def doc_var
+    @return Void
+do
+  var count = 0
+  count = count + 1          # reassignment
+  var user = User(name: 'Alice', age: 30)
+  user.age = 31              # field mutation
+end
+
+test doc_var
+it 'var binding can be reassigned'
+  var count = 0
+  count = count + 1
+  assert.equals(count, 1)
+end
+end
+
+# All assignments are deep copies — variables never share references.
+# Mutating a copy never affects the original.
+def doc_value_semantics
+    @return Void
+do
+  var a = [1, 2, 3]
+  var b = a       # deep copy — b is independent
+  b[0] = 99
+  print(a[0])     # still 1 — a is unchanged
+  print(b[0])     # 99
+end
+
+test doc_value_semantics
+it 'assignment creates independent copy'
+  var a = [1, 2, 3]
+  var b = a
+  b[0] = 99
+  assert.equals(a[0], 1)
+  assert.equals(b[0], 99)
+end
+end

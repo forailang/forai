@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   true
+def main
+    @return Void
+do
+  let a = false
+  let b = true
+  let c = true
+  print(not a and b or c)
+end

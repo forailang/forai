@@ -1,0 +1,23 @@
+# nowait — spawn a background task and return immediately (fire and forget).
+def doc_nowait
+    @return Void
+do
+  # nowait logEvent('page_viewed')
+  # nowait sendWelcomeEmail(user.email)
+end
+
+# all() — run multiple tasks concurrently, block until all complete.
+# Returns results as a tuple matching the order of the calls.
+def doc_all
+    @return Void
+do
+  # let a, b = all(fetchUsers(), fetchPosts())   # parallel, both must succeed
+  # let x, y, z = all(taskA(), taskB(), taskC())
+end
+
+# sleep() — pause execution for a given number of milliseconds.
+def doc_sleep
+    @return Void
+do
+  # sleep(500)   # pause for 500 ms
+end

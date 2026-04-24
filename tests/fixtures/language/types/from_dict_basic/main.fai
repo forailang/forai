@@ -1,0 +1,20 @@
+# expect: ok
+# stdout:
+#   Alice
+#   30
+def main
+    @return Void
+do
+  let d = {
+    name: 'Alice'
+    age: 30
+  }
+  let p Person = from_dict(d)
+  print(p.name)
+  print(p.age)
+end
+
+type Person
+  name String
+  age Int
+end

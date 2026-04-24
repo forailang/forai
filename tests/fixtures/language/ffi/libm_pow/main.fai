@@ -1,0 +1,13 @@
+# expect: ok
+# stdout:
+#   8
+
+extern m
+  def pow(base: Float, exp: Float) -> Float
+end
+
+def main
+    @return Void
+do
+  print(pow(2.0, 3.0))
+end

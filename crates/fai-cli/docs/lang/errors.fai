@@ -1,0 +1,52 @@
+# try / catch / finally — error handling. `throw` unwinds the call stack.
+# `e.message` is the error message string. `finally` always runs.
+def doc_try_catch
+    @return Void
+do
+  try
+    throw Error('something went wrong')
+  catch e
+    print(e.message)   # 'something went wrong'
+  finally
+    print('always runs')
+  end
+end
+
+test doc_try_catch
+it 'catch receives the thrown error'
+  var caught = ''
+  try
+    throw Error('boom')
+  catch e
+    caught = e.message
+  end
+  assert.equals(caught, 'boom')
+end
+it 'finally always runs'
+  var ran = false
+  try
+    throw Error('x')
+  catch e
+  finally
+    ran = true
+  end
+  assert.equals(ran, true)
+end
+end
+
+# throw works across function boundaries — the call stack unwinds to the nearest catch.
+def doc_throw
+    @return Void
+do
+  # def riskyOp
+  #     @return String
+  # do
+  #   throw Error('failed')
+  # end
+  #
+  # try
+  #   let result = riskyOp()
+  # catch e
+  #   print(e.message)   # 'failed'
+  # end
+end

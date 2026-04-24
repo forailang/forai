@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   1
+# Block.
+
+type def Block
+    @return Void
+end
+
+# Call the given block.
+def call
+    @param b Block
+    @return Void
+do
+  b()
+end
+
+test call
+it 'invokes block'
+  call do
+
+  end
+  assert.isTrue(true)
+end
+end
+
+def main
+    @return Void
+do
+  var x = 0
+  call do
+      x = 1
+  end
+  print(x)
+end

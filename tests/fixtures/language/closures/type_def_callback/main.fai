@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   clicked!
+
+type def ClickHandler
+    @return Int
+end
+
+# Fire.
+def fire
+    @param handler ClickHandler
+    @return Int
+do
+  handler()
+end
+
+test fire
+it 'returns the handler result'
+  let r = fire do
+      99
+  end
+  assert.equal(r, 99)
+end
+end
+
+def main
+    @return Void
+do
+  let code = fire do
+      1
+  end
+  if code == 1
+    print('clicked!')
+  end
+end

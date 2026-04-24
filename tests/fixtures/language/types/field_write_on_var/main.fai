@@ -1,0 +1,12 @@
+type Point
+  x Int
+  y Int
+end
+
+def main
+    @return Void
+do
+  var p = Point(x: 1, y: 2)
+  p.x = 99
+  print(p.x)
+end

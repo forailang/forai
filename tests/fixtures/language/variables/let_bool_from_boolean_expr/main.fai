@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   true
+def main
+    @return Void
+do
+  let a = true
+  let b = false
+  let myBool = a or b
+  print(myBool)
+end

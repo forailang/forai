@@ -1,0 +1,7 @@
+# expect: check_error
+# error: Malformed scientific notation
+def main
+    @return Void
+do
+  print(1e)
+end

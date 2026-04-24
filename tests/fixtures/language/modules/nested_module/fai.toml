@@ -1,0 +1,4 @@
+[project]
+name = "nested_module"
+version = "0.1.0"
+source_root = "."

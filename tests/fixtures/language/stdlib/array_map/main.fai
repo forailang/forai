@@ -1,0 +1,21 @@
+use std.array
+
+# expect: ok
+# stdout:
+#   2
+#   4
+#   6
+def main
+    @return Void
+do
+  let doubled = array.map([
+    1
+    2
+    3
+  ]) do with n Int
+      n * 2
+  end
+  for x in doubled
+    print(x)
+  end
+end

@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   10
+#   30
+def main
+    @return Void
+do
+  let xs = [
+    10
+    20
+    30
+  ]
+  print(xs[0])
+  print(xs[2])
+end

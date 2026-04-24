@@ -1,0 +1,16 @@
+use std.string
+
+# expect: ok
+# stdout:
+#   true
+#   false
+#   true
+#   true
+def main
+    @return Void
+do
+  print(string.contains('hello world', 'world'))
+  print(string.contains('hello world', 'planet'))
+  print(string.startsWith('hello', 'he'))
+  print(string.endsWith('hello', 'lo'))
+end

@@ -1,0 +1,10 @@
+use { greet } from mymod.inner
+
+# expect: ok
+# stdout:
+#   hello from deep
+def main
+    @return Void
+do
+  print(greet())
+end

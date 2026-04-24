@@ -1,0 +1,16 @@
+# expect: ok
+# stdout:
+#   6
+def main
+    @return Void
+do
+  var sum = 0
+  for x in [
+    1
+    2
+    3
+  ]
+    sum = sum + x
+  end
+  print(sum)
+end

@@ -1,0 +1,19 @@
+# expect: ok
+# stdout:
+#   Alice
+#   false
+def main
+    @return Void
+do
+  let d = {
+    name: 'Alice'
+  }
+  let p Person = from_dict(d)
+  print(p.name)
+  print(p.active)
+end
+
+type Person
+  name String
+  active Bool = false
+end

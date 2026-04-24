@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   42
+#   3.14
+#   true
+def main
+    @return Void
+do
+  print(toString(42))
+  print(toString(3.14))
+  print(toString(true))
+end

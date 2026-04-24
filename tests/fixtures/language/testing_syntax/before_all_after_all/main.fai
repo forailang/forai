@@ -1,0 +1,46 @@
+# expect: ok
+# stdout:
+#   after-all
+
+use std.file
+
+# Temp path.
+def tempPath
+    @return String
+do
+  '/tmp/fai_before_all_after_all.txt'
+end
+
+test tempPath
+it 'returns a stable temp path'
+  assert.isTrue(length(tempPath()) > 0)
+end
+end
+
+# No-op.
+def noop
+    @return Void
+do
+
+end
+
+test noop
+beforeAll
+  file.write(tempPath(), 'before-all')
+end
+it 'runs before all before the first case'
+  assert.equals(file.read(tempPath()), 'before-all')
+end
+it 'state from before all is still visible in later cases'
+  assert.equals(file.read(tempPath()), 'before-all')
+end
+afterAll
+  file.write(tempPath(), 'after-all')
+end
+end
+
+def main
+    @return String
+do
+  file.read(tempPath())
+end

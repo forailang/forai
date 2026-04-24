@@ -1,0 +1,9 @@
+# expect: ok
+# stdout:
+#   1.23
+def main
+    @return Void
+do
+  let myFloat = 1.23
+  print(myFloat)
+end

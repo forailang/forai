@@ -1,0 +1,11 @@
+[package]
+name = "fai-checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fai-compiler = { path = "../fai-compiler" }
+
+[dev-dependencies]
+fai-compiler = { path = "../fai-compiler" }

@@ -1,0 +1,12 @@
+# expect: check_error
+# error: Int
+def main
+    @return Void
+do
+  let xs = [
+    1
+    2
+    3
+  ]
+  print(xs['a'])
+end

@@ -1,0 +1,74 @@
+# Declare a named struct type. Construction uses named arguments.
+# Field access uses dot notation. Field mutation requires a `var` binding.
+def doc_type
+    @return Void
+do
+  # type Point
+  #   x Int
+  #   y Int
+  # end
+  #
+  # let p = Point(x: 1, y: 2)   # construction
+  # p.x                           # field access → 1
+  #
+  # var q = Point(x: 3, y: 4)
+  # q.x = 10                      # field mutation (var only)
+end
+
+# Generic types use @type to declare type parameters.
+def doc_generic_type
+    @return Void
+do
+  # type Box
+  #   @type T
+  #   value T
+  # end
+  #
+  # let b = Box(value: 42)    # T inferred as Int
+  # let s = Box(value: 'hi') # T inferred as String
+end
+
+# `type def` declares a named function type for callbacks and event handlers.
+# Use it as a parameter type, field type, or variable annotation.
+def doc_type_def
+    @return Void
+do
+  # type def ClickAction
+  #     @return Void
+  # end
+  #
+  # type def Transform
+  #     @param n Int
+  #     @return Int
+  # end
+  #
+  # # As a parameter:
+  # def run
+  #     @param action ClickAction
+  #     @return Void
+  # do
+  #   action()
+  # end
+  #
+  # # As an optional field:
+  # type Button
+  #   label String
+  #   onClick ClickAction?
+  # end
+  #
+  # # Calling an optional function field:
+  # if btn.onClick?
+  #   btn.onClick!()
+  # end
+end
+
+test doc_type_def
+it 'type def callback is callable'
+  var called = false
+  let action = do
+    called = true
+  end
+  action()
+  assert.equals(called, true)
+end
+end

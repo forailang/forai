@@ -1,0 +1,23 @@
+# expect: ok
+# stdout:
+#   9
+def multiply
+    @param n Int
+    @param factor Int, default: 3
+    @return Int
+do
+  n * factor
+end
+
+test multiply
+it 'uses default'
+  assert.equal(multiply(5), 15)
+end
+end
+
+def main
+    @return Void
+do
+  let x = 3.multiply()
+  print(x)
+end

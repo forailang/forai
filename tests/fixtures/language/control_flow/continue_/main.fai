@@ -1,0 +1,14 @@
+# expect: ok
+# stdout:
+#   1
+#   3
+def main
+    @return Void
+do
+  for i in 0..4
+    if i == 0 or i == 2
+      continue
+    end
+    print(i)
+  end
+end

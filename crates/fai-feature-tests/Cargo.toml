@@ -1,0 +1,16 @@
+[package]
+name = "fai-feature-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "features"
+path = "tests/features.rs"
+harness = false
+
+[dev-dependencies]
+libtest-mimic = "0.8"

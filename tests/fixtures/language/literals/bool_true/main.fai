@@ -1,0 +1,8 @@
+# expect: ok
+# stdout:
+#   true
+def main
+    @return Void
+do
+  print(true)
+end

@@ -1,0 +1,21 @@
+# expect: check_error
+# error: Int
+def double
+    @param n Int
+    @return Int
+do
+  n * 2
+end
+
+test double
+it 'ok'
+  assert.equal(double(2), 4)
+end
+end
+
+def main
+    @return Void
+do
+  let x = 'hi'.double()
+  print(x)
+end

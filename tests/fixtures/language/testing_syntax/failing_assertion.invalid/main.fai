@@ -1,0 +1,21 @@
+# expect: runtime_error
+# error: assertion
+def add
+    @param a Int
+    @param b Int
+    @return Int
+do
+  a + b
+end
+
+test add
+it 'deliberately fails'
+  assert.equals(add(1, 2), 999)
+end
+end
+
+def main
+    @return Void
+do
+  print('done')
+end

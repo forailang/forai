@@ -1,0 +1,17 @@
+use std.array
+
+# expect: ok
+# stdout:
+#   true
+#   false
+def main
+    @return Void
+do
+  let xs = [
+    1
+    2
+    3
+  ]
+  print(array.contains(xs, 2))
+  print(array.contains(xs, 99))
+end

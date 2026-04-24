@@ -1,0 +1,26 @@
+# PublicFn.
+def publicFn
+    @return Int
+do
+  helper() + 1
+end
+
+test publicFn
+  it 'returns 43'
+    assert.equal(publicFn(), 43)
+  end
+end
+
+private:
+# Helper.
+def helper
+    @return Int
+do
+  42
+end
+
+test helper
+  it 'returns 42'
+    assert.equal(helper(), 42)
+  end
+end

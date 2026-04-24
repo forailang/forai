@@ -1,0 +1,37 @@
+# Single quotes produce a plain string literal with no interpolation.
+# Double quotes support `{{variable}}` interpolation (double braces).
+def doc_literals
+    @return Void
+do
+  let plain = 'hello world'
+  let name = 'Alice'
+  let greeting = "hello {{name}}"   # → 'hello Alice'
+  let path = 'no {{interpolation}} here'
+end
+
+test doc_literals
+it 'double-quote interpolation'
+  let name = 'world'
+  let msg = "hello {{name}}"
+  assert.equals(msg, 'hello world')
+end
+it 'single-quote no interpolation'
+  let s = '{{not interpolated}}'
+  assert.equals(s, '{{not interpolated}}')
+end
+end
+
+# String concatenation uses +. toString() converts any value to a string.
+def doc_concatenation
+    @return Void
+do
+  let a = 'hello' + ' ' + 'world'   # 'hello world'
+  let n = 42
+  let s = 'value: ' + toString(n)   # 'value: 42'
+end
+
+test doc_concatenation
+it 'concatenates strings'
+  assert.equals('a' + 'b' + 'c', 'abc')
+end
+end

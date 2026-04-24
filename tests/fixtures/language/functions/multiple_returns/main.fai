@@ -1,0 +1,28 @@
+# expect: ok
+# stdout:
+#   1
+#   2
+def swap
+    @param a Int
+    @param b Int
+    @return first Int
+    @return second Int
+do
+  b, a
+end
+
+test swap
+it 'swaps'
+  let x, y = swap(2, 1)
+  assert.equal(x, 1)
+  assert.equal(y, 2)
+end
+end
+
+def main
+    @return Void
+do
+  let x, y = swap(2, 1)
+  print(x)
+  print(y)
+end

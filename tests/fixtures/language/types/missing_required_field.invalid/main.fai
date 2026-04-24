@@ -1,0 +1,13 @@
+# expect: check_error
+# error: y
+def main
+    @return Void
+do
+  let p = Point(x: 1)
+  print(p.x)
+end
+
+type Point
+  x Int
+  y Int
+end

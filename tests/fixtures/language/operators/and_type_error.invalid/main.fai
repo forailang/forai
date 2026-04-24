@@ -1,0 +1,7 @@
+# expect: check_error
+# error: requires Bool operands
+def main
+    @return Void
+do
+  print(1 and 2)
+end

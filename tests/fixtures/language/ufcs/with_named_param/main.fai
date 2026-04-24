@@ -1,0 +1,22 @@
+# expect: ok
+# stdout:
+#   Hi, Alice
+def greet
+    @param name String
+    @param salutation String
+    @return String
+do
+  salutation + ', ' + name
+end
+
+test greet
+it 'supports ufcs with named args'
+  assert.equal('Alice'.greet(salutation: 'Hi'), 'Hi, Alice')
+end
+end
+
+def main
+    @return Void
+do
+  print('Alice'.greet(salutation: 'Hi'))
+end

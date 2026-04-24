@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   true
+#   false
+#   true
+def main
+    @return Void
+do
+  print(1.5 == 1.5)
+  print(1.5 == 1.6)
+  print(1.5 < 1.6)
+end

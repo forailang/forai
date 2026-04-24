@@ -1,0 +1,21 @@
+# expect: ok
+# stdout:
+#   3.14
+def returnsFloat
+    @return Float
+do
+  3.14
+end
+
+test returnsFloat
+it 'returns 3.14'
+  assert.equal(returnsFloat(), 3.14)
+end
+end
+
+def main
+    @return Void
+do
+  let myFloat = returnsFloat()
+  print(myFloat)
+end

@@ -1,0 +1,41 @@
+# expect: ok
+# stdout:
+#   3
+# Block.
+
+type def Block
+    @return Void
+end
+
+# Runs two blocks in sequence.
+def runPair
+    @param a Block
+    @param b Block
+    @return Void
+do
+  a()
+  b()
+end
+
+test runPair
+it 'runs'
+  runPair(do
+
+  end) do
+
+  end
+  assert.isTrue(true)
+end
+end
+
+def main
+    @return Void
+do
+  var total = 0
+  runPair(do
+      total = total + 1
+  end) do
+      total = total + 2
+  end
+  print(total)
+end

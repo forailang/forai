@@ -1,0 +1,7 @@
+# expect: check_error
+# error: Malformed number literal
+def main
+    @return Void
+do
+  print(1.2.3e4)
+end

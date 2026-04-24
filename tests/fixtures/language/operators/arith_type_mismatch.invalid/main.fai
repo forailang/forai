@@ -1,0 +1,7 @@
+# expect: check_error
+# error: requires numeric or string
+def main
+    @return Void
+do
+  print(1 + 'a')
+end

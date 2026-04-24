@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   a@b.com
+def main
+    @return Void
+do
+  let d = {
+    name: 'Alice'
+  }
+  let d2 = set(d, 'email', 'a@b.com')
+  print(getString(d2, 'email'))
+end

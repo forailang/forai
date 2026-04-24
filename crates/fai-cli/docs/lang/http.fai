@@ -1,0 +1,98 @@
+# Make an HTTP GET request and read the response status and body.
+# Use `use std.http.request` for all HTTP methods.
+# Response fields: status (Int), body (String), headers (Dictionary).
+def doc_get_request
+    @return Void
+do
+  # use std.http.request
+  # let res = request.get('https://api.example.com/health')
+  # print(res.status)   # 200
+  # print(res.body)     # '{"status":"ok"}'
+end
+
+# Make a POST request with a JSON body and custom headers.
+# For hyphenated header names (e.g. x-api-key) use dictionary.set.
+def doc_post_with_headers
+    @return Void
+do
+  # use std.http.request
+  # use std.json
+  #
+  # let body = json.stringify({action: 'create', name: 'Alice'})
+  #
+  # # Simple headers — Dictionary literal (keys must be valid identifiers)
+  # let res = request.post('https://api.example.com/users', body,
+  #   headers: {Authorization: 'Bearer mytoken123'})
+  #
+  # # Hyphenated header names — use dictionary.set
+  # var h = {Authorization: 'Bearer mytoken123'}
+  # h = set(h, 'x-api-key', 'abc-xyz')
+  # let res = request.post('https://api.example.com/users', body, headers: h)
+  #
+  # print(res.status)   # 201
+end
+
+# Parse a JSON response body into a typed struct.
+# json.parse() returns a Dictionary. Use getString/getInt/getBool to extract fields.
+# All getX functions return optional (String?, Int?, Bool?). Use ! to unwrap or unwrap() for fallback.
+def doc_json_to_type
+    @return Void
+do
+  # use std.http.request
+  # use std.json
+  #
+  # type User
+  #   id Int
+  #   name String
+  #   email String
+  # end
+  #
+  # def fetchUser
+  #     @param userId Int
+  #     @return User
+  # do
+  #   let res = request.get("https://api.example.com/users/{{toString(userId)}}")
+  #   let body = json.parse(res.body)
+  #   User(
+  #     id:    unwrap(getInt(body, 'id'), 0),
+  #     name:  unwrap(getString(body, 'name'), ''),
+  #     email: unwrap(getString(body, 'email'), ''),
+  #   )
+  # end
+end
+
+# Parse a JSON array response into a typed list.
+# Use a for loop over the parsed array, extracting each item.
+def doc_json_array_to_list
+    @return Void
+do
+  # use std.http.request
+  # use std.json
+  # use std.array
+  #
+  # type Team
+  #   id String
+  #   name String
+  # end
+  #
+  # def fetchTeams
+  #     @param apiKey String
+  #     @return Team[]
+  # do
+  #   var h = {}
+  #   h = set(h, 'x-api-key', apiKey)
+  #   let res = request.get('https://api.example.com/teams', headers: h)
+  #   let body = json.parse(res.body)          # body is a Dictionary
+  #   var teams Team[] = []
+  #   # If the API returns `{"teams": [...]}`, body.teams is an Array.
+  #   # Iterate the array directly — there is no `.items` wrapper.
+  #   for item in body.teams
+  #     let team = Team(
+  #       id:   unwrap(getString(item, 'id'), ''),
+  #       name: unwrap(getString(item, 'name'), ''),
+  #     )
+  #     teams = array.append(teams, team)
+  #   end
+  #   teams
+  # end
+end

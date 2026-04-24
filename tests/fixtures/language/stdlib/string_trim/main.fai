@@ -1,0 +1,10 @@
+use std.string
+
+# expect: ok
+# stdout:
+#   hi
+def main
+    @return Void
+do
+  print(string.trim('   hi   '))
+end

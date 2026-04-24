@@ -1,0 +1,12 @@
+# Greet.
+def greet
+    @return String
+do
+  'hello from deep'
+end
+
+test greet
+  it 'greets'
+    assert.equal(greet(), 'hello from deep')
+  end
+end

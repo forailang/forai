@@ -1,0 +1,7 @@
+# expect: check_error
+# error: Unexpected character '|'
+def main
+    @return Void
+do
+  print(true || false)
+end

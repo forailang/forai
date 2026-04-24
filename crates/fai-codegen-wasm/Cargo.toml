@@ -1,0 +1,22 @@
+[package]
+name = "fai-codegen-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Phase H deleted the bytecode→wasm lowering path that once depended
+# on `fai-core`'s bytecode types; the direct AST→wasm builder consumes
+# only the compiler-side serde AST now.
+fai-compiler = { path = "../fai-compiler" }
+fai-checker = { path = "../fai-checker" }
+wasm-encoder = "0.225"
+
+[dev-dependencies]
+serde_json = "1"
+wasmtime = "29"
+# Used by the test helper `helpful_module_new` to turn opaque wasmtime
+# validation errors into reports that name the offending function and
+# print the surrounding WAT. See `crates/fai-codegen-wasm/src/tests.rs`.
+wasmparser = "0.221"
+wasmprinter = "0.221"

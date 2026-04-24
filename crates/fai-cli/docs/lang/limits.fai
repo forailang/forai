@@ -1,0 +1,242 @@
+# Resource limits
+#
+# Every countable table in the compiler and runtime has a hard cap, and
+# the compiler / VM refuse to silently truncate past it. Every limit
+# produces the same error shape:
+#
+#   <limit-name>: limit exceeded (N > CAP) in function `foo` at file:line:col. <fix hint>
+#
+# Editors and agents can grep for the limit name and the `file:line:col`
+# segment to jump to the offending expression.
+#
+# When you hit one of these, read the fix hint — it's concrete. If the
+# error says "hoist subexpressions into `let` bindings", that is the
+# fix; the compiler is telling you the function's peak live-register
+# pressure is too high for a single u8 register file, and factoring the
+# expression into named locals drops the peak.
+#
+# The same limits apply whether you `fai run` (VM interpreter) or build
+# to WebAssembly (`fai build --target wasm-html`, `fai run --wasm`).
+def doc_limits_overview
+    @return Void
+do
+  # The full inventory — see the per-section entries below for the fix
+  # patterns.
+  #
+  #   registers               255 per function
+  #   parameters              255 per function
+  #   upvalues                255 per closure
+  #   call arguments          255 per call
+  #   string pool             65535 per module
+  #   constants               65535 per function
+  #   wasm native method ids  255 per module (WASM backend only)
+  #   call depth              1024 runtime frames
+end
+
+# registers — 255 per function.
+#
+# Each let-binding, each temporary for a subexpression, each function
+# argument lands in a register. The VM and WASM codegen both address
+# registers via u8 indices, so the peak live-register count in a single
+# function can't exceed 255.
+#
+# Tripped by wide expressions — a type constructor called with 10+
+# labelled args where each arg is a nested `unwrap(getString(d, '...'),
+# '')` chain is the classic offender. Each nested call holds a live
+# register for the outer call's arg slot PLUS registers for its own
+# intermediates; at ~10 fields the peak blows through 255.
+#
+# Fix:
+#   - Hoist each subexpression into a `let` so the compiler can reuse
+#     the register slot once the let-binding isn't read again.
+#   - Split the function into smaller helpers — one helper per 4-5
+#     fields, then a composer that calls each and stitches the result.
+def doc_limits_registers
+    @return Void
+do
+  # Before (trips the cap):
+  #   MyType(
+  #     a: unwrap(getString(d, 'a'), ''),
+  #     b: unwrap(getString(d, 'b'), ''),
+  #     ...  # 10+ of these
+  #   )
+  #
+  # After (compiles cleanly, same behaviour):
+  #   let a = unwrap(getString(d, 'a'), '')
+  #   let b = unwrap(getString(d, 'b'), '')
+  #   ...
+  #   MyType(a: a, b: b, ...)
+end
+
+# parameters — 255 per function.
+#
+# `@param` entries. A function that takes 256+ params can't be called
+# because the call instruction indexes args via u8.
+#
+# Fix: collect related params into a typed record and pass one value.
+def doc_limits_parameters
+    @return Void
+do
+  # Before:
+  #   def render
+  #     @param a1 Int @param a2 Int ... @param a260 Int
+  #     @return View
+  #   do ... end
+  #
+  # After:
+  #   type Config a1 Int; a2 Int; ... end
+  #   def render
+  #     @param c Config
+  #     @return View
+  #   do ... end
+end
+
+# upvalues — 255 per closure.
+#
+# A closure captures variables from enclosing scopes as upvalues. The
+# upvalue index is u8, so a single closure can't capture 256+ distinct
+# values.
+#
+# Fix: capture one record that bundles the needed fields, instead of
+# capturing them individually.
+def doc_limits_upvalues
+    @return Void
+do
+  # Before:
+  #   def makeHandler
+  #     @return Handler
+  #   do
+  #     let a1 = ...; let a2 = ...; ... # 260 locals captured individually
+  #     do; useAll(a1, a2, ...) end
+  #   end
+  #
+  # After — bundle into one record so the closure captures a single
+  # upvalue:
+  #   type HandlerCtx a1 Int; a2 Int; ... end
+  #   def makeHandler
+  #     @return Handler
+  #   do
+  #     let ctx = HandlerCtx(a1: ..., a2: ...)
+  #     do; useAll(ctx) end
+  #   end
+end
+
+# call arguments — 255 per call.
+#
+# `foo(a1, a2, ..., a260)` — the call opcode stores arg_count as u8.
+#
+# Fix: pack the arguments into a Dictionary or Array and unpack inside
+# the function.
+def doc_limits_call_arguments
+    @return Void
+do
+  # Before:
+  #   foo(a1, a2, ..., a260)
+  #
+  # After:
+  #   foo({ 'a1': a1, 'a2': a2, ... })
+  #   # and inside `foo`, read fields back via getInt(args, 'a1') etc.
+end
+
+# string pool — 65535 per module.
+#
+# Each distinct string literal lives in the module-level string pool,
+# indexed via u16.
+#
+# This cap is large enough that real code shouldn't hit it — if you do,
+# the module has grown past what's sustainable. Split by topic, or
+# move static tables into a dedicated data module.
+def doc_limits_string_pool
+    @return Void
+do
+  # If you're auto-generating source, deduplicate repeated literals
+  # before emitting — the pool already dedupes, but the parser still
+  # walks every occurrence.
+end
+
+# constants — 65535 per function.
+#
+# Each distinct Float / Int literal in a function lives in that
+# function's constant pool, indexed via u16.
+#
+# Same story as string pool: hitting this cap means the function has
+# grown past what's maintainable. Split into helpers.
+def doc_limits_constants
+    @return Void
+do
+  # Before:
+  #   def massive ... do
+  #     if x == 1.1; ... elsif x == 1.2; ... # 65k+ of these
+  #   end
+  #
+  # After: rewrite the branching as a table lookup.
+  #   let branches = [1.1, 1.2, ...]
+end
+
+# wasm native method ids — 255 per module (WASM backend only).
+#
+# The WASM codegen dispatches std-library methods via a u8 method_id
+# switch in the runtime. This cap is a ceiling on how many distinct
+# native methods the runtime exposes — it's a language-implementation
+# limit, not a user-facing one. If you hit it while adding a new std
+# method, reuse a dispatch slot or widen the method_id encoding.
+def doc_limits_wasm_native_method_ids
+    @return Void
+do
+  # You only see this if you're extending the WASM codegen. Normal
+  # forai code never hits it.
+end
+
+# call depth — 1024 runtime frames.
+#
+# Unbounded recursion would blow the host thread's stack (Rust native
+# or wasmtime). The VM caps call depth at 1024 and surfaces a clean
+# `call depth: limit exceeded ...` runtime error instead of a process
+# abort.
+#
+# Fix: rewrite recursion as iteration, or use an accumulator to make
+# the recursion shallower. Tail-call optimisation is not guaranteed.
+def doc_limits_call_depth
+    @return Void
+do
+  # Before (blows the cap at n > 1024):
+  #   def sum
+  #     @param n Int
+  #     @return Int
+  #   do
+  #     if n <= 0; 0 else; n + sum(n - 1) end
+  #   end
+  #
+  # After (iterative; unbounded):
+  #   def sum
+  #     @param n Int
+  #     @return Int
+  #   do
+  #     var total = 0
+  #     var i = n
+  #     while i > 0
+  #       total = total + i
+  #       i = i - 1
+  #     end
+  #     total
+  #   end
+end
+
+# Backend parity.
+#
+# Every limit above applies to both the VM interpreter (`fai run`) and
+# the WASM backend (`fai run --wasm`, `fai build --target wasm-html`).
+# If a program compiles on one and not the other, that is a bug — file
+# an issue with the offending source.
+#
+# The one exception is `wasm native method ids`, which is an internal
+# limit of the WASM codegen's dispatch table and never surfaces in user
+# programs.
+def doc_limits_backend_parity
+    @return Void
+do
+  # Compile-time limits are enforced in the shared compiler pipeline,
+  # so they surface identically on both backends.
+  # Runtime limits (call depth) are enforced by each backend's VM and
+  # use the same error shape.
+end

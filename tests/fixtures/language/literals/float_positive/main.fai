@@ -1,0 +1,8 @@
+# expect: ok
+# stdout:
+#   3.14
+def main
+    @return Void
+do
+  print(3.14)
+end

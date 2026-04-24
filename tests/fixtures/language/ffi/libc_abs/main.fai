@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   42
+#   7
+
+extern c
+  def abs(n: Int) -> Int
+end
+
+def main
+    @return Void
+do
+  print(abs(-42))
+  print(abs(7))
+end

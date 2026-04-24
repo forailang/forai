@@ -1,0 +1,10 @@
+# expect: check_error
+# error: does not export 'hiddenHelper'
+
+use { hiddenHelper } from lib
+
+def main
+    @return Void
+do
+  print(hiddenHelper())
+end

@@ -1,0 +1,9 @@
+# expect: ok
+# stdout:
+#   true
+def main
+    @return Void
+do
+  let x Int? = null
+  print(x == null)
+end

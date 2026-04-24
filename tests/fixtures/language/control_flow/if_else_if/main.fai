@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   medium
+def main
+    @return Void
+do
+  let n = 5
+  if n < 3
+    print('small')
+  else if n < 10
+    print('medium')
+  else
+    print('big')
+  end
+end

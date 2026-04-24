@@ -1,0 +1,10 @@
+use { publicFn } from lib
+
+# expect: ok
+# stdout:
+#   43
+def main
+    @return Void
+do
+  print(publicFn())
+end

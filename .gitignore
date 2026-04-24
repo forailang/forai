@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# Local project planning notes
+/plans/
+
+# Local agent/editor state
+/.codex
+
+# Generated forai/WASM outputs
+/public/
+/crates/fai-cli/public/
+*.wasm
+*.wat
+*.js.map
+interface.json
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Coverage and profiling artifacts
+/coverage/
+/tarpaulin-report.html
+*.profraw
+*.profdata
+
+# Temporary files
+*.tmp
+*.temp
+*.log

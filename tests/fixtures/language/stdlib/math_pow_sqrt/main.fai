@@ -1,0 +1,12 @@
+use std.math
+
+# expect: ok
+# stdout:
+#   8
+#   3
+def main
+    @return Void
+do
+  print(math.pow(2.0, 3.0))
+  print(math.sqrt(9.0))
+end

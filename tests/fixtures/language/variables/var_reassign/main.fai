@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   1
+#   2
+def main
+    @return Void
+do
+  var x = 1
+  print(x)
+  x = 2
+  print(x)
+end

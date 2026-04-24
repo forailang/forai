@@ -1,0 +1,18 @@
+# expect: ok
+# stdout:
+#   true
+#   true
+#   true
+#   true
+#   false
+#   false
+def main
+    @return Void
+do
+  print('apple' < 'banana')
+  print('apple' <= 'apple')
+  print('banana' > 'apple')
+  print('banana' >= 'banana')
+  print('banana' < 'apple')
+  print('apple' > 'banana')
+end

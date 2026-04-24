@@ -1,0 +1,34 @@
+# expect: check_error
+# error: immutable
+# Block.
+
+type def Block
+    @return Void
+end
+
+# Call block.
+def call
+    @param b Block
+    @return Void
+do
+  b()
+end
+
+test call
+it 'calls'
+  call do
+
+  end
+  assert.isTrue(true)
+end
+end
+
+def main
+    @return Void
+do
+  let n = 0
+  call do
+      n = 1
+  end
+  print(n)
+end

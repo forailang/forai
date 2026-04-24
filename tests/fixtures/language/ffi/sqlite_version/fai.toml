@@ -1,0 +1,4 @@
+[project]
+name = "sqlite_version"
+version = "0.1.0"
+source_root = "."

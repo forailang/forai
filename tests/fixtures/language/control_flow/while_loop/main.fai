@@ -1,0 +1,14 @@
+# expect: ok
+# stdout:
+#   0
+#   1
+#   2
+def main
+    @return Void
+do
+  var i = 0
+  while i < 3
+    print(i)
+    i = i + 1
+  end
+end

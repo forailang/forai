@@ -1,0 +1,13 @@
+# Double.
+def double
+    @param n Int
+    @return Int
+do
+  n * 2
+end
+
+test double
+  it 'doubles'
+    assert.equal(double(3), 6)
+  end
+end

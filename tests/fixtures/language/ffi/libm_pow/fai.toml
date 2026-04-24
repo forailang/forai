@@ -1,0 +1,4 @@
+[project]
+name = "libm_pow"
+version = "0.1.0"
+source_root = "."

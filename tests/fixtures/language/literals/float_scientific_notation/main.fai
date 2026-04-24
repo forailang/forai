@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   1000
+#   150
+#   0.0125
+def main
+    @return Void
+do
+  print(1000.0)
+  print(150.0)
+  print(0.0125)
+end

@@ -1,0 +1,45 @@
+# expect: ok
+# stdout:
+#   version=ok
+#   rows=2
+#   id=1
+#   name=Alice
+#   score=9.5
+#   id=2
+#   name=Bob
+#   score=7.2
+#   filtered=1
+#   filtered_name=Alice
+
+use { open, close, exec, query, query_params, version } from Forsqlite
+
+use std.string
+
+def main
+    @return Void
+do
+  if string.startsWith(version(), '3.')
+    print('version=ok')
+  else
+    print('version=bad')
+  end
+  let db = open(':memory:')
+  exec(db, 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, score REAL)')
+  exec(db, "INSERT INTO users VALUES (1, 'Alice', 9.5)")
+  exec(db, "INSERT INTO users VALUES (2, 'Bob', 7.2)")
+  let rows = query(db, 'SELECT * FROM users ORDER BY id')
+  print("rows={{length(rows)}}")
+  for row in rows
+    print("id={{getInt(row, 'id')}}")
+    print("name={{getString(row, 'name')}}")
+    print("score={{get(row, 'score')}}")
+  end
+  let filtered = query_params(db, 'SELECT name, score FROM users WHERE score > ?', [
+    8
+  ])
+  print("filtered={{length(filtered)}}")
+  for row in filtered
+    print("filtered_name={{getString(row, 'name')}}")
+  end
+  close(db)
+end

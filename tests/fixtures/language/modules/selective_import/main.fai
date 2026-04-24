@@ -1,0 +1,12 @@
+use { double, triple } from util
+
+# expect: ok
+# stdout:
+#   4
+#   9
+def main
+    @return Void
+do
+  print(double(2))
+  print(triple(3))
+end

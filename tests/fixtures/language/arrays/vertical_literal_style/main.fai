@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   5
+def main
+    @return Void
+do
+  let myList = [
+    1
+    2
+    3
+    4
+    5
+  ]
+  print(length(myList))
+end

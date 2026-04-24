@@ -1,0 +1,29 @@
+# expect: ok
+# stdout:
+#   11
+#   true
+#   10
+#   true
+#   4
+#   true
+#   3
+#   true
+
+use std.string
+
+def main
+    @return Void
+do
+  let newline = 'line1\nline2'
+  let tabbed = 'left\tright'
+  let quoted = 'it\'s'
+  let path = 'a\\b'
+  print(length(newline))
+  print(string.contains(newline, '\n'))
+  print(length(tabbed))
+  print(string.contains(tabbed, '\t'))
+  print(length(quoted))
+  print(string.contains(quoted, '\''))
+  print(length(path))
+  print(string.contains(path, '\\'))
+end

@@ -1,0 +1,9 @@
+[package]
+name = "fai-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fai-core = { path = "../fai-core" }
+libloading = "0.8"

@@ -1,0 +1,33 @@
+# expect: ok
+# stdout:
+#   42
+#   42
+#   42
+def main
+    @return Void
+do
+  let outer = do with n Int
+      let inner = do with m Int
+          n + m
+      end
+      print(inner(2))
+  end
+  outer(40)
+  var total = 0
+  let countTwice = do
+      let step = do
+          total = total + 21
+      end
+      step()
+      step()
+  end
+  countTwice()
+  print(total)
+  let makeAdder = do with n Int
+      do with m Int
+          n + m
+      end
+  end
+  let add39 = makeAdder(39)
+  print(add39(3))
+end

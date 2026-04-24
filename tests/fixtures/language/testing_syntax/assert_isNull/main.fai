@@ -1,0 +1,28 @@
+# expect: ok
+# stdout:
+#   done
+def maybeValue
+    @param present Bool
+    @return Int?
+do
+  if present
+    42
+  else
+    null
+  end
+end
+
+test maybeValue
+it 'is null when absent'
+  assert.isNull(maybeValue(false))
+end
+it 'is not null when present'
+  assert.isNotNull(maybeValue(true))
+end
+end
+
+def main
+    @return Void
+do
+  print('done')
+end

@@ -1,0 +1,24 @@
+# expect: ok
+# stdout:
+#   Paris
+#   friend
+#   true
+def main
+    @return Void
+do
+  let p = Person(name: 'Alice')
+  print(p.address.city)
+  print(p.nickname)
+  print(p.note == null)
+end
+
+type Person
+  name String
+  address Address = Address()
+  nickname String? = 'friend'
+  note String?
+end
+
+type Address
+  city String = 'Paris'
+end
