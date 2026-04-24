@@ -1,0 +1,22 @@
+# expect: ok
+# browser:
+#   selector: #ffi-result
+#   text: ffi unavailable
+
+use std.browser
+
+use std.ffi
+
+extern c
+  def abs(n: Int) -> Int
+end
+
+def main
+    @return Void
+do
+  if ffi.available('c')
+    browser.setHtml('<div id="ffi-result">ffi available</div>')
+  else
+    browser.setHtml('<div id="ffi-result">ffi unavailable</div>')
+  end
+end

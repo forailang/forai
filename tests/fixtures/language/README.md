@@ -99,7 +99,7 @@ end
 | `stdout:` | Expected stdout. Each following `#` line (indented under the directive) is one output line. Trailing newline tolerated. |
 | `error:` | Pattern the diagnostic must contain. Plain substring, or `/regex/` for a regex. |
 | `skip: <reason>` | Temporarily skip. Must reference a tracking issue. |
-| `browser:` | Reserved. Browser assertions land in Phase D. |
+| `browser:` | Browser DOM assertion. Requires `selector:` plus `text:` or `html:` continuation lines. |
 
 ## Gates
 
@@ -122,6 +122,20 @@ at compile time with `error:` matching stderr.
 
 For `expect: runtime_error` fixtures: gates 1–3 reach execution, which
 must fail with `error:` matching stderr (or trap output).
+
+For browser fixtures, use `expect: ok` with a `browser:` block:
+
+```fai
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: Hello
+```
+
+The harness runs fmt-check and check, builds the fixture with
+`fai build --html`, serves the generated bundle with the contained
+Playwright runner in `tests/browser-harness`, and asserts either the
+selected element's `innerText` (`text:`) or `innerHTML` (`html:`).
 
 ## Conventions
 

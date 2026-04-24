@@ -1,0 +1,4 @@
+[project]
+name = "module_var_in_module"
+version = "0.1.0"
+source_root = "."

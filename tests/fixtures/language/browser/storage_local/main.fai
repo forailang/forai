@@ -1,0 +1,17 @@
+# expect: ok
+# browser:
+#   selector: #storage-result
+#   text: saved
+
+use std.browser
+
+use std.storage
+
+def main
+    @return Void
+do
+  storage.storageClear()
+  storage.storageSet('fai-browser-storage', 'saved')
+  let value = unwrap(storage.storageGet('fai-browser-storage'), 'missing')
+  browser.setHtml('<div id="storage-result">' + value + '</div>')
+end

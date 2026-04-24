@@ -1,0 +1,12 @@
+{
+  "name": "fai-browser-fixture-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install-browsers": "playwright install chromium",
+    "run-fixture": "node run-fixture.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.59.1"
+  }
+}

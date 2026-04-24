@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   42
+# Pass a generic-typed argument into a struct field and read it
+# back. forui's `signal.fai::createSignal(v)` follows this exact
+# shape (`Signal(value: v)` where `value` is the generic field);
+# the same ordering bug that breaks `echo(42)` also corrupts this
+# field round-trip.
+
+type Box
+  value $T
+end
+
+# Build a Box carrying v.
+def mkBox
+    @type T
+    @param v $T
+    @return Box
+do
+  Box(value: v)
+end
+
+def main
+    @return Void
+do
+  let b = mkBox(42)
+  print(b.value)
+end
+
+test mkBox
+it 'stores the generic arg in the struct field'
+  let b = mkBox(42)
+  assert.equals(b.value, 42)
+end
+end

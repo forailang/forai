@@ -598,6 +598,24 @@ pub enum BuildError {
     /// Module-qualified member access that is not a supported std or
     /// user-module function. Field access on values uses a separate path.
     ModuleAccessNotYetSupported(String),
+    /// Two discovered modules share the same canonical name. Happens
+    /// when a local module directory collides with a dependency
+    /// package — e.g. a `src/Forui/` directory in an app that also
+    /// depends on the `Forui` package. The user must rename one
+    /// rather than have the compiler silently pick a winner.
+    DuplicateModuleName(String),
+    /// Two discovered modules with distinct canonical names share
+    /// the same final segment (basename). Unqualified imports like
+    /// `use { X } from Forui` would resolve via the basename alias
+    /// and silently route to whichever module was discovered first.
+    /// Forcing a build failure surfaces the ambiguity so the user
+    /// switches to the fully-qualified `use { X } from Some.Forui`
+    /// form.
+    DuplicateModuleBasename {
+        basename: String,
+        first: String,
+        second: String,
+    },
 }
 
 /// Runtime-helper offset the function's `Call` instructions use.
@@ -1292,6 +1310,7 @@ pub fn build_function_with_spy(
         module_context,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     )
 }
 
@@ -1321,6 +1340,7 @@ pub fn build_function_with_spy_and_offset(
     module_context: Option<&str>,
     module_constants: &HashMap<String, fai_compiler::ast::Expression>,
     extern_out_params: &HashMap<String, Vec<bool>>,
+    module_vars: &HashMap<String, u32>,
 ) -> Result<BuildResult, BuildError> {
     let closures = RefCell::new(Vec::new());
     let ctx = BuildContext {
@@ -1341,6 +1361,7 @@ pub fn build_function_with_spy_and_offset(
         closures: &closures,
         module_constants,
         extern_out_params,
+        module_vars,
     };
     let main = {
         let mut b = Builder::new(fd, &ctx, None);
@@ -1360,10 +1381,17 @@ pub fn build_function_with_spy_and_offset(
 // and closure must compile through the direct builder.
 
 /// A fully-built wasm program ready to be serialised. `functions[0]`
-/// is `main` (exported as `_start`); anything after is a user-named
-/// top-level function. `closures` are the anonymous FunctionExpression
-/// heap-objects encountered inside those bodies — they land in the
-/// indirect function table after the top-level functions.
+/// is a synthesised `<__start__>` shim that runs the module-init
+/// function and then user `main` (if one exists); its wasm index is
+/// what the `_start` export points at. `functions[1]` is the
+/// synthesised `<__module_init__>` that assigns every top-level
+/// `var` initialiser into its wasm global. User functions follow
+/// (main first if defined, then other entry-AST functions, then
+/// per-module functions). `closures` are the anonymous
+/// FunctionExpression heap-objects encountered inside those bodies
+/// — they land in the indirect function table after the top-level
+/// functions.
+#[derive(Debug)]
 pub struct BuiltProgram {
     pub functions: Vec<(FunctionInfo, Function)>,
     pub closures: Vec<BuiltClosure>,
@@ -1374,6 +1402,13 @@ pub struct BuiltProgram {
     /// The dispatcher at `_fai_run_test(suite_i, case_i)` uses
     /// this to route. Empty in non-test builds.
     pub test_cases: Vec<TestCaseEntry>,
+    /// Number of top-level `var` declarations — each gets a
+    /// dedicated mutable i64 wasm global appended after the four
+    /// fixed runtime globals (`__heap_ptr`, `__env_ptr`,
+    /// `error_flag`, `error_value`). The module assembler uses this
+    /// to emit the right number of extra global slots, all
+    /// initialised to `VAL_NULL`.
+    pub module_var_count: u32,
 }
 
 /// Routing entry for one test case — the dispatcher uses the
@@ -1463,6 +1498,39 @@ pub fn build_program_full(
     import_remap: &[Option<u32>],
     is_test: bool,
 ) -> Result<BuiltProgram, BuildError> {
+    // Reject module-name collisions up front. Two kinds:
+    //
+    // 1. Same canonical name — a local `src/Forui/` directory and a
+    //    `Forui` dependency package both produce `m.name = "Forui"`.
+    //    Silently picking one would scramble call-resolution in a
+    //    way users can't diagnose.
+    //
+    // 2. Distinct canonical names, same final segment (basename) —
+    //    e.g. `MyApp.Forui` and `Forui`. The single-segment alias
+    //    path (see `module_aliases` below + `record_named_imports`)
+    //    routes `use { X } from Forui` through the basename, so an
+    //    ambiguous basename silently routes to first-seen. Refuse so
+    //    the user writes the fully-qualified path at import sites.
+    {
+        use std::collections::HashMap as StdMap;
+        let mut by_canonical: StdMap<&str, ()> = StdMap::new();
+        let mut by_basename: StdMap<&str, &str> = StdMap::new();
+        for m in modules {
+            if by_canonical.insert(m.name.as_str(), ()).is_some() {
+                return Err(BuildError::DuplicateModuleName(m.name.clone()));
+            }
+            let basename = m.name.rsplit('.').next().unwrap_or(m.name.as_str());
+            if let Some(first) = by_basename.get(basename).copied() {
+                return Err(BuildError::DuplicateModuleBasename {
+                    basename: basename.to_string(),
+                    first: first.to_string(),
+                    second: m.name.clone(),
+                });
+            }
+            by_basename.insert(basename, m.name.as_str());
+        }
+    }
+
     // Alias map merges user modules (under their last path segment)
     // with std `use` imports from the entry AST. Entry-AST std
     // aliases win on collision so `use std.array` isn't shadowed
@@ -1495,12 +1563,29 @@ pub fn build_program_full(
     fn record_named_imports(
         out: &mut HashMap<String, String>,
         stmts: &[fai_compiler::ast::Statement],
+        module_aliases: &HashMap<String, String>,
         insert_policy: fn(&mut HashMap<String, String>, String, String),
     ) {
         for s in stmts {
             if let fai_compiler::ast::Statement::UseStatement(u) = s {
                 if let Some(names) = &u.imported_names {
-                    let qualified_prefix = u.module_path.join(".");
+                    // A single-segment module path (`use { X } from
+                    // signal`) resolves through `module_aliases` —
+                    // when this file is loaded as part of a
+                    // dependency package, the alias table maps the
+                    // short name to the fully-qualified module path
+                    // (`signal` → `Forui.signal`). Without that
+                    // lookup, calls lowered with the relative path
+                    // miss in `function_by_name`, which only has the
+                    // canonical qualified entries.
+                    let qualified_prefix = if u.module_path.len() == 1 {
+                        module_aliases
+                            .get(&u.module_path[0])
+                            .cloned()
+                            .unwrap_or_else(|| u.module_path[0].clone())
+                    } else {
+                        u.module_path.join(".")
+                    };
                     for n in names {
                         insert_policy(out, n.clone(), format!("{}.{}", qualified_prefix, n));
                     }
@@ -1508,13 +1593,23 @@ pub fn build_program_full(
             }
         }
     }
-    record_named_imports(&mut named_imports, &ast.statements, |m, k, v| {
-        m.insert(k, v);
-    });
+    record_named_imports(
+        &mut named_imports,
+        &ast.statements,
+        &module_aliases,
+        |m, k, v| {
+            m.insert(k, v);
+        },
+    );
     for m in modules {
-        record_named_imports(&mut named_imports, &m.statements, |m, k, v| {
-            m.entry(k).or_insert(v);
-        });
+        record_named_imports(
+            &mut named_imports,
+            &m.statements,
+            &module_aliases,
+            |m, k, v| {
+                m.entry(k).or_insert(v);
+            },
+        );
     }
 
     // Collect extern functions from the entry AST first, then from
@@ -1632,11 +1727,207 @@ pub fn build_program_full(
         collect_module_consts(&m.statements, &mut module_constants);
     }
 
-    // Enumerate functions: main first (so `_start` points at it),
-    // then other entry-AST top-level funcs, then each module's
-    // funcs prefixed with the module path. Track each decl's
-    // module context so unqualified peer calls resolve correctly.
+    // Module-level `var NAME = EXPR` declarations. Each gets a
+    // dedicated mutable wasm global (i64) appended after the four
+    // fixed runtime globals; globals start at index 4. First-seen
+    // wins so a helper module can declare `var timerId = 0` and a
+    // peer file referencing `timerId` resolves to that slot.
+    //
+    // Initialisers are grouped by their source module so each runs
+    // in its own module context — otherwise a sibling-module
+    // initialiser like router.fai's `createSignal('/')` can't
+    // resolve `createSignal` via its own `use { createSignal }
+    // from signal` import when we compile it from a dependency
+    // context.
+    const MODULE_VAR_GLOBAL_BASE: u32 = 4;
+    let mut module_vars: HashMap<String, u32> = HashMap::new();
+    // Ordered list of (module_context, name, initialiser). None
+    // context means the entry AST's own top-level vars.
+    let mut module_var_inits: Vec<(
+        Option<String>,
+        String,
+        fai_compiler::ast::Expression,
+    )> = Vec::new();
+    {
+        fn collect_mvars(
+            stmts: &[fai_compiler::ast::Statement],
+            ctx_mod: Option<&str>,
+            map: &mut HashMap<String, u32>,
+            inits: &mut Vec<(Option<String>, String, fai_compiler::ast::Expression)>,
+            base: u32,
+        ) {
+            for s in stmts {
+                if let fai_compiler::ast::Statement::VarStatement(vs) = s {
+                    if vs.bindings.len() != 1 {
+                        continue;
+                    }
+                    let name = &vs.bindings[0].name;
+                    if map.contains_key(name) {
+                        continue;
+                    }
+                    let idx = base + inits.len() as u32;
+                    map.insert(name.clone(), idx);
+                    inits.push((
+                        ctx_mod.map(|s| s.to_string()),
+                        name.clone(),
+                        vs.value.clone(),
+                    ));
+                }
+            }
+        }
+        collect_mvars(
+            &ast.statements,
+            None,
+            &mut module_vars,
+            &mut module_var_inits,
+            MODULE_VAR_GLOBAL_BASE,
+        );
+        for m in modules {
+            collect_mvars(
+                &m.statements,
+                Some(m.name.as_str()),
+                &mut module_vars,
+                &mut module_var_inits,
+                MODULE_VAR_GLOBAL_BASE,
+            );
+        }
+    }
+    let module_var_count = module_var_inits.len() as u32;
+
+    // Does the user supply a `main`? `<__start__>` calls it after
+    // `<__module_init__>` when present; otherwise it just runs init
+    // and returns VAL_VOID via the init-call's return value.
+    let has_main = ast.statements.iter().any(|s| {
+        matches!(
+            s,
+            fai_compiler::ast::Statement::FunctionDeclaration(fd) if fd.name == "main",
+        )
+    });
+
+    // Synthesise the two wrapper functions. Names start with `<` so
+    // the export loop below skips them — hosts only see `_start`.
+    let loc_zero = fai_compiler::ast::SourceLocation { line: 0, column: 0 };
+    let mk_call_stmt = |name: &str| -> fai_compiler::ast::Statement {
+        fai_compiler::ast::Statement::ExpressionStatement(
+            fai_compiler::ast::ExpressionStatement {
+                expression: fai_compiler::ast::Expression::CallExpression(
+                    fai_compiler::ast::CallExpression {
+                        callee: Box::new(fai_compiler::ast::Expression::IdentifierExpression(
+                            fai_compiler::ast::IdentifierExpression {
+                                name: name.to_string(),
+                                location: loc_zero.clone(),
+                            },
+                        )),
+                        args: Vec::new(),
+                        location: loc_zero.clone(),
+                    },
+                ),
+                location: loc_zero.clone(),
+            },
+        )
+    };
+    // Group the initialisers by their module context so each module
+    // gets its own compiled init function. Per-module init functions
+    // are named `<__module_init__:{module_path}>` (entry-AST vars
+    // go into `<__module_init__:>`). A master `<__module_init__>`
+    // calls them in declaration order.
+    let mut per_module_inits: Vec<(Option<String>, Vec<fai_compiler::ast::Statement>)> =
+        Vec::new();
+    for (ctx_mod, name, value) in &module_var_inits {
+        let stmt = fai_compiler::ast::Statement::AssignmentStatement(
+            fai_compiler::ast::AssignmentStatement {
+                target: fai_compiler::ast::AssignmentTarget::Variables {
+                    names: vec![name.clone()],
+                },
+                value: value.clone(),
+                location: loc_zero.clone(),
+            },
+        );
+        match per_module_inits
+            .iter_mut()
+            .find(|(existing, _)| existing == ctx_mod)
+        {
+            Some((_, stmts)) => stmts.push(stmt),
+            None => per_module_inits.push((ctx_mod.clone(), vec![stmt])),
+        }
+    }
+    let per_module_init_names: Vec<String> = per_module_inits
+        .iter()
+        .map(|(ctx_mod, _)| match ctx_mod {
+            Some(m) => format!("<__module_init__:{}>", m),
+            None => "<__module_init__:>".to_string(),
+        })
+        .collect();
+    let per_module_init_decls: Vec<(fai_compiler::ast::FunctionDeclaration, Option<String>)> =
+        per_module_inits
+            .iter()
+            .zip(per_module_init_names.iter())
+            .map(|((ctx_mod, body), fn_name)| {
+                let fd = fai_compiler::ast::FunctionDeclaration {
+                    name: fn_name.clone(),
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    return_types: Vec::new(),
+                    body: body.clone(),
+                    doc: None,
+                    is_private: None,
+                    is_abstract: false,
+                    is_remote: false,
+                    location: loc_zero.clone(),
+                    doc_comment: None,
+                };
+                (fd, ctx_mod.clone())
+            })
+            .collect();
+
+    // Master `<__module_init__>` just dispatches to each per-module
+    // init. Order matches `module_var_inits` — first-seen wins for
+    // duplicate var names, same policy as global-index allocation.
+    let master_init_body: Vec<fai_compiler::ast::Statement> =
+        per_module_init_names.iter().map(|n| mk_call_stmt(n)).collect();
+    let module_init_fd = fai_compiler::ast::FunctionDeclaration {
+        name: "<__module_init__>".to_string(),
+        type_params: Vec::new(),
+        params: Vec::new(),
+        return_types: Vec::new(),
+        body: master_init_body,
+        doc: None,
+        is_private: None,
+        is_abstract: false,
+        is_remote: false,
+        location: loc_zero.clone(),
+        doc_comment: None,
+    };
+    let mut start_body: Vec<fai_compiler::ast::Statement> =
+        vec![mk_call_stmt("<__module_init__>")];
+    if has_main {
+        start_body.push(mk_call_stmt("main"));
+    }
+    let start_fd = fai_compiler::ast::FunctionDeclaration {
+        name: "<__start__>".to_string(),
+        type_params: Vec::new(),
+        params: Vec::new(),
+        return_types: Vec::new(),
+        body: start_body,
+        doc: None,
+        is_private: None,
+        is_abstract: false,
+        is_remote: false,
+        location: loc_zero.clone(),
+        doc_comment: None,
+    };
+
+    // Enumerate functions: synthesised wrappers first (so `_start`
+    // points at `<__start__>`), then user `main`, then other
+    // entry-AST top-level funcs, then each module's funcs prefixed
+    // with the module path. Track each decl's module context so
+    // unqualified peer calls resolve correctly.
     let mut decls: Vec<(fai_compiler::ast::FunctionDeclaration, Option<String>)> = Vec::new();
+    decls.push((start_fd, None));
+    decls.push((module_init_fd, None));
+    for per_module in per_module_init_decls {
+        decls.push(per_module);
+    }
     let main = ast.statements.iter().find_map(|s| match s {
         fai_compiler::ast::Statement::FunctionDeclaration(fd) if fd.name == "main" => {
             Some(fd.clone())
@@ -1725,6 +2016,7 @@ pub fn build_program_full(
             ctx_mod.as_deref(),
             &module_constants,
             &extern_out_params,
+            &module_vars,
         )?;
         functions.push((info, result.main));
         closures.extend(result.closures);
@@ -1797,6 +2089,7 @@ pub fn build_program_full(
                     ctx_mod.as_deref(),
                     &module_constants,
                     &extern_out_params,
+                    &module_vars,
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -1860,6 +2153,7 @@ pub fn build_program_full(
                     ctx_mod.as_deref(),
                     &module_constants,
                     &extern_out_params,
+                    &module_vars,
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -1914,6 +2208,7 @@ pub fn build_program_full(
                     ctx_mod.as_deref(),
                     &module_constants,
                     &extern_out_params,
+                    &module_vars,
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -1933,6 +2228,7 @@ pub fn build_program_full(
         closures,
         string_data: strings.into_inner().bytes,
         test_cases,
+        module_var_count,
     })
 }
 
@@ -2530,6 +2826,21 @@ pub fn assemble_wasm_module_with_test_flag(
         },
         &ConstExpr::i64_const(0),
     );
+    // Module-var globals. Initialised to VAL_NULL so any read-before-
+    // init observes NaN-boxed null rather than a bit-pattern 0, which
+    // wouldn't round-trip through the runtime's type checks. The
+    // `<__module_init__>` function emitted by the codegen writes the
+    // user-supplied initialiser into each slot at program start.
+    for _ in 0..program.module_var_count {
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i64_const(crate::runtime::VAL_NULL),
+        );
+    }
     module.section(&globals);
 
     // Function indices use the POST-filter import count so they
@@ -2729,6 +3040,15 @@ struct BuildContext<'a> {
     /// out db)`) propagate the written pointer back to the forai
     /// binding.
     extern_out_params: &'a HashMap<String, Vec<bool>>,
+    /// Module-level `var NAME = EXPR` bindings — names that resolve
+    /// to a dedicated mutable wasm global (i64 Boxed). Populated by
+    /// `build_program_full` from top-level var statements in the
+    /// entry AST and every discovered module; the indices line up
+    /// with the global slots appended by `assemble_wasm_module`
+    /// after the fixed runtime globals. Reads lower to `GlobalGet`,
+    /// writes to `GlobalSet`; initialisers are compiled into a
+    /// synthesised module-init function.
+    module_vars: &'a HashMap<String, u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -2794,11 +3114,15 @@ impl<'o> OuterScopeView<'o> {
 /// How an identifier resolves in the current builder's scope stack.
 /// `Local` is the ordinary case; `Upvalue` means the binding came from
 /// the outer scope (only possible when the builder is compiling a
-/// closure body) and needs to be read via `env_ptr + N*8`.
+/// closure body) and needs to be read via `env_ptr + N*8`. `ModuleVar`
+/// means the binding is a top-level `var` whose NaN-boxed value lives
+/// in a dedicated wasm global — reads are `GlobalGet(idx)`, writes are
+/// `GlobalSet(idx)`.
 #[derive(Clone, Copy)]
 enum Resolve {
     Local(LocalBinding),
     Upvalue(u32),
+    ModuleVar(u32),
 }
 
 /// Internal builder state.
@@ -2893,13 +3217,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         outer_scope: Option<&'c OuterScopeView<'c>>,
     ) -> Self {
         // Map each user parameter to its corresponding wasm local
-        // index. `type_params` (generic `@type T`) are treated the
-        // same way as user params — hidden locals the caller injects.
+        // index. Type params (generic `@type T`) come FIRST because
+        // the call-site emission pushes type-arg strings before the
+        // real user args (see `compile_call`), so they land in the
+        // callee's lowest locals. Binding user params first here
+        // would alias every user param to the wrong wasm local —
+        // generic calls then read back the type-arg string instead
+        // of the user value.
         let mut first_scope = HashMap::new();
         let mut idx = 0u32;
-        for p in &fd.params {
+        for t in &fd.type_params {
             first_scope.insert(
-                p.name.clone(),
+                t.name.clone(),
                 LocalBinding {
                     local: idx,
                     shape: ValueShape::Boxed,
@@ -2908,9 +3237,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             );
             idx += 1;
         }
-        for t in &fd.type_params {
+        for p in &fd.params {
             first_scope.insert(
-                t.name.clone(),
+                p.name.clone(),
                 LocalBinding {
                     local: idx,
                     shape: ValueShape::Boxed,
@@ -3159,9 +3488,12 @@ impl<'a, 'c> Builder<'a, 'c> {
         None
     }
 
-    /// Resolve an identifier: local in our own scope stack, or an
-    /// upvalue captured from the enclosing function's scope. Allocates
-    /// a fresh upvalue slot on first reference to an outer name.
+    /// Resolve an identifier: local in our own scope stack, an upvalue
+    /// captured from the enclosing function's scope, or a module-level
+    /// `var` global. Allocates a fresh upvalue slot on first reference
+    /// to an outer name. Module vars are checked last so a local `var`
+    /// or a captured upvalue of the same name takes precedence —
+    /// ordinary lexical shadowing.
     fn resolve(&mut self, name: &str) -> Option<Resolve> {
         if let Some(local) = self.lookup(name) {
             return Some(Resolve::Local(local));
@@ -3176,6 +3508,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.upvalue_by_name.insert(name.to_string(), uv_idx);
                 return Some(Resolve::Upvalue(uv_idx));
             }
+        }
+        if let Some(&idx) = self.ctx.module_vars.get(name) {
+            return Some(Resolve::ModuleVar(idx));
         }
         None
     }
@@ -3963,6 +4298,11 @@ impl<'a, 'c> Builder<'a, 'c> {
                         self.emit(Instruction::I64Store(mem0()));
                         Ok(())
                     }
+                    Some(Resolve::ModuleVar(global_idx)) => {
+                        self.compile_expr_as(&a.value, ValueShape::Boxed)?;
+                        self.emit(Instruction::GlobalSet(global_idx));
+                        Ok(())
+                    }
                     None => Err(BuildError::UnknownIdentifier(names[0].clone())),
                 }
             }
@@ -4001,9 +4341,16 @@ impl<'a, 'c> Builder<'a, 'c> {
                     }
                 };
                 // Refuse assignment to a module alias — modules
-                // aren't mutable bindings.
+                // aren't mutable bindings. A local/upvalue/module-var
+                // whose name happens to collide with the module alias
+                // (common when a parameter is named `signal` inside
+                // the `signal` module) keeps its binding semantics
+                // and flows through to field-store as a normal object.
                 if let Expression::IdentifierExpression(obj_id) = &*me.object {
-                    if self.ctx.module_aliases.contains_key(&obj_id.name) || obj_id.name == "assert"
+                    let shadowed_by_binding = self.resolve(&obj_id.name).is_some();
+                    if !shadowed_by_binding
+                        && (self.ctx.module_aliases.contains_key(&obj_id.name)
+                            || obj_id.name == "assert")
                     {
                         return Err(BuildError::UnsupportedStatement(
                             "AssignmentStatement/Field-on-module",
@@ -4361,6 +4708,10 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit_upvalue_read(uv);
                     Ok(ValueShape::Boxed)
                 }
+                Some(Resolve::ModuleVar(global_idx)) => {
+                    self.emit(Instruction::GlobalGet(global_idx));
+                    Ok(ValueShape::Boxed)
+                }
                 None => {
                     // Inline a module-level `let NAME = <literal>`
                     // constant (e.g. `SQLITE_OK = 0` from a dep)
@@ -4410,35 +4761,49 @@ impl<'a, 'c> Builder<'a, 'c> {
                         self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
                         return Ok(ValueShape::Boxed);
                     }
+                    // A local/upvalue/module-var whose name collides
+                    // with a module alias (e.g. a `signal` parameter
+                    // inside the `signal` module) wins — the binding
+                    // is the real receiver and `obj.property` is a
+                    // plain field read. Without this shortcut the
+                    // module-alias branch below would treat the
+                    // parameter as a first-class module and refuse.
+                    let shadowed_by_binding = self.resolve(&obj_id.name).is_some();
                     // Module-qualified function reference used as a
                     // value (e.g. `mock(ui.renderTitle, null)` or
                     // `apply(x, module.fn)`). If `obj.property`
                     // names a top-level function in the aliased
                     // module, synthesize a forwarding closure so
                     // the name can be passed around.
-                    if let Some(canonical) = self.ctx.module_aliases.get(&obj_id.name) {
-                        let full_name = format!("{}.{}", canonical, me.property);
-                        if self.function_by_name.contains_key(&full_name) {
-                            self.compile_function_reference(&full_name)?;
-                            return Ok(ValueShape::Boxed);
+                    if !shadowed_by_binding {
+                        if let Some(canonical) = self.ctx.module_aliases.get(&obj_id.name) {
+                            let full_name = format!("{}.{}", canonical, me.property);
+                            if self.function_by_name.contains_key(&full_name) {
+                                self.compile_function_reference(&full_name)?;
+                                return Ok(ValueShape::Boxed);
+                            }
+                            // Std module method as a value — e.g.
+                            // `mock(cli.readLine, 'x')`. The only
+                            // known consumer is the mock/spy no-op
+                            // family which drops the value; emit
+                            // `VAL_NULL` as a placeholder. If
+                            // something later calls this placeholder,
+                            // the wasm call-indirect will trap
+                            // (acceptable; the checker will have
+                            // flagged most such uses as type errors
+                            // anyway).
+                            if resolve_module_call(canonical, &me.property).is_some() {
+                                self.emit(Instruction::I64Const(VAL_NULL));
+                                return Ok(ValueShape::Boxed);
+                            }
                         }
-                        // Std module method as a value — e.g.
-                        // `mock(cli.readLine, 'x')`. The only known
-                        // consumer is the mock/spy no-op family
-                        // which drops the value; emit `VAL_NULL` as
-                        // a placeholder. If something later calls
-                        // this placeholder, the wasm call-indirect
-                        // will trap (acceptable; the checker will
-                        // have flagged most such uses as type
-                        // errors anyway).
-                        if resolve_module_call(canonical, &me.property).is_some() {
-                            self.emit(Instruction::I64Const(VAL_NULL));
-                            return Ok(ValueShape::Boxed);
+                        if self.ctx.module_aliases.contains_key(&obj_id.name)
+                            || obj_id.name == "assert"
+                        {
+                            return Err(BuildError::ModuleAccessNotYetSupported(
+                                me.property.clone(),
+                            ));
                         }
-                    }
-                    if self.ctx.module_aliases.contains_key(&obj_id.name) || obj_id.name == "assert"
-                    {
-                        return Err(BuildError::ModuleAccessNotYetSupported(me.property.clone()));
                     }
                 }
                 self.compile_field_access(&me.object, &me.property)?;
@@ -4491,18 +4856,29 @@ impl<'a, 'c> Builder<'a, 'c> {
                     // directly; the resolver handles it as its own
                     // module. Matches the bytecode translator's
                     // `mod_name == "assert"` special case.
-                    let canonical: Option<String> = self
-                        .ctx
-                        .module_aliases
-                        .get(&obj_id.name)
-                        .cloned()
-                        .or_else(|| {
-                            if obj_id.name == "assert" {
-                                Some("assert".to_string())
-                            } else {
-                                None
-                            }
-                        });
+                    //
+                    // Local bindings shadow module aliases: when the
+                    // receiver identifier is a parameter, let/var, or
+                    // module-level `var` (common when a parameter is
+                    // named `signal` inside the `signal` module), the
+                    // call is a plain method on the binding's value,
+                    // not a module dispatch.
+                    let shadowed_by_binding = self.resolve(&obj_id.name).is_some();
+                    let canonical: Option<String> = if shadowed_by_binding {
+                        None
+                    } else {
+                        self.ctx
+                            .module_aliases
+                            .get(&obj_id.name)
+                            .cloned()
+                            .or_else(|| {
+                                if obj_id.name == "assert" {
+                                    Some("assert".to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                    };
                     if let Some(canonical) = canonical {
                         if let Some(call) = resolve_module_call(&canonical, &me.property) {
                             // If this std-method was referenced by a
@@ -4545,7 +4921,11 @@ impl<'a, 'c> Builder<'a, 'c> {
                             if let Some(canonical) = self.ctx.module_aliases.get(&obj_id.name) {
                                 let route_as_bare = matches!(
                                     canonical.as_str(),
-                                    "std.dictionary" | "std.array" | "std.convert" | "std.error"
+                                    "std.dictionary"
+                                        | "std.array"
+                                        | "std.convert"
+                                        | "std.error"
+                                        | "std.browser"
                                 );
                                 if route_as_bare {
                                     let positional: Vec<&Expression> =
@@ -4558,14 +4938,51 @@ impl<'a, 'c> Builder<'a, 'c> {
                                 }
                             }
                         }
-                        return Err(BuildError::ModuleAccessNotYetSupported(me.property.clone()));
+                        // A bare identifier receiver that doesn't
+                        // resolve to any in-scope binding, named
+                        // function, or std bare global is almost
+                        // always a module-dispatch typo (or a case
+                        // where the alias map wasn't populated in
+                        // a test harness). Emit the targeted
+                        // diagnostic instead of falling through into
+                        // the generic closure-call path, which would
+                        // just fail later with `UnknownIdentifier`.
+                        if let Expression::IdentifierExpression(obj_id) = &*me.object {
+                            let is_module_alias =
+                                self.ctx.module_aliases.contains_key(&obj_id.name)
+                                    || obj_id.name == "assert";
+                            let has_binding = self.resolve(&obj_id.name).is_some();
+                            let has_function =
+                                self.function_by_name.contains_key(&obj_id.name);
+                            if is_module_alias || (!has_binding && !has_function) {
+                                return Err(BuildError::ModuleAccessNotYetSupported(
+                                    me.property.clone(),
+                                ));
+                            }
+                        }
+                        // Unqualified member call on a real value —
+                        // `matched!.builder()`, `row.cb(x)`,
+                        // `state.onUpdate()`. Treat the member
+                        // expression as a closure-valued field
+                        // access and dispatch through the closure
+                        // header.
+                        let positional: Vec<&Expression> =
+                            ce.args.iter().map(|a| &a.value).collect();
+                        return self.compile_indirect_call_from_expr(&ce.callee, &positional);
                     }
                 }
             }
+            // Any other callee expression — `foo!()`,
+            // `eventHandlers[id]()`, `getCb()()`, or any
+            // value-producing expression whose type is a closure.
+            // Evaluate it to a boxed closure via the normal
+            // expression path (which handles `ForceUnwrapExpression`
+            // etc. including its null-trap) and dispatch through the
+            // closure header. Non-closure values trap at runtime via
+            // `RT_OBJ_ADDR`.
             _ => {
-                return Err(BuildError::UnsupportedExpression(
-                    "CallExpression/non-identifier",
-                ))
+                let positional: Vec<&Expression> = ce.args.iter().map(|a| &a.value).collect();
+                return self.compile_indirect_call_from_expr(&ce.callee, &positional);
             }
         };
 
@@ -4614,19 +5031,25 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
         }
 
-        // First try the bare name. If this function was compiled in
-        // a user-module context, fall back to `"{module}.{name}"`
-        // so peer functions can call each other without the alias
-        // prefix (matches the bytecode compiler's `prefixed_global`).
-        let mut proto_idx = self.function_by_name.get(name.as_str()).copied();
+        // When this function was compiled inside a user-module
+        // context, peer functions (same module) win over a bare
+        // entry-AST name of the same spelling. Otherwise an entry
+        // file that happens to define a `testNode` helper would
+        // shadow every module-local `testNode` everywhere, breaking
+        // calls with the wrong arg count. Fall back to the bare
+        // lookup when the peer form isn't defined.
+        let mut proto_idx: Option<u32> = None;
         let mut resolved_name = name.clone();
+        if let Some(ctx_mod) = &self.module_context {
+            let qualified = format!("{}.{}", ctx_mod, name);
+            if let Some(&p) = self.function_by_name.get(&qualified) {
+                proto_idx = Some(p);
+                resolved_name = qualified;
+            }
+        }
         if proto_idx.is_none() {
-            if let Some(ctx_mod) = &self.module_context {
-                let qualified = format!("{}.{}", ctx_mod, name);
-                if let Some(&p) = self.function_by_name.get(&qualified) {
-                    proto_idx = Some(p);
-                    resolved_name = qualified;
-                }
+            if let Some(&p) = self.function_by_name.get(name.as_str()) {
+                proto_idx = Some(p);
             }
         }
         // `use { X } from mod` — bare `X(...)` resolves to `mod.X`.
@@ -7087,6 +7510,40 @@ impl<'a, 'c> Builder<'a, 'c> {
         callee: Resolve,
         args: &[&Expression],
     ) -> Result<(), BuildError> {
+        match callee {
+            Resolve::Local(l) => {
+                self.emit(Instruction::LocalGet(l.local));
+                self.emit_convert(l.shape, ValueShape::Boxed)?;
+            }
+            Resolve::Upvalue(u) => self.emit_upvalue_read(u),
+            Resolve::ModuleVar(global_idx) => {
+                self.emit(Instruction::GlobalGet(global_idx));
+            }
+        }
+        self.finish_indirect_call(args)
+    }
+
+    /// Indirect-call a callee expression that lowers to a boxed
+    /// closure value — e.g. `foo!()`, `obj.cb()` where `cb` is a
+    /// closure-typed field, `matched!.builder()`, or `arr[i]()`.
+    /// `compile_expr_as` already handles the inner expression
+    /// shapes (including `ForceUnwrapExpression`'s null-trap);
+    /// `finish_indirect_call` then unboxes to a heap address, swaps
+    /// `env_ptr`, pushes args, and dispatches through the closure's
+    /// `table_idx`.
+    fn compile_indirect_call_from_expr(
+        &mut self,
+        callee_expr: &Expression,
+        args: &[&Expression],
+    ) -> Result<(), BuildError> {
+        self.compile_expr_as(callee_expr, ValueShape::Boxed)?;
+        self.finish_indirect_call(args)
+    }
+
+    /// Finish the indirect-call sequence assuming the boxed closure
+    /// value is already on the stack. Unboxes to a heap address,
+    /// saves/restores `env_ptr`, pushes args, and dispatches.
+    fn finish_indirect_call(&mut self, args: &[&Expression]) -> Result<(), BuildError> {
         let arity = args.len() as u16;
         let Some(&type_idx) = self.ctx.fai_func_type_indices.get(&arity) else {
             return Err(BuildError::UnsupportedExpression(
@@ -7094,14 +7551,6 @@ impl<'a, 'c> Builder<'a, 'c> {
             ));
         };
 
-        // Load the closure value, unbox to an i32 heap address.
-        match callee {
-            Resolve::Local(l) => {
-                self.emit(Instruction::LocalGet(l.local));
-                self.emit_convert(l.shape, ValueShape::Boxed)?;
-            }
-            Resolve::Upvalue(u) => self.emit_upvalue_read(u),
-        }
         self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
         let addr_local = self.alloc_i32_local();
         self.emit(Instruction::LocalSet(addr_local));
@@ -7686,6 +8135,7 @@ mod tests {
         let closures = RefCell::new(Vec::new());
         let module_constants = HashMap::new();
         let extern_out_params: HashMap<String, Vec<bool>> = HashMap::new();
+        let module_vars: HashMap<String, u32> = HashMap::new();
         let ctx = BuildContext {
             rt: RtOffsets {
                 base: rt_base_for_standalone(),
@@ -7706,6 +8156,7 @@ mod tests {
             closures: &closures,
             module_constants: &module_constants,
             extern_out_params: &extern_out_params,
+            module_vars: &module_vars,
         };
         let mut builder = Builder::new(main, &ctx, None);
         f(&mut builder, expression)
@@ -8345,6 +8796,7 @@ mod tests {
                 &empty_std_ids,
                 all_closures.len() as u32,
                 None,
+                &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
             )
@@ -10166,41 +10618,19 @@ mod tests {
     }
 
     #[test]
-    fn direct_rejects_unsupported_feature() {
-        // `(get_fn())()` — calling the result of a call expression
-        // directly. The direct builder only routes
-        // `IdentifierExpression` / `MemberExpression` callees; a
-        // computed callee is refused with
-        // `CallExpression/non-identifier`. Programs hitting this
-        // pattern fall back to the bytecode path.
-        let prepared = fai_compiler::prepare_source(
-            concat!(
-                "# Get_fn.\ndef get_fn\n",
-                "    @return Int\n",
-                "do\n",
-                "  42\n",
-                "end\n",
-                "\n",
-                "def main\n",
-                "    @return Int\n",
-                "do\n",
-                "  (get_fn())()\n",
-                "end\n",
-            ),
-            None,
-        );
-        // If the parser rejects the double-call shape outright,
-        // skip the test — different forai versions draw the line
-        // at different layers. The point is: when the direct path
-        // sees a non-Identifier/Member callee at the AST level,
-        // it refuses. We exercise that refusal directly below via
-        // a synthetic AST instead of relying on surface syntax.
-        let _ = prepared;
-
-        // Construct a synthetic `(inner())()` AST — the inner call
-        // returns an Int (won't actually run), and the outer
-        // CallExpression wraps it as a callee. The builder refuses
-        // on compile_call's `non-identifier` branch.
+    fn direct_computed_callee_compiles() {
+        // `(get_fn())()` — calling the result of a call expression.
+        // The builder now lowers arbitrary callee expressions
+        // through `compile_indirect_call_from_expr`: evaluate the
+        // expression to a boxed closure, then dispatch through the
+        // closure header. Non-closure values trap at runtime via
+        // `RT_OBJ_ADDR`; compilation succeeds.
+        //
+        // Regression guard: this used to refuse with
+        // `UnsupportedExpression("CallExpression/non-identifier")`
+        // and forui's `eventHandlers[id]()` / `matched!.builder()`
+        // call sites hit that refusal. The direct builder now
+        // matches what forai programs actually need.
         use fai_compiler::ast;
         let loc = ast::SourceLocation { line: 1, column: 1 };
         let inner = ast::CallExpression {
@@ -10236,12 +10666,22 @@ mod tests {
             location: loc,
             doc_comment: None,
         };
-        let err = build_function(
+        // `get_fn` needs to exist in the function table so the
+        // inner call resolves; arity 0 / returns i64 matches the
+        // standalone type-index layout.
+        let get_fn_info = FunctionInfo {
+            name: "get_fn".into(),
+            param_count: 0,
+            type_param_count: 0,
+            include_in_coverage: false,
+            param_defaults: Vec::new(),
+        };
+        build_function(
             &main,
             RtOffsets {
                 base: rt_base_for_standalone(),
             },
-            &[],
+            &[get_fn_info],
             &CheckerInfo::empty(),
             &build_fai_type_indices(),
             &HashMap::new(),
@@ -10249,16 +10689,7 @@ mod tests {
             &identity_import_remap(),
             &RefCell::new(StringInterner::default()),
         )
-        .expect_err("builder should refuse computed callee");
-        match err {
-            BuildError::UnsupportedExpression(name) => {
-                assert_eq!(name, "CallExpression/non-identifier");
-            }
-            other => panic!(
-                "expected UnsupportedExpression(CallExpression/non-identifier), got {:?}",
-                other,
-            ),
-        }
+        .expect("builder should accept computed callee");
     }
 
     // ── closures ──────────────────────────────────────────────────
@@ -14066,5 +14497,391 @@ mod tests {
             "end\n",
         )));
         assert_eq!(run_module(&wasm) as u64, int_val(4));
+    }
+
+    /// Compile a source snippet through the same pipeline the CLI
+    /// uses (`build_program_full` + `assemble_wasm_module`) so the
+    /// synthesised `<__start__>` / `<__module_init__>` wrappers and
+    /// the extra module-var globals land in the output. The
+    /// standalone `compile_all` + `build_module` helpers bypass
+    /// `build_program_full`, so they would not exercise the code
+    /// paths under test here.
+    fn build_via_full_pipeline(src: &str) -> Vec<u8> {
+        let prepared = fai_compiler::prepare_source(src, None).expect("prepare failed");
+        let mut checker = fai_checker::Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checker failed");
+        let checker_info = CheckerInfo {
+            ufcs_calls: checker.ufcs_calls.clone(),
+            named_param_reorder: checker.named_param_reorder.clone(),
+            expression_types: checker.expression_types.clone(),
+            generic_type_args: checker.generic_type_args.clone(),
+        };
+        crate::codegen_direct_full_reasoned(&prepared.serde_ast, &[], &checker_info, None, false)
+            .expect("full-pipeline codegen failed")
+    }
+
+    #[test]
+    fn direct_module_level_var_read() {
+        // Module-level `var` referenced from `main` must resolve to
+        // its dedicated wasm global and read the initialised value.
+        let wasm = build_via_full_pipeline(concat!(
+            "var counter Int = 42\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  counter\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    #[test]
+    fn direct_module_level_var_write() {
+        // Assigning to a module-level `var` inside `main` must route
+        // through `GlobalSet`; the subsequent read sees the new value.
+        let wasm = build_via_full_pipeline(concat!(
+            "var counter Int = 0\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  counter = 7\n",
+            "  counter\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(7));
+    }
+
+    #[test]
+    fn direct_module_level_var_persists_across_calls() {
+        // A helper that bumps a module-level counter must share its
+        // state with `main`'s subsequent read — any scheme that
+        // reintroduced a per-call local for `counter` would lose
+        // updates here.
+        let wasm = build_via_full_pipeline(concat!(
+            "var counter Int = 0\n",
+            "\n",
+            "# Bump the module-level counter by one.\n",
+            "def bump\n",
+            "    @return Int\n",
+            "do\n",
+            "  counter = counter + 1\n",
+            "  counter\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  bump()\n",
+            "  bump()\n",
+            "  bump()\n",
+            "  counter\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(3));
+    }
+
+    #[test]
+    fn direct_start_export_is_zero_arg_when_no_main() {
+        // Library-shaped file: no `main`, first declared function
+        // takes two params. The synthesised `<__start__>` must still
+        // give `_start` a `() -> i64` signature so the host runner
+        // and test harness can invoke it.
+        let wasm = build_via_full_pipeline(concat!(
+            "# Return the sum of two integers.\n",
+            "def addPair\n",
+            "    @param a Int\n",
+            "    @param b Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  a + b\n",
+            "end\n",
+        ));
+        // `run_module` gets `_start` via `get_typed_func::<(), i64>`
+        // — instantiation would fail if `_start` had any parameters.
+        let _ = run_module(&wasm);
+    }
+
+    #[test]
+    fn direct_generic_echo_returns_user_arg() {
+        // `def echo @type T @param v $T @return $T do v end` called
+        // as `echo(42)` must return 42. Regression guard: the
+        // builder used to bind user params (locals 0..N) before
+        // type params (locals N..N+M), but the call site emits
+        // type-args first, so the callee read the type-arg string
+        // instead of the real user value. Any generic function that
+        // returns a user param was silently returning the wrong
+        // value before this fix.
+        let wasm = build_via_full_pipeline(concat!(
+            "# Return v unchanged.\n",
+            "def echo\n",
+            "    @type T\n",
+            "    @param v $T\n",
+            "    @return $T\n",
+            "do\n",
+            "  v\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  echo(42)\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    #[test]
+    fn direct_generic_value_into_struct_field_round_trips() {
+        // `def mkBox @type T @param v $T @return Box do Box(value: v) end`
+        // then reading `b.value` must return the value passed in.
+        // Same ordering bug — it corrupted the field write because
+        // the generic-parameter read inside the constructor call
+        // picked up the type-arg string, and that's what landed in
+        // the dict.
+        let wasm = build_via_full_pipeline(concat!(
+            "type Box\n",
+            "  value $T\n",
+            "end\n",
+            "\n",
+            "# Build a Box carrying v.\n",
+            "def mkBox\n",
+            "    @type T\n",
+            "    @param v $T\n",
+            "    @return Box\n",
+            "do\n",
+            "  Box(value: v)\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let b = mkBox(42)\n",
+            "  b.value\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    /// Build a one-statement stub `DiscoveredModule` for collision
+    /// tests — the body is unused; only the `name` field matters for
+    /// `build_program_full`'s module bookkeeping.
+    fn stub_module(name: &str) -> fai_compiler::compiler::DiscoveredModule {
+        fai_compiler::compiler::DiscoveredModule {
+            name: name.to_string(),
+            statements: Vec::new(),
+            private_names: Vec::new(),
+        }
+    }
+
+    fn build_program_with_modules_for_test(
+        entry_src: &str,
+        modules: &[fai_compiler::compiler::DiscoveredModule],
+    ) -> Result<BuiltProgram, BuildError> {
+        let prepared = fai_compiler::prepare_source(entry_src, None).expect("prepare failed");
+        let mut checker = fai_checker::Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checker failed");
+        let info = CheckerInfo {
+            ufcs_calls: checker.ufcs_calls.clone(),
+            named_param_reorder: checker.named_param_reorder.clone(),
+            expression_types: checker.expression_types.clone(),
+            generic_type_args: checker.generic_type_args.clone(),
+        };
+        let rt = RtOffsets {
+            base: direct_rt_base(),
+        };
+        let type_indices = direct_fai_func_type_indices();
+        let import_available = crate::runtime::available_imports_with_test_flag(None, false);
+        let (import_remap, _) = crate::runtime::build_import_remap(&import_available);
+        build_program_full(
+            &prepared.serde_ast,
+            modules,
+            rt,
+            &info,
+            &type_indices,
+            &import_remap,
+            false,
+        )
+    }
+
+    #[test]
+    fn direct_duplicate_module_canonical_name_errors() {
+        // Two discovered modules with the same canonical name — a
+        // local `Forui` directory plus a dependency package also
+        // named `Forui` is the concrete user-facing scenario. The
+        // builder must refuse rather than silently pick one and
+        // shadow the other.
+        let entry = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  1\n",
+            "end\n",
+        );
+        let modules = vec![stub_module("Forui"), stub_module("Forui")];
+        let err = build_program_with_modules_for_test(entry, &modules)
+            .expect_err("duplicate module name must fail");
+        match err {
+            BuildError::DuplicateModuleName(name) => assert_eq!(name, "Forui"),
+            other => panic!("expected DuplicateModuleName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn direct_duplicate_module_basename_errors() {
+        // Two modules with distinct canonical paths but the same
+        // final segment — e.g. a local `MyApp.Forui` plus a
+        // dependency `Forui` — would both register `Forui` as a
+        // bare-name alias. `use { X } from Forui` would silently
+        // resolve to whichever was discovered first. Build must
+        // refuse so the user writes the fully-qualified path.
+        let entry = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  1\n",
+            "end\n",
+        );
+        let modules = vec![stub_module("MyApp.Forui"), stub_module("Forui")];
+        let err = build_program_with_modules_for_test(entry, &modules)
+            .expect_err("duplicate module basename must fail");
+        match err {
+            BuildError::DuplicateModuleBasename { basename, first, second } => {
+                assert_eq!(basename, "Forui");
+                let pair = vec![first.clone(), second.clone()];
+                assert!(pair.contains(&"MyApp.Forui".to_string()));
+                assert!(pair.contains(&"Forui".to_string()));
+            }
+            other => panic!("expected DuplicateModuleBasename, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn direct_distinct_modules_with_no_basename_collision_ok() {
+        // Sanity: distinct canonical names with distinct basenames
+        // still build. Guards against over-reaching in the collision
+        // check.
+        let entry = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  1\n",
+            "end\n",
+        );
+        let modules = vec![stub_module("Forui.signal"), stub_module("Forui.view")];
+        build_program_with_modules_for_test(entry, &modules)
+            .expect("distinct names should build cleanly");
+    }
+
+    #[test]
+    fn direct_force_unwrap_call_on_optional_closure() {
+        // `cb!(arg)` — force-unwrap an optional closure and call it
+        // in one expression. `compile_call` routes this through the
+        // generic non-identifier callee path
+        // (`compile_indirect_call_from_expr`), which reuses the
+        // normal expression lowering for `ForceUnwrapExpression`.
+        // That lowering already emits the `== VAL_NULL → unreachable`
+        // null-trap before leaving the closure value on the stack,
+        // so the `!` contract is preserved end-to-end — without any
+        // special-case code in the call path.
+        //
+        // Regression guard: this used to refuse with
+        // `UnsupportedExpression("CallExpression/non-identifier")`,
+        // blocking forui's `navigateListener!(path)`,
+        // `onChangeListener!()`, and `mountedApp!()` call sites.
+        let wasm = build_via_full_pipeline(concat!(
+            "type def Callback\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  var cb Callback? = null\n",
+            "  cb = do with x Int\n",
+            "      x + 1\n",
+            "    end\n",
+            "  cb!(41)\n",
+            "end\n",
+        ));
+        assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    #[test]
+    fn direct_force_unwrap_call_traps_on_null() {
+        // Null optional + `!()` must trap at runtime — the `!`
+        // contract (panic if null) applies whether the unwrap feeds
+        // a read or a call. Paired with the happy-path test above,
+        // this locks the generic callee path's null-check in place
+        // so a later simplification can't quietly drop it.
+        let wasm = build_via_full_pipeline(concat!(
+            "type def Callback\n",
+            "    @return Void\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  var cb Callback? = null\n",
+            "  cb!()\n",
+            "end\n",
+        ));
+        let engine = Engine::default();
+        let module = RuntimeModule::new(&engine, &wasm).expect("valid wasm");
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        use wasmtime::{FuncType, ValType as WtValType};
+        fn conv(v: wasm_encoder::ValType) -> WtValType {
+            match v {
+                wasm_encoder::ValType::I32 => WtValType::I32,
+                wasm_encoder::ValType::I64 => WtValType::I64,
+                wasm_encoder::ValType::F32 => WtValType::F32,
+                wasm_encoder::ValType::F64 => WtValType::F64,
+                _ => WtValType::I32,
+            }
+        }
+        for (name, params, results) in runtime::import_signatures() {
+            let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
+            let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
+            let results_clone = results.clone();
+            linker
+                .func_new(
+                    "env",
+                    name,
+                    FuncType::new(&engine, wt_params, wt_results),
+                    move |_caller, _args, rets| {
+                        for (slot, ty) in rets.iter_mut().zip(results_clone.iter()) {
+                            *slot = match ty {
+                                wasm_encoder::ValType::I32 => Val::I32(0),
+                                wasm_encoder::ValType::I64 => Val::I64(0),
+                                wasm_encoder::ValType::F32 => Val::F32(0),
+                                wasm_encoder::ValType::F64 => Val::F64(0),
+                                _ => Val::I32(0),
+                            };
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
+        let start = instance
+            .get_typed_func::<(), i64>(&mut store, "_start")
+            .expect("_start export");
+        let err = start.call(&mut store, ()).expect_err("should trap");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unreachable"),
+            "expected unreachable trap, got: {}",
+            msg,
+        );
     }
 }

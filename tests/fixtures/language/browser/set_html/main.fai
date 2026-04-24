@@ -1,0 +1,12 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: Hello from browser
+
+use std.browser
+
+def main
+    @return Void
+do
+  browser.setHtml('<main><h1 class="message">Hello from browser</h1></main>')
+end

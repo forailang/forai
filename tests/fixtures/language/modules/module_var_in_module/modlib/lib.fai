@@ -1,0 +1,32 @@
+var hits Int = 0
+
+# Increment the shared counter and return the new value.
+def bump
+    @return Int
+do
+  hits = hits + 1
+  hits
+end
+
+# Return the current counter without mutating it.
+def getCount
+    @return Int
+do
+  hits
+end
+
+test bump
+it 'increments'
+  hits = 0
+  assert.equal(bump(), 1)
+  assert.equal(bump(), 2)
+end
+end
+
+test getCount
+it 'reads without mutating'
+  hits = 10
+  assert.equal(getCount(), 10)
+  assert.equal(getCount(), 10)
+end
+end

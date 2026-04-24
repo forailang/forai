@@ -10,6 +10,7 @@
 # Generated forai/WASM outputs
 /public/
 /crates/fai-cli/public/
+/tests/browser-harness/node_modules/
 *.wasm
 *.wat
 *.js.map

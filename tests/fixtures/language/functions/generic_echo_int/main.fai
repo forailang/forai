@@ -1,0 +1,28 @@
+# expect: ok
+# stdout:
+#   42
+# Return the argument unchanged. The classic generic function —
+# `echo(42)` must round-trip 42 back out. Regression guard: the
+# direct-wasm builder used to bind user params before type params
+# in its local-layout, mismatching the call-site order (type args
+# first, then user args). Generic calls read back the type-arg
+# string instead of the user value.
+def echo
+    @type T
+    @param v $T
+    @return $T
+do
+  v
+end
+
+def main
+    @return Void
+do
+  print(echo(42))
+end
+
+test echo
+it 'returns its int argument'
+  assert.equals(echo(42), 42)
+end
+end

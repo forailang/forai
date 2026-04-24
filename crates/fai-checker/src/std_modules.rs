@@ -144,6 +144,20 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
     );
 
     m.insert(
+        "std.browser".into(),
+        vec![
+            ("setHtml", "setHtml"),
+            ("setHtmlAt", "setHtmlAt"),
+            ("getLocationPath", "getLocationPath"),
+            ("pushHistoryState", "pushHistoryState"),
+            ("remoteCall", "remoteCall"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect(),
+    );
+
+    m.insert(
         "std.file".into(),
         vec![
             ("read", "fileRead"),

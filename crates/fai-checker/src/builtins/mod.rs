@@ -172,6 +172,13 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         // std.html
         BuiltinDoc { module: "std.html", name: "escape", builtin_name: "htmlEscape", doc: "Escape special HTML characters in a string." },
 
+        // std.browser
+        BuiltinDoc { module: "std.browser", name: "setHtml", builtin_name: "setHtml", doc: "Replace the browser app root contents with HTML." },
+        BuiltinDoc { module: "std.browser", name: "setHtmlAt", builtin_name: "setHtmlAt", doc: "Replace a selected browser element with HTML." },
+        BuiltinDoc { module: "std.browser", name: "getLocationPath", builtin_name: "getLocationPath", doc: "Return the browser location path." },
+        BuiltinDoc { module: "std.browser", name: "pushHistoryState", builtin_name: "pushHistoryState", doc: "Push a browser history path." },
+        BuiltinDoc { module: "std.browser", name: "remoteCall", builtin_name: "remoteCall", doc: "Call a forai remote endpoint from browser code." },
+
         // std.file
         BuiltinDoc { module: "std.file", name: "read",   builtin_name: "fileRead",   doc: "Read the entire contents of a file as a string." },
         BuiltinDoc { module: "std.file", name: "write",  builtin_name: "fileWrite",  doc: "Write text to a file. Returns true on success." },

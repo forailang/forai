@@ -1,0 +1,31 @@
+# expect: ok
+# stdout:
+#   1
+#   2
+#   3
+
+var counter Int = 0
+
+# Bump the module-level counter by one.
+def bump
+    @return Int
+do
+  counter = counter + 1
+  counter
+end
+
+def main
+    @return Void
+do
+  print(bump())
+  print(bump())
+  print(bump())
+end
+
+test bump
+it 'increments the module-level counter'
+  counter = 0
+  assert.equal(bump(), 1)
+  assert.equal(bump(), 2)
+end
+end

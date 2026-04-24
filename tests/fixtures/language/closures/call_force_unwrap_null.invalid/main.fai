@@ -1,0 +1,13 @@
+# expect: runtime_error
+# error: unreachable
+
+type def Callback
+    @return Void
+end
+
+def main
+    @return Void
+do
+  var maybeCb Callback? = null
+  maybeCb!()
+end

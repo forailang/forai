@@ -1,0 +1,17 @@
+# expect: ok
+# browser:
+#   selector: #http-result
+#   text: 200 browser get ok
+
+use std.browser
+
+use std.http.request
+
+use std.convert
+
+def main
+    @return Void
+do
+  let response = request.get('/__fai_fixture/http-get')
+  browser.setHtml('<div id="http-result">' + convert.toString(response.status) + ' ' + response.body + '</div>')
+end

@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   42
+
+var counter Int = 42
+
+def main
+    @return Void
+do
+  print(counter)
+end

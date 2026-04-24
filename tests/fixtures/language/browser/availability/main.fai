@@ -1,0 +1,37 @@
+# expect: ok
+# browser:
+#   selector: #availability-result
+#   text: net=false ffi=false file=false
+
+use std.browser
+
+use std.net
+
+use std.ffi
+
+use std.file
+
+# Render a Bool as text.
+def boolText
+    @param value Bool
+    @return String
+do
+  if value
+    'true'
+  else
+    'false'
+  end
+end
+
+test boolText
+it 'renders booleans'
+  assert.equal(boolText(true), 'true')
+  assert.equal(boolText(false), 'false')
+end
+end
+
+def main
+    @return Void
+do
+  browser.setHtml('<div id="availability-result">net=' + boolText(net.available()) + ' ffi=' + boolText(ffi.available('c')) + ' file=' + boolText(file.exists('/tmp/anything')) + '</div>')
+end

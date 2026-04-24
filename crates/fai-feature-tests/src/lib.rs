@@ -47,8 +47,16 @@ pub struct Fixture {
     pub display_name: String,
     pub expect: Expect,
     pub stdout: Option<String>,
+    pub browser: Option<BrowserAssertion>,
     pub error: Option<ErrorPattern>,
     pub skip: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BrowserAssertion {
+    pub selector: Option<String>,
+    pub text: Option<String>,
+    pub html: Option<String>,
 }
 
 #[derive(Debug)]
@@ -147,6 +155,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     // first line that is not a comment (blank or code).
     let mut expect = Expect::Ok;
     let mut stdout_lines: Option<Vec<String>> = None;
+    let mut browser = BrowserAssertion::default();
     let mut error: Option<ErrorPattern> = None;
     let mut skip: Option<String> = None;
 
@@ -172,6 +181,9 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
                 // continuation: we already stripped all leading spaces, so
                 // the value is what remains.
                 stdout_lines.get_or_insert_with(Vec::new).push(value);
+            } else if active == Some("browser") {
+                let value = raw[1..].trim_start_matches(' ');
+                parse_browser_line(&mut browser, value)?;
             }
             continue;
         }
@@ -217,7 +229,9 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
                     active = Some("skip");
                 }
                 "browser" => {
-                    // Reserved — Phase D.
+                    if !value.is_empty() {
+                        parse_browser_line(&mut browser, value)?;
+                    }
                     active = Some("browser");
                 }
                 _ => {
@@ -245,15 +259,44 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     }
 
     let stdout = stdout_lines.map(|v| v.join("\n"));
+    let browser = if browser.selector.is_some() || browser.text.is_some() || browser.html.is_some()
+    {
+        Some(browser)
+    } else {
+        None
+    };
 
     Ok(Fixture {
         path: main_path.to_path_buf(),
         display_name,
         expect,
         stdout,
+        browser,
         error,
         skip,
     })
+}
+
+fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), String> {
+    let Some((key, value)) = line.split_once(':') else {
+        return Err(format!(
+            "browser directive lines must be `selector:`, `text:`, or `html:`, got `{}`",
+            line
+        ));
+    };
+    let value = value.trim().to_string();
+    match key.trim() {
+        "selector" => browser.selector = Some(value),
+        "text" => browser.text = Some(value),
+        "html" => browser.html = Some(value),
+        other => {
+            return Err(format!(
+                "unknown browser assertion `{}` (want selector|text|html)",
+                other
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── Gates ────────────────────────────────────────────────────────────
@@ -267,7 +310,11 @@ pub fn run_fixture(fx: &Fixture) -> Result<(), FixtureFailure> {
         Expect::Ok => {
             assert_fmt_check(fx)?;
             assert_check_ok(fx)?;
-            assert_run_ok(fx)?;
+            if fx.browser.is_some() {
+                assert_browser_run(fx)?;
+            } else {
+                assert_run_ok(fx)?;
+            }
         }
         Expect::CheckError => {
             // Skip fmt-check — invalid programs may not parse. The
@@ -293,6 +340,112 @@ fn fai_command(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to spawn fai binary")
+}
+
+fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
+    let path = fx.path.to_string_lossy().to_string();
+    let build_dir = browser_build_dir(fx);
+    let wasm_path = build_dir.join("main.wasm");
+    let _ = fs::remove_dir_all(&build_dir);
+    fs::create_dir_all(&build_dir).map_err(|e| FixtureFailure {
+        gate: "browser",
+        detail: format!("failed to create {}: {}", build_dir.display(), e),
+    })?;
+
+    let out = Command::new(fai_binary())
+        .args(["build", path.as_str(), "--html", "-o"])
+        .arg(&wasm_path)
+        .output()
+        .expect("failed to spawn fai binary");
+    if !out.status.success() {
+        return Err(FixtureFailure {
+            gate: "browser-build",
+            detail: format!(
+                "fai build --html exited {}\n  stdout: {}\n  stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+        });
+    }
+
+    let harness = workspace_root().join("tests").join("browser-harness");
+    let script = harness.join("run-fixture.mjs");
+    let assertion = browser_assertion_json(fx.browser.as_ref().unwrap());
+    let out = Command::new("node")
+        .arg(&script)
+        .arg(&build_dir)
+        .arg(assertion)
+        .current_dir(&harness)
+        .output()
+        .map_err(|e| FixtureFailure {
+            gate: "browser",
+            detail: format!(
+                "failed to run browser harness. Install with `npm install --prefix {}` and `npm run --prefix {} install-browsers`: {}",
+                harness.display(),
+                harness.display(),
+                e
+            ),
+        })?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    Err(FixtureFailure {
+        gate: "browser",
+        detail: format!(
+            "browser harness exited {}\n  stdout: {}\n  stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+    })
+}
+
+fn browser_build_dir(fx: &Fixture) -> PathBuf {
+    let mut safe = String::new();
+    for ch in fx.display_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            safe.push(ch);
+        } else {
+            safe.push('_');
+        }
+    }
+    workspace_root()
+        .join("target")
+        .join("fai-browser-fixtures")
+        .join(safe)
+}
+
+fn browser_assertion_json(assertion: &BrowserAssertion) -> String {
+    let mut parts = Vec::new();
+    if let Some(selector) = &assertion.selector {
+        parts.push(format!("\"selector\":\"{}\"", escape_json(selector)));
+    }
+    if let Some(text) = &assertion.text {
+        parts.push(format!("\"text\":\"{}\"", escape_json(text)));
+    }
+    if let Some(html) = &assertion.html {
+        parts.push(format!("\"html\":\"{}\"", escape_json(html)));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn assert_fmt_check(fx: &Fixture) -> Result<(), FixtureFailure> {

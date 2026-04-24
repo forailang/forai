@@ -173,11 +173,20 @@ pub fn run_wasm_tests_with_externs(
         .call(&mut store, ())
         .map_err(|e| fmt_err("script init error", e))?;
 
+    // Library files with no `test` blocks have no `_fai_run_test`
+    // export — the assembler only emits it when there are cases to
+    // dispatch. Nothing to run in that situation; return an empty
+    // summary so the outer pipeline can still report missing-test
+    // coverage failures for the file.
+    let mut summary = TestSummary::default();
+    if tests.is_empty() {
+        return Ok(summary);
+    }
+
     let run_test = instance
         .get_typed_func::<(i32, i32), ()>(&mut store, "_fai_run_test")
         .map_err(|e| fmt_err("missing _fai_run_test export", e))?;
 
-    let mut summary = TestSummary::default();
     summary.total = tests.iter().map(|t| t.case_descriptions.len()).sum();
     for (suite_i, test) in tests.iter().enumerate() {
         let mut suite_report = SuiteReport {

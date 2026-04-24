@@ -1,0 +1,14 @@
+use { bump, getCount } from modlib
+
+# expect: ok
+# stdout:
+#   1
+#   2
+#   2
+def main
+    @return Void
+do
+  print(bump())
+  print(bump())
+  print(getCount())
+end

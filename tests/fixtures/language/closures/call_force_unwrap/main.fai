@@ -1,0 +1,18 @@
+# expect: ok
+# stdout:
+#   3
+
+type def Callback
+    @param x Int
+    @return Int
+end
+
+def main
+    @return Void
+do
+  var maybeCb Callback? = null
+  maybeCb = do with x Int
+      x + 1
+  end
+  print(maybeCb!(2))
+end

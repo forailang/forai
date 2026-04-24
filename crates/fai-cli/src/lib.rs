@@ -3004,6 +3004,8 @@ function wasmGrow(needed){{var mem=instance.exports.memory;var cur=mem.buffer.by
 function writeStrToWasm(s){{var b=new TextEncoder().encode(s),h=instance.exports.__heap_ptr.value;wasmGrow(h+8+b.length+8);var m=new Uint8Array(instance.exports.memory.buffer),d=new DataView(instance.exports.memory.buffer);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;return OBJ_MASK|BigInt(h)}}
 function readNanBoxedStr(v){{var n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{var a=Number(n&0x0000FFFFFFFFFFFFn),d=new DataView(instance.exports.memory.buffer);if(d.getInt32(a,true)===0){{var l=d.getInt32(a+4,true);return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,a+8,l))}}}}return''}}
 function invokeExport(name){{var fn=instance.exports[name];if(!fn)return;var args=Array.prototype.slice.call(arguments,1);try{{return fn.apply(null,args)}}catch(e){{console.error('FAI',name,'failed',e);throw e}}}}
+function responseHeaders(xhr){{var headers={{}};String(xhr.getAllResponseHeaders()||'').trim().split(/[\r\n]+/).forEach(function(line){{if(!line)return;var i=line.indexOf(':');if(i>0)headers[line.slice(0,i).toLowerCase()]=line.slice(i+1).trim()}});return headers}}
+function httpRequest(method,url,body){{try{{var x=new XMLHttpRequest();x.open(method,url,false);if(body!==undefined)x.setRequestHeader('Content-Type','text/plain; charset=utf-8');x.send(body===undefined?null:body);return jsToWasm({{status:x.status,body:x.responseText||'',headers:responseHeaders(x)}})}}catch(e){{console.error('FAI http request failed',e);return NULL_VAL}}}}
 function handleEvent(id){{var fn=instance.exports.invokeHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n)}}catch(e){{console.error('FAI handleEvent failed',e)}}}}
 function handleInputEvent(id,value){{var fn=instance.exports.invokeChangeHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n,writeStrToWasm(value))}}catch(e){{console.error('FAI handleInputEvent failed',e)}}}}
 function handleSubmitEvent(id){{var fn=instance.exports.invokeSubmitHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n)}}catch(e){{console.error('FAI handleSubmitEvent failed',e)}}}}
@@ -3029,7 +3031,48 @@ var env={{
   storage_get:function(kp,kl,bp){{try{{var k=readStr(kp,kl);var v=window.localStorage.getItem(k);if(v===null)return -1;var b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
   storage_set:function(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove:function(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
-  storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}}
+  storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}},
+  file_exists:function(){{return 0}},
+  http_request_get:function(p,l){{return httpRequest('GET',readStr(p,l))}},
+  http_request_post:function(up,ul,bp,bl){{return httpRequest('POST',readStr(up,ul),readStr(bp,bl))}},
+  http_request_put:function(up,ul,bp,bl){{return httpRequest('PUT',readStr(up,ul),readStr(bp,bl))}},
+  http_request_patch:function(up,ul,bp,bl){{return httpRequest('PATCH',readStr(up,ul),readStr(bp,bl))}},
+  http_request_delete:function(p,l){{return httpRequest('DELETE',readStr(p,l))}},
+  net_available:function(){{return 0}},
+  ffi_available:function(){{return 0}},
+  log_info:function(p,l){{console.info(readStr(p,l))}},
+  log_warn:function(p,l){{console.warn(readStr(p,l))}},
+  log_error:function(p,l){{console.error(readStr(p,l))}},
+  path_join:function(a,b,c,d){{var left=readStr(a,b).replace(/\/+$/,''),right=readStr(c,d).replace(/^\/+/,'');return writeStrToWasm(left+'/'+right)}},
+  path_basename:function(p,l){{var s=readStr(p,l).replace(/\/+$/,'');var i=s.lastIndexOf('/');return writeStrToWasm(i>=0?s.slice(i+1):s)}},
+  path_dirname:function(p,l){{var s=readStr(p,l).replace(/\/+$/,'');var i=s.lastIndexOf('/');return writeStrToWasm(i>0?s.slice(0,i):'.')}},
+  path_extname:function(p,l){{var s=readStr(p,l),base=s.slice(s.lastIndexOf('/')+1),i=base.lastIndexOf('.');return writeStrToWasm(i>0?base.slice(i):'')}},
+  html_escape:function(p,l){{return writeStrToWasm(readStr(p,l).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'))}},
+  file_list:function(){{return jsToWasm([])}},
+  json_require_string:function(v,kp,kl){{var obj=wasmToJs(v),key=readStr(kp,kl);return writeStrToWasm(obj&&typeof obj[key]==='string'?obj[key]:'')}},
+  array_map:function(arr){{return arr}},
+  array_filter:function(arr){{return arr}},
+  array_find:function(){{return NULL_VAL}},
+  array_is_any:function(){{return QNAN|TAG_BOOL}},
+  array_is_all:function(){{return QNAN|TAG_BOOL|1n}},
+  tcp_listen:function(){{return 0}},
+  tcp_accept:function(){{return NULL_VAL}},
+  tcp_connect:function(){{return 0}},
+  tcp_read:function(){{return NULL_VAL}},
+  tcp_read_line:function(){{return NULL_VAL}},
+  tcp_write:function(){{return -1}},
+  tcp_close:function(){{}},
+  tcp_address:function(){{return writeStrToWasm('')}},
+  udp_bind:function(){{return 0}},
+  udp_send:function(){{return -1}},
+  udp_receive:function(){{return NULL_VAL}},
+  udp_broadcast:function(){{}},
+  cli_read_line:function(){{return NULL_VAL}},
+  cli_write:function(p,l){{output.style.display='block';output.textContent+=readStr(p,l)}},
+  cli_write_line:function(p,l){{output.style.display='block';output.textContent+=readStr(p,l)+'\n'}},
+  cli_clear:function(){{output.textContent=''}},
+  cli_move_to:function(){{}},
+  __fai_set_trap_msg:function(p,l){{console.error(readStr(p,l))}}
 }};
 fetch('/{}').then(function(r){{return r.arrayBuffer()}}).then(function(b){{return WebAssembly.instantiate(b,{{env:env}})}}).then(function(r){{
   instance=r.instance;invokeExport('_start');
