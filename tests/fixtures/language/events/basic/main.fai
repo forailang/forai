@@ -1,0 +1,217 @@
+# expect: ok
+# stdout:
+#   done
+
+use std.array
+
+use std.events
+
+var calls String[] = []
+
+# Module-level call log so handlers can record what they saw and the
+# enclosing test can assert against the resulting array.
+# Wipe the call log AND every registered subscriber so each test
+# starts from a known state — `clearAll` is the registry-reset helper
+# the registry exposes for exactly this case.
+def resetState
+    @return Void
+do
+  calls = []
+  events.clearAll()
+end
+
+test resetState
+it 'wipes the registry so a stray subscriber from a prior case is gone'
+  events.on('temp') do with e Event
+      calls = array.append(calls, 'should-not-fire')
+  end
+  resetState()
+  events.emit('temp', 'x')
+  assert.equals(length(calls), 0)
+end
+end
+
+# emit with no subscribers is a no-op.
+def emitWithNoListeners
+    @return Void
+do
+  events.emit('nobody-home', 'x')
+end
+
+test emitWithNoListeners
+it 'returns silently with zero subscribers'
+  resetState()
+  emitWithNoListeners()
+  assert.equals(length(calls), 0)
+end
+end
+
+# Single subscriber receives the event with its name and data.
+def attachOneListener
+    @return Subscription
+do
+  resetState()
+  events.on('greet') do with e Event
+      calls = array.append(calls, 'name:' + e.name)
+  end
+end
+
+test attachOneListener
+it 'delivers the event name to a single subscriber'
+  attachOneListener()
+  events.emit('greet', 'world')
+  assert.equals(length(calls), 1)
+  assert.equals(calls[0], 'name:greet')
+end
+end
+
+# Multiple subscribers fire in registration order on a single emit.
+def attachThreeOrdered
+    @return Void
+do
+  resetState()
+  events.on('multi') do with e Event
+      calls = array.append(calls, 'a')
+  end
+  events.on('multi') do with e Event
+      calls = array.append(calls, 'b')
+  end
+  let _last = events.on('multi') do with e Event
+      calls = array.append(calls, 'c')
+  end
+end
+
+test attachThreeOrdered
+it 'fires every subscriber in registration order'
+  attachThreeOrdered()
+  events.emit('multi', 'x')
+  assert.equals(length(calls), 3)
+  assert.equals(calls[0], 'a')
+  assert.equals(calls[1], 'b')
+  assert.equals(calls[2], 'c')
+end
+end
+
+# `once` fires exactly once and auto-removes itself.
+def attachOnce
+    @return Void
+do
+  resetState()
+  let _sub = events.once('one-shot') do with e Event
+      calls = array.append(calls, 'fired')
+  end
+end
+
+test attachOnce
+it 'fires once and self-removes from the registry'
+  attachOnce()
+  events.emit('one-shot', 'a')
+  events.emit('one-shot', 'b')
+  assert.equals(length(calls), 1)
+  assert.equals(calls[0], 'fired')
+  assert.equals(events.subscribers('one-shot'), 0)
+end
+end
+
+# `off` cancels the subscription. A second `off` of the same handle
+# is a silent no-op and returns false.
+def attachToCancel
+    @return Subscription
+do
+  resetState()
+  events.on('cancellable') do with e Event
+      calls = array.append(calls, 'should-not-fire')
+  end
+end
+
+test attachToCancel
+it 'off cancels and returns true the first time, false thereafter'
+  let sub = attachToCancel()
+  assert.equals(events.off(sub), true)
+  assert.equals(events.off(sub), false)
+  events.emit('cancellable', 'x')
+  assert.equals(length(calls), 0)
+end
+end
+
+# `subscribers` reports the live count.
+def threeOnTwoNames
+    @return Void
+do
+  resetState()
+  events.on('a') do with e Event
+      calls = array.append(calls, '1')
+  end
+  events.on('a') do with e Event
+      calls = array.append(calls, '2')
+  end
+  let _last = events.on('b') do with e Event
+      calls = array.append(calls, '3')
+  end
+end
+
+test threeOnTwoNames
+it 'subscribers counts only matching handlers per name'
+  threeOnTwoNames()
+  assert.equals(events.subscribers('a'), 2)
+  assert.equals(events.subscribers('b'), 1)
+  assert.equals(events.subscribers('missing'), 0)
+end
+end
+
+# `clear` drops only the named events subscribers.
+def attachToClear
+    @return Void
+do
+  resetState()
+  events.on('drop-me') do with e Event
+      calls = array.append(calls, 'gone')
+  end
+  let _last = events.on('keep-me') do with e Event
+      calls = array.append(calls, 'kept')
+  end
+end
+
+test attachToClear
+it 'clear drops one events subscribers without touching siblings'
+  attachToClear()
+  events.clear('drop-me')
+  assert.equals(events.subscribers('drop-me'), 0)
+  assert.equals(events.subscribers('keep-me'), 1)
+  events.emit('keep-me', 'x')
+  assert.equals(length(calls), 1)
+  assert.equals(calls[0], 'kept')
+end
+end
+
+# Recursive emit during dispatch — nested call is synchronous.
+def nestedEmitSetup
+    @return Void
+do
+  resetState()
+  events.on('outer') do with e Event
+      calls = array.append(calls, 'outer-pre')
+      events.emit('inner', 'x')
+      calls = array.append(calls, 'outer-post')
+  end
+  let _last = events.on('inner') do with e Event
+      calls = array.append(calls, 'inner')
+  end
+end
+
+test nestedEmitSetup
+it 'a nested emit completes synchronously inside the outer subscriber'
+  nestedEmitSetup()
+  events.emit('outer', 'x')
+  assert.equals(length(calls), 3)
+  assert.equals(calls[0], 'outer-pre')
+  assert.equals(calls[1], 'inner')
+  assert.equals(calls[2], 'outer-post')
+end
+end
+
+def main
+    @return Void
+do
+  print('done')
+end

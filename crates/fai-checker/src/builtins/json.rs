@@ -16,7 +16,7 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         b,
         "jsonRequireString",
         &[p("value", Type::Dictionary), p("key", Type::String)],
-        &[Type::String],
+        &[optional_of(Type::String)],
     );
 }
 
@@ -56,6 +56,18 @@ mod tests {
             Type::Function(sig) => {
                 assert!(matches!(sig.returns[0], Type::String));
             }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_json_require_string_returns_optional_string() {
+        let b = fresh();
+        match b.get("jsonRequireString").unwrap() {
+            Type::Function(sig) => match &sig.returns[0] {
+                Type::Optional(inner) => assert!(matches!(**inner, Type::String)),
+                other => panic!("expected Optional<String>, got {:?}", other),
+            },
             _ => panic!("expected Function"),
         }
     }

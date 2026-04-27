@@ -1,0 +1,12 @@
+# expect: check_error
+# error: helperFromDiff
+
+use { Node } from view
+
+use { compareNodes } from diff
+
+def main
+    @return Void
+do
+  print('ok')
+end

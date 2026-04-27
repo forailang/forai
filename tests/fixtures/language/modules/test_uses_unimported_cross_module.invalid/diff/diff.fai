@@ -1,0 +1,18 @@
+use { Node } from view
+
+# Compare two Nodes.
+def compareNodes
+    @param a Node
+    @param b Node
+    @return Bool
+do
+  a.kind == b.kind and a.text == b.text
+end
+
+# Helper that view's test will (incorrectly) call without importing.
+def helperFromDiff
+    @param kind String
+    @return Node
+do
+  Node(kind: kind, text: '')
+end

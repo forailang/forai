@@ -4,6 +4,8 @@ use wasmtime::Linker;
 
 mod array;
 mod async_ops;
+mod env;
+mod events;
 mod http_server;
 mod io;
 mod json;
@@ -31,6 +33,8 @@ pub(super) fn install_all(linker: &mut Linker<()>) -> Result<(), String> {
     util::install(linker)?;
     http_server::install(linker)?;
     storage::install(linker)?;
+    env::install(linker)?;
+    events::install(linker)?;
     array::install(linker)?;
     sockets::install(linker)?;
     spy::install(linker)?;

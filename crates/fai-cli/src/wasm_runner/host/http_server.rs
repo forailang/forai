@@ -17,7 +17,7 @@ use super::super::output;
 
 use super::super::heap::{decode_closure_header, wasm_alloc_str};
 use super::super::nan_box::{
-    encode_object, ADDR_MASK, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_INT, VAL_NULL,
+    encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_INT, VAL_NULL,
 };
 
 // Must stay in sync with fai-codegen-wasm/src/runtime.rs
@@ -249,6 +249,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         return;
                     }
                 };
+                // The host successfully bound the port — fan out
+                // `http:listening` to any subscriber that wired itself
+                // up before main called `server.listen`.
+                let started = build_server_started(&mut caller, port);
+                super::events::dispatch_event(&mut caller, "http:listening", started);
                 for conn in listener.incoming() {
                     let stream = match conn {
                         Ok(s) => s,
@@ -276,7 +281,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                         parse_http_request_into_guest(&mut caller, &mem, &stream)
                     };
+                    super::events::dispatch_event(
+                        &mut caller,
+                        "http:beforeRequest",
+                        request_val,
+                    );
                     let response = dispatch_router_request(&mut caller, id as u32, request_val);
+                    let pair = build_request_response(&mut caller, request_val, response);
+                    super::events::dispatch_event(&mut caller, "http:afterResponse", pair);
                     write_http_response(&mut caller, stream, response);
                 }
             },
@@ -408,6 +420,8 @@ fn dispatch_router_request(caller: &mut Caller<'_, ()>, router_id: u32, request_
                         "[router] handler error for {} {}: {}",
                         method, path, e
                     ));
+                    let err_payload = build_http_error(caller, request_val, &e);
+                    super::events::dispatch_event(caller, "http:error", err_payload);
                     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                     return build_response_dict(
                         caller,
@@ -572,6 +586,42 @@ fn align8(n: u32) -> u32 {
     (n + 7) & !7
 }
 
+/// Build a `RequestResponse { request, response }` Dict on the guest
+/// heap — the `http:afterResponse` payload.
+fn build_request_response(caller: &mut Caller<'_, ()>, request_val: i64, response_val: i64) -> i64 {
+    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let key_request = wasm_alloc_str(caller, &mem, "request");
+    let key_response = wasm_alloc_str(caller, &mem, "response");
+    alloc_dict(
+        caller,
+        &mem,
+        &[(key_request, request_val), (key_response, response_val)],
+    )
+}
+
+/// Build a `ServerStarted { port }` Dict on the guest heap — the
+/// `http:listening` payload.
+fn build_server_started(caller: &mut Caller<'_, ()>, port: i32) -> i64 {
+    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let key_port = wasm_alloc_str(caller, &mem, "port");
+    let port_val = (QNAN | TAG_INT | (port as u32 as u64)) as i64;
+    alloc_dict(caller, &mem, &[(key_port, port_val)])
+}
+
+/// Build an `HttpError { request, message }` Dict on the guest heap
+/// — the `http:error` payload.
+fn build_http_error(caller: &mut Caller<'_, ()>, request_val: i64, message: &str) -> i64 {
+    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let key_request = wasm_alloc_str(caller, &mem, "request");
+    let key_message = wasm_alloc_str(caller, &mem, "message");
+    let message_val = wasm_alloc_str(caller, &mem, message);
+    alloc_dict(
+        caller,
+        &mem,
+        &[(key_request, request_val), (key_message, message_val)],
+    )
+}
+
 /// Peek at the first 7 bytes of the stream to detect an OPTIONS
 /// preflight. Matches the VM's `is_options_request`.
 fn is_options_request(stream: &TcpStream) -> bool {
@@ -690,9 +740,12 @@ fn parse_http_request_into_guest(
     )
 }
 
-/// Look up `status`/`body`/`contentType`/`location` in a NaN-boxed
-/// response Dict and write an HTTP response. Mirrors VM's
-/// `write_http_response`.
+/// Look up `status`/`body`/`contentType`/`location` plus the optional
+/// `cookies` and `headers` fields in a NaN-boxed `HttpResponse` Dict
+/// and write an HTTP response. Cookies serialize to one `Set-Cookie:`
+/// line each; headers contribute extra header lines after the
+/// built-ins. Mirrors the VM's `write_http_response` for the legacy
+/// fields.
 fn write_http_response(caller: &mut Caller<'_, ()>, mut stream: TcpStream, response_val: i64) {
     let val = response_val as u64;
     // Must be an object pointer.
@@ -713,8 +766,36 @@ fn write_http_response(caller: &mut Caller<'_, ()>, mut stream: TcpStream, respo
     let content_type =
         read_dict_string(&mem, caller, addr, "contentType").unwrap_or_else(|| "text/plain".into());
     let location = read_dict_string(&mem, caller, addr, "location");
+    let cookie_lines = read_cookies(&mem, caller, addr);
+    let extra_headers = read_extra_headers(&mem, caller, addr);
 
-    let status_text = match status {
+    let status_text = status_text(status);
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n",
+        status, status_text, content_type, body.len()
+    );
+    if let Some(loc) = location {
+        response.push_str(&format!("Location: {}\r\n", loc));
+    }
+    for line in &cookie_lines {
+        response.push_str("Set-Cookie: ");
+        response.push_str(line);
+        response.push_str("\r\n");
+    }
+    for (name, value) in &extra_headers {
+        response.push_str(name);
+        response.push_str(": ");
+        response.push_str(value);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    response.push_str(&body);
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn status_text(status: i32) -> &'static str {
+    match status {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
@@ -728,18 +809,182 @@ fn write_http_response(caller: &mut Caller<'_, ()>, mut stream: TcpStream, respo
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
         _ => "OK",
-    };
-    let mut response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n",
-        status, status_text, content_type, body.len()
-    );
-    if let Some(loc) = location {
-        response.push_str(&format!("Location: {}\r\n", loc));
     }
-    response.push_str("\r\n");
-    response.push_str(&body);
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+}
+
+/// Format a single `Set-Cookie:` value (everything after the `: `).
+/// Pure-Rust so the formatting can be unit-tested without standing up
+/// a guest wasm instance. Skips optional attributes that the caller
+/// didn't set.
+fn format_cookie(
+    name: &str,
+    value: &str,
+    path: Option<&str>,
+    max_age: Option<i32>,
+    http_only: Option<bool>,
+    secure: Option<bool>,
+    same_site: Option<&str>,
+) -> String {
+    let mut out = format!("{}={}", name, value);
+    if let Some(p) = path {
+        if !p.is_empty() {
+            out.push_str("; Path=");
+            out.push_str(p);
+        }
+    }
+    if let Some(age) = max_age {
+        out.push_str(&format!("; Max-Age={}", age));
+    }
+    if matches!(http_only, Some(true)) {
+        out.push_str("; HttpOnly");
+    }
+    if matches!(secure, Some(true)) {
+        out.push_str("; Secure");
+    }
+    if let Some(ss) = same_site {
+        if !ss.is_empty() {
+            out.push_str("; SameSite=");
+            out.push_str(ss);
+        }
+    }
+    out
+}
+
+/// Read the `cookies` field out of a response Dict and format each
+/// Cookie record into a `Set-Cookie:` line value.
+fn read_cookies(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize) -> Vec<String> {
+    let Some(cookies_val) = dict_lookup(mem, caller, addr, "cookies") else {
+        return Vec::new();
+    };
+    let v = cookies_val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return Vec::new();
+    }
+    let arr_addr = (v & ADDR_MASK) as usize;
+    let count = match read_array_count(mem, caller, arr_addr) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut lines = Vec::new();
+    for i in 0..count {
+        let Some(item) = read_array_item(mem, caller, arr_addr, i) else {
+            continue;
+        };
+        let item_v = item as u64;
+        if (item_v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+            continue;
+        }
+        let cookie_addr = (item_v & ADDR_MASK) as usize;
+        let name = match read_dict_string(mem, caller, cookie_addr, "name") {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let value = read_dict_string(mem, caller, cookie_addr, "value").unwrap_or_default();
+        let path = read_dict_string(mem, caller, cookie_addr, "path");
+        let max_age = read_dict_int(mem, caller, cookie_addr, "maxAge");
+        let http_only = read_dict_bool(mem, caller, cookie_addr, "httpOnly");
+        let secure = read_dict_bool(mem, caller, cookie_addr, "secure");
+        let same_site = read_dict_string(mem, caller, cookie_addr, "sameSite");
+        lines.push(format_cookie(
+            &name,
+            &value,
+            path.as_deref(),
+            max_age,
+            http_only,
+            secure,
+            same_site.as_deref(),
+        ));
+    }
+    lines
+}
+
+/// Read the optional `headers` Dictionary off the response Dict and
+/// return its `(name, value)` pairs in iteration order. Non-string
+/// values are skipped.
+fn read_extra_headers(
+    mem: &Memory,
+    caller: &mut Caller<'_, ()>,
+    addr: usize,
+) -> Vec<(String, String)> {
+    let Some(headers_val) = dict_lookup(mem, caller, addr, "headers") else {
+        return Vec::new();
+    };
+    let v = headers_val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return Vec::new();
+    }
+    let inner_addr = (v & ADDR_MASK) as usize;
+    let data = mem.data(&*caller);
+    if inner_addr + 8 > data.len() {
+        return Vec::new();
+    }
+    let tag = i32::from_le_bytes(data[inner_addr..inner_addr + 4].try_into().unwrap_or([0; 4]));
+    if tag != OBJ_TAG_DICT {
+        return Vec::new();
+    }
+    let count = i32::from_le_bytes(
+        data[inner_addr + 4..inner_addr + 8]
+            .try_into()
+            .unwrap_or([0; 4]),
+    ) as usize;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let ea = inner_addr + 8 + i * 16;
+        if ea + 16 > data.len() {
+            break;
+        }
+        let k = i64::from_le_bytes(data[ea..ea + 8].try_into().unwrap_or([0; 8]));
+        let v = i64::from_le_bytes(data[ea + 8..ea + 16].try_into().unwrap_or([0; 8]));
+        let kv = k as u64;
+        if (kv & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+            continue;
+        }
+        let kaddr = (kv & ADDR_MASK) as usize;
+        let Some(name) = read_string_bytes(mem.data(&*caller), kaddr) else {
+            continue;
+        };
+        let vv = v as u64;
+        if (vv & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+            continue;
+        }
+        let vaddr = (vv & ADDR_MASK) as usize;
+        let Some(value) = read_string_bytes(mem.data(&*caller), vaddr) else {
+            continue;
+        };
+        out.push((name.to_string(), value.to_string()));
+    }
+    out
+}
+
+fn read_array_count(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize) -> Option<usize> {
+    let data = mem.data(&*caller);
+    if addr + 8 > data.len() {
+        return None;
+    }
+    let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().ok()?);
+    if tag != OBJ_TAG_ARRAY {
+        return None;
+    }
+    Some(i32::from_le_bytes(data[addr + 4..addr + 8].try_into().ok()?) as usize)
+}
+
+fn read_array_item(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize, i: usize) -> Option<i64> {
+    let data = mem.data(&*caller);
+    let off = addr + 8 + i * 8;
+    if off + 8 > data.len() {
+        return None;
+    }
+    Some(i64::from_le_bytes(data[off..off + 8].try_into().ok()?))
+}
+
+fn read_dict_bool(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize, key: &str) -> Option<bool> {
+    let val = dict_lookup(mem, caller, addr, key)?;
+    let v = val as u64;
+    if (v & (QNAN | SIGN_BIT | 0x0007_0000_0000_0000)) == (QNAN | crate::wasm_runner::nan_box::TAG_BOOL) {
+        Some((v & 1) == 1)
+    } else {
+        None
+    }
 }
 
 /// Look up a key in a guest-heap Dict and, if the value is a String,
@@ -910,5 +1155,105 @@ fn invoke_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) -> Op
             _ => None,
         },
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-Rust tests for the HttpResponse serializer's helpers.
+    //! The wasmtime-driven path (Dict reading + handler invocation)
+    //! is exercised via the `tests/fixtures/language/http_server/`
+    //! fixtures.
+
+    use super::*;
+
+    #[test]
+    fn format_cookie_minimum_is_name_value_only() {
+        let line = format_cookie("session", "tok-1", None, None, None, None, None);
+        assert_eq!(line, "session=tok-1");
+    }
+
+    #[test]
+    fn format_cookie_includes_path_when_set() {
+        let line = format_cookie("session", "tok", Some("/"), None, None, None, None);
+        assert_eq!(line, "session=tok; Path=/");
+    }
+
+    #[test]
+    fn format_cookie_skips_empty_path() {
+        let line = format_cookie("session", "tok", Some(""), None, None, None, None);
+        assert_eq!(line, "session=tok");
+    }
+
+    #[test]
+    fn format_cookie_includes_max_age_when_set() {
+        let line = format_cookie("session", "tok", None, Some(3600), None, None, None);
+        assert_eq!(line, "session=tok; Max-Age=3600");
+    }
+
+    #[test]
+    fn format_cookie_emits_http_only_only_when_true() {
+        let yes = format_cookie("a", "b", None, None, Some(true), None, None);
+        let no = format_cookie("a", "b", None, None, Some(false), None, None);
+        let absent = format_cookie("a", "b", None, None, None, None, None);
+        assert_eq!(yes, "a=b; HttpOnly");
+        assert_eq!(no, "a=b");
+        assert_eq!(absent, "a=b");
+    }
+
+    #[test]
+    fn format_cookie_emits_secure_only_when_true() {
+        let yes = format_cookie("a", "b", None, None, None, Some(true), None);
+        let no = format_cookie("a", "b", None, None, None, Some(false), None);
+        assert_eq!(yes, "a=b; Secure");
+        assert_eq!(no, "a=b");
+    }
+
+    #[test]
+    fn format_cookie_includes_same_site_value() {
+        let line = format_cookie("a", "b", None, None, None, None, Some("Lax"));
+        assert_eq!(line, "a=b; SameSite=Lax");
+    }
+
+    #[test]
+    fn format_cookie_skips_empty_same_site() {
+        let line = format_cookie("a", "b", None, None, None, None, Some(""));
+        assert_eq!(line, "a=b");
+    }
+
+    #[test]
+    fn format_cookie_combines_every_attribute_in_canonical_order() {
+        let line = format_cookie(
+            "session",
+            "tok",
+            Some("/"),
+            Some(3600),
+            Some(true),
+            Some(true),
+            Some("Strict"),
+        );
+        assert_eq!(
+            line,
+            "session=tok; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Strict"
+        );
+    }
+
+    #[test]
+    fn status_text_covers_common_codes() {
+        assert_eq!(status_text(200), "OK");
+        assert_eq!(status_text(201), "Created");
+        assert_eq!(status_text(204), "No Content");
+        assert_eq!(status_text(301), "Moved Permanently");
+        assert_eq!(status_text(302), "Found");
+        assert_eq!(status_text(400), "Bad Request");
+        assert_eq!(status_text(401), "Unauthorized");
+        assert_eq!(status_text(404), "Not Found");
+        assert_eq!(status_text(500), "Internal Server Error");
+    }
+
+    #[test]
+    fn status_text_falls_back_to_ok_for_unknown_codes() {
+        assert_eq!(status_text(418), "OK");
+        assert_eq!(status_text(599), "OK");
     }
 }

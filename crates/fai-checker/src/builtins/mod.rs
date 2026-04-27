@@ -12,6 +12,8 @@ mod browser;
 mod concurrency;
 mod core;
 mod dict;
+mod env;
+mod events;
 mod ffi;
 mod file;
 mod http;
@@ -32,6 +34,8 @@ pub fn install_builtins() -> HashMap<String, Type> {
     dict::install(&mut b);
     json::install(&mut b);
     file::install(&mut b);
+    env::install(&mut b);
+    events::install(&mut b);
     time_log::install(&mut b);
     math::install(&mut b);
     browser::install(&mut b);
@@ -190,6 +194,19 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.path", name: "dirname",  builtin_name: "pathDirname",  doc: "Return the directory portion of a path." },
         BuiltinDoc { module: "std.path", name: "basename", builtin_name: "pathBasename", doc: "Return the filename portion of a path." },
         BuiltinDoc { module: "std.path", name: "extname",  builtin_name: "pathExtname",  doc: "Return the file extension, including the leading dot." },
+
+        // std.env
+        BuiltinDoc { module: "std.env", name: "get",  builtin_name: "envGet",  doc: "Read a process environment variable, or null if unset." },
+        BuiltinDoc { module: "std.env", name: "load", builtin_name: "envLoad", doc: "Parse a dotenv-style file and merge its entries into the process environment. Returns true on success, false if the file is missing or unreadable." },
+
+        // std.events
+        BuiltinDoc { module: "std.events", name: "on",          builtin_name: "eventOn",          doc: "Register a handler for an event name. Returns a Subscription handle." },
+        BuiltinDoc { module: "std.events", name: "once",        builtin_name: "eventOnce",        doc: "Register a handler that fires once and is then auto-removed." },
+        BuiltinDoc { module: "std.events", name: "off",         builtin_name: "eventOff",         doc: "Cancel a Subscription. Returns true if it was active, false if already removed." },
+        BuiltinDoc { module: "std.events", name: "emit",        builtin_name: "eventEmit",        doc: "Synchronously deliver an event to every subscriber registered under name." },
+        BuiltinDoc { module: "std.events", name: "subscribers", builtin_name: "eventSubscribers", doc: "Return the number of active subscribers for an event name." },
+        BuiltinDoc { module: "std.events", name: "clear",       builtin_name: "eventClear",       doc: "Remove every subscriber registered under name." },
+        BuiltinDoc { module: "std.events", name: "clearAll",    builtin_name: "eventClearAll",    doc: "Remove every subscription across every event name. Test cleanup helper." },
 
         // std.time
         BuiltinDoc { module: "std.time", name: "now",  builtin_name: "timeNow",  doc: "Return the current time as an ISO 8601 string." },

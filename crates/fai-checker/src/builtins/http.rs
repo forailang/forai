@@ -50,36 +50,38 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[response_type],
     );
 
-    // HTTP server — response builders
+    // HTTP server — response builders. All return HttpResponse so
+    // every routing path settles on the same wire shape.
+    let http_response_type = named_type("HttpResponse", NamedCategory::Type);
     ins(
         b,
         "httpServerOk",
         &[p("body", Type::String)],
-        &[Type::Dictionary],
+        &[http_response_type.clone()],
     );
     ins(
         b,
         "httpServerText",
         &[p("status", Type::Int), p("body", Type::String)],
-        &[Type::Dictionary],
+        &[http_response_type.clone()],
     );
     ins(
         b,
         "httpServerHtml",
         &[p("status", Type::Int), p("body", Type::String)],
-        &[Type::Dictionary],
+        &[http_response_type.clone()],
     );
     ins(
         b,
         "httpServerJson",
         &[p("status", Type::Int), p("value", Type::Unknown)],
-        &[Type::Dictionary],
+        &[http_response_type.clone()],
     );
     ins(
         b,
         "httpServerRedirect",
         &[p("status", Type::Int), p("url", Type::String)],
-        &[Type::Dictionary],
+        &[http_response_type.clone()],
     );
     // Kept for backward compatibility (not exported from std.http.server module anymore)
     ins(
@@ -95,7 +97,7 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
                         "request",
                         named_type("HttpRequest", NamedCategory::Type),
                     )],
-                    vec![Type::Dictionary],
+                    vec![http_response_type.clone()],
                 ),
             ),
         ],
@@ -108,7 +110,7 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     let route_handler = function_type(
         "routeHandler",
         vec![param("request", http_request_type)],
-        vec![Type::Dictionary],
+        vec![http_response_type.clone()],
     );
 
     // server.router() -> Router
@@ -202,6 +204,50 @@ mod tests {
                 Type::Named { name, .. } => assert_eq!(name, "Response"),
                 _ => panic!("expected Named"),
             },
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_http_server_builders_return_http_response() {
+        let b = fresh();
+        for builder in &[
+            "httpServerOk",
+            "httpServerText",
+            "httpServerHtml",
+            "httpServerJson",
+            "httpServerRedirect",
+        ] {
+            match b.get(*builder).unwrap() {
+                Type::Function(sig) => match &sig.returns[0] {
+                    Type::Named { name, .. } => assert_eq!(
+                        name, "HttpResponse",
+                        "{} should return HttpResponse, got {}",
+                        builder, name
+                    ),
+                    other => panic!("{}: expected Named, got {:?}", builder, other),
+                },
+                _ => panic!("{} should be Function", builder),
+            }
+        }
+    }
+
+    #[test]
+    fn test_route_handler_returns_http_response() {
+        let b = fresh();
+        // Route handlers reach into the typed signature via the
+        // router get/post functions' second param.
+        match b.get("httpServerRouterGet").unwrap() {
+            Type::Function(sig) => {
+                let handler = &sig.params[2].ty;
+                match handler {
+                    Type::Function(handler_sig) => match &handler_sig.returns[0] {
+                        Type::Named { name, .. } => assert_eq!(name, "HttpResponse"),
+                        other => panic!("expected Named, got {:?}", other),
+                    },
+                    other => panic!("expected Function handler param, got {:?}", other),
+                }
+            }
             _ => panic!("expected Function"),
         }
     }

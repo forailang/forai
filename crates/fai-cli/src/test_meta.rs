@@ -63,7 +63,9 @@ fn collect(statements: &[Statement], out: &mut TestMeta) {
     for stmt in statements {
         match stmt {
             Statement::FunctionDeclaration(fd) => {
-                out.coverage_candidates.push(fd.name.clone());
+                if !fd.is_private.unwrap_or(false) {
+                    out.coverage_candidates.push(fd.name.clone());
+                }
             }
             Statement::TestDeclaration(td) => {
                 out.suites.push(TestSuiteMeta {
@@ -171,5 +173,29 @@ mod tests {
         let meta = extract(&prepared);
         // Only the entry `main` is picked up.
         assert_eq!(meta.coverage_candidates, vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn private_functions_are_not_coverage_candidates() {
+        let prepared = prepare(
+            concat!(
+                "# Public.\ndef publicFn\n",
+                "    @return Int\n",
+                "do\n",
+                "  privateFn()\n",
+                "end\n",
+                "\n",
+                "private:\n",
+                "# Private.\ndef privateFn\n",
+                "    @return Int\n",
+                "do\n",
+                "  1\n",
+                "end\n",
+            ),
+            true,
+        );
+        let meta = extract(&prepared);
+        assert!(meta.coverage_candidates.contains(&"publicFn".to_string()));
+        assert!(!meta.coverage_candidates.contains(&"privateFn".to_string()));
     }
 }

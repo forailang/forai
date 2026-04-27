@@ -51,6 +51,74 @@ pub fn prepare_module_directory(dir_path: &str) -> Result<PreparedProgram, Strin
     })
 }
 
+/// Test-mode variant of [`prepare_module_directory`].
+///
+/// Loads every `.fai` file in `dir_path` into a single module with
+/// `is_test = true`, so test blocks are preserved and every public
+/// function flagged for coverage. Used by `fai test` for library
+/// projects that don't have a single entry-point file — the runner
+/// walks the source root as one module and runs every test it finds
+/// in one wasm pass.
+///
+/// Crucially, this also resolves transitive module dependencies. The
+/// loaded `__module__` typically references both nested submodule
+/// directories (e.g. `data/tasks/`) and external packages declared in
+/// `fai.toml` (e.g. `Forsqlite`). To pull those in, the function
+/// builds a synthetic entry source containing the union of every
+/// `use` statement found across the source root's files and runs the
+/// standard `discover_modules` walk against it. The directory itself
+/// is then attached as `__module__` so its function and test
+/// statements participate in codegen.
+pub fn prepare_module_directory_for_tests(dir_path: &str) -> Result<PreparedProgram, String> {
+    // Collect every distinct `use` line across the directory's files
+    // so the synthetic entry mirrors what an entry-point file would
+    // see if the user had written one. Module-mate symbols don't need
+    // explicit `use` — they're visible through `__module__` directly.
+    let entries = std::fs::read_dir(dir_path)
+        .map_err(|e| format!("cannot read module directory '{}': {}", dir_path, e))?;
+    let mut fai_files: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("fai") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    fai_files.sort();
+
+    let mut entry_source = String::new();
+    let mut seen_use_lines = std::collections::HashSet::new();
+    for file_path in &fai_files {
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read '{}': {}", file_path.display(), e))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("use ") && seen_use_lines.insert(trimmed.to_string()) {
+                entry_source.push_str(trimmed);
+                entry_source.push('\n');
+            }
+        }
+    }
+
+    // Run the standard test-prepare path against the synthetic entry
+    // so external packages, std modules, and nested submodules all
+    // come along through `discover_modules`. Then attach the loaded
+    // directory as a same-source-root module so its definitions and
+    // test blocks are part of the program.
+    let mut prepared = prepare_source_with_synthetic_and_entry_for_tests(
+        &entry_source,
+        Some(dir_path),
+        Vec::new(),
+        None,
+    )?;
+    let module = load_module_directory("__module__", dir_path, None, None, true)?;
+    prepared.modules.insert(0, module);
+    Ok(prepared)
+}
+
 /// Prepare source with additional synthetic modules that exist only
 /// in memory (no files on disk). Each entry is (module_name, source_code).
 /// Other files can `use { X } from ModuleName` to access them.
@@ -668,6 +736,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn test_prepare_for_tests_strips_external_package_test_blocks() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fai-compiler-test-deps-{}", nonce));
+        let app_src = root.join("app/src");
+        let pkg_src = root.join("libpkg/src");
+        fs::create_dir_all(&app_src).unwrap();
+        fs::create_dir_all(&pkg_src).unwrap();
+        fs::write(
+            root.join("app/fai.toml"),
+            format!(
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                root.join("libpkg").display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("libpkg/fai.toml"),
+            "[project]\nname = \"LibPkg\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        fs::write(
+            app_src.join("main.fai"),
+            "use { helper } from LibPkg\n\ndef main\n    @return Int\ndo\n  helper()\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            pkg_src.join("libpkg.fai"),
+            "# Helper.\ndef helper\n    @return Int\ndo\n  42\nend\n\ntest helper\nit 'works'\n  assert.equals(helper(), 42)\nend\nend\n",
+        )
+        .unwrap();
+
+        let source = fs::read_to_string(app_src.join("main.fai")).unwrap();
+        let tests = prepare_source_with_synthetic_and_entry_for_tests(
+            &source,
+            Some(app_src.to_str().unwrap()),
+            Vec::new(),
+            Some(app_src.join("main.fai").to_str().unwrap()),
+        )
+        .unwrap();
+        let pkg = tests
+            .modules
+            .iter()
+            .find(|m| m.name == "LibPkg")
+            .expect("external package module loaded");
+        let test_count = pkg
+            .statements
+            .iter()
+            .filter(|s| matches!(s, crate::ast::Statement::TestDeclaration(_)))
+            .count();
+        assert_eq!(
+            test_count, 0,
+            "app target tests must not run external dependency package tests"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 /// Walk statements looking for `use` declarations and load their module files.
@@ -776,7 +905,7 @@ fn discover_module_use(
     seen.insert(module_name.clone());
 
     let first = path.first().map(|s| s.as_str()).unwrap_or("");
-    let (module_dir, module_source_root, child_package_prefix, transitive_packages) =
+    let (module_dir, module_source_root, child_package_prefix, transitive_packages, module_is_test) =
         if first.starts_with(|c: char| c.is_uppercase()) {
             if let Some(pkg_entry) = packages.get(first) {
                 let pkg_src_root = &pkg_entry.src_root;
@@ -792,7 +921,13 @@ fn discover_module_use(
                     extended.entry(k).or_insert(v);
                 }
                 let child_pkg_prefix = Some(first.to_string());
-                (dir, pkg_src_root.clone(), child_pkg_prefix, extended)
+                (
+                    dir,
+                    pkg_src_root.clone(),
+                    child_pkg_prefix,
+                    extended,
+                    is_test && pkg_entry.is_sibling,
+                )
             } else {
                 return Err(format!(
                     "unknown package '{}' — not found in fai.toml [dependencies]",
@@ -809,6 +944,7 @@ fn discover_module_use(
                 workspace_source_root.to_string(),
                 None,
                 packages.clone(),
+                is_test,
             )
         } else {
             (
@@ -816,10 +952,17 @@ fn discover_module_use(
                 active_source_root.to_string(),
                 package_prefix.map(|s| s.to_string()),
                 packages.clone(),
+                is_test,
             )
         };
 
-    let module = load_module_directory(&module_name, &module_dir, entry_path, entry_ast, is_test)?;
+    let module = load_module_directory(
+        &module_name,
+        &module_dir,
+        entry_path,
+        entry_ast,
+        module_is_test,
+    )?;
 
     for file_path in &get_fai_files(&module_dir)? {
         // For the transitive-dependency walk, if this file is the entry

@@ -1,0 +1,72 @@
+# expect: ok
+# stdout:
+#   true
+#   3040
+#   sqlite://db/test.sqlite
+#   null
+
+use std.env
+
+use std.file
+
+# Build a temp dotenv file the test can load.
+def setUpEnvFile
+    @return String
+do
+  let path = '/tmp/fai_std_env_fixture.env'
+  file.write(path, '# fixture .env\n' + 'FAI_FIXTURE_PORT=3040\n' + 'FAI_FIXTURE_DB="sqlite://db/test.sqlite"\n' + '\n' + 'INVALID LINE WITHOUT EQUALS\n')
+  path
+end
+
+test setUpEnvFile
+it 'writes a dotenv file at a stable temp path'
+  let path = setUpEnvFile()
+  assert.isTrue(length(path) > 0)
+  assert.isTrue(file.exists(path))
+end
+end
+
+# Load the fixture .env and look up a key.
+def lookupAfterLoad
+    @param key String
+    @return String?
+do
+  let path = setUpEnvFile()
+  env.load(path)
+  env.get(key)
+end
+
+test lookupAfterLoad
+it 'finds keys that the dotenv file declared'
+  assert.equals(lookupAfterLoad('FAI_FIXTURE_PORT')!, '3040')
+end
+it 'strips matching double quotes from values'
+  assert.equals(lookupAfterLoad('FAI_FIXTURE_DB')!, 'sqlite://db/test.sqlite')
+end
+it 'returns null for an unset key'
+  assert.isNull(lookupAfterLoad('FAI_FIXTURE_NOT_SET'))
+end
+end
+
+# `env.load` returns false for a missing file rather than trapping.
+def loadMissing
+    @return Bool
+do
+  env.load('/tmp/fai_std_env_does_not_exist.env')
+end
+
+test loadMissing
+it 'returns false when the file is missing'
+  assert.equals(loadMissing(), false)
+end
+end
+
+def main
+    @return Void
+do
+  let path = setUpEnvFile()
+  print(env.load(path))
+  print(env.get('FAI_FIXTURE_PORT')!)
+  print(env.get('FAI_FIXTURE_DB')!)
+  print(env.get('FAI_FIXTURE_NOT_SET'))
+end

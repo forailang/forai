@@ -22,6 +22,8 @@ pub struct InterfaceSpec {
 #[derive(Debug)]
 pub struct FunctionSpec {
     pub name: String,
+    pub module: Option<String>,
+    pub key: Option<String>,
     pub type_params: Vec<String>,
     pub params: Vec<ParamSpec>,
     pub returns: Vec<String>,
@@ -38,6 +40,8 @@ pub struct ParamSpec {
 #[derive(Debug)]
 pub struct TypeSpec {
     pub name: String,
+    pub module: Option<String>,
+    pub key: Option<String>,
     pub type_params: Vec<String>,
     pub fields: Vec<FieldSpec>,
 }
@@ -136,7 +140,10 @@ pub fn extract_remote_schema(statements: &[Statement]) -> InterfaceSpec {
     }
 }
 
-fn extract_function(fd: &FunctionDeclaration) -> FunctionSpec {
+pub(crate) fn extract_function_with_origin(
+    fd: &FunctionDeclaration,
+    module: Option<&str>,
+) -> FunctionSpec {
     let params = fd
         .params
         .iter()
@@ -155,6 +162,8 @@ fn extract_function(fd: &FunctionDeclaration) -> FunctionSpec {
 
     FunctionSpec {
         name: fd.name.clone(),
+        module: module.map(str::to_string),
+        key: module.map(|m| format!("{}.{}", m, fd.name)),
         type_params: fd.type_params.iter().map(|tp| tp.name.clone()).collect(),
         params,
         returns,
@@ -162,7 +171,11 @@ fn extract_function(fd: &FunctionDeclaration) -> FunctionSpec {
     }
 }
 
-fn extract_type(td: &TypeDeclaration) -> TypeSpec {
+fn extract_function(fd: &FunctionDeclaration) -> FunctionSpec {
+    extract_function_with_origin(fd, None)
+}
+
+pub(crate) fn extract_type_with_origin(td: &TypeDeclaration, module: Option<&str>) -> TypeSpec {
     let fields = td
         .fields
         .iter()
@@ -185,9 +198,15 @@ fn extract_type(td: &TypeDeclaration) -> TypeSpec {
 
     TypeSpec {
         name: td.name.clone(),
+        module: module.map(str::to_string),
+        key: module.map(|m| format!("{}.{}", m, td.name)),
         type_params: td.type_params.iter().map(|tp| tp.name.clone()).collect(),
         fields,
     }
+}
+
+fn extract_type(td: &TypeDeclaration) -> TypeSpec {
+    extract_type_with_origin(td, None)
 }
 
 fn extract_enum(ed: &EnumDeclaration) -> EnumSpec {
@@ -228,6 +247,12 @@ fn compute_hash(functions: &[FunctionSpec], types: &[TypeSpec], enums: &[EnumSpe
 
     for f in functions {
         f.name.hash(&mut hasher);
+        if let Some(module) = &f.module {
+            module.hash(&mut hasher);
+        }
+        if let Some(key) = &f.key {
+            key.hash(&mut hasher);
+        }
         for p in &f.params {
             p.name.hash(&mut hasher);
             p.type_name.hash(&mut hasher);
@@ -238,6 +263,12 @@ fn compute_hash(functions: &[FunctionSpec], types: &[TypeSpec], enums: &[EnumSpe
     }
     for t in types {
         t.name.hash(&mut hasher);
+        if let Some(module) = &t.module {
+            module.hash(&mut hasher);
+        }
+        if let Some(key) = &t.key {
+            key.hash(&mut hasher);
+        }
         for f in &t.fields {
             f.name.hash(&mut hasher);
             f.type_name.hash(&mut hasher);
@@ -256,6 +287,22 @@ fn compute_hash(functions: &[FunctionSpec], types: &[TypeSpec], enums: &[EnumSpe
     format!("{:x}", hasher.finish())
 }
 
+pub(crate) fn make_remote_schema(
+    functions: Vec<FunctionSpec>,
+    types: Vec<TypeSpec>,
+) -> InterfaceSpec {
+    let enums = Vec::new();
+    let hash = compute_hash(&functions, &types, &enums);
+    InterfaceSpec {
+        name: String::new(),
+        version: String::new(),
+        hash,
+        functions,
+        types,
+        enums,
+    }
+}
+
 /// Serialize interface spec to JSON string.
 pub fn spec_to_json(spec: &InterfaceSpec) -> String {
     let mut json = String::new();
@@ -269,6 +316,12 @@ pub fn spec_to_json(spec: &InterfaceSpec) -> String {
     for (i, f) in spec.functions.iter().enumerate() {
         json.push_str("    {\n");
         json.push_str(&format!("      \"name\": \"{}\",\n", f.name));
+        if let Some(module) = &f.module {
+            json.push_str(&format!("      \"module\": \"{}\",\n", module));
+        }
+        if let Some(key) = &f.key {
+            json.push_str(&format!("      \"key\": \"{}\",\n", key));
+        }
         if !f.type_params.is_empty() {
             let tps: Vec<String> = f.type_params.iter().map(|t| format!("\"{}\"", t)).collect();
             json.push_str(&format!("      \"typeParams\": [{}],\n", tps.join(", ")));
@@ -299,6 +352,12 @@ pub fn spec_to_json(spec: &InterfaceSpec) -> String {
     for (i, t) in spec.types.iter().enumerate() {
         json.push_str("    {\n");
         json.push_str(&format!("      \"name\": \"{}\",\n", t.name));
+        if let Some(module) = &t.module {
+            json.push_str(&format!("      \"module\": \"{}\",\n", module));
+        }
+        if let Some(key) = &t.key {
+            json.push_str(&format!("      \"key\": \"{}\",\n", key));
+        }
         if !t.type_params.is_empty() {
             let tps: Vec<String> = t
                 .type_params
@@ -977,6 +1036,18 @@ mod tests {
         assert!(json.contains("\"Task\""));
         assert!(json.contains("\"getTasks\""));
         assert!(json.contains("\"hash\""));
+    }
+
+    #[test]
+    fn test_origin_metadata_json_roundtrip() {
+        let function =
+            extract_function_with_origin(&make_remote_fn("getTasks"), Some("data.tasks"));
+        let type_spec = extract_type_with_origin(&make_remote_type("Task"), Some("data.tasks"));
+        let spec = make_remote_schema(vec![function], vec![type_spec]);
+        let json = spec_to_json(&spec);
+        assert!(json.contains("\"module\": \"data.tasks\""));
+        assert!(json.contains("\"key\": \"data.tasks.getTasks\""));
+        assert!(json.contains("\"key\": \"data.tasks.Task\""));
     }
 
     // ── field attributes ─────────────────────────────────────────────

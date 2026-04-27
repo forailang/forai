@@ -19,7 +19,10 @@ use crate::program::FunctionInfo;
 use crate::runtime::{
     IMPORT_ARRAY_FILTER, IMPORT_ARRAY_FIND, IMPORT_ARRAY_IS_ALL, IMPORT_ARRAY_IS_ANY,
     IMPORT_ARRAY_MAP, IMPORT_CALL_FFI, IMPORT_CLI_CLEAR, IMPORT_CLI_MOVE_TO, IMPORT_CLI_READ_LINE,
-    IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS,
+    IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_ENV_GET, IMPORT_ENV_LOAD, IMPORT_EVENT_CLEAR,
+    IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_EMIT, IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE,
+    IMPORT_EVENT_SUBSCRIBERS, IMPORT_FFI_AVAILABLE,
+    IMPORT_FILE_EXISTS,
     IMPORT_FILE_LIST, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
     IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH, IMPORT_HTTP_REQUEST_POST,
     IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY,
@@ -52,6 +55,17 @@ use crate::runtime::{
 /// so the body can read upvalues at `GlobalGet(ENV_PTR) + N*8`.
 const GLOBAL_ENV_PTR: u32 = 1;
 
+/// `error_flag` (i32, 0/1). Set by a `throw` whose enclosing
+/// function has no `try` frame for it; cleared by the post-call
+/// propagation in a caller that does have a `try`. Initialized to
+/// 0 in the global section.
+const GLOBAL_ERROR_FLAG: u32 = 2;
+
+/// `error_value` (i64, NaN-boxed). Holds the thrown value when
+/// `error_flag` is set. Cleared at the same time as `error_flag`.
+/// Initialized to 0 in the global section.
+const GLOBAL_ERROR_VALUE: u32 = 3;
+
 fn mem0() -> MemArg {
     MemArg {
         offset: 0,
@@ -66,6 +80,90 @@ fn mem_off(off: u64) -> MemArg {
         align: 0,
         memory_index: 0,
     }
+}
+
+/// FieldDeclarations for built-in named types — `Event`,
+/// `HttpRequest`, `RpcCall`, etc. — registered in
+/// `fai-checker/src/checker/program.rs::resolve_type_fields`. The
+/// codegen merges these into its own `type_fields` map alongside
+/// user-declared `type Foo ... end` entries so that
+/// `let x T = from_dict(d)` expansion (see
+/// `compile_from_dict_local_value`) finds the field list at codegen
+/// time. The TypeNodes are intentionally minimal — `from_dict`'s
+/// runtime path only reads field name / attributes / default_value
+/// per-field, not the type. Drift risk between this list and
+/// program.rs's checker entries surfaces as a loud
+/// `UnknownIdentifier("from_dict")` at compile time.
+fn builtin_type_fields() -> Vec<(String, Vec<fai_compiler::ast::FieldDeclaration>)> {
+    use fai_compiler::ast::{FieldDeclaration, SourceLocation, TypeNode};
+
+    let loc = SourceLocation { line: 0, column: 0 };
+    let unknown_node = || TypeNode {
+        kind: "type".to_string(),
+        name: Some("Unknown".to_string()),
+        is_type_parameter: None,
+        function_params: None,
+        function_returns: None,
+        is_array: false,
+        is_optional: false,
+        location: loc.clone(),
+    };
+    let mk = |fields: &[&str]| -> Vec<FieldDeclaration> {
+        fields
+            .iter()
+            .map(|n| FieldDeclaration {
+                name: (*n).to_string(),
+                type_node: unknown_node(),
+                default_value: None,
+                attributes: Vec::new(),
+                location: loc.clone(),
+            })
+            .collect()
+    };
+
+    vec![
+        // Lifecycle / messaging
+        ("Event".to_string(), mk(&["name", "data"])),
+        ("Subscription".to_string(), mk(&["id", "name"])),
+        // HTTP wire shapes
+        (
+            "HttpRequest".to_string(),
+            mk(&["method", "path", "body", "headers"]),
+        ),
+        (
+            "HttpResponse".to_string(),
+            mk(&[
+                "status",
+                "body",
+                "contentType",
+                "location",
+                "cookies",
+                "headers",
+            ]),
+        ),
+        (
+            "Cookie".to_string(),
+            mk(&[
+                "name",
+                "value",
+                "path",
+                "maxAge",
+                "httpOnly",
+                "secure",
+                "sameSite",
+            ]),
+        ),
+        // Standard event payloads
+        (
+            "RequestResponse".to_string(),
+            mk(&["request", "response"]),
+        ),
+        ("ServerStarted".to_string(), mk(&["port"])),
+        ("HttpError".to_string(), mk(&["request", "message"])),
+        ("RpcCall".to_string(), mk(&["fnName", "args"])),
+        ("RpcResult".to_string(), mk(&["fnName", "value"])),
+        ("RpcError".to_string(), mk(&["fnName", "message"])),
+    ]
 }
 
 /// Collects string literals seen during compilation so the module
@@ -212,11 +310,14 @@ enum ModuleCall {
     /// dispatch to `IMPORT_STORAGE_GET`, return `null` on `-1` or
     /// wrap the scratch bytes as a `String`.
     StorageGet,
-    /// `std.convert.{toInt,toFloat}(v)` — both are pass-through at
-    /// runtime (the value is already NaN-boxed; the check happened
-    /// at type-check time). Mirrors the bytecode translator's
-    /// inline `toInt/toFloat` branch.
-    ConvertPassthrough,
+    /// `std.convert.toInt(v) -> Int`. Type-aware at codegen:
+    /// Int passthrough, Float truncates, String routes to
+    /// `RT_PARSE_INT`. Other types fall through unchanged.
+    ConvertToInt,
+    /// `std.convert.toFloat(v) -> Float`. Type-aware at codegen:
+    /// Float passthrough, Int converts, String routes to
+    /// `RT_PARSE_FLOAT`. Other types fall through unchanged.
+    ConvertToFloat,
     /// `std.convert.toString(v) -> String`. Call `RT_VALUE_TO_STR`
     /// on the boxed value and return the resulting String obj.
     ConvertToString,
@@ -390,7 +491,8 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
     // std.convert — RT-helper dispatch + pass-throughs.
     if module == "std.convert" {
         match method {
-            "toInt" | "toFloat" => return Some(ModuleCall::ConvertPassthrough),
+            "toInt" => return Some(ModuleCall::ConvertToInt),
+            "toFloat" => return Some(ModuleCall::ConvertToFloat),
             "toString" => return Some(ModuleCall::ConvertToString),
             "toBool" => return Some(ModuleCall::ConvertToBool),
             "parseInt" => return Some(ModuleCall::ConvertParseInt),
@@ -485,6 +587,24 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ("std.path", "basename") => (IMPORT_PATH_BASENAME, &[AS::String], RS::Boxed),
         ("std.path", "dirname") => (IMPORT_PATH_DIRNAME, &[AS::String], RS::Boxed),
         ("std.path", "extname") => (IMPORT_PATH_EXTNAME, &[AS::String], RS::Boxed),
+
+        // std.env — process environment + dotenv loader. `get` returns
+        // a NaN-boxed String allocated host-side or VAL_NULL when the
+        // key is unset. `load` returns a 0/1 flag wrapped as Bool.
+        ("std.env", "get") => (IMPORT_ENV_GET, &[AS::String], RS::Boxed),
+        ("std.env", "load") => (IMPORT_ENV_LOAD, &[AS::String], RS::MakeBool),
+
+        // std.events — host-backed registry. The host stores closure
+        // handles by event name and invokes them via the indirect
+        // function table on `emit`. `on`/`once` return a NaN-boxed
+        // Subscription Dict (`{id, name}`); `off` returns Bool.
+        ("std.events", "on") => (IMPORT_EVENT_ON, &[AS::String, AS::Boxed], RS::Boxed),
+        ("std.events", "once") => (IMPORT_EVENT_ONCE, &[AS::String, AS::Boxed], RS::Boxed),
+        ("std.events", "off") => (IMPORT_EVENT_OFF, &[AS::Boxed], RS::MakeBool),
+        ("std.events", "emit") => (IMPORT_EVENT_EMIT, &[AS::String, AS::Boxed], RS::Void),
+        ("std.events", "subscribers") => (IMPORT_EVENT_SUBSCRIBERS, &[AS::String], RS::MakeInt),
+        ("std.events", "clear") => (IMPORT_EVENT_CLEAR, &[AS::String], RS::Void),
+        ("std.events", "clearAll") => (IMPORT_EVENT_CLEAR_ALL, &[], RS::Void),
 
         // std.html — (String) → String.
         ("std.html", "escape") => (IMPORT_HTML_ESCAPE, &[AS::String], RS::Boxed),
@@ -604,18 +724,6 @@ pub enum BuildError {
     /// depends on the `Forui` package. The user must rename one
     /// rather than have the compiler silently pick a winner.
     DuplicateModuleName(String),
-    /// Two discovered modules with distinct canonical names share
-    /// the same final segment (basename). Unqualified imports like
-    /// `use { X } from Forui` would resolve via the basename alias
-    /// and silently route to whichever module was discovered first.
-    /// Forcing a build failure surfaces the ambiguity so the user
-    /// switches to the fully-qualified `use { X } from Some.Forui`
-    /// form.
-    DuplicateModuleBasename {
-        basename: String,
-        first: String,
-        second: String,
-    },
 }
 
 /// Runtime-helper offset the function's `Call` instructions use.
@@ -1365,7 +1473,10 @@ pub fn build_function_with_spy_and_offset(
     };
     let main = {
         let mut b = Builder::new(fd, &ctx, None);
-        b.module_context = module_context.map(|s| s.to_string());
+        if let Some(module_context) = module_context {
+            b.module_key = module_context.to_string();
+            b.module_context = Some(module_context.to_string());
+        }
         b.compile_body()?;
         b.finish()
     };
@@ -1498,50 +1609,45 @@ pub fn build_program_full(
     import_remap: &[Option<u32>],
     is_test: bool,
 ) -> Result<BuiltProgram, BuildError> {
-    // Reject module-name collisions up front. Two kinds:
-    //
-    // 1. Same canonical name — a local `src/Forui/` directory and a
-    //    `Forui` dependency package both produce `m.name = "Forui"`.
-    //    Silently picking one would scramble call-resolution in a
-    //    way users can't diagnose.
-    //
-    // 2. Distinct canonical names, same final segment (basename) —
-    //    e.g. `MyApp.Forui` and `Forui`. The single-segment alias
-    //    path (see `module_aliases` below + `record_named_imports`)
-    //    routes `use { X } from Forui` through the basename, so an
-    //    ambiguous basename silently routes to first-seen. Refuse so
-    //    the user writes the fully-qualified path at import sites.
+    // Reject canonical module-name collisions up front. A local
+    // `src/Forui/` directory and a dependency package also named
+    // `Forui` both produce `m.name = "Forui"`; silently picking one
+    // would scramble call-resolution in a way users can't diagnose.
     {
         use std::collections::HashMap as StdMap;
         let mut by_canonical: StdMap<&str, ()> = StdMap::new();
-        let mut by_basename: StdMap<&str, &str> = StdMap::new();
         for m in modules {
             if by_canonical.insert(m.name.as_str(), ()).is_some() {
                 return Err(BuildError::DuplicateModuleName(m.name.clone()));
             }
-            let basename = m.name.rsplit('.').next().unwrap_or(m.name.as_str());
-            if let Some(first) = by_basename.get(basename).copied() {
-                return Err(BuildError::DuplicateModuleBasename {
-                    basename: basename.to_string(),
-                    first: first.to_string(),
-                    second: m.name.clone(),
-                });
-            }
-            by_basename.insert(basename, m.name.as_str());
         }
     }
 
-    // Alias map merges user modules (under their last path segment)
-    // with std `use` imports from the entry AST. Entry-AST std
-    // aliases win on collision so `use std.array` isn't shadowed
-    // by a user module conveniently named `array`.
+    // Alias map merges explicit namespace `use` imports with unique
+    // user-module basename aliases. If two modules share a basename
+    // (`auth` and `pages.auth`), no implicit alias is created for
+    // that basename; explicit named imports still resolve through
+    // their canonical module path.
     let mut module_aliases: HashMap<String, String> = HashMap::new();
-    for m in modules {
-        if let Some(last) = m.name.rsplit('.').next() {
-            module_aliases.insert(last.to_string(), m.name.clone());
+    {
+        use std::collections::HashMap as StdMap;
+        let mut basename_counts: StdMap<String, usize> = StdMap::new();
+        for m in modules {
+            if let Some(last) = m.name.rsplit('.').next() {
+                *basename_counts.entry(last.to_string()).or_insert(0) += 1;
+            }
+        }
+        for m in modules {
+            if let Some(last) = m.name.rsplit('.').next() {
+                if basename_counts.get(last).copied().unwrap_or(0) == 1 {
+                    module_aliases.insert(last.to_string(), m.name.clone());
+                }
+            }
         }
     }
-    for (k, v) in collect_module_aliases_from(&ast.statements) {
+    // Entry-AST aliases win on collision so `use std.array` isn't
+    // shadowed by a user module conveniently named `array`.
+    for (k, v) in collect_module_aliases_from(None, &ast.statements) {
         module_aliases.insert(k, v);
     }
     // Also fold in aliases declared inside each discovered module —
@@ -1549,7 +1655,7 @@ pub fn build_program_full(
     // to resolve when its functions compile. Entry-level aliases
     // already won above; here we only insert keys that aren't taken.
     for m in modules {
-        for (k, v) in collect_module_aliases_from(&m.statements) {
+        for (k, v) in collect_module_aliases_from(Some(&m.name), &m.statements) {
             module_aliases.entry(k).or_insert(v);
         }
     }
@@ -1563,29 +1669,14 @@ pub fn build_program_full(
     fn record_named_imports(
         out: &mut HashMap<String, String>,
         stmts: &[fai_compiler::ast::Statement],
-        module_aliases: &HashMap<String, String>,
+        current_module_name: Option<&str>,
         insert_policy: fn(&mut HashMap<String, String>, String, String),
     ) {
         for s in stmts {
             if let fai_compiler::ast::Statement::UseStatement(u) = s {
                 if let Some(names) = &u.imported_names {
-                    // A single-segment module path (`use { X } from
-                    // signal`) resolves through `module_aliases` —
-                    // when this file is loaded as part of a
-                    // dependency package, the alias table maps the
-                    // short name to the fully-qualified module path
-                    // (`signal` → `Forui.signal`). Without that
-                    // lookup, calls lowered with the relative path
-                    // miss in `function_by_name`, which only has the
-                    // canonical qualified entries.
-                    let qualified_prefix = if u.module_path.len() == 1 {
-                        module_aliases
-                            .get(&u.module_path[0])
-                            .cloned()
-                            .unwrap_or_else(|| u.module_path[0].clone())
-                    } else {
-                        u.module_path.join(".")
-                    };
+                    let qualified_prefix =
+                        qualify_module_path_for_codegen(current_module_name, &u.module_path);
                     for n in names {
                         insert_policy(out, n.clone(), format!("{}.{}", qualified_prefix, n));
                     }
@@ -1593,19 +1684,14 @@ pub fn build_program_full(
             }
         }
     }
-    record_named_imports(
-        &mut named_imports,
-        &ast.statements,
-        &module_aliases,
-        |m, k, v| {
-            m.insert(k, v);
-        },
-    );
+    record_named_imports(&mut named_imports, &ast.statements, None, |m, k, v| {
+        m.insert(k, v);
+    });
     for m in modules {
         record_named_imports(
             &mut named_imports,
             &m.statements,
-            &module_aliases,
+            Some(&m.name),
             |m, k, v| {
                 m.entry(k).or_insert(v);
             },
@@ -1695,6 +1781,15 @@ pub fn build_program_full(
             }
         }
     }
+    // Built-in named types (Event, HttpRequest, RpcCall, etc.) live
+    // in the checker's `type_fields` but never reached the codegen
+    // here. Without this, `let x T = from_dict(d)` for a built-in T
+    // falls through the expansion at `compile_let_statement` and
+    // codegen reports `UnknownIdentifier("from_dict")`. User-declared
+    // types of the same name still win — they were inserted above.
+    for (name, fields) in builtin_type_fields() {
+        type_fields.entry(name).or_insert(fields);
+    }
 
     // Module-level constants — top-level `let NAME = <literal>`
     // bindings. Collected from the entry AST and every module so a
@@ -1743,11 +1838,8 @@ pub fn build_program_full(
     let mut module_vars: HashMap<String, u32> = HashMap::new();
     // Ordered list of (module_context, name, initialiser). None
     // context means the entry AST's own top-level vars.
-    let mut module_var_inits: Vec<(
-        Option<String>,
-        String,
-        fai_compiler::ast::Expression,
-    )> = Vec::new();
+    let mut module_var_inits: Vec<(Option<String>, String, fai_compiler::ast::Expression)> =
+        Vec::new();
     {
         fn collect_mvars(
             stmts: &[fai_compiler::ast::Statement],
@@ -1808,31 +1900,28 @@ pub fn build_program_full(
     // the export loop below skips them — hosts only see `_start`.
     let loc_zero = fai_compiler::ast::SourceLocation { line: 0, column: 0 };
     let mk_call_stmt = |name: &str| -> fai_compiler::ast::Statement {
-        fai_compiler::ast::Statement::ExpressionStatement(
-            fai_compiler::ast::ExpressionStatement {
-                expression: fai_compiler::ast::Expression::CallExpression(
-                    fai_compiler::ast::CallExpression {
-                        callee: Box::new(fai_compiler::ast::Expression::IdentifierExpression(
-                            fai_compiler::ast::IdentifierExpression {
-                                name: name.to_string(),
-                                location: loc_zero.clone(),
-                            },
-                        )),
-                        args: Vec::new(),
-                        location: loc_zero.clone(),
-                    },
-                ),
-                location: loc_zero.clone(),
-            },
-        )
+        fai_compiler::ast::Statement::ExpressionStatement(fai_compiler::ast::ExpressionStatement {
+            expression: fai_compiler::ast::Expression::CallExpression(
+                fai_compiler::ast::CallExpression {
+                    callee: Box::new(fai_compiler::ast::Expression::IdentifierExpression(
+                        fai_compiler::ast::IdentifierExpression {
+                            name: name.to_string(),
+                            location: loc_zero.clone(),
+                        },
+                    )),
+                    args: Vec::new(),
+                    location: loc_zero.clone(),
+                },
+            ),
+            location: loc_zero.clone(),
+        })
     };
     // Group the initialisers by their module context so each module
     // gets its own compiled init function. Per-module init functions
     // are named `<__module_init__:{module_path}>` (entry-AST vars
     // go into `<__module_init__:>`). A master `<__module_init__>`
     // calls them in declaration order.
-    let mut per_module_inits: Vec<(Option<String>, Vec<fai_compiler::ast::Statement>)> =
-        Vec::new();
+    let mut per_module_inits: Vec<(Option<String>, Vec<fai_compiler::ast::Statement>)> = Vec::new();
     for (ctx_mod, name, value) in &module_var_inits {
         let stmt = fai_compiler::ast::Statement::AssignmentStatement(
             fai_compiler::ast::AssignmentStatement {
@@ -1883,8 +1972,10 @@ pub fn build_program_full(
     // Master `<__module_init__>` just dispatches to each per-module
     // init. Order matches `module_var_inits` — first-seen wins for
     // duplicate var names, same policy as global-index allocation.
-    let master_init_body: Vec<fai_compiler::ast::Statement> =
-        per_module_init_names.iter().map(|n| mk_call_stmt(n)).collect();
+    let master_init_body: Vec<fai_compiler::ast::Statement> = per_module_init_names
+        .iter()
+        .map(|n| mk_call_stmt(n))
+        .collect();
     let module_init_fd = fai_compiler::ast::FunctionDeclaration {
         name: "<__module_init__>".to_string(),
         type_params: Vec::new(),
@@ -1898,9 +1989,8 @@ pub fn build_program_full(
         location: loc_zero.clone(),
         doc_comment: None,
     };
-    let mut start_body: Vec<fai_compiler::ast::Statement> =
-        vec![mk_call_stmt("<__module_init__>")];
-    if has_main {
+    let mut start_body: Vec<fai_compiler::ast::Statement> = vec![mk_call_stmt("<__module_init__>")];
+    if has_main && !is_test {
         start_body.push(mk_call_stmt("main"));
     }
     let start_fd = fai_compiler::ast::FunctionDeclaration {
@@ -2232,7 +2322,10 @@ pub fn build_program_full(
     })
 }
 
-fn collect_module_aliases_from(stmts: &[fai_compiler::ast::Statement]) -> HashMap<String, String> {
+fn collect_module_aliases_from(
+    current_module_name: Option<&str>,
+    stmts: &[fai_compiler::ast::Statement],
+) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
     for s in stmts {
         if let fai_compiler::ast::Statement::UseStatement(u) = s {
@@ -2240,11 +2333,39 @@ fn collect_module_aliases_from(stmts: &[fai_compiler::ast::Statement]) -> HashMa
                 continue;
             }
             if let Some(last) = u.module_path.last() {
-                aliases.insert(last.clone(), u.module_path.join("."));
+                aliases.insert(
+                    last.clone(),
+                    qualify_module_path_for_codegen(current_module_name, &u.module_path),
+                );
             }
         }
     }
     aliases
+}
+
+fn qualify_module_path_for_codegen(current_module_name: Option<&str>, path: &[String]) -> String {
+    if path.first().map(|s| s.as_str()) == Some("std") {
+        return path.join(".");
+    }
+    let is_external = path
+        .first()
+        .map(|s| s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+        .unwrap_or(false);
+    if is_external {
+        return path.join(".");
+    }
+    if let Some(current) = current_module_name {
+        let package = current.split('.').next().unwrap_or(current);
+        let is_package = package
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false);
+        if is_package {
+            return format!("{}.{}", package, path.join("."));
+        }
+    }
+    path.join(".")
 }
 
 fn collect_extern_fn_indices_from(stmts: &[fai_compiler::ast::Statement]) -> HashMap<String, u16> {
@@ -2869,6 +2990,8 @@ pub fn assemble_wasm_module_with_test_flag(
     }
     exports.export("__heap_ptr", ExportKind::Global, 0);
     exports.export("__env_ptr", ExportKind::Global, 1);
+    exports.export("__error_flag", ExportKind::Global, GLOBAL_ERROR_FLAG);
+    exports.export("__error_value", ExportKind::Global, GLOBAL_ERROR_VALUE);
     if test_runner_type_idx.is_some() {
         exports.export("_fai_run_test", ExportKind::Func, test_runner_func_idx);
     }
@@ -3999,10 +4122,16 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     /// Lower `throw expr`. Inside a `try`, stores the value into the
-    /// innermost try's `err_local` and branches to `$catch_handler`.
-    /// Outside any try, emits `unreachable` — the wasm trap surfaces
-    /// as a runtime error at the caller (matches the VM-era
-    /// "uncaught throw terminates the program" behaviour).
+    /// innermost try's `err_local` and branches to `$catch_handler`
+    /// — the inline fast path with no globals touched.
+    ///
+    /// Outside any try, stash the thrown value into the
+    /// `error_flag`/`error_value` globals and return early with a
+    /// placeholder result. The caller's post-call propagation check
+    /// (see `emit_post_call_propagation`) will see the flag set and
+    /// either deliver the error to its enclosing `try` or propagate
+    /// further up. This is the unwind path that makes
+    /// cross-function throw + catch work.
     fn compile_throw(&mut self, s: &ThrowStatement) -> Result<(), BuildError> {
         self.compile_expr(&s.expression)?;
         if let Some(frame) = self.tries.last() {
@@ -4011,11 +4140,52 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::LocalSet(err_local));
             self.emit(Instruction::Br(rel));
         } else {
-            // Nothing to catch it — trap.
-            self.emit(Instruction::Drop);
-            self.emit(Instruction::Unreachable);
+            // Stash the value into the error globals; the caller
+            // will pick it up via the post-call propagation check.
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+            self.emit(Instruction::I32Const(1));
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
+            // Placeholder return value — the caller throws it away
+            // as soon as it sees the flag set.
+            self.emit(Instruction::I64Const(0));
+            self.emit(Instruction::Return);
         }
         Ok(())
+    }
+
+    /// Emit the post-call propagation check. The call's i64 result
+    /// must already be on the stack. The check stashes the result
+    /// into a local so the inner `If` block doesn't need to reach
+    /// across wasm's per-block operand stack — if it then sees
+    /// `error_flag` set, it either delivers the error to the
+    /// enclosing `try` (Br to the catch handler) or returns early
+    /// with the result still acting as the function's placeholder
+    /// return value. If the flag isn't set, the saved result is
+    /// pushed back so the caller's expression context sees an i64
+    /// exactly as if no check had run.
+    fn emit_post_call_propagation(&mut self) {
+        let result_local = self.alloc_local();
+        self.emit(Instruction::LocalSet(result_local));
+        self.emit(Instruction::GlobalGet(GLOBAL_ERROR_FLAG));
+        self.emit_open(Instruction::If(BlockType::Empty));
+        if let Some(frame) = self.tries.last() {
+            let rel = self.block_depth - frame.catch_abs;
+            let err_local = frame.err_local;
+            self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
+            self.emit(Instruction::LocalSet(err_local));
+            self.emit(Instruction::I32Const(0));
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
+            self.emit(Instruction::I64Const(0));
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+            self.emit(Instruction::Br(rel));
+        } else {
+            // Push the saved result and return — it's a placeholder
+            // the caller throws away once it sees the flag set.
+            self.emit(Instruction::LocalGet(result_local));
+            self.emit(Instruction::Return);
+        }
+        self.emit_close();
+        self.emit(Instruction::LocalGet(result_local));
     }
 
     /// `nowait expr` — fire-and-forget: wrap `expr` in a zero-arg
@@ -4952,8 +5122,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                                 self.ctx.module_aliases.contains_key(&obj_id.name)
                                     || obj_id.name == "assert";
                             let has_binding = self.resolve(&obj_id.name).is_some();
-                            let has_function =
-                                self.function_by_name.contains_key(&obj_id.name);
+                            let has_function = self.function_by_name.contains_key(&obj_id.name);
                             if is_module_alias || (!has_binding && !has_function) {
                                 return Err(BuildError::ModuleAccessNotYetSupported(
                                     me.property.clone(),
@@ -5142,6 +5311,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
             self.emit(Instruction::Call(wasm_idx));
+            self.emit_post_call_propagation();
             return Ok(());
         }
 
@@ -5192,6 +5362,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
+        self.emit_post_call_propagation();
         Ok(())
     }
 
@@ -5308,7 +5479,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             ModuleCall::MathPow => self.compile_math_pow(call_args),
             ModuleCall::CliReadLine => self.compile_cli_read_line(call_args),
             ModuleCall::StorageGet => self.compile_storage_get(call_args),
-            ModuleCall::ConvertPassthrough => self.compile_convert_passthrough(call_args),
+            ModuleCall::ConvertToInt => self.compile_convert_to_int_call(call_args),
+            ModuleCall::ConvertToFloat => self.compile_convert_to_float_call(call_args),
             ModuleCall::ConvertToString => self.compile_convert_to_string(call_args),
             ModuleCall::ConvertParseInt => self.compile_convert_parse(RT_PARSE_INT, call_args),
             ModuleCall::ConvertParseFloat => self.compile_convert_parse(RT_PARSE_FLOAT, call_args),
@@ -5924,20 +6096,81 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
-    /// `std.convert.{toInt,toFloat}(v)` — runtime pass-through. The
-    /// checker-level coercion already happened; at runtime the
-    /// NaN-boxed value is left untouched. Matches the bytecode
-    /// translator's inline `toInt/toFloat` handling.
-    fn compile_convert_passthrough(
+    /// `std.convert.toInt(v) -> Int`. Module-call dispatch wrapper.
+    fn compile_convert_to_int_call(
         &mut self,
         call_args: &[fai_compiler::ast::CallArgument],
     ) -> Result<(), BuildError> {
         if call_args.len() != 1 {
             return Err(BuildError::UnsupportedExpression(
-                "ModuleCall/convert-passthrough-arg-count",
+                "ModuleCall/convert.toInt-arg-count",
             ));
         }
-        self.compile_expr(&call_args[0].value)?;
+        self.compile_convert_to_int(&call_args[0].value)
+    }
+
+    /// `std.convert.toFloat(v) -> Float`. Module-call dispatch wrapper.
+    fn compile_convert_to_float_call(
+        &mut self,
+        call_args: &[fai_compiler::ast::CallArgument],
+    ) -> Result<(), BuildError> {
+        if call_args.len() != 1 {
+            return Err(BuildError::UnsupportedExpression(
+                "ModuleCall/convert.toFloat-arg-count",
+            ));
+        }
+        self.compile_convert_to_float(&call_args[0].value)
+    }
+
+    /// Type-aware `toInt(v)`. Dispatches on the static type the
+    /// checker inferred for `v`:
+    /// - `Int`  → passthrough.
+    /// - `Float` → truncate to i32 (saturating) and re-box as Int.
+    /// - `String` → parse via `RT_PARSE_INT`. Returns null on parse
+    ///   failure (matches `convert.parseInt` semantics).
+    /// - other (`Unknown`, etc.) → passthrough as a best effort. The
+    ///   checker normally narrows the type before we get here; a true
+    ///   `Unknown` falling through is a legacy passthrough match.
+    fn compile_convert_to_int(&mut self, arg: &Expression) -> Result<(), BuildError> {
+        let arg_ty = self.expression_type_at(arg).cloned();
+        match arg_ty {
+            Some(fai_checker::types::Type::Float) => {
+                self.compile_expr_as(arg, ValueShape::RawFloat)?;
+                self.emit(Instruction::I32TruncSatF64S);
+                self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
+            }
+            Some(fai_checker::types::Type::String) => {
+                self.compile_expr(arg)?;
+                self.emit(Instruction::Call(self.rt().base + RT_PARSE_INT));
+            }
+            _ => {
+                self.compile_expr(arg)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Type-aware `toFloat(v)`. Dispatches on the static type:
+    /// - `Float` → passthrough (already raw f64 bits).
+    /// - `Int`   → unbox, convert i64→f64, reinterpret as Float bits.
+    /// - `String` → parse via `RT_PARSE_FLOAT`.
+    /// - other → passthrough.
+    fn compile_convert_to_float(&mut self, arg: &Expression) -> Result<(), BuildError> {
+        let arg_ty = self.expression_type_at(arg).cloned();
+        match arg_ty {
+            Some(fai_checker::types::Type::Int) => {
+                self.compile_expr_as(arg, ValueShape::RawInt)?;
+                self.emit(Instruction::F64ConvertI64S);
+                self.emit(Instruction::I64ReinterpretF64);
+            }
+            Some(fai_checker::types::Type::String) => {
+                self.compile_expr(arg)?;
+                self.emit(Instruction::Call(self.rt().base + RT_PARSE_FLOAT));
+            }
+            _ => {
+                self.compile_expr(arg)?;
+            }
+        }
         Ok(())
     }
 
@@ -5952,7 +6185,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 "ModuleCall/convert.toString-arg-count",
             ));
         }
-        self.compile_expr(&call_args[0].value)?;
+        self.compile_expr_as(&call_args[0].value, ValueShape::Boxed)?;
         self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
         Ok(())
     }
@@ -6159,6 +6392,25 @@ impl<'a, 'c> Builder<'a, 'c> {
                     .map(|(module, _)| format!("{}.query_params", module))
                     .and_then(|qualified| self.function_by_name.get(&qualified).copied())
             })
+            .or_else(|| {
+                // Last-resort fallback: scan all known functions for a
+                // `<module>.query_params` entry. Covers `prepare_module_
+                // directory_for_tests` where forsqlite tests itself: the
+                // synthetic module name (`__module__`) doesn't appear in
+                // `named_imports`, but `function_by_name` does carry the
+                // qualified entry. Picking the first match is fine since
+                // a project linking two `query_params`-defining modules
+                // would already be ambiguous at the use site.
+                self.function_by_name
+                    .iter()
+                    .find_map(|(name, idx)| {
+                        if name.ends_with(".query_params") {
+                            Some(*idx)
+                        } else {
+                            None
+                        }
+                    })
+            })
             .ok_or_else(|| BuildError::UnknownIdentifier("query_params".to_string()))?;
         let expected = self.functions()[proto_idx as usize].param_count as usize;
         let type_param_count = self.functions()[proto_idx as usize].type_param_count as usize;
@@ -6181,6 +6433,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
+        self.emit_post_call_propagation();
         let rows_local = self.alloc_local();
         self.emit(Instruction::LocalSet(rows_local));
 
@@ -6642,33 +6895,17 @@ impl<'a, 'c> Builder<'a, 'c> {
             // ── conversions ──────────────────────────────────
             "toString" => self.compile_to_string_bare(args).map(Some),
             "toInt" => {
-                // Pass-through at runtime — the checker did the
-                // coercion at type-check time. Matches translate.rs.
                 if args.len() != 1 {
                     return Err(BuildError::UnsupportedExpression("toInt-arg-count"));
                 }
-                self.compile_expr(args[0])?;
+                self.compile_convert_to_int(args[0])?;
                 Ok(Some(()))
             }
             "toFloat" => {
-                // `toFloat(x)` returns a Float. The value we leave on
-                // the stack must have the Boxed-Float bit pattern
-                // (i.e. the f64 bits themselves), not a NaN-boxed
-                // Int. When the checker proved the arg is Int, unbox
-                // it and convert Int→f64 explicitly. When it's
-                // already Float, the Boxed rep is the f64 bits, so
-                // a plain passthrough is enough.
                 if args.len() != 1 {
                     return Err(BuildError::UnsupportedExpression("toFloat-arg-count"));
                 }
-                let arg_ty = self.expression_type_at(args[0]).cloned();
-                if matches!(arg_ty, Some(fai_checker::types::Type::Int)) {
-                    self.compile_expr_as(args[0], ValueShape::RawInt)?;
-                    self.emit(Instruction::F64ConvertI64S);
-                    self.emit(Instruction::I64ReinterpretF64);
-                } else {
-                    self.compile_expr(args[0])?;
-                }
+                self.compile_convert_to_float(args[0])?;
                 Ok(Some(()))
             }
             "parseInt" => self.compile_parse_bare(args, RT_PARSE_INT).map(Some),
@@ -7127,7 +7364,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         if args.len() != 1 {
             return Err(BuildError::UnsupportedExpression("toString-arg-count"));
         }
-        self.compile_expr(args[0])?;
+        self.compile_expr_as(args[0], ValueShape::Boxed)?;
         self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
         Ok(())
     }
@@ -7577,9 +7814,11 @@ impl<'a, 'c> Builder<'a, 'c> {
             table_index: 0,
         });
 
-        // Restore env_ptr.
+        // Restore env_ptr before the propagation check so an unwind
+        // doesn't leak a closure's upvalue frame into outer scope.
         self.emit(Instruction::LocalGet(saved_env));
         self.emit(Instruction::GlobalSet(GLOBAL_ENV_PTR));
+        self.emit_post_call_propagation();
         Ok(())
     }
 
@@ -7710,6 +7949,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             // Inherit the enclosing function's module context so
             // peer-function calls inside the closure resolve via the
             // `{module}.{name}` fallback, same as non-closure calls.
+            inner.module_key = self.module_key.clone();
             inner.module_context = self.module_context.clone();
             inner.compile_body()?;
             let upvalues = std::mem::take(&mut inner.upvalues);
@@ -13601,10 +13841,18 @@ mod tests {
         module_name: &str,
         module_src: &str,
     ) -> Option<Vec<u8>> {
+        try_compile_with_modules(entry_src, vec![(module_name, module_src)])
+    }
+
+    /// Compile an entry source with multiple synthetic user modules.
+    fn try_compile_with_modules(entry_src: &str, modules: Vec<(&str, &str)>) -> Option<Vec<u8>> {
         let prepared = fai_compiler::prepare_source_with_synthetic(
             entry_src,
             None,
-            vec![(module_name.to_string(), module_src.to_string())],
+            modules
+                .into_iter()
+                .map(|(name, src)| (name.to_string(), src.to_string()))
+                .collect(),
         )
         .expect("prepare");
         let mut checker = fai_checker::Checker::new();
@@ -13828,6 +14076,56 @@ mod tests {
     }
 
     #[test]
+    fn production_direct_test_mode_start_does_not_call_main() {
+        let prepared = fai_compiler::prepare_source_with_synthetic_and_entry_for_tests(
+            concat!(
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  99\n",
+                "end\n",
+                "\n",
+                "# Value.\ndef value\n",
+                "    @return Int\n",
+                "do\n",
+                "  1\n",
+                "end\n",
+                "\n",
+                "test value\n",
+                "it 'returns one'\n",
+                "  assert.equals(value(), 1)\n",
+                "end\n",
+                "end\n",
+            ),
+            None,
+            Vec::new(),
+            None,
+        )
+        .expect("prepare");
+        let mut checker = fai_checker::Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checker");
+        let info = CheckerInfo {
+            ufcs_calls: checker.ufcs_calls,
+            named_param_reorder: checker.named_param_reorder,
+            expression_types: checker.expression_types,
+            generic_type_args: checker.generic_type_args,
+        };
+        let wasm = crate::try_codegen_direct_full(
+            &prepared.serde_ast,
+            &prepared.modules,
+            &info,
+            None,
+            true,
+        )
+        .expect("test-mode direct build should succeed");
+
+        let result = run_module(&wasm) as i64;
+        assert_eq!(result, runtime::VAL_VOID);
+    }
+
+    #[test]
     fn production_direct_test_runner_traps_on_failing_case() {
         let prepared = fai_compiler::prepare_source_with_synthetic_and_entry_for_tests(
             concat!(
@@ -13993,6 +14291,113 @@ mod tests {
         let result = run_module(&wasm) as u64;
         // square(6) + 1 = 37
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 37;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_allows_same_basename_modules_for_named_imports() {
+        // Folder namespaces can naturally contain both `auth` and
+        // `pages.auth`. Named imports use the full canonical module
+        // path, so this is not ambiguous and should not require
+        // renaming either folder.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { LoginPage } from pages.auth\n",
+                "use { checkTask } from data.tasks\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  LoginPage() + checkTask()\n",
+                "end\n",
+            ),
+            vec![
+                (
+                    "auth",
+                    concat!(
+                        "# Require session.\ndef requireSession\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  20\n",
+                        "end\n",
+                    ),
+                ),
+                (
+                    "pages.auth",
+                    concat!(
+                        "# Login page.\ndef LoginPage\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  22\n",
+                        "end\n",
+                    ),
+                ),
+                (
+                    "data.tasks",
+                    concat!(
+                        "use { requireSession } from auth\n",
+                        "\n",
+                        "# Check task.\ndef checkTask\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  requireSession()\n",
+                        "end\n",
+                    ),
+                ),
+            ],
+        )
+        .expect("same-basename named imports should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_ufcs_in_user_module_uses_module_key() {
+        // The checker keys UFCS rewrites by `(module, line, column)`.
+        // Direct codegen must use the discovered module's canonical
+        // name while compiling that module, otherwise `value.increment()`
+        // is treated as an ordinary member call.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { run } from pages.tasks\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  run()\n",
+                "end\n",
+            ),
+            vec![
+                (
+                    "maths",
+                    concat!(
+                        "# Increment.\ndef increment\n",
+                        "    @param value Int\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  value + 1\n",
+                        "end\n",
+                    ),
+                ),
+                (
+                    "pages.tasks",
+                    concat!(
+                        "use { increment } from maths\n",
+                        "\n",
+                        "# Run.\ndef run\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  let value = 41\n",
+                        "  value.increment()\n",
+                        "end\n",
+                    ),
+                ),
+            ],
+        )
+        .expect("UFCS inside an imported module should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
         assert_eq!(result, expected);
     }
 
@@ -14349,6 +14754,33 @@ mod tests {
             "end\n",
         )));
         assert_eq!(run_module(&wasm) as u64, int_val(2));
+    }
+
+    #[test]
+    fn direct_bare_to_string_boxes_raw_int_expression() {
+        // Native integer arithmetic compiles to a raw Int shape; toString
+        // must box it before handing it to the generic value-to-string helper.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  length(toString(0 + 1))\n",
+            "end\n",
+        )));
+        assert_eq!(run_module(&wasm) as u64, int_val(1));
+    }
+
+    #[test]
+    fn direct_convert_to_string_boxes_raw_int_expression() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "use std.convert\n\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  length(convert.toString(0 + 1))\n",
+            "end\n",
+        )));
+        assert_eq!(run_module(&wasm) as u64, int_val(1));
     }
 
     #[test]
@@ -14716,13 +15148,7 @@ mod tests {
         // named `Forui` is the concrete user-facing scenario. The
         // builder must refuse rather than silently pick one and
         // shadow the other.
-        let entry = concat!(
-            "def main\n",
-            "    @return Int\n",
-            "do\n",
-            "  1\n",
-            "end\n",
-        );
+        let entry = concat!("def main\n", "    @return Int\n", "do\n", "  1\n", "end\n",);
         let modules = vec![stub_module("Forui"), stub_module("Forui")];
         let err = build_program_with_modules_for_test(entry, &modules)
             .expect_err("duplicate module name must fail");
@@ -14733,32 +15159,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_duplicate_module_basename_errors() {
+    fn direct_duplicate_module_basename_is_allowed_without_alias_use() {
         // Two modules with distinct canonical paths but the same
-        // final segment — e.g. a local `MyApp.Forui` plus a
-        // dependency `Forui` — would both register `Forui` as a
-        // bare-name alias. `use { X } from Forui` would silently
-        // resolve to whichever was discovered first. Build must
-        // refuse so the user writes the fully-qualified path.
-        let entry = concat!(
-            "def main\n",
-            "    @return Int\n",
-            "do\n",
-            "  1\n",
-            "end\n",
-        );
+        // final segment are valid folder namespaces. The direct
+        // builder should avoid creating an implicit ambiguous
+        // basename alias, not reject the whole target graph.
+        let entry = concat!("def main\n", "    @return Int\n", "do\n", "  1\n", "end\n",);
         let modules = vec![stub_module("MyApp.Forui"), stub_module("Forui")];
-        let err = build_program_with_modules_for_test(entry, &modules)
-            .expect_err("duplicate module basename must fail");
-        match err {
-            BuildError::DuplicateModuleBasename { basename, first, second } => {
-                assert_eq!(basename, "Forui");
-                let pair = vec![first.clone(), second.clone()];
-                assert!(pair.contains(&"MyApp.Forui".to_string()));
-                assert!(pair.contains(&"Forui".to_string()));
-            }
-            other => panic!("expected DuplicateModuleBasename, got {:?}", other),
-        }
+        build_program_with_modules_for_test(entry, &modules)
+            .expect("same basename modules should not fail by themselves");
     }
 
     #[test]
@@ -14766,13 +15175,7 @@ mod tests {
         // Sanity: distinct canonical names with distinct basenames
         // still build. Guards against over-reaching in the collision
         // check.
-        let entry = concat!(
-            "def main\n",
-            "    @return Int\n",
-            "do\n",
-            "  1\n",
-            "end\n",
-        );
+        let entry = concat!("def main\n", "    @return Int\n", "do\n", "  1\n", "end\n",);
         let modules = vec![stub_module("Forui.signal"), stub_module("Forui.view")];
         build_program_with_modules_for_test(entry, &modules)
             .expect("distinct names should build cleanly");

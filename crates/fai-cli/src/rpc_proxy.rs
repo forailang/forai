@@ -176,6 +176,7 @@ pub fn generate_proxies_from_schema(schema_json: &str, url: &str) -> Result<Stri
             if name.is_empty() {
                 continue;
             }
+            let rpc_name = f["key"].as_str().unwrap_or(name);
 
             // Doc comment
             output.push_str(&format!("# Auto-generated RPC proxy for {}.\n", name));
@@ -207,7 +208,7 @@ pub fn generate_proxies_from_schema(schema_json: &str, url: &str) -> Result<Stri
             if param_names.is_empty() {
                 output.push_str(&format!(
                     "  remoteCall('{}', '{}', '[]', '{}')\n",
-                    url, name, hash
+                    url, rpc_name, hash
                 ));
             } else {
                 let parts: Vec<String> = param_names
@@ -220,7 +221,7 @@ pub fn generate_proxies_from_schema(schema_json: &str, url: &str) -> Result<Stri
                 ));
                 output.push_str(&format!(
                     "  remoteCall('{}', '{}', __args, '{}')\n",
-                    url, name, hash
+                    url, rpc_name, hash
                 ));
             }
             output.push_str("end\n\n");
@@ -449,6 +450,18 @@ mod tests {
         assert!(
             result.contains("remoteCall('http://localhost:3040', 'getTasks', '[]', 'abc')"),
             "should call remoteCall. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_schema_proxy_uses_module_qualified_key() {
+        let schema = r#"{"hash":"abc","functions":[{"name":"getTasks","module":"data.tasks","key":"data.tasks.getTasks","params":[],"returns":["String[]"]}],"types":[],"enums":[]}"#;
+        let result = generate_proxies_from_schema(schema, "http://localhost:3040").unwrap();
+        assert!(result.contains("def getTasks"), "should generate function");
+        assert!(
+            result.contains("remoteCall('http://localhost:3040', 'data.tasks.getTasks'"),
+            "should call remoteCall with module-qualified key. Got:\n{}",
             result
         );
     }

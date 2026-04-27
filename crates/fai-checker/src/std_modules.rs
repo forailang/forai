@@ -184,6 +184,30 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
     );
 
     m.insert(
+        "std.env".into(),
+        vec![("get", "envGet"), ("load", "envLoad")]
+            .into_iter()
+            .map(|(a, b)| (a.into(), b.into()))
+            .collect(),
+    );
+
+    m.insert(
+        "std.events".into(),
+        vec![
+            ("on", "eventOn"),
+            ("once", "eventOnce"),
+            ("off", "eventOff"),
+            ("emit", "eventEmit"),
+            ("subscribers", "eventSubscribers"),
+            ("clear", "eventClear"),
+            ("clearAll", "eventClearAll"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect(),
+    );
+
+    m.insert(
         "std.time".into(),
         vec![("now", "timeNow"), ("unix", "timeUnix")]
             .into_iter()

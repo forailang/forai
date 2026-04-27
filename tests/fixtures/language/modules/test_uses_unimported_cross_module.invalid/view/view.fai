@@ -1,0 +1,20 @@
+type Node
+  kind String
+  text String
+end
+
+# Builds a Node.
+def makeNode
+    @param kind String
+    @param text String
+    @return Node
+do
+  Node(kind: kind, text: text)
+end
+
+test makeNode
+it 'uses helperFromDiff without importing it'
+  let n = helperFromDiff('button')
+  assert.equals(n.kind, 'button')
+end
+end

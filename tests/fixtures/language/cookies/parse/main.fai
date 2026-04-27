@@ -1,0 +1,140 @@
+# expect: ok
+# stdout:
+#   tok-1
+#   dark
+#   no-cookie
+
+use std.array
+
+use std.dictionary
+
+use std.string
+
+# Inline copy of forui's parseCookies — exercises the same logic
+# until forui's own tests run via the project test runner. Splits a
+# Cookie: header value into a name → value Dictionary.
+def parseCookies
+    @param header String
+    @return Dictionary
+do
+  var out Dictionary = {}
+  if string.length(header) == 0
+    out
+  else
+    let pairs = string.split(header, ';')
+    for raw in pairs
+      let pair = string.trim(raw)
+      if string.contains(pair, '=')
+        let eq = string.indexOf(pair, '=')
+        if eq > 0
+          let name = string.trim(string.substring(pair, 0, eq))
+          let value = string.trim(string.substring(pair, eq + 1, string.length(pair)))
+          if string.length(name) > 0
+            out = dictionary.set(out, name, value)
+          end
+        end
+      end
+    end
+    out
+  end
+end
+
+test parseCookies
+it 'splits a single pair'
+  let parsed = parseCookies('a=1')
+  assert.equals(getString(parsed, 'a')!, '1')
+end
+it 'splits multiple pairs and trims whitespace'
+  let parsed = parseCookies('  fai_session = tok-1 ; theme=dark ')
+  assert.equals(getString(parsed, 'fai_session')!, 'tok-1')
+  assert.equals(getString(parsed, 'theme')!, 'dark')
+end
+it 'preserves equals signs in the value'
+  let parsed = parseCookies('token=abc=def=')
+  assert.equals(getString(parsed, 'token')!, 'abc=def=')
+end
+it 'returns empty dict for empty input'
+  let parsed = parseCookies('')
+  assert.equals(length(getKeys(parsed)), 0)
+end
+it 'skips entries without an equals'
+  let parsed = parseCookies('only-name; ok=yes')
+  assert.equals(getString(parsed, 'ok')!, 'yes')
+end
+end
+
+# Look up a named cookie on an HttpRequest. Mirrors forui's getCookie.
+def getCookie
+    @param req HttpRequest
+    @param name String
+    @return String?
+do
+  let header = getString(req.headers, 'Cookie')
+  if header?
+    let cookies = parseCookies(header!)
+    getString(cookies, name)
+  else
+    null
+  end
+end
+
+test getCookie
+it 'returns the value when the cookie is present'
+  let req HttpRequest = from_dict({
+    method: 'GET'
+    path: '/'
+    body: ''
+    headers: {
+      Cookie: 'fai_session=tok-1; theme=dark'
+    }
+  })
+  assert.equals(getCookie(req, 'fai_session')!, 'tok-1')
+  assert.equals(getCookie(req, 'theme')!, 'dark')
+end
+it 'returns null when the cookie is missing'
+  let req HttpRequest = from_dict({
+    method: 'GET'
+    path: '/'
+    body: ''
+    headers: {
+      Cookie: 'theme=dark'
+    }
+  })
+  assert.isNull(getCookie(req, 'fai_session'))
+end
+it 'returns null when no Cookie header is set at all'
+  let req HttpRequest = from_dict({
+    method: 'GET'
+    path: '/'
+    body: ''
+    headers: {}
+  })
+  assert.isNull(getCookie(req, 'fai_session'))
+end
+end
+
+def main
+    @return Void
+do
+  let withSession HttpRequest = from_dict({
+    method: 'GET'
+    path: '/tasks'
+    body: ''
+    headers: {
+      Cookie: 'fai_session=tok-1; theme=dark'
+    }
+  })
+  print(getCookie(withSession, 'fai_session')!)
+  print(getCookie(withSession, 'theme')!)
+  let blank HttpRequest = from_dict({
+    method: 'GET'
+    path: '/'
+    body: ''
+    headers: {}
+  })
+  if getCookie(blank, 'fai_session')?
+    print('unexpected')
+  else
+    print('no-cookie')
+  end
+end

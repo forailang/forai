@@ -677,33 +677,64 @@ use { useSignal, isLoading, isLoaded, isError, reload, setValue } from Forui.sig
 use { navigate, routeParam, Link, Router, Route } from Forui.router
 ```
 
-### 4 — Remote package (RPC sub-project)
+### 4 — Fullstack RPC across sub-projects
 
-In a multi-target fullstack project the client imports an auto-generated `Server` module
-that proxies all `remote def` functions declared in the server target:
+In a multi-target fullstack project, `remote def` marks a function as callable
+across the network. Client code imports remote functions from their real module
+path; the build replaces those calls with generated RPC stubs for client targets.
 
 ```fai
-# src/client/pages/tasks.fai
-use { Task, getTasks, addTask } from Server   # auto-generated from server's remote def/type
+# src/pages/tasks.fai
+use { Task, getTasks, addTask } from data.tasks
 ```
 
-The `Server` module is generated automatically by `fai build`. You never write it yourself.
-To expose a function to the client, mark it `remote def` in the server entry file:
+Server targets expose remote functions through `addRpcRoutes`. Any `remote def`
+reachable in the server target's build graph is available to `addRpcRoutes`.
+Importing the module from the server entry is the usual way to include it in the
+server RPC surface:
 
 ```fai
-# src/server/main.fai
-remote type Task        # exported to client proxy
+# src/platforms/server/main.fai
+use std.http.server
+use { getTasks, addTask } from data.tasks
+
+def main
+    @return Void
+do
+  var r = server.router()
+  addRpcRoutes(r)       # generated from reachable remote defs
+  server.listen(r, 3040)
+end
+```
+
+The remote declarations live with the domain code:
+
+```fai
+# src/data/tasks/main.fai
+remote type Task
   id Int
   text String
 end
 
-remote def getTasks     # exported to client proxy
+remote def getTasks
     @param token String
     @return Task[]
 do
   ...
 end
+
+remote def addTask
+    @param token String
+    @param text String
+    @return Task
+do
+  ...
+end
 ```
+
+A `remote def` that exists on disk but is not reachable from the server target's
+imports is not exposed by that server. Non-remote helpers in the same module are
+not part of the RPC API.
 
 ### Visibility
 
@@ -729,7 +760,8 @@ descriptions are available via `fai doc <name>` at any time.
 
 Available modules: `std.string`, `std.array`, `std.dictionary`, `std.math`,
 `std.convert`, `std.json`, `std.http.request`, `std.http.server`, `std.file`,
-`std.path`, `std.error`, `std.time`, `std.log`, `std.cli`, `std.net`, `std.ffi`.
+`std.path`, `std.env`, `std.events`, `std.error`, `std.time`, `std.log`,
+`std.cli`, `std.net`, `std.ffi`.
 
 Most stdlib functions are also available as bare builtins where the checker
 imports them globally, but module-qualified calls are preferred in examples when

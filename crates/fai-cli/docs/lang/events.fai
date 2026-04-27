@@ -1,0 +1,128 @@
+# std.events — synchronous in-process pub/sub.
+#
+# `emit(name, data)` synchronously delivers an Event to every
+# subscriber registered under `name`. Subscribers run in registration
+# order on a snapshot taken at the start of `emit`, so adding or
+# removing subscribers mid-dispatch doesn't perturb the in-flight
+# pass.
+#
+# `on(name, handler)` and `once(name, handler)` register a closure
+# and return a Subscription handle. `once` auto-removes after its
+# first delivery. `off(sub)` cancels — the Subscription is
+# self-describing so `off` works without the caller knowing which
+# event name it was registered against.
+#
+# Events use `Unknown` payloads so emitters pass any value and
+# subscribers recover a typed view via `let x T = from_dict(e.data)`.
+#
+# API
+#   on(name: String, handler: Event -> Void) → Subscription
+#   once(name: String, handler: Event -> Void) → Subscription
+#   off(sub: Subscription) → Bool
+#   emit(name: String, data: Unknown) → Void
+#   subscribers(name: String) → Int
+#   clear(name: String) → Void
+#   clearAll() → Void
+#
+# Built-in types
+#   type Event { name String; data Unknown }
+#   type Subscription { id Int; name String }
+def doc_events_api
+    @return Void
+do
+  # use std.events
+  #
+  # let sub = events.on('user:created') do with e Event
+  #     let user User = from_dict(e.data)
+  #     print('welcome ' + user.name)
+  # end
+  # events.emit('user:created', User(id: 1, name: 'Alice'))
+  # events.off(sub)
+end
+
+# Cross-cutting hooks. Multiple subscribers on the same event run in
+# registration order; each sees the same Event payload.
+def doc_events_multiple_subscribers
+    @return Void
+do
+  # use std.events
+  #
+  # events.on('http:request') do with e Event
+  #     log.info('incoming')
+  # end
+  # events.on('http:request') do with e Event
+  #     metrics.recordRequest()
+  # end
+  # # Both fire on every emit.
+end
+
+# `once` for one-shot setup tasks — drains itself after the first
+# delivery so subsequent emits don't re-run it.
+def doc_events_once
+    @return Void
+do
+  # use std.events
+  #
+  # events.once('app:ready') do with e Event
+  #     print('initialised')
+  # end
+end
+
+# Recursive emit during dispatch is synchronous — the inner emit
+# completes before the outer subscriber's next statement runs.
+def doc_events_recursive_emit
+    @return Void
+do
+  # events.on('outer') do with e Event
+  #     events.emit('inner', 'x')   # runs every 'inner' subscriber
+  #     # ...continues here after inner emit returns
+  # end
+end
+
+# Test cleanup — call `clearAll()` between cases so a stray
+# subscriber from a previous case doesn't leak across.
+def doc_events_test_cleanup
+    @return Void
+do
+  # test mySubscriber
+  # beforeEach
+  #   events.clearAll()
+  # end
+  # it 'fires when expected'
+  #   events.on('topic') do with e Event
+  #       # ...
+  #   end
+  #   events.emit('topic', 'x')
+  # end
+  # end
+end
+
+# Concurrency. Today `emit` runs subscribers synchronously on the
+# calling task. The event API is concurrency-model-agnostic: when
+# the runtime grows cooperative-yield support, emit/on stay the
+# public face; only dispatch semantics change underneath. See
+# `plans/event-system.md` for the phasing.
+def doc_events_concurrency_note
+    @return Void
+do
+  # # v0 today: synchronous. Subscribers run in registration order
+  # # on the calling task; emit returns after the last subscriber.
+end
+
+# Event-name convention — colon-separated, lowercase. Reserved
+# prefixes:
+#   http:*    HTTP server lifecycle
+#   rpc:*     auto-generated RPC dispatcher hooks
+#   job:*     background / scheduled work
+#   db:*      forsqlite hooks
+#   app:*     user code
+def doc_events_naming
+    @return Void
+do
+  # # Good.
+  # events.emit('user:created', user)
+  # events.emit('cart:itemAdded', item)
+  #
+  # # Avoid — too generic, will collide.
+  # events.emit('update', x)
+end

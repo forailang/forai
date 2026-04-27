@@ -284,6 +284,109 @@ impl Checker {
         self.type_fields
             .insert("Router".to_string(), HashMap::new());
 
+        // Event type (passed to handlers registered via std.events.on).
+        // `data` is `Unknown` so emitters pass any value; subscribers
+        // recover a typed view via `let x T = from_dict(event.data)`.
+        let mut event_fields = HashMap::new();
+        event_fields.insert("name".to_string(), Type::String);
+        event_fields.insert("data".to_string(), Type::Unknown);
+        self.type_fields.insert("Event".to_string(), event_fields);
+
+        // Subscription type — the handle returned by `std.events.on`/
+        // `once`. Self-describing so `off(sub)` works without the
+        // caller knowing which event name the subscription targets.
+        let mut subscription_fields = HashMap::new();
+        subscription_fields.insert("id".to_string(), Type::Int);
+        subscription_fields.insert("name".to_string(), Type::String);
+        self.type_fields
+            .insert("Subscription".to_string(), subscription_fields);
+
+        // HttpResponse type — what HTTP route handlers and RPC
+        // handlers return. Replaces the legacy Dictionary-shaped
+        // response. Optional fields (`contentType`, `location`,
+        // `cookies`, `headers`) are read by the host serializer when
+        // present and skipped when absent.
+        let mut http_response_fields = HashMap::new();
+        http_response_fields.insert("status".to_string(), Type::Int);
+        http_response_fields.insert("body".to_string(), Type::String);
+        http_response_fields.insert("contentType".to_string(), optional_of(Type::String));
+        http_response_fields.insert("location".to_string(), optional_of(Type::String));
+        http_response_fields.insert(
+            "cookies".to_string(),
+            optional_of(array_of(named_type("Cookie", NamedCategory::Type))),
+        );
+        http_response_fields.insert("headers".to_string(), optional_of(Type::Dictionary));
+        self.type_fields
+            .insert("HttpResponse".to_string(), http_response_fields);
+
+        // Cookie type — Set-Cookie attributes the host serializer
+        // emits onto the wire. Path/maxAge/httpOnly/secure/sameSite
+        // are optional; only `name` and `value` are required.
+        let mut cookie_fields = HashMap::new();
+        cookie_fields.insert("name".to_string(), Type::String);
+        cookie_fields.insert("value".to_string(), Type::String);
+        cookie_fields.insert("path".to_string(), optional_of(Type::String));
+        cookie_fields.insert("maxAge".to_string(), optional_of(Type::Int));
+        cookie_fields.insert("httpOnly".to_string(), optional_of(Type::Bool));
+        cookie_fields.insert("secure".to_string(), optional_of(Type::Bool));
+        cookie_fields.insert("sameSite".to_string(), optional_of(Type::String));
+        self.type_fields.insert("Cookie".to_string(), cookie_fields);
+
+        // Standard event payload shapes — registered as type_fields so
+        // subscribers can `let x T = from_dict(event.data)` to recover
+        // a typed view of the payload. Emitters (host or codegen-side)
+        // pass Dict-shaped values matching these field sets.
+
+        // RequestResponse — http:afterResponse payload.
+        let mut request_response_fields = HashMap::new();
+        request_response_fields.insert(
+            "request".to_string(),
+            named_type("HttpRequest", NamedCategory::Type),
+        );
+        request_response_fields.insert(
+            "response".to_string(),
+            named_type("HttpResponse", NamedCategory::Type),
+        );
+        self.type_fields
+            .insert("RequestResponse".to_string(), request_response_fields);
+
+        // ServerStarted — http:listening payload.
+        let mut server_started_fields = HashMap::new();
+        server_started_fields.insert("port".to_string(), Type::Int);
+        self.type_fields
+            .insert("ServerStarted".to_string(), server_started_fields);
+
+        // HttpError — http:error payload (handler threw).
+        let mut http_error_fields = HashMap::new();
+        http_error_fields.insert(
+            "request".to_string(),
+            named_type("HttpRequest", NamedCategory::Type),
+        );
+        http_error_fields.insert("message".to_string(), Type::String);
+        self.type_fields
+            .insert("HttpError".to_string(), http_error_fields);
+
+        // RpcCall — rpc:beforeCall payload.
+        let mut rpc_call_fields = HashMap::new();
+        rpc_call_fields.insert("fnName".to_string(), Type::String);
+        rpc_call_fields.insert("args".to_string(), Type::String);
+        self.type_fields
+            .insert("RpcCall".to_string(), rpc_call_fields);
+
+        // RpcResult — rpc:afterCall payload.
+        let mut rpc_result_fields = HashMap::new();
+        rpc_result_fields.insert("fnName".to_string(), Type::String);
+        rpc_result_fields.insert("value".to_string(), Type::String);
+        self.type_fields
+            .insert("RpcResult".to_string(), rpc_result_fields);
+
+        // RpcError — rpc:error payload.
+        let mut rpc_error_fields = HashMap::new();
+        rpc_error_fields.insert("fnName".to_string(), Type::String);
+        rpc_error_fields.insert("message".to_string(), Type::String);
+        self.type_fields
+            .insert("RpcError".to_string(), rpc_error_fields);
+
         // Resolve fields for all type declarations
         let decls: Vec<_> = self.type_declarations.values().cloned().collect();
         for decl in &decls {

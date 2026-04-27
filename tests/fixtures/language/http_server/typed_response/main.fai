@@ -1,0 +1,98 @@
+# expect: ok
+# stdout:
+#   200
+#   {"ok":true}
+#   text/plain
+#   /login
+
+use std.http.server
+
+# server.json round-trips through the HttpResponse shape.
+def buildJson
+    @return HttpResponse
+do
+  server.json(200, '{"ok":true}')
+end
+
+test buildJson
+it 'returns an HttpResponse with the supplied status and body'
+  let resp = buildJson()
+  assert.equals(resp.status, 200)
+  assert.equals(resp.body, '{"ok":true}')
+end
+end
+
+# server.text tags the response with text/plain.
+def buildText
+    @return HttpResponse
+do
+  server.text(404, 'not found')
+end
+
+test buildText
+it 'tags text responses with text/plain'
+  let resp = buildText()
+  assert.equals(resp.status, 404)
+  assert.equals(resp.contentType!, 'text/plain')
+end
+end
+
+# server.html tags the response with text/html.
+def buildHtml
+    @return HttpResponse
+do
+  server.html(200, '<h1>hi</h1>')
+end
+
+test buildHtml
+it 'tags html responses with text/html'
+  let resp = buildHtml()
+  assert.isTrue(string.contains(resp.contentType!, 'text/html'))
+  assert.equals(resp.body, '<h1>hi</h1>')
+end
+end
+
+# server.redirect carries the target URL on `location`.
+def buildRedirect
+    @return HttpResponse
+do
+  server.redirect(302, '/login')
+end
+
+test buildRedirect
+it 'attaches the target URL to location'
+  let resp = buildRedirect()
+  assert.equals(resp.status, 302)
+  assert.equals(resp.location!, '/login')
+end
+end
+
+# Builders don't populate cookies or headers — those Optional fields
+# read back as null until the user explicitly sets them.
+def buildersOmitOptionalFields
+    @return HttpResponse
+do
+  server.json(200, 'x')
+end
+
+test buildersOmitOptionalFields
+it 'leaves cookies and headers null when the builder does not set them'
+  let resp = buildersOmitOptionalFields()
+  assert.isNull(resp.cookies)
+  assert.isNull(resp.headers)
+end
+end
+
+use std.string
+
+def main
+    @return Void
+do
+  let json = buildJson()
+  print(toString(json.status))
+  print(json.body)
+  let text = buildText()
+  print(text.contentType!)
+  let redirect = buildRedirect()
+  print(redirect.location!)
+end

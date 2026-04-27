@@ -21,6 +21,7 @@ mod mcp;
 mod report;
 pub mod rpc_dispatch;
 pub mod rpc_proxy;
+mod rpc_surface;
 mod test_meta;
 mod wasm_runner;
 
@@ -478,10 +479,12 @@ fn step_check(args: &[String], reporter: &Reporter) {
     }
 
     // Library project: no single entry point — check all source files as one module.
-    // prepare_module_directory loads all .fai files in the directory together so that
-    // cross-file references (Connection, SQLITE_OK, etc.) resolve correctly.
+    // prepare_module_directory_for_tests loads all .fai files in the directory
+    // together AND keeps test bodies so cross-file references and test bodies are
+    // both checked. Without `_for_tests` the checker skips test bodies and misses
+    // real type errors that only surface as codegen failures at `fai test` time.
     let src_path = project_root.join(&src_dir);
-    let prepared = match fai_compiler::prepare_module_directory(&src_path.to_string_lossy()) {
+    let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path.to_string_lossy()) {
         Ok(p) => p,
         Err(e) => {
             reporter.error_line(&e);
@@ -562,9 +565,15 @@ fn try_check_single_file(path: &str) -> Result<(), String> {
         source_root.as_deref(),
         /* verbose = */ false,
     );
-    inject_rpc_dispatch(&mut content, &info, source_root.as_deref());
+    inject_rpc_dispatch(&mut content, &info, source_root.as_deref(), Some(path));
     let synthetic_modules = generate_rpc_proxy_modules(source_root.as_deref());
-    let prepared = fai_compiler::prepare_source_with_synthetic_and_entry(
+    // Use the test-mode prepare so test bodies survive into the AST the
+    // checker walks. Without this, `fai check` skips test bodies and
+    // misses real type errors there — the user only finds out at
+    // `fai test` time, where the codegen surfaces them as confusing
+    // "internal error: UnknownIdentifier" failures instead of clean
+    // checker diagnostics.
+    let prepared = fai_compiler::prepare_source_with_synthetic_and_entry_for_tests(
         &content,
         source_root.as_deref(),
         synthetic_modules,
@@ -587,90 +596,106 @@ fn step_test(args: &[String], reporter: &Reporter) {
         return;
     }
 
-    // Test all .fai files in the project's source directory.
-    // Skip if no standard project found (e.g. workspace root).
+    // Test the project's source tree. Skip if no standard project
+    // found (e.g. workspace root).
     let (project_root, src_dir) = match find_project_source_from_cwd() {
         Some(r) => r,
         None => return,
     };
-    // Sub-project mode: `fai build` recurses into each target and runs
-    // its own step_test under the `▶ building target` header. The outer
-    // project-wide pass has nothing meaningful to test on top of that —
-    // the target's sources live under e.g. `src/client/**`, not at the
-    // shared `src/` root — and printing `[ok] test — no public functions`
-    // at the top was just misleading noise. Skip the outer pass and let
-    // each target report its own result.
     let toml = std::fs::read_to_string(project_root.join("fai.toml")).unwrap_or_default();
     let info = parse_project_info(&toml);
+
     if !info.sub_projects.is_empty() {
+        // Multi-target project: each `[project.<name>]` has its own
+        // entry, target, and dependency wiring. Run them in turn so
+        // every target gets its target-specific RPC dispatch and
+        // available-import filtering. The shared `src/` tree means
+        // many tests run more than once — that's intentional, since
+        // platform-specific code (server vs web) compiles differently
+        // for each target. Sort by name for deterministic order.
+        let mut names: Vec<&String> = info.sub_projects.keys().collect();
+        names.sort();
+        for name in names {
+            let sub = &info.sub_projects[name];
+            let Some(main) = &sub.main else { continue };
+            let main_path = project_root.join(main);
+            if !main_path.exists() {
+                continue;
+            }
+            println!("▶ testing target {}", name);
+            run_tests_file(&main_path.to_string_lossy(), reporter);
+        }
         return;
     }
+
+    // Flat project (library or single-target app): load the source
+    // root as one module and run every test in one wasm pass. Files
+    // reference each other through normal module-mate visibility, so
+    // extern blocks in `_ffi.fai`, private helpers, and public APIs
+    // all resolve regardless of which file declares which.
     let src_path = project_root.join(&src_dir);
-    // Walk the tree recursively so nested module dirs (e.g. `pages/`,
-    // `components/`, `util/`) contribute to the test+coverage rollup.
-    let files = collect_fai_files_recursive(&src_path);
+    run_tests_module(&src_path, reporter);
+}
 
-    let mut total_passed = 0usize;
-    let mut total_failed = 0usize;
-    let mut total_covered = 0usize;
-    let mut total_uncovered: Vec<String> = Vec::new();
-
-    for file in &files {
-        let content = match std::fs::read_to_string(file) {
-            Ok(c) => c,
-            Err(e) => {
-                reporter.error_line(&format!("error reading {}: {}", file, e));
-                continue;
-            }
-        };
-        let source_root = find_source_root(file);
-        let prepared = match fai_compiler::prepare_source(&content, source_root.as_deref()) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let mut checker = fai_checker::Checker::new();
-        if run_checker(&mut checker, &prepared).is_err() {
-            continue;
+/// Run every test in a flat library/app source directory as one
+/// module. Mirrors the tail of `run_tests_file` but uses
+/// `prepare_module_directory_for_tests` so there's no notion of an
+/// "entry file" — every `.fai` file in `src_path` contributes its
+/// declarations and tests to the same module.
+fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
+    let src_path_str = src_path.to_string_lossy().to_string();
+    let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path_str) {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.error_line(&e);
+            reporter.step(StepStatus::Fail, "test", "compile error");
+            std::process::exit(1);
         }
-        let info = fai_codegen_wasm::direct::CheckerInfo {
-            ufcs_calls: checker.ufcs_calls.clone(),
-            named_param_reorder: checker.named_param_reorder.clone(),
-            expression_types: checker.expression_types.clone(),
-            generic_type_args: checker.generic_type_args.clone(),
-        };
-        let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned(
-            &prepared.serde_ast,
-            &prepared.modules,
-            &info,
-            None,
-            true,
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                reporter.error_line(&format!(
-                    "internal error: direct AST→wasm codegen refused {}: {:?}",
-                    file, e,
-                ));
-                continue;
-            }
-        };
-        // Test + coverage metadata walks the AST directly.
-        let meta = test_meta::extract(&prepared);
-        let tests = meta.suites;
-        let public_fns: Vec<String> = meta
-            .coverage_candidates
-            .into_iter()
-            .filter(|n| !n.is_empty() && !n.starts_with('<') && n != "main" && !n.starts_with("__"))
-            .collect();
-        let suite_names: std::collections::HashSet<String> =
-            tests.iter().map(|t| t.suite_name.clone()).collect();
-        let uncovered: Vec<String> = public_fns
-            .into_iter()
-            .filter(|n| !suite_names.contains(n))
-            .collect();
+    };
+    let mut checker = fai_checker::Checker::new();
+    // Checker errors are surfaced by the earlier `step_check` pass —
+    // here we only need the UFCS / named-param maps to feed codegen.
+    let _ = run_checker(&mut checker, &prepared);
+    let info = fai_codegen_wasm::direct::CheckerInfo {
+        ufcs_calls: checker.ufcs_calls.clone(),
+        named_param_reorder: checker.named_param_reorder.clone(),
+        expression_types: checker.expression_types.clone(),
+        generic_type_args: checker.generic_type_args.clone(),
+    };
+    let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned(
+        &prepared.serde_ast,
+        &prepared.modules,
+        &info,
+        None,
+        true,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            reporter.error_line(&format!(
+                "internal error: direct AST→wasm codegen refused this module: {:?}",
+                e,
+            ));
+            reporter.step(StepStatus::Fail, "test", "compile error");
+            std::process::exit(1);
+        }
+    };
+    let meta = test_meta::extract(&prepared);
+    let tests = meta.suites;
+    let public_fns: Vec<String> = meta
+        .coverage_candidates
+        .into_iter()
+        .filter(|n| !n.is_empty() && !n.starts_with('<') && n != "main" && !n.starts_with("__"))
+        .collect();
+    let suite_names: std::collections::HashSet<String> =
+        tests.iter().map(|t| t.suite_name.clone()).collect();
+    let uncovered: Vec<String> = public_fns
+        .into_iter()
+        .filter(|n| !suite_names.contains(n))
+        .collect();
 
-        let mut current_suite: Option<String> = None;
-        let externs = extract_externs_from_prepared(&prepared, source_root.as_deref());
+    let mut current_suite: Option<String> = None;
+    let externs = extract_externs_from_prepared(&prepared, Some(&src_path_str));
+    let (passed, failed) =
         match wasm_runner::run_wasm_tests_with_externs(&wasm_bytes, &tests, externs, |outcome| {
             if current_suite.as_deref() != Some(&outcome.suite_name) {
                 println!("  {}", outcome.suite_name);
@@ -681,48 +706,34 @@ fn step_test(args: &[String], reporter: &Reporter) {
                 Some(msg) => println!("    ✗ {} — {}", outcome.case_desc, msg),
             }
         }) {
-            Ok(summary) => {
-                total_passed += summary.passed;
-                total_failed += summary.failed;
-                total_covered += summary.passed + summary.failed;
-                total_uncovered.extend(uncovered);
-            }
+            Ok(summary) => (summary.passed, summary.failed),
             Err(e) => {
-                reporter.error_line(&format!(
-                    "runtime error during test setup in {}: {}",
-                    file, e
-                ));
+                reporter.error_line(&format!("runtime error during test setup: {}", e));
                 reporter.step(StepStatus::Fail, "test", "setup failed");
                 std::process::exit(1);
             }
-        }
-    }
+        };
 
-    // Missing tests are reported as failed tests — same `[fail] test`
-    // outcome, same exit code. The scaffold treats an untested public
-    // function as a build-blocking problem; folding it into the pass/
-    // fail count keeps a single mental model across both kinds of
-    // test failure (assertion and missing-block).
-    let missing = total_uncovered.len();
-    let combined_failures = total_failed + missing;
+    let missing = uncovered.len();
+    let combined_failures = failed + missing;
     if combined_failures > 0 {
-        for name in &total_uncovered {
+        for name in &uncovered {
             reporter.error_line(&format!("{}: missing test block", name));
         }
         reporter.step(
             StepStatus::Fail,
             "test",
-            &format!("{} passed, {} failed", total_passed, combined_failures),
+            &format!("{} passed, {} failed", passed, combined_failures),
         );
         std::process::exit(1);
     }
-    if total_covered == 0 {
+    if passed == 0 {
         reporter.step(StepStatus::Ok, "test", "no public functions to test");
     } else {
         reporter.step(
             StepStatus::Ok,
             "test",
-            &format!("{} passed, coverage 100%", total_covered),
+            &format!("{} passed, coverage 100%", passed),
         );
     }
 }
@@ -845,10 +856,12 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
     }
 
     // For test compilation: use prepare_source + checker for dependency resolution
-    // and UFCS marks, but don't inject the RPC dispatch (it adds many functions
-    // that inflate VM register usage and may cause stack overflows). The dispatch
-    // is only needed at build time, not when running tests.
-    let content = raw_content;
+    // and UFCS marks, but don't inject the full RPC dispatch (it adds many
+    // functions that inflate VM register usage and may cause stack overflows).
+    // Tests still compile every function body, including `main`, so server
+    // entrypoints need a tiny private addRpcRoutes stub.
+    let mut content = raw_content;
+    inject_rpc_test_stub(&mut content);
     let source_root = find_source_root(path);
     let synthetic_modules = generate_rpc_proxy_modules(source_root.as_deref());
     // Compile without dispatch injection. Use prepare_source to resolve deps,
@@ -962,6 +975,15 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
             &format!("{} passed, coverage 100%", passed),
         );
     }
+}
+
+fn inject_rpc_test_stub(content: &mut String) {
+    if !content.contains("addRpcRoutes") || content.contains("def addRpcRoutes") {
+        return;
+    }
+    content.push_str(
+        "\nprivate:\n# Test-mode RPC route stub.\ndef addRpcRoutes\n    @param router Router\n    @return Void\ndo\nend\n",
+    );
 }
 
 /// Collect public, named function declarations from a file's top-level
@@ -1091,7 +1113,12 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
     );
 
     // Plan 101: inject generated RPC dispatch/proxies for run path too.
-    inject_rpc_dispatch(&mut content, &run_info, run_source_root.as_deref());
+    inject_rpc_dispatch(
+        &mut content,
+        &run_info,
+        run_source_root.as_deref(),
+        Some(&path),
+    );
 
     // Generate synthetic RPC-proxy modules so `use { X } from Server`
     // resolves during the run-path's type check. Without this, a
@@ -1442,7 +1469,7 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
     let build_native = matches!(info.target, Some(BuildTarget::Native));
 
     // Plan 101: Generate RPC dispatch (server) and proxy modules (client).
-    inject_rpc_dispatch(&mut content, &info, source_root.as_deref());
+    inject_rpc_dispatch(&mut content, &info, source_root.as_deref(), Some(&path));
 
     let synthetic_modules = if !build_native {
         generate_rpc_proxy_modules(source_root.as_deref())
@@ -1519,22 +1546,23 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
         }
     }
 
-    // Plan 101: If the source has remote functions/types, write schema.json
-    // next to the build output so client builds can consume it.
-    if content.contains("remote def") || content.contains("remote type") {
-        let schema_dir = std::path::Path::new(&output_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let prepared = fai_compiler::prepare_source(&content, None)
-            .ok()
-            .map(|p| p.serde_ast.statements);
-        if let Some(stmts) = prepared {
-            let spec = interface::extract_remote_schema(&stmts);
+    // Plan 101: If the target graph has remote functions/types, write
+    // schema.json next to the build output so client builds can consume it.
+    let mut wrote_schema = false;
+    if let Ok(surface) =
+        rpc_surface::collect_from_source(&content, source_root.as_deref(), Some(&path))
+    {
+        if !surface.is_empty() {
+            let schema_dir = std::path::Path::new(&output_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let spec = surface.to_schema();
             let json = interface::spec_to_json(&spec);
             let schema_path = schema_dir.join("schema.json");
             if let Err(e) = std::fs::write(&schema_path, &json) {
                 reporter.error_line(&format!("warning: could not write schema.json: {}", e));
             } else {
+                wrote_schema = true;
                 reporter.detail(&format!("generated {}", schema_path.display()));
             }
         }
@@ -1673,7 +1701,7 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
         .and_then(|n| n.to_str())
         .unwrap_or(&output_path);
     summary_parts.push(format!("{} {}", wasm_stem, format_bytes(wasm_bytes.len())));
-    if content.contains("remote def") || content.contains("remote type") {
+    if wrote_schema {
         summary_parts.push("schema.json".to_string());
     }
     if generate_html {
@@ -1995,49 +2023,15 @@ pub(crate) fn generate_rpc_proxy_modules(source_root: Option<&str>) -> Vec<(Stri
     result
 }
 
-/// Plan 101 Phase 4: Inject generated RPC dispatch for server sub-projects.
-/// If the server sub-project serves a shared dependency (has remote deps
-/// defined on a sibling client sub-project), generate the dispatch, handler,
-/// and serve() function from the shared module's remote functions.
-fn inject_rpc_dispatch(content: &mut String, _info: &ProjectInfo, source_root: Option<&str>) {
-    // Find workspace root with sub-projects
-    let project_root = match source_root {
-        Some(sr) => {
-            let mut dir = std::path::Path::new(sr).to_path_buf();
-            let mut found = None;
-            loop {
-                let toml_path = dir.join("fai.toml");
-                if toml_path.exists() {
-                    if let Ok(toml_content) = std::fs::read_to_string(&toml_path) {
-                        let candidate = parse_project_info(&toml_content);
-                        if !candidate.sub_projects.is_empty() {
-                            found = Some(dir.clone());
-                            break;
-                        }
-                    }
-                }
-                if !dir.pop() {
-                    break;
-                }
-            }
-            match found {
-                Some(r) => r,
-                None => return,
-            }
-        }
-        None => return,
-    };
-
-    let workspace_toml = project_root.join("fai.toml");
-    let workspace_info = match std::fs::read_to_string(&workspace_toml) {
-        Ok(c) => parse_project_info(&c),
-        Err(_) => return,
-    };
-
-    // Find any sub-project that has a remote dep — the dep name is the
-    // shared module we need to generate dispatch for. The SERVER is the
-    // sub-project that IMPLEMENTS those functions (target = native).
-    // We inject dispatch into the current build if it's a server target.
+/// Plan 101 Phase 4: Inject generated RPC dispatch for server targets.
+/// The dispatch surface is every `remote def` reachable from the prepared
+/// target graph, so endpoint modules can live in normal app folders.
+fn inject_rpc_dispatch(
+    content: &mut String,
+    _info: &ProjectInfo,
+    source_root: Option<&str>,
+    entry_path: Option<&str>,
+) {
     // Only inject dispatch if the source uses the RPC API.
     // Support both the new addRpcRoutes pattern and the legacy startRpcServer.
     let uses_rpc = content.contains("addRpcRoutes") || content.contains("startRpcServer");
@@ -2045,10 +2039,20 @@ fn inject_rpc_dispatch(content: &mut String, _info: &ProjectInfo, source_root: O
         return;
     }
 
-    // Server is the source of truth — generate dispatch from its OWN
-    // remote def functions. No shared module needed.
-    match rpc_dispatch::generate_dispatch(content, "") {
-        Ok(dispatch) => {
+    // Server targets expose every `remote def` reachable in their prepared
+    // build graph. Endpoints can live in normal app modules (`data.tasks`,
+    // `auth`, etc.); the generated dispatch imports them as needed.
+    match rpc_surface::collect_from_source(content, source_root, entry_path) {
+        Ok(surface) => {
+            let dispatch_functions = surface.dispatch_functions();
+            let dispatch =
+                match rpc_dispatch::generate_dispatch_for_functions(&dispatch_functions, "") {
+                    Ok(dispatch) => dispatch,
+                    Err(e) => {
+                        eprintln!("error: failed to generate addRpcRoutes: {}", e);
+                        std::process::exit(1);
+                    }
+                };
             if !dispatch.trim().is_empty() {
                 if is_verbose() {
                     eprintln!("    generated RPC dispatch (addRpcRoutes + handler + dispatch)");
@@ -2057,25 +2061,26 @@ fn inject_rpc_dispatch(content: &mut String, _info: &ProjectInfo, source_root: O
                 content.push_str(&dispatch);
             } else {
                 // The server source calls addRpcRoutes/startRpcServer but has no
-                // 'remote def' functions for the dispatcher to route to. Without
-                // this check, the build fails later with a cryptic "unknown
-                // function 'addRpcRoutes'" — this tells agents exactly what
-                // to add, and where.
+                // reachable 'remote def' functions for the dispatcher to route to.
+                // Without this check, the build fails later with a cryptic
+                // "unknown function 'addRpcRoutes'" — this tells agents exactly
+                // what to add, and where.
                 eprintln!(
-                    "error: this server calls addRpcRoutes but declares no 'remote def' functions"
+                    "error: this server calls addRpcRoutes but no reachable 'remote def' functions were found"
                 );
                 eprintln!(
                     "       addRpcRoutes is auto-generated — and only generated when the server"
                 );
+                eprintln!("       target graph exposes at least one function. Mark each endpoint");
                 eprintln!(
-                    "       exposes at least one function. Mark each function you want to expose"
+                    "       you want to expose as 'remote def' in any module imported by this target"
                 );
-                eprintln!("       to the client as 'remote def' (see `fai_examples rpc`).");
+                eprintln!("       (see `fai_examples rpc`).");
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            eprintln!("  warning: failed to generate dispatch: {}", e);
+            eprintln!("  warning: failed to discover RPC surface: {}", e);
         }
     }
 }
@@ -2719,7 +2724,16 @@ const env = {{
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
   storage_set(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
-  storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}}
+  storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}},
+  env_get(){{return 0x7FFD000000000000n}},
+  env_load(){{return 0}},
+  event_on(){{return 0x7FFD000000000000n}},
+  event_once(){{return 0x7FFD000000000000n}},
+  event_off(){{return 0}},
+  event_emit(){{}},
+  event_subscribers(){{return 0}},
+  event_clear(){{}},
+  event_clear_all(){{}}
 }};
 let instance;
 WebAssembly.instantiateStreaming(fetch('/{}'), {{ env }}).then(result => {{
@@ -2810,7 +2824,16 @@ const env={{
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
   storage_set(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
-  storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}}
+  storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}},
+  env_get(){{return NULL_VAL}},
+  env_load(){{return 0}},
+  event_on(){{return NULL_VAL}},
+  event_once(){{return NULL_VAL}},
+  event_off(){{return 0}},
+  event_emit(){{}},
+  event_subscribers(){{return 0}},
+  event_clear(){{}},
+  event_clear_all(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;debugLog('FAI wasm instantiated', Object.keys(instance.exports));const result=invokeExport('_start');const s=readNanBoxedStr(result);if(s&&s.startsWith('{{'))state=s;
@@ -3032,6 +3055,15 @@ var env={{
   storage_set:function(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove:function(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
   storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}},
+  env_get:function(){{return NULL_VAL}},
+  env_load:function(){{return 0}},
+  event_on:function(){{return NULL_VAL}},
+  event_once:function(){{return NULL_VAL}},
+  event_off:function(){{return 0}},
+  event_emit:function(){{}},
+  event_subscribers:function(){{return 0}},
+  event_clear:function(){{}},
+  event_clear_all:function(){{}},
   file_exists:function(){{return 0}},
   http_request_get:function(p,l){{return httpRequest('GET',readStr(p,l))}},
   http_request_post:function(up,ul,bp,bl){{return httpRequest('POST',readStr(up,ul),readStr(bp,bl))}},
@@ -4359,9 +4391,6 @@ mod tests {
         "end\n",
     );
 
-    // Note: test blocks are compiled in --is-test mode but the type-checker
-    // does not validate them, so we use a program that has no test blocks
-    // but compiles cleanly in test mode.
     const TEST_FAI: &str = concat!(
         "def main\n",
         "    @return Void\n",
@@ -5049,6 +5078,137 @@ mod tests {
         assert!(public.join("fai-runtime.js").exists());
         assert!(public.join("forui.css").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_schema_excludes_unreachable_remote_defs() {
+        let dir = temp_dir("cmd_build_rpc_reachable_schema");
+        let src = dir.join("src");
+        let forui_pkg = dir.join("forui");
+        std::fs::create_dir_all(src.join("platforms/server")).unwrap();
+        std::fs::create_dir_all(src.join("data/tasks")).unwrap();
+        std::fs::create_dir_all(src.join("data/admin")).unwrap();
+        std::fs::create_dir_all(forui_pkg.join("src/rpc")).unwrap();
+
+        std::fs::write(
+            forui_pkg.join("fai.toml"),
+            "[project]\nname = \"Forui\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            forui_pkg.join("src/rpc/main.fai"),
+            concat!(
+                "use std.http.server\n\n",
+                "# Handles generated RPC requests.\n",
+                "def handleRpcRequest\n",
+                "    @param request HttpRequest\n",
+                "    @param specJson String\n",
+                "    @param specHash String\n",
+                "    @param dispatch (String, String) -> String\n",
+                "    @return HttpResponse\n",
+                "do\n",
+                "  server.json(200, '{}')\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("fai.toml"),
+            format!(
+                "[project]\nname = \"RpcReachable\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                forui_pkg.display()
+            ),
+        )
+        .unwrap();
+        let server_main = src.join("platforms/server/main.fai");
+        std::fs::write(
+            &server_main,
+            concat!(
+                "use std.http.server\n",
+                "use { getTasks } from data.tasks\n\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "  let r = server.router()\n",
+                "  addRpcRoutes(r)\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("data/tasks/main.fai"),
+            concat!(
+                "# Gets reachable tasks.\n",
+                "remote def getTasks\n",
+                "    @return String[]\n",
+                "do\n",
+                "  []\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("data/admin/main.fai"),
+            concat!(
+                "# Dangerous endpoint that must stay unexposed.\n",
+                "remote def deleteEverything\n",
+                "    @return String\n",
+                "do\n",
+                "  'nope'\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+
+        let out_path = dir.join("build/server/main.wasm");
+        std::fs::create_dir_all(out_path.parent().unwrap()).unwrap();
+        let args: Vec<String> = vec![
+            server_main.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            out_path.to_string_lossy().into_owned(),
+        ];
+        cmd_build(&args);
+
+        let schema = std::fs::read_to_string(dir.join("build/server/schema.json"))
+            .expect("server build should write schema.json");
+        assert!(
+            schema.contains("\"key\": \"data.tasks.getTasks\""),
+            "schema should expose imported remote def. Got:\n{}",
+            schema
+        );
+        assert!(
+            !schema.contains("deleteEverything"),
+            "schema should not expose unimported remote def. Got:\n{}",
+            schema
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rpc_test_stub_is_private() {
+        let mut content = concat!(
+            "use std.http.server\n\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  let r = server.router()\n",
+            "  addRpcRoutes(r)\n",
+            "end\n",
+        )
+        .to_string();
+        inject_rpc_test_stub(&mut content);
+        let parsed = fai_parser::parse(&content).expect("stub should parse");
+        let stub = parsed
+            .statements
+            .iter()
+            .find_map(|stmt| match stmt {
+                fai_parser::ast::Statement::Function(fd) if fd.name == "addRpcRoutes" => Some(fd),
+                _ => None,
+            })
+            .expect("stub should be injected");
+        assert!(stub.is_private, "test stub should not require coverage");
     }
 
     #[test]

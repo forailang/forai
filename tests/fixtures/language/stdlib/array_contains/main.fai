@@ -4,6 +4,8 @@ use std.array
 # stdout:
 #   true
 #   false
+#   true
+#   false
 def main
     @return Void
 do
@@ -14,4 +16,10 @@ do
   ]
   print(array.contains(xs, 2))
   print(array.contains(xs, 99))
+  let names = [
+    'alice' + ''
+    'bob' + ''
+  ]
+  print(array.contains(names, 'alice'))
+  print(array.contains(names, 'eve'))
 end

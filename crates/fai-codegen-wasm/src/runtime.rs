@@ -378,7 +378,37 @@ pub const IMPORT_SPY_CHECK_CALL: u32 = 73;
 pub const IMPORT_SPY_ASSERT_CALLED_WITH: u32 = 74;
 pub const IMPORT_SPY_ASSERT_CALL_COUNT: u32 = 75;
 pub const IMPORT_SPY_ASSERT_NOT_CALLED: u32 = 76;
-pub const IMPORT_COUNT: u32 = 77;
+/// `env.env_get(key_ptr, key_len) -> i64` — host process environment
+/// lookup. Returns a NaN-boxed String allocated on the guest heap, or
+/// VAL_NULL when the key is unset. Browser builds receive a stub that
+/// always returns VAL_NULL.
+pub const IMPORT_ENV_GET: u32 = 77;
+/// `env.env_load(path_ptr, path_len) -> i32` — read a dotenv-style file
+/// and merge `KEY=VALUE` lines into the host process environment.
+/// Returns 1 on success, 0 if the file is missing or unreadable.
+/// Malformed lines are skipped silently. Browser builds stub to 0.
+pub const IMPORT_ENV_LOAD: u32 = 78;
+/// `env.event_on(name_ptr, name_len, handler_val) -> i64` — register a
+/// subscriber. Returns a NaN-boxed `Subscription { id, name }` Dict.
+pub const IMPORT_EVENT_ON: u32 = 79;
+/// `env.event_once(...)` — same as `event_on` but auto-removes after
+/// the first delivery.
+pub const IMPORT_EVENT_ONCE: u32 = 80;
+/// `env.event_off(sub_val) -> i32` (Bool 0/1) — cancel a subscription.
+/// Returns 1 if the subscription was active, 0 if already removed.
+pub const IMPORT_EVENT_OFF: u32 = 81;
+/// `env.event_emit(name_ptr, name_len, data_val) -> void` — deliver
+/// an event synchronously to every subscriber registered under name,
+/// in registration order, on a snapshot of the subscriber list.
+pub const IMPORT_EVENT_EMIT: u32 = 82;
+/// `env.event_subscribers(name_ptr, name_len) -> i32` — count.
+pub const IMPORT_EVENT_SUBSCRIBERS: u32 = 83;
+/// `env.event_clear(name_ptr, name_len) -> void` — drop every
+/// subscriber for a single event name.
+pub const IMPORT_EVENT_CLEAR: u32 = 84;
+/// `env.event_clear_all() -> void` — drop every subscription.
+pub const IMPORT_EVENT_CLEAR_ALL: u32 = 85;
+pub const IMPORT_COUNT: u32 = 86;
 
 /// Return which imports are available for a given build target.
 /// `None` means all imports available (native/test). The returned
@@ -6295,8 +6325,17 @@ fn emit_array_contains_body(f: &mut Function, base: u32) {
         f.instruction(&Instruction::I32Mul);
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::I64Load(mem0()));
-        // compare to arg1 (local 6)
+        // Compare to arg1 (local 6) via RT_EQ so heap-allocated values
+        // (strings, dicts, arrays) match by content rather than by
+        // pointer identity. Ints, floats, bools, and null still
+        // resolve to the same bit-equality short-circuit RT_EQ uses
+        // for non-object operands.
         f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_EQ));
+        // RT_EQ returns a NaN-boxed Bool (VAL_TRUE / VAL_FALSE).
+        // Compare against VAL_TRUE to get the i32 condition the loop
+        // branch needs.
+        f.instruction(&Instruction::I64Const(VAL_TRUE));
         f.instruction(&Instruction::I64Eq);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         f.instruction(&Instruction::I32Const(1));
@@ -6914,5 +6953,43 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I32],
             vec![ValType::I32],
         ),
+        // IMPORT_ENV_GET: (key_ptr, key_len) -> i64 (NaN-boxed String | VAL_NULL)
+        (
+            "env_get",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_ENV_LOAD: (path_ptr, path_len) -> i32 (1=ok, 0=err)
+        ("env_load", vec![ValType::I32, ValType::I32], vec![ValType::I32]),
+        // IMPORT_EVENT_ON: (name_ptr, name_len, handler_val) -> i64 (Subscription Dict)
+        (
+            "event_on",
+            vec![ValType::I32, ValType::I32, ValType::I64],
+            vec![ValType::I64],
+        ),
+        // IMPORT_EVENT_ONCE: (name_ptr, name_len, handler_val) -> i64 (Subscription Dict)
+        (
+            "event_once",
+            vec![ValType::I32, ValType::I32, ValType::I64],
+            vec![ValType::I64],
+        ),
+        // IMPORT_EVENT_OFF: (sub_val) -> i32 (Bool)
+        ("event_off", vec![ValType::I64], vec![ValType::I32]),
+        // IMPORT_EVENT_EMIT: (name_ptr, name_len, data_val) -> void
+        (
+            "event_emit",
+            vec![ValType::I32, ValType::I32, ValType::I64],
+            vec![],
+        ),
+        // IMPORT_EVENT_SUBSCRIBERS: (name_ptr, name_len) -> i32 (count)
+        (
+            "event_subscribers",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        ),
+        // IMPORT_EVENT_CLEAR: (name_ptr, name_len) -> void
+        ("event_clear", vec![ValType::I32, ValType::I32], vec![]),
+        // IMPORT_EVENT_CLEAR_ALL: () -> void
+        ("event_clear_all", vec![], vec![]),
     ]
 }

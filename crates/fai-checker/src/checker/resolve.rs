@@ -73,7 +73,18 @@ impl Checker {
             "Void" => Ok(Type::Void),
             "Ptr" => Ok(Type::Ptr("Ptr".to_string())),
             // Built-in named types (not user-defined, not extern)
-            "HttpRequest" | "Router" => Ok(named_type(name, NamedCategory::Type)),
+            "HttpRequest"
+            | "HttpResponse"
+            | "Router"
+            | "Event"
+            | "Subscription"
+            | "Cookie"
+            | "RequestResponse"
+            | "ServerStarted"
+            | "HttpError"
+            | "RpcCall"
+            | "RpcResult"
+            | "RpcError" => Ok(named_type(name, NamedCategory::Type)),
             _ => {
                 if self.type_declarations.contains_key(name) {
                     return Ok(named_type(name, NamedCategory::Type));
