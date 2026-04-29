@@ -34,8 +34,32 @@ struct Registry {
     by_name: HashMap<String, Vec<Subscription>>,
 }
 
+/// One queued deferred event. `data_val` is a NaN-boxed pointer into
+/// guest memory (Dict / String / etc.), captured at `emitDeferred` time
+/// and replayed verbatim on `drain`. The guest GC isn't moving so the
+/// pointer stays valid between enqueue and drain — once we get a real
+/// GC this needs to root the value.
+#[derive(Clone)]
+struct DeferredEvent {
+    name: String,
+    data_val: i64,
+}
+
+#[derive(Default)]
+struct Queue {
+    events: Vec<DeferredEvent>,
+    /// Set while `drain` is running so a subscriber that throws (sets
+    /// `__error_flag`) doesn't abort the whole drain — instead the
+    /// drain loop catches the error, emits an `events:error` event with
+    /// `{ name, message }` data, and continues. Recursive drain calls
+    /// are no-ops (we're already draining; the new entries land in the
+    /// queue and the active drain picks them up).
+    draining: bool,
+}
+
 thread_local! {
     static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
+    static QUEUE: RefCell<Queue> = RefCell::new(Queue::default());
 }
 
 // ── Pure registry operations ────────────────────────────────────────
@@ -113,6 +137,48 @@ fn clear_all() {
         reg.by_name.clear();
         reg.next_id = 0;
     });
+    QUEUE.with(|q| {
+        let mut queue = q.borrow_mut();
+        queue.events.clear();
+        queue.draining = false;
+    });
+}
+
+// ── Deferred queue ─────────────────────────────────────────────────
+
+fn enqueue_deferred(name: &str, data_val: i64) {
+    QUEUE.with(|q| {
+        q.borrow_mut().events.push(DeferredEvent {
+            name: name.to_string(),
+            data_val,
+        });
+    });
+}
+
+fn queue_len() -> i32 {
+    QUEUE.with(|q| q.borrow().events.len() as i32)
+}
+
+/// Pop the next queued event. Returns `None` when empty. Used by
+/// `drain_queue` so subscribers can `emitDeferred` more events
+/// during dispatch and the loop picks them up in the same pass.
+fn pop_next_deferred() -> Option<DeferredEvent> {
+    QUEUE.with(|q| {
+        let mut queue = q.borrow_mut();
+        if queue.events.is_empty() {
+            None
+        } else {
+            Some(queue.events.remove(0))
+        }
+    })
+}
+
+fn set_draining(value: bool) {
+    QUEUE.with(|q| q.borrow_mut().draining = value);
+}
+
+fn is_draining() -> bool {
+    QUEUE.with(|q| q.borrow().draining)
 }
 
 /// Emit an event from the host side. `data_val` is a NaN-boxed value
@@ -138,6 +204,92 @@ pub(super) fn dispatch_event(caller: &mut Caller<'_, ()>, name: &str, data_val: 
             return;
         }
     }
+}
+
+/// Drain every queued deferred event in FIFO order. Subscribers can
+/// `emitDeferred` more events during drain — those join the same pass
+/// because we re-pop from the queue each iteration.
+///
+/// A subscriber that throws (sets `__error_flag`) does not abort the
+/// drain. The error is read out, the flag is cleared, and an
+/// `events:error` event with `{ name, message }` is dispatched (sync,
+/// not deferred — observability subscribers want immediate visibility)
+/// before the loop continues to the next queued entry.
+///
+/// Recursive `drain` calls are no-ops — the outer drain is already
+/// pulling entries off the queue, and any subscriber pushing more
+/// gets picked up by that loop.
+pub(super) fn drain_queue(caller: &mut Caller<'_, ()>) {
+    if is_draining() {
+        return;
+    }
+    set_draining(true);
+    while let Some(ev) = pop_next_deferred() {
+        dispatch_event(caller, &ev.name, ev.data_val);
+        if get_error_flag(caller) != 0 {
+            // A subscriber threw during deferred dispatch. Clear the
+            // flag, capture the error, and emit `events:error` so
+            // observability handlers can recover without coupling to
+            // the failing subscriber. Then continue draining.
+            let message = take_error_message(caller);
+            let err_val = build_events_error_payload(caller, &ev.name, &message);
+            dispatch_event(caller, "events:error", err_val);
+            // The events:error subscriber itself might have thrown —
+            // in that case we do bail out (no second-order recovery).
+            if get_error_flag(caller) != 0 {
+                set_draining(false);
+                return;
+            }
+        }
+    }
+    set_draining(false);
+}
+
+/// Read `__error_value`'s `message` field (an Error is a `{ message,
+/// kind }` Dict at runtime), then clear both error globals so drain
+/// can continue. Returns the message text; falls back to a generic
+/// label if the error value can't be read for any reason.
+fn take_error_message(caller: &mut Caller<'_, ()>) -> String {
+    let err_val = read_global_i64(caller, "__error_value");
+    let message = read_error_message(caller, err_val).unwrap_or_else(|| "(unknown)".to_string());
+    write_global_i32(caller, "__error_flag", 0);
+    write_global_i64(caller, "__error_value", 0);
+    message
+}
+
+/// Pull the `message` field out of a NaN-boxed Error Dict. Returns
+/// `None` for any malformed shape; the caller falls back to a
+/// generic label.
+fn read_error_message(caller: &mut Caller<'_, ()>, err_val: i64) -> Option<String> {
+    let v = err_val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return None;
+    }
+    let addr = (v & ADDR_MASK) as usize;
+    let mem = caller.get_export("memory")?.into_memory()?;
+    read_dict_string(&mem, caller, addr, "message")
+}
+
+/// Build the Dict payload for an `events:error` event:
+/// `{ name: <event-name>, message: <error-message> }`.
+fn build_events_error_payload(
+    caller: &mut Caller<'_, ()>,
+    failed_event: &str,
+    message: &str,
+) -> i64 {
+    let mem = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .expect("memory export");
+    let key_name = wasm_alloc_str(caller, &mem, "name");
+    let key_message = wasm_alloc_str(caller, &mem, "message");
+    let v_name = wasm_alloc_str(caller, &mem, failed_event);
+    let v_message = wasm_alloc_str(caller, &mem, message);
+    alloc_dict(
+        caller,
+        &mem,
+        &[(key_name, v_name), (key_message, v_message)],
+    )
 }
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -237,6 +389,32 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         })
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // event_emit_deferred(name_ptr, name_len, data_val) -> void
+    linker
+        .func_wrap(
+            "env",
+            "event_emit_deferred",
+            |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, data_val: i64| {
+                let name = read_name(&mut caller, name_ptr, name_len);
+                enqueue_deferred(&name, data_val);
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // event_drain() -> void
+    linker
+        .func_wrap("env", "event_drain", |mut caller: Caller<'_, ()>| {
+            drain_queue(&mut caller);
+        })
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // event_queue_len() -> i32
+    linker
+        .func_wrap("env", "event_queue_len", |_caller: Caller<'_, ()>| -> i32 {
+            queue_len()
+        })
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
 }
 
@@ -329,6 +507,23 @@ fn read_global_i32(caller: &mut Caller<'_, ()>, name: &str) -> i32 {
 fn write_global_i32(caller: &mut Caller<'_, ()>, name: &str, val: i32) {
     if let Some(g) = caller.get_export(name).and_then(|e| e.into_global()) {
         let _ = g.set(&mut *caller, Val::I32(val));
+    }
+}
+
+fn read_global_i64(caller: &mut Caller<'_, ()>, name: &str) -> i64 {
+    caller
+        .get_export(name)
+        .and_then(|e| e.into_global())
+        .and_then(|g| match g.get(&mut *caller) {
+            Val::I64(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn write_global_i64(caller: &mut Caller<'_, ()>, name: &str, val: i64) {
+    if let Some(g) = caller.get_export(name).and_then(|e| e.into_global()) {
+        let _ = g.set(&mut *caller, Val::I64(val));
     }
 }
 

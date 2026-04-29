@@ -22,6 +22,7 @@ mod report;
 pub mod rpc_dispatch;
 pub mod rpc_proxy;
 mod rpc_surface;
+mod templates;
 mod test_meta;
 mod wasm_runner;
 
@@ -1139,7 +1140,14 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
         );
         std::process::exit(1);
     }
-    let wasm_bytes = compile_fai_to_wasm(&content, &path, false, synthetic_modules.clone(), None);
+    let wasm_bytes = compile_fai_to_wasm(
+        &content,
+        &path,
+        false,
+        synthetic_modules.clone(),
+        None,
+        None,
+    );
     let externs = extract_extern_info_full(&content, &path, synthetic_modules);
     if let Err(e) = wasm_runner::run_wasm_with_externs(&wasm_bytes, externs) {
         reporter.error_line(&e);
@@ -1491,11 +1499,65 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
         None
     };
 
+    // Find which sub-project's `main` matches this entry path so we
+    // can read its `rpc_server` flag and remote-dependency URL. When
+    // `rpc_server = false` (the default for client targets), every
+    // `remote def` body is rewritten to call `remoteCall(...)` so the
+    // client wasm never executes server-only code (the OOB on signup
+    // in the browser was caused by the unrewritten `auth.signup`
+    // dereferencing null SQLite handles). When `rpc_server = true` —
+    // or when no remote URL is configured — the rewrite is skipped
+    // and bodies stay intact.
+    let active_sub = {
+        let canonical_entry = std::fs::canonicalize(&path).ok();
+        info.sub_projects.values().find(|sub| {
+            sub.main
+                .as_ref()
+                .and_then(|m| {
+                    let candidate = source_root
+                        .as_deref()
+                        .and_then(|sr| std::path::Path::new(sr).parent())
+                        .map(|root| root.join(m))
+                        .unwrap_or_else(|| std::path::PathBuf::from(m));
+                    std::fs::canonicalize(&candidate).ok()
+                })
+                .zip(canonical_entry.clone())
+                .map(|(sub_main, entry)| sub_main == entry)
+                .unwrap_or(false)
+        })
+    };
+    let project_root_for_hash = source_root
+        .as_deref()
+        .and_then(|sr| std::path::Path::new(sr).parent().map(|p| p.to_path_buf()));
+    let rpc_proxy_substitution: Option<(String, String)> = match active_sub {
+        Some(sub) if !sub.rpc_server => sub
+            .remote_deps
+            .iter()
+            .find_map(|(dep_name, envs)| {
+                let cfg = envs.get("dev").or_else(|| envs.values().next())?;
+                let hash = project_root_for_hash
+                    .as_ref()
+                    .and_then(|root| find_dependency_hash(root, dep_name, &info))
+                    .unwrap_or_default();
+                Some((cfg.url.clone(), hash))
+            }),
+        _ => None,
+    };
+
     // Plan 94 Phase G: for default (non-html) builds try the direct
     // AST→wasm path before falling back to the bytecode codegen.
     // `wasm-html` forces bytecode because the direct module
     // assembler doesn't honour target-filtered imports yet.
-    let wasm_bytes = compile_fai_to_wasm(&content, &path, false, synthetic_modules, codegen_target);
+    let wasm_bytes = compile_fai_to_wasm(
+        &content,
+        &path,
+        false,
+        synthetic_modules,
+        codegen_target,
+        rpc_proxy_substitution
+            .as_ref()
+            .map(|(u, h)| (u.as_str(), h.as_str())),
+    );
 
     // Determine output directory and filename
     let output_path = if let Some(pos) = args.iter().position(|a| a == "-o") {
@@ -1513,6 +1575,27 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
             .and_then(|sr| std::path::Path::new(sr).parent())
             .unwrap_or_else(|| std::path::Path::new("."));
         let out_dir = project_root.join(build_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        out_dir
+            .join(format!("{}.wasm", stem))
+            .to_str()
+            .unwrap()
+            .to_string()
+    } else if let Some(bd) = build_dir_opt.as_deref() {
+        // For non-html targets, honor [project].build_dir when set so a
+        // hello-world starter declaring build_dir = "build" actually writes
+        // there instead of dropping main.wasm next to main.fai. When unset,
+        // fall back to the historical "next to source" behavior.
+        let project_root = source_root
+            .as_deref()
+            .and_then(|sr| std::path::Path::new(sr).parent())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let out_dir = project_root.join(bd);
         let _ = std::fs::create_dir_all(&out_dir);
         let stem = std::path::Path::new(&path)
             .file_stem()
@@ -2023,6 +2106,161 @@ pub(crate) fn generate_rpc_proxy_modules(source_root: Option<&str>) -> Vec<(Stri
     result
 }
 
+/// Format a compiler-AST `TypeNode` back into source for round-tripping
+/// when generating proxy bodies. Mirrors `rpc_proxy::format_type_node`
+/// but for the compiler-AST (the parser-AST version is in rpc_proxy.rs).
+fn format_compiler_type_node(tn: &fai_compiler::ast::TypeNode) -> String {
+    let mut s = tn.name.clone().unwrap_or_else(|| "Void".to_string());
+    if tn.is_array {
+        s.push_str("[]");
+    }
+    if tn.is_optional {
+        s.push('?');
+    }
+    s
+}
+
+/// Generate proxy fai source for a single `remote def`. The output is a
+/// complete fai program containing one function with the same signature
+/// as `fd` but a body that calls `remoteCall(url, key, args, hash)`. The
+/// caller parses this, converts to compiler-AST, and lifts the body
+/// statements over the original to swap in the proxy implementation.
+fn generate_remote_def_proxy_source(
+    fd: &fai_compiler::ast::FunctionDeclaration,
+    key: &str,
+    url: &str,
+    hash: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("use std.json\n\n");
+    out.push_str("# Auto-generated client proxy for a `remote def`.\n");
+    out.push_str(&format!("def {}\n", fd.name));
+    for p in &fd.params {
+        out.push_str(&format!(
+            "    @param {} {}\n",
+            p.name,
+            format_compiler_type_node(&p.type_node)
+        ));
+    }
+    for r in &fd.return_types {
+        out.push_str(&format!(
+            "    @return {}\n",
+            format_compiler_type_node(&r.type_node)
+        ));
+    }
+    out.push_str("do\n");
+    if fd.params.is_empty() {
+        out.push_str(&format!(
+            "  remoteCall('{}', '{}', '[]', '{}')\n",
+            url, key, hash
+        ));
+    } else {
+        let parts: Vec<String> = fd
+            .params
+            .iter()
+            .map(|p| format!("json.stringify({})", p.name))
+            .collect();
+        out.push_str(&format!(
+            "  let __args = '[' + {} + ']'\n",
+            parts.join(" + ',' + ")
+        ));
+        out.push_str(&format!(
+            "  remoteCall('{}', '{}', __args, '{}')\n",
+            url, key, hash
+        ));
+    }
+    out.push_str("end\n");
+    out
+}
+
+/// Rewrite each `remote def` body in `modules` to call `remoteCall(...)`
+/// instead of running the original (server-side) body. Triggered for
+/// client targets with `rpc_server = false` (the default) so that
+/// browser/wasm builds never execute server-only code paths like SQLite
+/// access — the OOB seen on the signup flow was caused by `auth.signup`'s
+/// real body running in the browser and dereferencing null Connection
+/// handles.
+///
+/// Tests in the regular `fai test` flow keep the original bodies so unit
+/// tests that exercise data-layer functions natively still work — this
+/// rewrite is bypassed when `is_test` is true.
+fn rewrite_remote_def_bodies(
+    modules: &mut [fai_compiler::module::DiscoveredModule],
+    url: &str,
+    hash: &str,
+) {
+    for module in modules.iter_mut() {
+        let module_name = module.name.clone();
+        let mut had_rewrite = false;
+        for stmt in module.statements.iter_mut() {
+            if let fai_compiler::ast::Statement::FunctionDeclaration(fd) = stmt {
+                if !fd.is_remote {
+                    continue;
+                }
+                let key = format!("{}.{}", module_name, fd.name);
+                let proxy_src = generate_remote_def_proxy_source(fd, &key, url, hash);
+                let parsed = match fai_parser::parse(&proxy_src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to parse rewritten proxy for {}: {}",
+                            key, e
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let serde = fai_compiler::native_bridge::convert_program(&parsed);
+                let new_body = serde
+                    .statements
+                    .iter()
+                    .find_map(|s| match s {
+                        fai_compiler::ast::Statement::FunctionDeclaration(rfd)
+                            if rfd.name == fd.name =>
+                        {
+                            Some(rfd.body.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("regenerated proxy must contain the named function");
+                fd.body = new_body;
+                // Mark non-remote so downstream code (RPC dispatch
+                // generation, schema export) doesn't try to wire this
+                // up server-side too — the body is now a client stub.
+                fd.is_remote = false;
+                had_rewrite = true;
+            }
+        }
+        if had_rewrite {
+            // The proxy body uses `json.stringify(...)` to serialise
+            // arguments — make sure the module sees `std.json` even
+            // when the original source didn't import it. Idempotent:
+            // skip when the module already has `use std.json` (named
+            // or namespace) at top level.
+            let already_has_json = module.statements.iter().any(|s| {
+                if let fai_compiler::ast::Statement::UseStatement(u) = s {
+                    u.module_path == ["std".to_string(), "json".to_string()]
+                } else {
+                    false
+                }
+            });
+            if !already_has_json {
+                let zero = fai_compiler::ast::SourceLocation { line: 0, column: 0 };
+                module.statements.insert(
+                    0,
+                    fai_compiler::ast::Statement::UseStatement(
+                        fai_compiler::ast::UseStatement {
+                            module_path: vec!["std".to_string(), "json".to_string()],
+                            imported_names: None,
+                            is_remote: false,
+                            location: zero,
+                        },
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// Plan 101 Phase 4: Inject generated RPC dispatch for server targets.
 /// The dispatch surface is every `remote def` reachable from the prepared
 /// target graph, so endpoint modules can live in normal app folders.
@@ -2480,6 +2718,14 @@ struct SubProject {
     /// Remote config for dependencies, keyed by dependency name then environment.
     remote_deps:
         std::collections::HashMap<String, std::collections::HashMap<String, RemoteEnvConfig>>,
+    /// `true` when this sub-project hosts the RPC endpoint — `remote def`
+    /// bodies stay intact and are wired into the dispatcher. When `false`
+    /// (the default for client targets), each `remote def` reachable in
+    /// this build has its body rewritten to `remoteCall(url, name, args,
+    /// hash)` so the client never executes server-only code (e.g. SQLite
+    /// access) under wasm. The URL comes from the matching
+    /// `[project.X.dependencies.<dep>.remote.<env>]` entry.
+    rpc_server: bool,
 }
 
 /// Everything `forai build` reads out of the project's `fai.toml` up
@@ -2563,6 +2809,7 @@ fn parse_project_info(content: &str) -> ProjectInfo {
                     "source" => sub.source = Some(v_unquoted),
                     "main" => sub.main = Some(v_unquoted),
                     "build_dir" => sub.build_dir = Some(v_unquoted),
+                    "rpc_server" => sub.rpc_server = v_unquoted == "true",
                     _ => {}
                 }
             } else if parts.len() >= 4 && parts[1] == "dependencies" && parts[3] == "remote" {
@@ -2733,7 +2980,10 @@ const env = {{
   event_emit(){{}},
   event_subscribers(){{return 0}},
   event_clear(){{}},
-  event_clear_all(){{}}
+  event_clear_all(){{}},
+  event_emit_deferred(){{}},
+  event_drain(){{}},
+  event_queue_len(){{return 0}}
 }};
 let instance;
 WebAssembly.instantiateStreaming(fetch('/{}'), {{ env }}).then(result => {{
@@ -2833,7 +3083,10 @@ const env={{
   event_emit(){{}},
   event_subscribers(){{return 0}},
   event_clear(){{}},
-  event_clear_all(){{}}
+  event_clear_all(){{}},
+  event_emit_deferred(){{}},
+  event_drain(){{}},
+  event_queue_len(){{return 0}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;debugLog('FAI wasm instantiated', Object.keys(instance.exports));const result=invokeExport('_start');const s=readNanBoxedStr(result);if(s&&s.startsWith('{{'))state=s;
@@ -3029,9 +3282,15 @@ function readNanBoxedStr(v){{var n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{var a=
 function invokeExport(name){{var fn=instance.exports[name];if(!fn)return;var args=Array.prototype.slice.call(arguments,1);try{{return fn.apply(null,args)}}catch(e){{console.error('FAI',name,'failed',e);throw e}}}}
 function responseHeaders(xhr){{var headers={{}};String(xhr.getAllResponseHeaders()||'').trim().split(/[\r\n]+/).forEach(function(line){{if(!line)return;var i=line.indexOf(':');if(i>0)headers[line.slice(0,i).toLowerCase()]=line.slice(i+1).trim()}});return headers}}
 function httpRequest(method,url,body){{try{{var x=new XMLHttpRequest();x.open(method,url,false);if(body!==undefined)x.setRequestHeader('Content-Type','text/plain; charset=utf-8');x.send(body===undefined?null:body);return jsToWasm({{status:x.status,body:x.responseText||'',headers:responseHeaders(x)}})}}catch(e){{console.error('FAI http request failed',e);return NULL_VAL}}}}
-function handleEvent(id){{var fn=instance.exports.invokeHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n)}}catch(e){{console.error('FAI handleEvent failed',e)}}}}
-function handleInputEvent(id,value){{var fn=instance.exports.invokeChangeHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n,writeStrToWasm(value))}}catch(e){{console.error('FAI handleInputEvent failed',e)}}}}
-function handleSubmitEvent(id){{var fn=instance.exports.invokeSubmitHandler;if(!fn)return;try{{fn(BigInt(id)|0x7FFC000400000000n)}}catch(e){{console.error('FAI handleSubmitEvent failed',e)}}}}
+var faiEventRegistry={{byName:Object.create(null),nextId:0,queue:[],draining:false}};
+function faiBuildEvent(name,dataVal){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var kn=writeStrToWasm('name'),vn=writeStrToWasm(name),kd=writeStrToWasm('data');m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=kn;bi[1]=vn;bi[2]=kd;bi[3]=BigInt.asIntN(64,BigInt(dataVal));return OBJ_MASK|BigInt(addr)}}
+function faiBuildSubscription(id,name){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var ki=writeStrToWasm('id'),kn=writeStrToWasm('name'),vn=writeStrToWasm(name),iv=INT_MASK|BigInt.asUintN(32,BigInt(id));m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=ki;bi[1]=iv;bi[2]=kn;bi[3]=vn;return OBJ_MASK|BigInt(addr)}}
+function faiReadSubscription(subVal){{var n=BigInt.asIntN(64,BigInt(subVal));var u=BigInt.asUintN(64,n);if((u&OBJ_MASK)!==OBJ_MASK)return null;var a=Number(u&0x0000FFFFFFFFFFFFn),dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==3)return null;var cnt=dv.getInt32(a+4,true),id=null,name=null;for(var i=0;i<cnt;i++){{var ea=a+8+i*16,bi=new BigInt64Array(instance.exports.memory.buffer,ea,2),k=readNanBoxedStr(bi[0]),v=BigInt.asUintN(64,bi[1]);if(k==='id')id=Number(BigInt.asIntN(32,v&0xFFFFFFFFn));else if(k==='name')name=readNanBoxedStr(bi[1])}}if(id===null||name===null)return null;return{{id:id,name:name}}}}
+function faiInvokeClosure(closureVal,arg){{var u=BigInt.asUintN(64,BigInt(closureVal));if((u&OBJ_MASK)!==OBJ_MASK)return NULL_VAL;var a=Number(u&0x0000FFFFFFFFFFFFn);if(a+16>instance.exports.memory.buffer.byteLength)return NULL_VAL;var dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==4)return NULL_VAL;var tidx=dv.getInt32(a+4,true),envAddr=a+16;if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(!tbl)return NULL_VAL;try{{return tbl.get(tidx)(BigInt.asIntN(64,BigInt(arg)))}}catch(e){{console.error('FAI event closure failed',e);return NULL_VAL}}}}
+function faiEventEmit(name,dataVal){{var list=faiEventRegistry.byName[name];if(!list||list.length===0)return;var snap=list.slice();faiEventRegistry.byName[name]=list.filter(function(s){{return !s.once}});var ev=faiBuildEvent(name,dataVal);for(var i=0;i<snap.length;i++)faiInvokeClosure(snap[i].closureVal,ev)}}
+function handleEvent(id){{faiEventEmit('view:click',jsToWasm({{id:id}}))}}
+function handleInputEvent(id,value){{faiEventEmit('view:input',jsToWasm({{id:id,value:value}}))}}
+function handleSubmitEvent(id){{faiEventEmit('view:submit',jsToWasm({{id:id}}))}}
 function morphDom(root,newHtml,replaceSelf){{var tmp=document.createElement('div');tmp.innerHTML=newHtml;if(replaceSelf&&root.parentNode&&tmp.childNodes.length===1){{morphNode(root,tmp.childNodes[0],root.parentNode);return}}morphChildren(root,tmp)}}
 function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}var used={{}};for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];used[nk]=true;if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}for(var i=oc.length-1;i>=0;i--){{var k=oc[i].nodeType===1?oc[i].getAttribute('data-fai-key'):null;if(k&&!used[k])op.removeChild(oc[i])}}}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
 function morphNode(o,n,p){{if(o.nodeType!==n.nodeType){{p.replaceChild(n,o);return}}if(o.nodeType===3){{if(o.textContent!==n.textContent)o.textContent=n.textContent;return}}if(o.nodeType===1){{if(o.nodeName!==n.nodeName){{p.replaceChild(n,o);return}}patchAttrs(o,n);if(!/^(INPUT|IMG|BR|HR|META|LINK)$/.test(o.nodeName))morphChildren(o,n)}}}}
@@ -3057,13 +3316,16 @@ var env={{
   storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}},
   env_get:function(){{return NULL_VAL}},
   env_load:function(){{return 0}},
-  event_on:function(){{return NULL_VAL}},
-  event_once:function(){{return NULL_VAL}},
-  event_off:function(){{return 0}},
-  event_emit:function(){{}},
-  event_subscribers:function(){{return 0}},
-  event_clear:function(){{}},
-  event_clear_all:function(){{}},
+  event_on:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:BigInt.asIntN(64,BigInt(cv)),once:false}});return faiBuildSubscription(id,name)}},
+  event_once:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:BigInt.asIntN(64,BigInt(cv)),once:true}});return faiBuildSubscription(id,name)}},
+  event_off:function(sv){{var sub=faiReadSubscription(sv);if(!sub)return 0;var list=faiEventRegistry.byName[sub.name];if(!list)return 0;var before=list.length;faiEventRegistry.byName[sub.name]=list.filter(function(s){{return s.id!==sub.id}});return before!==faiEventRegistry.byName[sub.name].length?1:0}},
+  event_emit:function(np,nl,dv){{faiEventEmit(readStr(np,nl),dv)}},
+  event_subscribers:function(np,nl){{var list=faiEventRegistry.byName[readStr(np,nl)];return list?list.length:0}},
+  event_clear:function(np,nl){{delete faiEventRegistry.byName[readStr(np,nl)]}},
+  event_clear_all:function(){{faiEventRegistry.byName=Object.create(null);faiEventRegistry.nextId=0;faiEventRegistry.queue=[];faiEventRegistry.draining=false}},
+  event_emit_deferred:function(np,nl,dv){{faiEventRegistry.queue.push({{name:readStr(np,nl),dataVal:BigInt.asIntN(64,BigInt(dv))}})}},
+  event_drain:function(){{if(faiEventRegistry.draining)return;faiEventRegistry.draining=true;while(faiEventRegistry.queue.length>0){{var ev=faiEventRegistry.queue.shift();faiEventEmit(ev.name,ev.dataVal)}}faiEventRegistry.draining=false}},
+  event_queue_len:function(){{return faiEventRegistry.queue.length}},
   file_exists:function(){{return 0}},
   http_request_get:function(p,l){{return httpRequest('GET',readStr(p,l))}},
   http_request_post:function(up,ul,bp,bl){{return httpRequest('POST',readStr(up,ul),readStr(bp,bl))}},
@@ -3179,69 +3441,231 @@ fn step_fmt(args: &[String], reporter: &Reporter) {
 }
 
 fn cmd_new(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: forai new <project-name>");
-        std::process::exit(1);
-    }
+    let parsed = match parse_new_args(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    };
 
-    let name = &args[0];
-    let project_root = std::path::Path::new(name);
+    let project_root = std::path::Path::new(&parsed.project_dir);
 
     if project_root.exists() {
         eprintln!("error: target already exists: {}", project_root.display());
         std::process::exit(1);
     }
 
+    let project_name = project_root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if let Some(tref_str) = &parsed.template {
+        let tref = match templates::parse_template_ref(tref_str) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        scaffold_from_template_ref(tref, project_root, &project_name);
+        return;
+    }
+
+    inline_scaffold(project_root, &project_name);
+}
+
+struct NewArgs {
+    project_dir: String,
+    template: Option<String>,
+}
+
+fn parse_new_args(args: &[String]) -> Result<NewArgs, String> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut template: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("error: --template requires a value".to_string());
+                }
+                template = Some(args[i].clone());
+            }
+            "--yes" | "-y" => {
+                // Reserved for future confirmation prompts (network mode).
+                // Currently a no-op for the local-template path.
+            }
+            arg if arg.starts_with("--") => {
+                return Err(format!("error: unknown flag: {}", arg));
+            }
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if positional.is_empty() {
+        return Err("Usage: forai new <project-dir> [--template <ref>]".to_string());
+    }
+    if positional.len() > 1 {
+        return Err(format!(
+            "error: expected one project directory, got {}",
+            positional.len()
+        ));
+    }
+    Ok(NewArgs {
+        project_dir: positional.into_iter().next().unwrap(),
+        template,
+    })
+}
+
+fn scaffold_from_template_ref(
+    tref: templates::TemplateRef,
+    project_root: &std::path::Path,
+    project_name: &str,
+) {
+    match tref {
+        templates::TemplateRef::Local(path) => {
+            let opts = templates::ScaffoldOptions {
+                template_root: &path,
+                target_dir: project_root,
+                project_name,
+            };
+            if let Err(e) = templates::scaffold_from_local(&opts) {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+            overlay_meta_files(project_root, project_name);
+            println!(
+                "scaffolded {} from {}",
+                project_name,
+                path.display()
+            );
+        }
+        templates::TemplateRef::Github { owner, repo, git_ref } => {
+            scaffold_from_github(&owner, &repo, git_ref.as_deref(), project_root, project_name);
+        }
+        templates::TemplateRef::Url { .. } => {
+            eprintln!("error: arbitrary URL templates are not yet supported");
+            eprintln!("note: use the GitHub shorthand `<owner>/<repo>[#ref]`");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+fn scaffold_from_github(
+    owner: &str,
+    repo: &str,
+    git_ref: Option<&str>,
+    project_root: &std::path::Path,
+    project_name: &str,
+) {
+    let ref_label = git_ref.unwrap_or("HEAD");
+    println!(
+        "fetching https://github.com/{}/{} ({})",
+        owner, repo, ref_label
+    );
+    let template_root = match templates::fetch_github_template(owner, repo, git_ref) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let opts = templates::ScaffoldOptions {
+        template_root: &template_root,
+        target_dir: project_root,
+        project_name,
+    };
+    let res = templates::scaffold_from_local(&opts);
+    let _ = std::fs::remove_dir_all(&template_root);
+    if let Err(e) = res {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+    overlay_meta_files(project_root, project_name);
+    println!(
+        "scaffolded {} from {}/{} ({})",
+        project_name, owner, repo, ref_label
+    );
+}
+
+#[cfg(not(feature = "http-client"))]
+fn scaffold_from_github(
+    _owner: &str,
+    _repo: &str,
+    _git_ref: Option<&str>,
+    _project_root: &std::path::Path,
+    _project_name: &str,
+) {
+    eprintln!("error: this fai build was compiled without the `http-client` feature");
+    eprintln!("note: rebuild with `--features http-client` to use network templates");
+    std::process::exit(1);
+}
+
+fn inline_scaffold(project_root: &std::path::Path, project_name: &str) {
     let src_dir = project_root.join("src");
     if let Err(e) = std::fs::create_dir_all(&src_dir) {
         eprintln!("error creating directory: {}", e);
         std::process::exit(1);
     }
 
-    let codex_dir = project_root.join(".codex");
-    if let Err(e) = std::fs::create_dir_all(&codex_dir) {
-        eprintln!("error creating directory: {}", e);
-        std::process::exit(1);
-    }
-
-    let project_name = project_root
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-
-    let files: Vec<(std::path::PathBuf, String)> = vec![
-        (src_dir.join("main.fai"), scaffold_main(&project_name)),
+    let project_files: Vec<(std::path::PathBuf, String)> = vec![
+        (src_dir.join("main.fai"), scaffold_main(project_name)),
         (
             project_root.join("fai.toml"),
-            scaffold_fai_toml(&project_name),
+            scaffold_fai_toml(project_name),
         ),
         (
             project_root.join("README.md"),
-            scaffold_readme(&project_name),
-        ),
-        (project_root.join("language.md"), scaffold_language_md()),
-        (
-            project_root.join("CLAUDE.md"),
-            scaffold_claude_md(&project_name),
-        ),
-        (project_root.join("AGENTS.md"), scaffold_agents_md()),
-        (project_root.join(".mcp.json"), scaffold_mcp_json()),
-        (
-            project_root.join(".codex/config.toml"),
-            scaffold_codex_config(),
+            scaffold_readme(project_name),
         ),
     ];
 
-    for (path, content) in &files {
+    for (path, content) in &project_files {
         if let Err(e) = std::fs::write(path, content) {
             eprintln!("error writing {}: {}", path.display(), e);
             std::process::exit(1);
         }
     }
 
+    overlay_meta_files(project_root, project_name);
+
     println!("created project '{}'", project_name);
-    for (path, _) in &files {
-        println!("  {}", path.display());
+}
+
+/// Write language-level metadata files (`CLAUDE.md`, `AGENTS.md`,
+/// `language.md`, `.mcp.json`, `.codex/config.toml`) into a project
+/// directory. These belong with the language tooling, not with any
+/// individual template — `fai new` overlays them onto every new
+/// project regardless of template source.
+///
+/// A file the template already ships is preserved (template wins).
+/// Anything missing is filled in with the canonical default.
+fn overlay_meta_files(dir: &std::path::Path, project_name: &str) {
+    let codex_dir = dir.join(".codex");
+    if !codex_dir.exists() {
+        let _ = std::fs::create_dir_all(&codex_dir);
+    }
+
+    let files: Vec<(std::path::PathBuf, String)> = vec![
+        (dir.join("language.md"), scaffold_language_md()),
+        (dir.join("CLAUDE.md"), scaffold_claude_md(project_name)),
+        (dir.join("AGENTS.md"), scaffold_agents_md()),
+        (dir.join(".mcp.json"), scaffold_mcp_json()),
+        (dir.join(".codex/config.toml"), scaffold_codex_config()),
+    ];
+
+    for (path, content) in &files {
+        if path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::write(path, content) {
+            eprintln!("warning: could not write {}: {}", path.display(), e);
+        }
     }
 }
 
@@ -4212,15 +4636,24 @@ fn read_file(path: &str) -> String {
 /// Compile forai source to wasm via the direct AST→wasm path.
 /// If direct refuses now, it's a bug or an unsupported construct that
 /// should be surfaced instead of silently falling back to another backend.
+///
+/// `rpc_proxy_substitution` is set by `step_build` when the active
+/// sub-project has `rpc_server = false` (default) and a remote dependency
+/// URL is available. Passing `Some((url, hash))` rewrites every reachable
+/// `remote def` body to call `remoteCall(url, key, args, hash)` so the
+/// client wasm never executes server-only code. Set to `None` for the
+/// server target (`rpc_server = true`) and for `is_test = true` so unit
+/// tests exercising server bodies natively keep working.
 fn compile_fai_to_wasm(
     content: &str,
     path: &str,
     is_test: bool,
     synthetic_modules: Vec<(String, String)>,
     target: Option<&str>,
+    rpc_proxy_substitution: Option<(&str, &str)>,
 ) -> Vec<u8> {
     let source_root = find_source_root(path);
-    let prepared = match fai_compiler::prepare_source_with_synthetic_and_entry(
+    let mut prepared = match fai_compiler::prepare_source_with_synthetic_and_entry(
         content,
         source_root.as_deref(),
         synthetic_modules,
@@ -4232,6 +4665,10 @@ fn compile_fai_to_wasm(
             std::process::exit(1);
         }
     };
+
+    if let Some((url, hash)) = rpc_proxy_substitution {
+        rewrite_remote_def_bodies(&mut prepared.modules, url, hash);
+    }
 
     let mut checker = fai_checker::Checker::new();
     if let Err(e) = run_checker(&mut checker, &prepared) {
@@ -5009,26 +5446,35 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_runtime_js_exports_submit_handler() {
-        // Regression guard: the forui view layer registers onSubmit handlers
-        // for TextInput Enter-key events. The generated runtime JS must expose
-        // a `handleSubmitEvent(id)` bridge that calls the wasm
-        // `invokeSubmitHandler` export.
+    fn test_generate_runtime_js_exposes_view_event_bridges() {
+        // The forui view layer wires DOM events through forai's std.events:
+        // the generated inline `onclick`/`oninput`/`onkeydown` handlers call
+        // `handleEvent` / `handleInputEvent` / `handleSubmitEvent`, which emit
+        // `view:click`, `view:input`, `view:submit` topics. Forui subscribes
+        // to those topics and runs the registered closures.
         let js = generate_runtime_js("prog.wasm");
-        assert!(
-            js.contains("function handleSubmitEvent"),
-            "generated runtime JS is missing handleSubmitEvent:\n{}",
-            js
-        );
-        assert!(
-            js.contains("invokeSubmitHandler"),
-            "handleSubmitEvent doesn't call invokeSubmitHandler:\n{}",
-            js
-        );
-        // Sibling bridges should still be present so this test doesn't falsely
-        // pass by accident if someone refactors.
         assert!(js.contains("function handleEvent"));
         assert!(js.contains("function handleInputEvent"));
+        assert!(js.contains("function handleSubmitEvent"));
+        assert!(
+            js.contains("'view:click'"),
+            "handleEvent should emit on view:click:\n{}",
+            js
+        );
+        assert!(
+            js.contains("'view:input'"),
+            "handleInputEvent should emit on view:input:\n{}",
+            js
+        );
+        assert!(
+            js.contains("'view:submit'"),
+            "handleSubmitEvent should emit on view:submit:\n{}",
+            js
+        );
+        // The event_* env imports must be live, not stubs — std.events
+        // is implemented host-side, including in the browser.
+        assert!(js.contains("faiEventRegistry"));
+        assert!(js.contains("faiInvokeClosure"));
     }
 
     #[test]
@@ -6065,5 +6511,148 @@ mod tests {
         assert!(project_path.join("AGENTS.md").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_cmd_new_with_local_template() {
+        let base = temp_dir("cmd_new_local_tpl");
+        let tpl = base.join("tpl");
+
+        // Stand up a tiny template fixture
+        std::fs::create_dir_all(tpl.join("src/pages")).unwrap();
+        std::fs::write(
+            tpl.join("fai.toml"),
+            "[project]\nname = \"TplName\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tpl.join("src/pages/home.fai"),
+            "def HomePage\n  @return Void\ndo\nend\n",
+        )
+        .unwrap();
+        std::fs::write(tpl.join("README.md"), "# tpl readme\n").unwrap();
+
+        let project_path = base.join("scaffolded-app");
+        let args: Vec<String> = vec![
+            project_path.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            tpl.to_str().unwrap().to_string(),
+        ];
+        cmd_new(&args);
+
+        // Template files copied verbatim
+        assert!(project_path.join("src/pages/home.fai").exists());
+        assert!(project_path.join("README.md").exists());
+        // Project name substituted in fai.toml
+        let toml = std::fs::read_to_string(project_path.join("fai.toml")).unwrap();
+        assert!(
+            toml.contains("name = \"scaffolded-app\""),
+            "fai.toml should carry the new project name, got:\n{}",
+            toml
+        );
+        assert!(
+            !toml.contains("TplName"),
+            "old name should be gone from fai.toml, got:\n{}",
+            toml
+        );
+
+        // Meta files (language reference, AI guidance, MCP config) are
+        // overlaid by `fai new` regardless of template — they're
+        // language-level concerns, not project-shape.
+        assert!(project_path.join("CLAUDE.md").exists());
+        assert!(project_path.join("AGENTS.md").exists());
+        assert!(project_path.join("language.md").exists());
+        assert!(project_path.join(".mcp.json").exists());
+        assert!(project_path.join(".codex/config.toml").exists());
+
+        // The auto-overlaid CLAUDE.md should reference the new project
+        // name, not the template's source name.
+        let claude = std::fs::read_to_string(project_path.join("CLAUDE.md")).unwrap();
+        assert!(
+            claude.starts_with("# scaffolded-app\n"),
+            "CLAUDE.md heading should use the new project name, got:\n{}",
+            &claude[..claude.len().min(80)]
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_cmd_new_template_can_ship_its_own_meta_files() {
+        // A template that ships e.g. a custom CLAUDE.md (forui-specific
+        // guidance, say) should keep its version — `fai new` only fills
+        // in meta files the template *didn't* provide.
+        let base = temp_dir("cmd_new_meta_override");
+        let tpl = base.join("tpl");
+        std::fs::create_dir_all(tpl.join("src")).unwrap();
+        std::fs::write(tpl.join("fai.toml"), "[project]\nname = \"X\"\n").unwrap();
+        std::fs::write(tpl.join("src/main.fai"), "def main\n  @return Void\ndo\nend\n").unwrap();
+        std::fs::write(tpl.join("CLAUDE.md"), "# Custom guidance\n\nTemplate-owned.\n").unwrap();
+
+        let project_path = base.join("app");
+        cmd_new(&[
+            project_path.to_str().unwrap().to_string(),
+            "--template".to_string(),
+            tpl.to_str().unwrap().to_string(),
+        ]);
+
+        let claude = std::fs::read_to_string(project_path.join("CLAUDE.md")).unwrap();
+        assert!(
+            claude.contains("Template-owned"),
+            "template-supplied CLAUDE.md should be preserved, got:\n{}",
+            claude
+        );
+        // But meta files the template *didn't* ship still get filled in.
+        assert!(project_path.join("language.md").exists());
+        assert!(project_path.join("AGENTS.md").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overlay_meta_writes_files_when_absent() {
+        let base = temp_dir("overlay_writes");
+        let dir = base.join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        overlay_meta_files(&dir, "my-app");
+        assert!(dir.join("language.md").exists());
+        assert!(dir.join("CLAUDE.md").exists());
+        assert!(dir.join("AGENTS.md").exists());
+        assert!(dir.join(".mcp.json").exists());
+        assert!(dir.join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn overlay_meta_preserves_existing_file() {
+        let base = temp_dir("overlay_preserves");
+        let dir = base.join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "OWNED").unwrap();
+        overlay_meta_files(&dir, "my-app");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap(),
+            "OWNED"
+        );
+    }
+
+    #[test]
+    fn overlay_meta_interpolates_project_name() {
+        let base = temp_dir("overlay_name");
+        let dir = base.join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        overlay_meta_files(&dir, "fancy-app");
+        let claude = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        assert!(claude.starts_with("# fancy-app\n"));
+    }
+
+    #[test]
+    fn overlay_meta_creates_codex_dir_if_missing() {
+        let base = temp_dir("overlay_codex");
+        let dir = base.join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        // .codex doesn't exist yet
+        overlay_meta_files(&dir, "p");
+        assert!(dir.join(".codex").is_dir());
+        assert!(dir.join(".codex/config.toml").exists());
     }
 }

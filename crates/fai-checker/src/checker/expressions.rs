@@ -81,18 +81,21 @@ impl Checker {
                 if ae.items.is_empty() {
                     return Ok(array_of(Type::Unknown));
                 }
-                let first = self.check_expression(&ae.items[0], env)?;
+                // Walk items, unifying types as we go. `unify_branch_type`
+                // already handles same-type, T + null → T?, and similar
+                // narrow widening. When two items have no clean
+                // unification (e.g. Int + String), the literal becomes
+                // `Unknown[]` — forai is dynamically typed at runtime, and
+                // mixed-type arrays (sqlite param lists, RPC arg arrays)
+                // are a real callsite shape that the runtime is happy with.
+                // See forai#1.
+                let mut element_type = self.check_expression(&ae.items[0], env)?;
                 for item in &ae.items[1..] {
                     let item_type = self.check_expression(item, env)?;
-                    if !same_type(&first, &item_type) {
-                        return Err(CheckError::new(format!(
-                            "Array items must have one type: got {} and {}",
-                            describe_type(&first),
-                            describe_type(&item_type)
-                        )));
-                    }
+                    element_type = unify_branch_type(&element_type, &item_type)
+                        .unwrap_or(Type::Unknown);
                 }
-                Ok(array_of(first))
+                Ok(array_of(element_type))
             }
             Expression::DictionaryExpression(de) => {
                 // Check all entry values

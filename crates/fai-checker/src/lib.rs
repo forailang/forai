@@ -841,11 +841,12 @@ end
     // ── Array type errors ────────────────────────────────────────────
 
     #[test]
-    fn test_array_mixed_types_errors() {
-        check_err(
-            "def main\n    @return Void\ndo\n  let a = [1 'hello' 3]\nend",
-            "Array items must have one type",
-        );
+    fn test_array_mixed_types_widen_to_unknown() {
+        // forai#1: mixed-type literals widen to `Unknown[]` instead of
+        // erroring. Sqlite param arrays and RPC arg arrays both rely on
+        // this — the runtime is happy with mixed-type arrays, the
+        // checker should not preemptively reject them.
+        check_ok("def main\n    @return Void\ndo\n  let a Unknown[] = [1 'hello' 3]\nend");
     }
 
     // ── Optional check and force unwrap errors ───────────────────────

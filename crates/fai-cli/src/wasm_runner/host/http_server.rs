@@ -289,6 +289,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     let response = dispatch_router_request(&mut caller, id as u32, request_val);
                     let pair = build_request_response(&mut caller, request_val, response);
                     super::events::dispatch_event(&mut caller, "http:afterResponse", pair);
+                    // Drain any deferred events queued during the
+                    // request — `http:beforeRequest` / `http:afterResponse`
+                    // subscribers can `emitDeferred(...)` for fire-and-
+                    // forget logging or metrics. Drain happens after
+                    // afterResponse so subscribers see the response in
+                    // its final shape, but before we write the wire
+                    // response so a deferred subscriber that throws
+                    // doesn't block the client. See Phase 5 of
+                    // plans/event-system.md.
+                    super::events::drain_queue(&mut caller);
                     write_http_response(&mut caller, stream, response);
                 }
             },

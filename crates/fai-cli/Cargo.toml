@@ -25,9 +25,11 @@ fai-codegen-wasm = { path = "../fai-codegen-wasm" }
 fai-ffi = { path = "../fai-ffi" }
 wasmtime = "29"
 ureq = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 
 [features]
 default = ["http-client"]
-http-client = ["ureq"]
+http-client = ["ureq", "flate2", "tar"]

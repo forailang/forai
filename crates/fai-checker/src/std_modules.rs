@@ -201,6 +201,9 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("subscribers", "eventSubscribers"),
             ("clear", "eventClear"),
             ("clearAll", "eventClearAll"),
+            ("emitDeferred", "eventEmitDeferred"),
+            ("drain", "eventDrain"),
+            ("queueLen", "eventQueueLen"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))

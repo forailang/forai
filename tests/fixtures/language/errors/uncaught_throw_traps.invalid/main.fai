@@ -1,0 +1,28 @@
+# expect: runtime_error
+# error: unreachable
+# Top-level uncaught throw must terminate the program. Pre-fix this
+# trapped via `Drop + Unreachable`. After cross-function throw landed,
+# the new path stashes into `error_flag`/`error_value` and `Return`s —
+# without a guard inside `<__start__>`, control walked all the way out
+# of the program with the globals set but exit 0. This fixture pins
+# the desired behavior: a runtime error/trap, not a silent success.
+# Throws unconditionally.
+def explode
+    @return Void
+do
+  throw Error('boom')
+end
+
+test explode
+it 'placeholder so coverage sees a test for explode'
+  print('placeholder')
+end
+end
+
+def main
+    @return Void
+do
+  print('before')
+  explode()
+  print('after')
+end

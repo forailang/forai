@@ -20,7 +20,8 @@ use crate::runtime::{
     IMPORT_ARRAY_FILTER, IMPORT_ARRAY_FIND, IMPORT_ARRAY_IS_ALL, IMPORT_ARRAY_IS_ANY,
     IMPORT_ARRAY_MAP, IMPORT_CALL_FFI, IMPORT_CLI_CLEAR, IMPORT_CLI_MOVE_TO, IMPORT_CLI_READ_LINE,
     IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_ENV_GET, IMPORT_ENV_LOAD, IMPORT_EVENT_CLEAR,
-    IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_EMIT, IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE,
+    IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT, IMPORT_EVENT_EMIT_DEFERRED,
+    IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE, IMPORT_EVENT_QUEUE_LEN,
     IMPORT_EVENT_SUBSCRIBERS, IMPORT_FFI_AVAILABLE,
     IMPORT_FILE_EXISTS,
     IMPORT_FILE_LIST, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
@@ -605,6 +606,13 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ("std.events", "subscribers") => (IMPORT_EVENT_SUBSCRIBERS, &[AS::String], RS::MakeInt),
         ("std.events", "clear") => (IMPORT_EVENT_CLEAR, &[AS::String], RS::Void),
         ("std.events", "clearAll") => (IMPORT_EVENT_CLEAR_ALL, &[], RS::Void),
+        ("std.events", "emitDeferred") => (
+            IMPORT_EVENT_EMIT_DEFERRED,
+            &[AS::String, AS::Boxed],
+            RS::Void,
+        ),
+        ("std.events", "drain") => (IMPORT_EVENT_DRAIN, &[], RS::Void),
+        ("std.events", "queueLen") => (IMPORT_EVENT_QUEUE_LEN, &[], RS::MakeInt),
 
         // std.html — (String) → String.
         ("std.html", "escape") => (IMPORT_HTML_ESCAPE, &[AS::String], RS::Boxed),
@@ -3724,10 +3732,36 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::Return);
             return Ok(());
         }
+        // `<__start__>` is the synthesised wrapper that calls
+        // `<__module_init__>` then user `main`. Drain the deferred
+        // event queue once everything has run so any
+        // `events.emitDeferred` from main / module init / event
+        // subscribers gets dispatched before the program exits.
+        // The drain has to happen between the tail expression
+        // evaluating and the `Return` so main's return value (which
+        // hosts read off `_start`) survives. See Phase 5 of
+        // plans/event-system.md.
+        let is_start = self.fd.name == "<__start__>";
         let last = self.fd.body.len() - 1;
         for (i, stmt) in self.fd.body.iter().enumerate() {
             if i == last {
-                self.compile_tail_stmt(stmt)?;
+                if is_start {
+                    if let Statement::ExpressionStatement(es) = stmt {
+                        self.compile_expr_as(&es.expression, ValueShape::Boxed)?;
+                        let saved = self.alloc_local();
+                        self.emit(Instruction::LocalSet(saved));
+                        self.emit_import_call(crate::runtime::IMPORT_EVENT_DRAIN);
+                        self.emit(Instruction::LocalGet(saved));
+                        self.emit(Instruction::Return);
+                    } else {
+                        // `<__start__>` bodies are always built from
+                        // mk_call_stmt() ExpressionStatements; this
+                        // fall-through is just a safety net.
+                        self.compile_tail_stmt(stmt)?;
+                    }
+                } else {
+                    self.compile_tail_stmt(stmt)?;
+                }
             } else {
                 self.compile_stmt(stmt)?;
             }
@@ -4178,6 +4212,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::I64Const(0));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
             self.emit(Instruction::Br(rel));
+        } else if self.fd.name == "<__start__>" {
+            // Outermost frame — there is nowhere left to propagate.
+            // A clean `Return` here would silently exit the program
+            // with `error_flag` still set; trap instead so an
+            // uncaught throw terminates the program (the pre-fix
+            // behaviour from before cross-function throw landed).
+            // See forai#4.
+            self.emit(Instruction::Unreachable);
         } else {
             // Push the saved result and return — it's a placeholder
             // the caller throws away once it sees the flag set.

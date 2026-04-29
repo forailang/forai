@@ -60,6 +60,17 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     );
     ins(b, "eventClear", &[p("name", Type::String)], &[Type::Void]);
     ins(b, "eventClearAll", &[], &[Type::Void]);
+    // Phase 5: deferred emit + drain. `emitDeferred` enqueues without
+    // dispatching; `drain` runs the queue until empty, dispatching
+    // each event through the same path as sync `emit`.
+    ins(
+        b,
+        "eventEmitDeferred",
+        &[p("name", Type::String), p("data", Type::Unknown)],
+        &[Type::Void],
+    );
+    ins(b, "eventDrain", &[], &[Type::Void]);
+    ins(b, "eventQueueLen", &[], &[Type::Int]);
 }
 
 #[cfg(test)]

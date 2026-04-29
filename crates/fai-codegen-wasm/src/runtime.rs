@@ -408,7 +408,20 @@ pub const IMPORT_EVENT_SUBSCRIBERS: u32 = 83;
 pub const IMPORT_EVENT_CLEAR: u32 = 84;
 /// `env.event_clear_all() -> void` — drop every subscription.
 pub const IMPORT_EVENT_CLEAR_ALL: u32 = 85;
-pub const IMPORT_COUNT: u32 = 86;
+/// `env.event_emit_deferred(name_ptr, name_len, data_val) -> void` —
+/// queue an event for later dispatch. Each call appends one entry to
+/// a single FIFO queue; entries are drained by `event_drain` in emit
+/// order regardless of name. See Phase 5 of plans/event-system.md.
+pub const IMPORT_EVENT_EMIT_DEFERRED: u32 = 86;
+/// `env.event_drain() -> void` — dispatch every queued deferred event
+/// in FIFO order. Subscribers can `emitDeferred` more events during
+/// drain; those join the same drain pass. A subscriber that throws
+/// becomes an `events:error` event with `{ name, message }` data and
+/// drain continues — fire-and-forget by design.
+pub const IMPORT_EVENT_DRAIN: u32 = 87;
+/// `env.event_queue_len() -> i32` — current deferred queue length.
+pub const IMPORT_EVENT_QUEUE_LEN: u32 = 88;
+pub const IMPORT_COUNT: u32 = 89;
 
 /// Return which imports are available for a given build target.
 /// `None` means all imports available (native/test). The returned
@@ -6991,5 +7004,15 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ("event_clear", vec![ValType::I32, ValType::I32], vec![]),
         // IMPORT_EVENT_CLEAR_ALL: () -> void
         ("event_clear_all", vec![], vec![]),
+        // IMPORT_EVENT_EMIT_DEFERRED: (name_ptr, name_len, data_val) -> void
+        (
+            "event_emit_deferred",
+            vec![ValType::I32, ValType::I32, ValType::I64],
+            vec![],
+        ),
+        // IMPORT_EVENT_DRAIN: () -> void
+        ("event_drain", vec![], vec![]),
+        // IMPORT_EVENT_QUEUE_LEN: () -> i32
+        ("event_queue_len", vec![], vec![ValType::I32]),
     ]
 }
