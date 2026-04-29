@@ -1,0 +1,92 @@
+name: nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            asset: fai-linux-x86_64.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            asset: fai-linux-aarch64.tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            asset: fai-darwin-x86_64.tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            asset: fai-darwin-aarch64.tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build fai
+        run: cargo build --release --locked --bin fai --target ${{ matrix.target }}
+      - name: package
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/fai"
+          strip "$bin" || true
+          tar -czf "${{ matrix.asset }}" -C "target/${{ matrix.target }}/release" fai
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256" 2>/dev/null \
+            || shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  release:
+    name: publish nightly release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: list assets
+        run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly (${{ github.sha }})
+          body: |
+            Rolling nightly build from `main` @ ${{ github.sha }}.
+            See `install.sh` in the repo for one-line installation.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
