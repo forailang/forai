@@ -20,8 +20,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: build fai (cli tests in fai.rs invoke target/debug/fai)
-        run: cargo build --locked --bin fai
+      - name: build cli binaries (tests in fai.rs/main.rs/feature-tests invoke target/debug/{fai,forai})
+        run: cargo build --locked --bin fai --bin forai
       - run: cargo test --workspace --locked
 
   build:
