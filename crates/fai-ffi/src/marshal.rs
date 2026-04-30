@@ -4,7 +4,7 @@
 //! This works correctly on all platforms including aarch64 macOS.
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 
 use fai_core::gc::*;
 use fai_core::value::Value;
@@ -162,7 +162,7 @@ fn convert_float_return(raw: f64) -> Value {
 }
 
 unsafe fn convert_string_return(raw: usize) -> Value {
-    let ptr = raw as *const i8;
+    let ptr = raw as *const c_char;
     if ptr.is_null() {
         Value::null()
     } else {
