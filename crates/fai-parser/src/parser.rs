@@ -1718,6 +1718,28 @@ impl Parser {
             }
             break;
         }
+        // Trailing do...end after a UFCS member chain:
+        // `obj.method do ... end` → method(obj, <closure>) via UFCS rewrite
+        // The pre-loop check at the top of this function handles bare
+        // identifiers, but the chain `Foo(...).bar do ... end` needs a
+        // second check after the .member traversal completes.
+        if self.check(TokenType::Do) {
+            let is_call_target = matches!(&expr, Expression::Identifier(_) | Expression::Member(_));
+            if is_call_target {
+                let block = self.parse_do_block()?;
+                let bloc = block.location().clone();
+                let loc = expr.location().clone();
+                expr = Expression::Call(CallExpr {
+                    callee: Box::new(expr),
+                    args: vec![CallArgument {
+                        label: None,
+                        value: block,
+                        location: bloc,
+                    }],
+                    location: loc,
+                });
+            }
+        }
         Ok(expr)
     }
 

@@ -1,0 +1,54 @@
+# expect: ok
+# stdout:
+#   fired
+# UFCS + trailing closure: `obj.method do ... end` desugars to
+# `method(obj, <closure>)`. Pre-fix, the parser handled
+# `bareIdent do ... end` and `call(...) do ... end` but not
+# `chain.member do ... end` — the trailing-do check only ran
+# before walking `.member` segments. After the fix, the same
+# check fires after the chain too.
+
+type def Action
+    @return Void
+end
+
+# Identifier holder for chaining.
+def make
+    @return Int
+do
+  1
+end
+
+# Run an action on a number, returning the same number.
+def withAction
+    @param n Int
+    @param a Action
+    @return Int
+do
+  a()
+  n
+end
+
+test make
+it 'returns 1'
+  assert.equals(make(), 1)
+end
+end
+
+test withAction
+it 'invokes the closure passed via UFCS+trailing-closure'
+  var fired = false
+  let _ = make().withAction do
+      fired = true
+  end
+  assert.isTrue(fired)
+end
+end
+
+def main
+    @return Void
+do
+  let _y = make().withAction do
+      print('fired')
+  end
+end
