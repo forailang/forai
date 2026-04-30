@@ -34,6 +34,11 @@ case "$uname_m" in
     *) err "unsupported architecture: $uname_m" ;;
 esac
 
+# Only Apple Silicon Macs are published; Intel Macs aren't in the build matrix.
+if [ "$os" = "darwin" ] && [ "$arch" = "x86_64" ]; then
+    err "Intel Macs are not supported — only Apple Silicon (arm64) Darwin builds are published"
+fi
+
 asset="fai-${os}-${arch}.tar.gz"
 url="https://github.com/${REPO}/releases/download/${TAG}/${asset}"
 sha_url="${url}.sha256"
