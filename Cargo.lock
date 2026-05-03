@@ -518,6 +518,7 @@ dependencies = [
  "serde_json",
  "tar",
  "ureq",
+ "wasmparser 0.221.3",
  "wasmtime",
 ]
 

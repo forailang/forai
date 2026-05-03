@@ -24,6 +24,7 @@ fai-parser = { path = "../fai-parser" }
 fai-codegen-wasm = { path = "../fai-codegen-wasm" }
 fai-ffi = { path = "../fai-ffi" }
 wasmtime = "29"
+wasmparser = "0.221"
 ureq = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }

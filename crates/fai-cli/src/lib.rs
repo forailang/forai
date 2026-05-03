@@ -1530,16 +1530,23 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
     // AST→wasm path before falling back to the bytecode codegen.
     // `wasm-html` forces bytecode because the direct module
     // assembler doesn't honour target-filtered imports yet.
-    let wasm_bytes = compile_fai_to_wasm(
+    let mut wasm_bytes = compile_fai_to_wasm(
         &content,
         &path,
         false,
-        synthetic_modules,
+        synthetic_modules.clone(),
         codegen_target,
         rpc_proxy_substitution
             .as_ref()
             .map(|(u, h)| (u.as_str(), h.as_str())),
     );
+
+    // Embed FFI extern metadata into the wasm so a prebuilt `.wasm`
+    // dispatched via `fai run path/to/x.wasm` can rehydrate the
+    // `call_ffi` table without re-reading the original source. No-op
+    // when the project has no `extern` blocks (byte-identical output).
+    let externs = extract_extern_info_full(&content, &path, synthetic_modules);
+    wasm_runner::externs_section::embed_externs(&mut wasm_bytes, &externs);
 
     // Determine output directory and filename
     let output_path = if let Some(pos) = args.iter().position(|a| a == "-o") {

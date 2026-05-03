@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 use wasmtime::*;
 
+pub(crate) mod externs_section;
 mod heap;
 mod host;
 mod nan_box;
@@ -37,8 +38,15 @@ fn fmt_err(context: &str, e: wasmtime::Error) -> String {
 /// Run a compiled FAI WASM module. Output goes to the current host stdout sink
 /// (real stdout by default; a capture buffer when a [`output::CaptureGuard`]
 /// is active on this thread).
+///
+/// Auto-discovers FFI extern metadata from the wasm's `fai-externs`
+/// custom section if present, so a prebuilt `.wasm` carrying `extern`
+/// blocks (sqlite, libm, etc.) dispatches `call_ffi` correctly without
+/// the original source. Use [`run_wasm_with_externs`] when you have
+/// the externs in hand and want to override what's embedded.
 pub fn run_wasm(wasm_bytes: &[u8]) -> Result<(), String> {
-    run_wasm_with_externs(wasm_bytes, Vec::new())
+    let externs = externs_section::extract_externs(wasm_bytes);
+    run_wasm_with_externs(wasm_bytes, externs)
 }
 
 /// Same as [`run_wasm`], but populates the extern-function table the
