@@ -1,0 +1,19 @@
+use { bumpA, readB } from modlib
+
+# expect: ok
+# stdout:
+#   1
+#   42
+# Cross-file `var` reference: `a.fai` defines `bumpA` which reads
+# the var `seed` declared in `b.fai`. Pre-fix, the checker resolved
+# names file-by-file in alphabetical order — a function in the
+# alphabetically-earlier file failed with `Unknown name` for vars in
+# alphabetically-later files. After the fix, a per-module pre-pass
+# declares all top-level vars/lets before any function body is
+# checked, so the order doesn't matter.
+def main
+    @return Void
+do
+  print(bumpA())
+  print(readB())
+end

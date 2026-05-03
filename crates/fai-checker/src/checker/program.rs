@@ -82,6 +82,14 @@ impl Checker {
             // Forward-declare all functions/types/enums (public and private within module)
             self.forward_declare_all(&module.statements, &mut env)?;
 
+            // Forward-declare module-level `var` / `let` bindings before
+            // any function body is checked. Without this, a `var` defined
+            // in one file of the module isn't visible to a function in
+            // another file checked earlier in source order. The pre-pass
+            // type-checks each initializer and adds the name to env;
+            // the main loop below skips bindings that are already there.
+            self.forward_declare_module_bindings(&module.statements, &mut env);
+
             // Mark the module currently being checked so that any
             // ufcs_calls / named_param_reorder entries get tagged with
             // this module's name. This prevents source-coordinate
@@ -661,6 +669,46 @@ impl Checker {
         Ok(())
     }
 
+    /// Type-check each top-level `var` / `let` binding and register the
+    /// resulting name in the env. Run after `forward_declare_all` and
+    /// before the main statement check loop. Errors are pushed onto
+    /// `collected_errors` rather than returned so a single bad
+    /// initializer doesn't abort the rest of the pre-pass.
+    ///
+    /// The main loop's `check_top_level_statement` for VarStatement /
+    /// LetStatement no-ops when the binding name is already present in
+    /// env, so this pre-pass is the single place each module-level
+    /// binding gets checked.
+    fn forward_declare_module_bindings(
+        &mut self,
+        statements: &[Statement],
+        env: &mut Environment,
+    ) {
+        for stmt in statements {
+            match stmt {
+                Statement::VarStatement(vs) => {
+                    if let Err(e) =
+                        self.check_binding_statement(&vs.bindings, &vs.value, env, true, "var")
+                    {
+                        install_failed_binding_placeholders(stmt, env);
+                        self.collected_errors
+                            .push(self.attach_location(e, &vs.location));
+                    }
+                }
+                Statement::LetStatement(ls) => {
+                    if let Err(e) =
+                        self.check_binding_statement(&ls.bindings, &ls.value, env, false, "let")
+                    {
+                        install_failed_binding_placeholders(stmt, env);
+                        self.collected_errors
+                            .push(self.attach_location(e, &ls.location));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Build a module's public export table purely from its AST, no
     /// body check required. Mirrors `forward_declare_all` for signatures
     /// but writes into a map instead of an Environment so the result can
@@ -827,11 +875,20 @@ impl Checker {
         match stmt {
             Statement::UseStatement(_) => Ok(()),
             Statement::LetStatement(ls) => {
+                // forward_declare_module_bindings already handled this if
+                // every binding name is in the env; skip to avoid the
+                // duplicate-name error from a redundant define.
+                if ls.bindings.iter().all(|b| env.get(&b.name).is_ok()) {
+                    return Ok(());
+                }
                 self.check_binding_statement(&ls.bindings, &ls.value, env, false, "let")
                     .map_err(|e| self.attach_location(e, &ls.location))?;
                 Ok(())
             }
             Statement::VarStatement(vs) => {
+                if vs.bindings.iter().all(|b| env.get(&b.name).is_ok()) {
+                    return Ok(());
+                }
                 self.check_binding_statement(&vs.bindings, &vs.value, env, true, "var")
                     .map_err(|e| self.attach_location(e, &vs.location))?;
                 Ok(())

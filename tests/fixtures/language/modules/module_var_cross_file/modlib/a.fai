@@ -1,0 +1,13 @@
+# `bumpA` reads `seed` defined in b.fai. a.fai is alphabetically
+# first, so before the fix this failed to resolve.
+def bumpA
+    @return Int
+do
+  seed + 1
+end
+
+test bumpA
+it 'reads cross-file var defined in b.fai'
+  assert.equal(bumpA(), 42 + 1)
+end
+end

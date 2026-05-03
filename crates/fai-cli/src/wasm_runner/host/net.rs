@@ -3,8 +3,36 @@
 use wasmtime::*;
 
 #[cfg(feature = "http-client")]
-use super::super::heap::build_value;
+use super::super::heap::{build_value, wasm_alloc_str};
 use super::super::nan_box::VAL_NULL;
+#[cfg(feature = "http-client")]
+use super::events::{alloc_dict, write_global_i32, write_global_i64};
+
+/// Build a forai-shaped Error Dict (`{ message, kind }`) in guest
+/// memory and stash it into `__error_value` with `__error_flag = 1`
+/// so the post-call propagation in the wasm binary picks it up as if
+/// the host had `throw`n. Returns `VAL_NULL` as the result-stack
+/// placeholder — the caller's emit_post_call_propagation reads the
+/// flag, sees it set, and skips the placeholder.
+#[cfg(feature = "http-client")]
+fn signal_remote_call_error(caller: &mut Caller<'_, ()>, message: &str) -> i64 {
+    let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+        Some(m) => m,
+        None => return VAL_NULL,
+    };
+    let key_message = wasm_alloc_str(caller, &mem, "message");
+    let key_kind = wasm_alloc_str(caller, &mem, "kind");
+    let v_message = wasm_alloc_str(caller, &mem, message);
+    let v_kind = wasm_alloc_str(caller, &mem, "remote");
+    let err_box = alloc_dict(
+        caller,
+        &mem,
+        &[(key_message, v_message), (key_kind, v_kind)],
+    );
+    write_global_i32(caller, "__error_flag", 1);
+    write_global_i64(caller, "__error_value", err_box);
+    VAL_NULL
+}
 
 /// Mirror of `fai-runtime::natives::discover_c_library` for parity.
 /// Checks pkg-config, then common system paths, then Homebrew.
@@ -430,28 +458,60 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         .timeout_global(Some(std::time::Duration::from_secs(10)))
                         .build()
                         .new_agent();
+                    // Send the request and surface every failure mode as a
+                    // wasm throw the caller's try/catch can recover from:
+                    //   - network failure (offline, DNS, refused, timeout)
+                    //   - HTTP non-2xx (4xx/5xx — server reachable but
+                    //     returned an error status, possibly with a non-JSON
+                    //     body like an nginx error page)
+                    //   - invalid JSON (server responded but the body wasn't
+                    //     parseable — protocol mismatch, truncation, etc.)
+                    //   - app-level error (`{"ok":false,"error":...}`) —
+                    //     pass the server's message through verbatim
                     match agent
                         .post(&rpc_url)
                         .header("Content-Type", "application/json")
                         .send(body.as_bytes())
                     {
+                        Err(e) => signal_remote_call_error(
+                            &mut caller,
+                            &format!("network error: {}", e),
+                        ),
                         Ok(resp) => {
+                            let status = resp.status().as_u16();
                             let resp_body = resp.into_body().read_to_string().unwrap_or_default();
-                            if let Ok(parsed) =
-                                serde_json::from_str::<serde_json::Value>(&resp_body)
-                            {
-                                if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    let value =
-                                        parsed.get("value").unwrap_or(&serde_json::Value::Null);
-                                    build_value(&mut caller, &mem, value)
-                                } else {
-                                    VAL_NULL
-                                }
+                            if !(200..300).contains(&status) {
+                                signal_remote_call_error(
+                                    &mut caller,
+                                    &format!("HTTP {}", status),
+                                )
                             } else {
-                                VAL_NULL
+                                match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                                    Ok(parsed) => {
+                                        if parsed
+                                            .get("ok")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            let value = parsed
+                                                .get("value")
+                                                .unwrap_or(&serde_json::Value::Null);
+                                            build_value(&mut caller, &mem, value)
+                                        } else {
+                                            let msg = parsed
+                                                .get("error")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("remote call failed");
+                                            signal_remote_call_error(&mut caller, msg)
+                                        }
+                                    }
+                                    Err(_) => signal_remote_call_error(
+                                        &mut caller,
+                                        "invalid JSON in response",
+                                    ),
+                                }
                             }
                         }
-                        Err(_) => VAL_NULL,
                     }
                 }
                 #[cfg(not(feature = "http-client"))]

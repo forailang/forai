@@ -1097,9 +1097,21 @@ fn load_package_deps(source_root: &str) -> std::collections::HashMap<String, Pac
         }
 
         // Parse: "file:///path/to/src" = "1.0.0"
+        // Or relative: "file:../../forui" = "1.0.0" — resolved against the
+        // project root (the directory containing this fai.toml) so the dep
+        // path doesn't depend on the process's current working directory.
         if let Some((key_part, _)) = trimmed.split_once('=') {
             let key = key_part.trim().trim_matches('"');
-            if let Some(local_path) = key.strip_prefix("file://") {
+            if let Some(raw_path) = key.strip_prefix("file://") {
+                let local_path = if std::path::Path::new(raw_path).is_absolute() {
+                    raw_path.to_string()
+                } else {
+                    project_root
+                        .join(raw_path)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let local_path = local_path.as_str();
                 // Read the package's fai.toml to find its name and source_root
                 let pkg_toml = format!("{}/fai.toml", local_path);
                 if let Ok(pkg_content) = std::fs::read_to_string(&pkg_toml) {

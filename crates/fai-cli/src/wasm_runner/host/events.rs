@@ -472,7 +472,7 @@ fn read_subscription(
 /// allocations don't overlap even when the caller keeps growing the
 /// dict in place (we don't, but parity with the response builders is
 /// worth maintaining).
-fn alloc_dict(caller: &mut Caller<'_, ()>, mem: &Memory, entries: &[(i64, i64)]) -> i64 {
+pub(super) fn alloc_dict(caller: &mut Caller<'_, ()>, mem: &Memory, entries: &[(i64, i64)]) -> i64 {
     let addr = read_global_i32(caller, "__heap_ptr") as u32;
     let cap = std::cmp::max(entries.len(), 16);
     let data = mem.data_mut(&mut *caller);
@@ -504,7 +504,7 @@ fn read_global_i32(caller: &mut Caller<'_, ()>, name: &str) -> i32 {
         .unwrap_or(0)
 }
 
-fn write_global_i32(caller: &mut Caller<'_, ()>, name: &str, val: i32) {
+pub(super) fn write_global_i32(caller: &mut Caller<'_, ()>, name: &str, val: i32) {
     if let Some(g) = caller.get_export(name).and_then(|e| e.into_global()) {
         let _ = g.set(&mut *caller, Val::I32(val));
     }
@@ -521,7 +521,7 @@ fn read_global_i64(caller: &mut Caller<'_, ()>, name: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn write_global_i64(caller: &mut Caller<'_, ()>, name: &str, val: i64) {
+pub(super) fn write_global_i64(caller: &mut Caller<'_, ()>, name: &str, val: i64) {
     if let Some(g) = caller.get_export(name).and_then(|e| e.into_global()) {
         let _ = g.set(&mut *caller, Val::I64(val));
     }

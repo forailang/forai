@@ -238,7 +238,12 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "env",
             "http_server_router_listen",
             |mut caller: Caller<'_, ()>, id: i32, port: i32| {
-                let addr = format!("127.0.0.1:{}", port as u16);
+                // Bind to all interfaces so the same server reachable via
+                // localhost is also reachable via 127.0.0.1, the LAN IP, etc.
+                // Cookies set by the server scope to the host the request
+                // arrived on, so they match same-origin requests from the
+                // browser regardless of which hostname the user typed.
+                let addr = format!("0.0.0.0:{}", port as u16);
                 let listener = match TcpListener::bind(&addr) {
                     Ok(l) => l,
                     Err(e) => {

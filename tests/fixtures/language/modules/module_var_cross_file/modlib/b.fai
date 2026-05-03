@@ -1,0 +1,15 @@
+var seed Int = 42
+
+# Read the cross-file var directly from the file that owns it.
+# Confirms the var works locally too.
+def readB
+    @return Int
+do
+  seed
+end
+
+test readB
+it 'reads its own var'
+  assert.equal(readB(), 42)
+end
+end

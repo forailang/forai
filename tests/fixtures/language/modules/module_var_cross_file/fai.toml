@@ -1,0 +1,4 @@
+[project]
+name = "module_var_cross_file"
+version = "0.1.0"
+source_root = "."

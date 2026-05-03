@@ -1381,18 +1381,9 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
                         if matches!(sub.target, Some(BuildTarget::WasmHtml)) {
                             build_args.push("--html".to_string());
                         }
-                        if let Some(bd) = &sub.build_dir {
-                            let out_dir = root.join(bd);
-                            let _ = std::fs::create_dir_all(&out_dir);
-                            let stem = entry.file_stem().unwrap_or_default().to_string_lossy();
-                            build_args.push("-o".to_string());
-                            build_args.push(
-                                out_dir
-                                    .join(format!("{}.wasm", stem))
-                                    .to_string_lossy()
-                                    .into_owned(),
-                            );
-                        }
+                        build_args.push("-o".to_string());
+                        build_args
+                            .push(sub_project_output_path(sub, &root, &entry, name));
                         cmd_build(&build_args);
                     } else {
                         eprintln!("  warning: target '{}' — no entry point found", name);
@@ -1438,18 +1429,9 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
                 if matches!(sub.target, Some(BuildTarget::WasmHtml)) {
                     build_args.push("--html".to_string());
                 }
-                if let Some(bd) = &sub.build_dir {
-                    let out_dir = root.join(bd);
-                    let _ = std::fs::create_dir_all(&out_dir);
-                    let stem = entry.file_stem().unwrap_or_default().to_string_lossy();
-                    build_args.push("-o".to_string());
-                    build_args.push(
-                        out_dir
-                            .join(format!("{}.wasm", stem))
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
+                build_args.push("-o".to_string());
+                build_args
+                    .push(sub_project_output_path(sub, &root, &entry, first_arg));
                 cmd_build(&build_args);
                 return;
             }
@@ -1576,20 +1558,15 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
             .unwrap_or_else(|| std::path::Path::new("."));
         let out_dir = project_root.join(build_dir);
         let _ = std::fs::create_dir_all(&out_dir);
-        let stem = std::path::Path::new(&path)
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap();
         out_dir
-            .join(format!("{}.wasm", stem))
+            .join(artifact_filename(&info.name, &path))
             .to_str()
             .unwrap()
             .to_string()
     } else if let Some(bd) = build_dir_opt.as_deref() {
         // For non-html targets, honor [project].build_dir when set so a
         // hello-world starter declaring build_dir = "build" actually writes
-        // there instead of dropping main.wasm next to main.fai. When unset,
+        // there instead of dropping the wasm next to main.fai. When unset,
         // fall back to the historical "next to source" behavior.
         let project_root = source_root
             .as_deref()
@@ -1597,20 +1574,21 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
             .unwrap_or_else(|| std::path::Path::new("."));
         let out_dir = project_root.join(bd);
         let _ = std::fs::create_dir_all(&out_dir);
-        let stem = std::path::Path::new(&path)
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap();
         out_dir
-            .join(format!("{}.wasm", stem))
+            .join(artifact_filename(&info.name, &path))
             .to_str()
             .unwrap()
             .to_string()
-    } else if let Some(stem) = path.strip_suffix(".fai") {
-        format!("{}.wasm", stem)
     } else {
-        format!("{}.wasm", path)
+        // No build_dir: keep the wasm next to the source file. Filename
+        // still derives from the project name when set.
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        dir.join(artifact_filename(&info.name, &path))
+            .to_str()
+            .unwrap()
+            .to_string()
     };
 
     match std::fs::write(&output_path, &wasm_bytes) {
@@ -1999,15 +1977,24 @@ fn locate_peer_interface_hash(
         if !in_deps {
             continue;
         }
-        // `"file:///abs/path" = "0.1.0"` — extract the path.
+        // `"file:///abs/path" = "0.1.0"` or `"file:../sibling" = "0.1.0"` —
+        // extract the path. Relative paths resolve against the consumer's
+        // project root so the dep doesn't depend on cwd.
         let Some((k, _v)) = t.split_once('=') else {
             continue;
         };
         let dep_spec = k.trim().trim_matches('"');
-        let Some(path_str) = dep_spec.strip_prefix("file://") else {
+        let Some(raw_path) = dep_spec.strip_prefix("file://") else {
             continue;
         };
-        let dep_root = std::path::Path::new(path_str);
+        let dep_root_buf = if std::path::Path::new(raw_path).is_absolute() {
+            std::path::PathBuf::from(raw_path)
+        } else {
+            consumer_root.join(raw_path)
+        };
+        let path_str = dep_root_buf.to_string_lossy().into_owned();
+        let path_str = path_str.as_str();
+        let dep_root = dep_root_buf.as_path();
 
         // Read the dep's project name to match against peer_name.
         let dep_info =
@@ -2766,6 +2753,52 @@ fn read_project_info(source_root: Option<&str>) -> (String, String, Option<Strin
 
 /// Parse a fai.toml content string into a ProjectInfo. Extracted from
 /// `read_project_info_full` for testability.
+/// Pick the `.wasm` artifact filename for a build. The project's
+/// `name` field wins; when it's the parser's default placeholder
+/// (`"unknown"`) or empty, we fall back to the source file's stem so
+/// ad-hoc `forai build foo.fai` runs against a loose file still produce
+/// `foo.wasm`. The returned string includes the `.wasm` extension.
+fn artifact_filename(project_name: &str, source_path: &str) -> String {
+    let stem = if !project_name.is_empty() && project_name != "unknown" {
+        project_name.to_string()
+    } else {
+        std::path::Path::new(source_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("main")
+            .to_string()
+    };
+    format!("{}.wasm", stem)
+}
+
+/// Compute the `-o <path>` value for a sub-project build. Used by
+/// both `cmd_build` paths (build-all and `-p <name>`). The artifact
+/// is always named after the sub-project key (`web.wasm`,
+/// `server.wasm`) — that name has to be passed explicitly via `-o`
+/// because the recursive `cmd_build` call will re-parse the fai.toml
+/// and otherwise pick up the top-level `[project].name`, which would
+/// collide across sub-projects. Creates the output directory as a
+/// side effect.
+fn sub_project_output_path(
+    sub: &SubProject,
+    root: &std::path::Path,
+    entry: &std::path::Path,
+    sub_name: &str,
+) -> String {
+    let out_dir = match &sub.build_dir {
+        Some(bd) => root.join(bd),
+        None => entry
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| root.to_path_buf()),
+    };
+    let _ = std::fs::create_dir_all(&out_dir);
+    out_dir
+        .join(format!("{}.wasm", sub_name))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn parse_project_info(content: &str) -> ProjectInfo {
     let mut info = ProjectInfo {
         name: "unknown".into(),
@@ -3306,7 +3339,7 @@ var env={{
   set_html_at:function(a,b,p,l){{var selector=readStr(a,b),html=readStr(p,l);var root=document.querySelector(selector);if(!root&&selector.charAt(0)==='#'){{root=document.createElement('div');root.id=selector.slice(1);app.innerHTML='';app.appendChild(root)}}if(!root)return;morphDom(root,html,selector!=='#app');wireEvents()}},
   json_parse:function(p,l){{try{{return jsToWasm(JSON.parse(readStr(p,l)))}}catch(e){{return QNAN|TAG_NULL}}}},
   json_stringify:function(v){{try{{return writeStrToWasm(JSON.stringify(wasmToJs(v)))}}catch(e){{return writeStrToWasm('null')}}}},
-  remote_call:function(a,b,c,d,e,f,g,h){{var u=readStr(a,b),fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);var body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});try{{var x=new XMLHttpRequest();x.open('POST',u.replace(/\/+$/,'')+'/fai/rpc',false);x.setRequestHeader('Content-Type','application/json');x.send(body);var resp=JSON.parse(x.responseText);if(resp.ok)return jsToWasm(resp.value);return NULL_VAL}}catch(e){{return NULL_VAL}}}},
+  remote_call:function(a,b,c,d,e,f,g,h){{var fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);var body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});function throwBack(msg){{var box=jsToWasm({{message:msg,kind:'remote'}});instance.exports.__error_flag.value=1;instance.exports.__error_value.value=BigInt.asIntN(64,BigInt(box));return NULL_VAL}}var x=new XMLHttpRequest();try{{x.open('POST','/fai/rpc',false);x.setRequestHeader('Content-Type','application/json');x.send(body)}}catch(e){{return throwBack('network error: '+(e&&e.message?e.message:'request failed'))}}if(x.status===0)return throwBack('network error: request blocked or offline');if(x.status<200||x.status>=300)return throwBack('HTTP '+x.status+(x.statusText?': '+x.statusText:''));var resp;try{{resp=JSON.parse(x.responseText)}}catch(e){{return throwBack('invalid JSON in response')}}if(resp.ok)return jsToWasm(resp.value);return throwBack(resp.error||'remote call failed')}},
   float_to_str:function(v,p){{var s=(v===Math.floor(v)&&isFinite(v))?String(BigInt(v)):String(v);var b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p,b.length).set(b);return b.length}},
   get_location_path:function(){{return writeStrToWasm(window.location.pathname)}},
   push_history_state:function(p,l){{history.pushState(null,'',readStr(p,l))}},
@@ -3684,7 +3717,7 @@ fn cmd_doc(args: &[String]) {
 
             let toml_path = project_root.join("fai.toml");
             if let Ok(toml_content) = std::fs::read_to_string(&toml_path) {
-                for (dep_name, dep_path) in doc_parse_file_deps(&toml_content) {
+                for (dep_name, dep_path) in doc_parse_file_deps(&toml_content, &project_root) {
                     // Package function docs
                     all_entries.extend(doc::collect_dependency_docs(&dep_path, &dep_name));
                     // Package overview doc (from the `docs` attribute in the package's fai.toml)
@@ -3763,7 +3796,12 @@ fn cmd_doc(args: &[String]) {
 
 /// Parse `[dependencies]` from a fai.toml string and return
 /// `(package_name, project_root_path)` pairs for `file://` entries.
-fn doc_parse_file_deps(toml_content: &str) -> Vec<(String, std::path::PathBuf)> {
+/// Relative paths resolve against `project_root` (the dir containing
+/// the fai.toml that holds the dep) so they don't depend on cwd.
+fn doc_parse_file_deps(
+    toml_content: &str,
+    project_root: &std::path::Path,
+) -> Vec<(String, std::path::PathBuf)> {
     let mut deps = Vec::new();
     let mut in_deps = false;
     for line in toml_content.lines() {
@@ -3779,10 +3817,16 @@ fn doc_parse_file_deps(toml_content: &str) -> Vec<(String, std::path::PathBuf)> 
             continue;
         };
         let dep_spec = k.trim().trim_matches('"');
-        let Some(path_str) = dep_spec.strip_prefix("file://") else {
+        let Some(raw_path) = dep_spec.strip_prefix("file://") else {
             continue;
         };
-        let dep_root = std::path::PathBuf::from(path_str);
+        let dep_root = if std::path::Path::new(raw_path).is_absolute() {
+            std::path::PathBuf::from(raw_path)
+        } else {
+            project_root.join(raw_path)
+        };
+        let path_str = dep_root.to_string_lossy().into_owned();
+        let path_str = path_str.as_str();
         let dep_info =
             read_project_info_full(Some(dep_root.join("src").to_str().unwrap_or(path_str)));
         let dep_name = if dep_info.name.is_empty() || dep_info.name == "unknown" {
@@ -5433,7 +5477,12 @@ mod tests {
 
     #[test]
     fn test_cmd_build_non_fai_extension() {
-        // Tests the else branch when path doesn't end with .fai (line 207)
+        // No fai.toml + non-`.fai` extension. The naming policy strips
+        // the extension via Path::file_stem, so prog.txt builds to
+        // prog.wasm. (Previously the policy preserved the full filename
+        // and produced prog.txt.wasm — that was an artefact of the old
+        // strip-suffix branch and didn't compose with the new
+        // project-name-driven naming.)
         let dir = temp_dir("cmd_build_txt");
         let txt_path = dir.join("prog.txt");
         std::fs::write(&txt_path, SIMPLE_FAI).unwrap();
@@ -5441,7 +5490,7 @@ mod tests {
         let args: Vec<String> = vec![txt_path.to_str().unwrap().to_string()];
         cmd_build(&args);
 
-        assert!(dir.join("prog.txt.wasm").exists());
+        assert!(dir.join("prog.wasm").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5494,7 +5543,7 @@ mod tests {
         cmd_build(&args);
 
         let public = dir.join("public");
-        assert!(public.join("prog.wasm").exists());
+        assert!(public.join("Test.wasm").exists());
         assert!(public.join("index.html").exists());
         assert!(public.join("fai-runtime.js").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -5519,7 +5568,7 @@ mod tests {
         cmd_build(&args);
 
         let public = dir.join("public");
-        assert!(public.join("prog.wasm").exists());
+        assert!(public.join("Test.wasm").exists());
         assert!(public.join("index.html").exists());
         assert!(public.join("fai-runtime.js").exists());
         assert!(public.join("forui.css").exists());
@@ -5980,7 +6029,9 @@ mod tests {
         cmd_build(&[fai_path.to_str().unwrap().to_string()]);
         std::env::remove_var("FORAI_SELF_BINARY");
 
-        let native = src.join("main");
+        // Native binary is named after [project].name ("NativeTest"),
+        // not the source file's stem.
+        let native = src.join("NativeTest");
         assert!(
             native.exists(),
             "native binary not produced at {}",
@@ -6057,14 +6108,16 @@ mod tests {
 
         // Both members should have produced a .wasm next to their
         // source file (default output location when no build_dir set).
+        // Filename comes from each member's [project].name, not from
+        // the source file's stem.
         assert!(
-            a_src.join("main.wasm").exists(),
-            "pkg_a main.wasm should exist, dir contents: {:?}",
+            a_src.join("PkgA.wasm").exists(),
+            "pkg_a PkgA.wasm should exist, dir contents: {:?}",
             std::fs::read_dir(&a_src).unwrap().collect::<Vec<_>>()
         );
         assert!(
-            b_src.join("pkgb.wasm").exists(),
-            "pkg_b pkgb.wasm should exist, dir contents: {:?}",
+            b_src.join("PkgB.wasm").exists(),
+            "pkg_b PkgB.wasm should exist, dir contents: {:?}",
             std::fs::read_dir(&b_src).unwrap().collect::<Vec<_>>()
         );
 
@@ -6198,8 +6251,8 @@ mod tests {
         cmd_build(&args);
         std::env::set_current_dir(&prev).unwrap();
 
-        let client_out = dir.join("build/client/main.wasm");
-        let server_out = dir.join("build/server/main.wasm");
+        let client_out = dir.join("build/client/client.wasm");
+        let server_out = dir.join("build/server/server.wasm");
         assert_eq!(
             client_out.exists(),
             expect_client,
@@ -6654,5 +6707,240 @@ mod tests {
         overlay_meta_files(&dir, "p");
         assert!(dir.join(".codex").is_dir());
         assert!(dir.join(".codex/config.toml").exists());
+    }
+
+    // ── artifact_filename / sub_project_output_path helpers ─────────
+
+    #[test]
+    fn artifact_filename_uses_project_name_when_set() {
+        assert_eq!(
+            artifact_filename("MySuperApp", "/x/y/main.fai"),
+            "MySuperApp.wasm"
+        );
+        assert_eq!(
+            artifact_filename("Forui", "/anywhere/entry.fai"),
+            "Forui.wasm"
+        );
+    }
+
+    #[test]
+    fn artifact_filename_falls_back_to_source_stem_when_name_is_default_unknown() {
+        // The parser fills `name` with "unknown" when `name = "..."`
+        // is missing from [project]. That sentinel must trigger the
+        // source-stem fallback so we don't ship `unknown.wasm`.
+        assert_eq!(
+            artifact_filename("unknown", "/x/y/myscratch.fai"),
+            "myscratch.wasm"
+        );
+    }
+
+    #[test]
+    fn artifact_filename_falls_back_when_name_is_empty() {
+        assert_eq!(artifact_filename("", "/x/main.fai"), "main.wasm");
+    }
+
+    #[test]
+    fn artifact_filename_strips_extension_in_fallback() {
+        // The fallback is Path::file_stem-based, so any extension is
+        // stripped — not just `.fai`.
+        assert_eq!(artifact_filename("", "/x/scratch.txt"), "scratch.wasm");
+    }
+
+    #[test]
+    fn sub_project_output_path_uses_build_dir_when_set() {
+        let tmp = temp_dir("subproj_path_with_bd");
+        let entry = tmp.join("src/web/main.fai");
+        let sub = SubProject {
+            build_dir: Some("build/web".to_string()),
+            ..SubProject::default()
+        };
+        let out = sub_project_output_path(&sub, &tmp, &entry, "web");
+        assert_eq!(out, tmp.join("build/web/web.wasm").to_string_lossy());
+        assert!(tmp.join("build/web").is_dir(), "out dir should be created");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sub_project_output_path_falls_back_to_entry_dir_when_no_build_dir() {
+        let tmp = temp_dir("subproj_path_no_bd");
+        let entry_dir = tmp.join("src/server");
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let entry = entry_dir.join("main.fai");
+        let sub = SubProject::default();
+        let out = sub_project_output_path(&sub, &tmp, &entry, "server");
+        assert_eq!(out, entry_dir.join("server.wasm").to_string_lossy());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Build artifact naming ────────────────────────────────────────
+    // The .wasm filename derives from the project's `name` field, not
+    // from the source file's stem. So `name = "MyApp"` always builds
+    // to `MyApp.wasm` regardless of whether the entry is main.fai,
+    // entry.fai, or anything else. For multi-project files, each
+    // sub-project's artifact uses the sub-project key (`web`, `server`,
+    // …). Source-stem naming remains as the fallback for ad-hoc
+    // builds with no fai.toml or with the default `"unknown"` name.
+
+    #[test]
+    fn test_build_uses_project_name_for_wasm_artifact() {
+        let dir = temp_dir("build_name_single_wasm");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"MySuperApp\"\nversion = \"0.1.0\"\nsource_root = \"src\"\nbuild_dir = \"out\"\n",
+        ).unwrap();
+        std::fs::write(src.join("main.fai"), SIMPLE_FAI).unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&[src.join("main.fai").to_string_lossy().into_owned()]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        let named = dir.join("out/MySuperApp.wasm");
+        let stem_named = dir.join("out/main.wasm");
+        assert!(
+            named.exists(),
+            "expected MySuperApp.wasm (project name), out dir: {:?}",
+            std::fs::read_dir(dir.join("out")).ok().map(|d| d
+                .filter_map(|e| e.ok().map(|x| x.file_name()))
+                .collect::<Vec<_>>())
+        );
+        assert!(
+            !stem_named.exists(),
+            "main.wasm should NOT exist — naming should come from project name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_html_uses_project_name() {
+        let dir = temp_dir("build_name_single_html");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"BrowserApp\"\nversion = \"0.1.0\"\nsource_root = \"src\"\ntarget = \"wasm-html\"\nbuild_dir = \"public\"\n",
+        ).unwrap();
+        std::fs::write(src.join("main.fai"), SIMPLE_FAI).unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&[
+            src.join("main.fai").to_string_lossy().into_owned(),
+            "--html".to_string(),
+        ]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(
+            dir.join("public/BrowserApp.wasm").exists(),
+            "wasm-html build should write BrowserApp.wasm"
+        );
+        assert!(
+            !dir.join("public/main.wasm").exists(),
+            "wasm-html build should NOT write main.wasm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_falls_back_to_source_stem_without_fai_toml() {
+        // A loose .fai file with no fai.toml has no project name to
+        // use. The naming policy falls back to the source stem so
+        // ad-hoc `forai build foo.fai` keeps working.
+        let dir = temp_dir("build_name_no_toml");
+        let path = dir.join("scratch.fai");
+        std::fs::write(&path, SIMPLE_FAI).unwrap();
+
+        cmd_build(&[path.to_string_lossy().into_owned()]);
+
+        assert!(
+            dir.join("scratch.wasm").exists(),
+            "no fai.toml should fall back to <source-stem>.wasm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_falls_back_when_name_is_default_unknown() {
+        // fai.toml exists but doesn't set `name` (parser leaves it as
+        // the default "unknown"). The fallback should still kick in —
+        // we don't want files called `unknown.wasm`.
+        let dir = temp_dir("build_name_default_unknown");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nversion = \"0.1.0\"\nsource_root = \"src\"\nbuild_dir = \"out\"\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.fai"), SIMPLE_FAI).unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&[src.join("main.fai").to_string_lossy().into_owned()]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(
+            dir.join("out/main.wasm").exists(),
+            "missing name should fall back to <source-stem>.wasm"
+        );
+        assert!(
+            !dir.join("out/unknown.wasm").exists(),
+            "should not produce unknown.wasm from the default name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_sub_project_uses_sub_project_key_as_artifact_name() {
+        // Multi-project: `[project.web]` and `[project.server]` should
+        // produce `web.wasm` and `server.wasm` regardless of each
+        // sub-project's main.fai stem.
+        let dir = temp_dir("build_name_multi");
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"AppShell\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
+             [project.web]\ntarget = \"wasm\"\nsource = \"src/web\"\nmain = \"src/web/main.fai\"\nbuild_dir = \"build/web\"\n\n\
+             [project.server]\ntarget = \"wasm\"\nsource = \"src/server\"\nmain = \"src/server/main.fai\"\nbuild_dir = \"build/server\"\n",
+        ).unwrap();
+        let web_src = dir.join("src/web");
+        let server_src = dir.join("src/server");
+        std::fs::create_dir_all(&web_src).unwrap();
+        std::fs::create_dir_all(&server_src).unwrap();
+        std::fs::write(web_src.join("main.fai"), SIMPLE_FAI).unwrap();
+        std::fs::write(server_src.join("main.fai"), SIMPLE_FAI).unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&[]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(
+            dir.join("build/web/web.wasm").exists(),
+            "sub-project 'web' should produce web.wasm"
+        );
+        assert!(
+            dir.join("build/server/server.wasm").exists(),
+            "sub-project 'server' should produce server.wasm"
+        );
+        assert!(
+            !dir.join("build/web/main.wasm").exists(),
+            "sub-project 'web' should NOT produce main.wasm"
+        );
+        assert!(
+            !dir.join("build/server/main.wasm").exists(),
+            "sub-project 'server' should NOT produce main.wasm"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
