@@ -121,8 +121,12 @@ version = "0.1.0"
 source_root = "src"
 
 [dependencies]
-"file:///path/to/forui" = "0.1.0"
-"file:///path/to/html-forui" = "0.1.0"
+Forui = "file:///path/to/forui"
+HtmlForui = "file:///path/to/html-forui"
+
+# Or fetch from a public git repo:
+# Forui = "https://github.com/forailang/forui"
+# HtmlForui = "https://github.com/forailang/html-forui"
 "#;
 
 const EXAMPLE_FAI_TOML_FULLSTACK: &str = r#"
@@ -147,8 +151,12 @@ main = "src/server/main.fai"
 build_dir = "build/server"
 
 [dependencies]
-"file:///path/to/forui" = "0.1.0"
-"file:///path/to/html-forui" = "0.1.0"
+Forui = "file:///path/to/forui"
+HtmlForui = "file:///path/to/html-forui"
+
+# Or fetch from a public git repo:
+# Forui = "https://github.com/forailang/forui"
+# HtmlForui = "https://github.com/forailang/html-forui"
 
 # Client calls server via RPC at this URL:
 [project.client.dependencies.server.remote.dev]

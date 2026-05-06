@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod dep_url;
 pub mod module;
 
 /// Back-compat alias. The bytecode compiler in `compiler.rs` was
@@ -277,7 +278,7 @@ mod tests {
                 "[project]\nname = \"WS\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
                  [project.client]\nsource = \"src/client\"\n\n\
                  [project.server]\nsource = \"src/server\"\n\n\
-                 [dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                 [dependencies]\nExtPkg = \"file://{}\"\n",
                 ext_root.display(),
             ),
         )
@@ -310,6 +311,65 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&ext_root);
+    }
+
+    /// Plan: dependencies use `Name = "url"` format — the LHS is the
+    /// canonical package name, the RHS is a `file://` path or
+    /// `https://` git URL. This test exercises the file:// branch;
+    /// https:// is covered separately by `dep_url::tests`.
+    #[test]
+    fn test_load_package_deps_name_eq_url_format_with_file_scheme() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root: PathBuf =
+            std::env::temp_dir().join(format!("fai-compiler-deps-newfmt-{}", nonce));
+        let src = root.join("src");
+        let dep_root = root.join("dep");
+        let dep_src = dep_root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dep_src).unwrap();
+
+        fs::write(
+            root.join("fai.toml"),
+            format!(
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nDep = \"file://{}\"\n",
+                dep_root.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dep_root.join("fai.toml"),
+            "[project]\nname = \"Dep\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        fs::write(
+            src.join("main.fai"),
+            "use { answer } from Dep\n\ndef main\n    @return Int\ndo\n  answer()\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            dep_src.join("dep.fai"),
+            "# Answer.\ndef answer\n    @return Int\ndo\n  42\nend\n",
+        )
+        .unwrap();
+
+        let source = fs::read_to_string(src.join("main.fai")).unwrap();
+        let prepared = prepare_source(&source, Some(src.to_str().unwrap())).unwrap();
+        let dep = prepared
+            .modules
+            .iter()
+            .find(|m| m.name == "Dep")
+            .expect("Dep module should be discovered via Name = \"file://...\" form");
+        let has_answer = dep.statements.iter().any(|s| {
+            matches!(
+                s, crate::ast::Statement::FunctionDeclaration(fd) if fd.name == "answer"
+            )
+        });
+        assert!(has_answer, "Dep module should expose `answer`");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -488,7 +548,7 @@ mod tests {
         fs::write(
             root.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nDep = \"file://{}\"\n",
                 dep_root.display()
             ),
         )
@@ -549,7 +609,7 @@ mod tests {
         fs::write(
             root.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nDep = \"file://{}\"\n",
                 dep_root.display()
             ),
         )
@@ -616,7 +676,7 @@ mod tests {
         fs::write(
             root.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nUI = \"file://{}\"\nHtmlUI = \"file://{}\"\n",
                 ui_root.display(),
                 html_root.display(),
             ),
@@ -630,7 +690,7 @@ mod tests {
         fs::write(
             html_root.join("fai.toml"),
             format!(
-                "[project]\nname = \"HtmlUI\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"HtmlUI\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nUI = \"file://{}\"\n",
                 ui_root.display(),
             ),
         )
@@ -753,7 +813,7 @@ mod tests {
         fs::write(
             root.join("app/fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nLibPkg = \"file://{}\"\n",
                 root.join("libpkg").display()
             ),
         )
@@ -1086,7 +1146,10 @@ fn load_package_deps(source_root: &str) -> std::collections::HashMap<String, Pac
         Err(_) => return packages,
     };
 
-    // Simple TOML parser: look for [dependencies] section and extract file:// paths
+    // [dependencies] format: `Name = "url"` where url is `file://...`
+    // or `https://github.com/<owner>/<repo>`. The LHS Name must match
+    // the dep's own [project] name; mismatches are skipped with a
+    // warning to stderr so the consumer notices and fixes the typo.
     let mut in_deps = false;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1098,60 +1161,65 @@ fn load_package_deps(source_root: &str) -> std::collections::HashMap<String, Pac
             continue;
         }
 
-        // Parse: "file:///path/to/src" = "1.0.0"
-        // Or relative: "file:../../forui" = "1.0.0" — resolved against the
-        // project root (the directory containing this fai.toml) so the dep
-        // path doesn't depend on the process's current working directory.
-        if let Some((key_part, _)) = trimmed.split_once('=') {
-            let key = key_part.trim().trim_matches('"');
-            if let Some(raw_path) = key.strip_prefix("file://") {
-                let local_path = if std::path::Path::new(raw_path).is_absolute() {
-                    raw_path.to_string()
-                } else {
-                    project_root
-                        .join(raw_path)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let local_path = local_path.as_str();
-                // Read the package's fai.toml to find its name and source_root
-                let pkg_toml = format!("{}/fai.toml", local_path);
-                if let Ok(pkg_content) = std::fs::read_to_string(&pkg_toml) {
-                    let mut pkg_name = String::new();
-                    let mut pkg_src = "src".to_string();
-                    let mut in_project = false;
-                    for pline in pkg_content.lines() {
-                        let pt = pline.trim();
-                        if pt.starts_with('[') {
-                            in_project = pt == "[project]";
-                            continue;
-                        }
-                        if !in_project {
-                            continue;
-                        }
-                        if let Some((k, v)) = pt.split_once('=') {
-                            let k = k.trim();
-                            let v = v.trim().trim_matches('"');
-                            match k {
-                                "name" => pkg_name = v.to_string(),
-                                "source_root" => pkg_src = v.to_string(),
-                                _ => {}
-                            }
-                        }
-                    }
-                    if !pkg_name.is_empty() {
-                        let full_src = format!("{}/{}", local_path, pkg_src);
-                        packages.insert(
-                            pkg_name,
-                            PackageEntry {
-                                src_root: full_src,
-                                is_sibling: false,
-                            },
-                        );
-                    }
+        let Some(spec) = dep_url::parse_dep_line(trimmed) else {
+            continue;
+        };
+        let local_path = match dep_url::resolve_dep_url(&spec.url, &project_root) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "warning: dependency '{}' could not be resolved: {}",
+                    spec.name, e
+                );
+                continue;
+            }
+        };
+        let local_path_str = local_path.to_string_lossy().into_owned();
+        let pkg_toml = local_path.join("fai.toml");
+        let Ok(pkg_content) = std::fs::read_to_string(&pkg_toml) else {
+            continue;
+        };
+        let mut pkg_name = String::new();
+        let mut pkg_src = "src".to_string();
+        let mut in_project = false;
+        for pline in pkg_content.lines() {
+            let pt = pline.trim();
+            if pt.starts_with('[') {
+                in_project = pt == "[project]";
+                continue;
+            }
+            if !in_project {
+                continue;
+            }
+            if let Some((k, v)) = pt.split_once('=') {
+                let k = k.trim();
+                let v = v.trim().trim_matches('"');
+                match k {
+                    "name" => pkg_name = v.to_string(),
+                    "source_root" => pkg_src = v.to_string(),
+                    _ => {}
                 }
             }
         }
+        if pkg_name.is_empty() {
+            continue;
+        }
+        if pkg_name != spec.name {
+            eprintln!(
+                "warning: dependency '{}' resolves to a package named '{}' — \
+                 the [dependencies] LHS must match the dep's [project] name",
+                spec.name, pkg_name,
+            );
+            continue;
+        }
+        let full_src = format!("{}/{}", local_path_str, pkg_src);
+        packages.insert(
+            pkg_name,
+            PackageEntry {
+                src_root: full_src,
+                is_sibling: false,
+            },
+        );
     }
 
     // Also resolve sub-project siblings from the workspace fai.toml.

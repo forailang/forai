@@ -242,7 +242,7 @@ name = "myapp"
 version = "1.0"
 
 [dependencies]
-"file:///some/path" = "1.0"
+SomeDep = "file:///some/path"
 
 [ffi.sqlite]
 lib = "sqlite3"

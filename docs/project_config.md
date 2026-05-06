@@ -375,29 +375,29 @@ just another project it depends on.
 
 ## `[dependencies]`
 
-External projects this project depends on. The keys are quoted
-specifiers; the values are version strings (parsed but currently
-not validated against the dep's actual version).
+External projects this project depends on. Format is `Name = "url"`
+where the LHS is the canonical package name and the RHS is a `file://`
+path or a `https://` git URL.
 
-The resolver reads each dep's own `fai.toml`, picks up its
-`[project].name` and `[project].source_root`, and registers it under
-that name for `use { ... } from <Name>` resolution.
+The resolver reads each dep's own `fai.toml` and verifies its
+`[project].name` matches the LHS. Mismatches are skipped with a
+warning so typos surface clearly.
 
-### Accepted specifier forms
+### Accepted URL forms
 
 | Form | Meaning | Example |
 |---|---|---|
-| `"file:///<absolute>"` | Absolute path. Three slashes after `file:` because that's the URL form. | `"file:///home/me/code/forui"` |
-| `"file://<relative>"` | Relative path, resolved against the directory containing **this** `fai.toml` (not the process's `cwd`). Two slashes. | `"file://../../forui"` |
+| `"file:///<absolute>"` | Absolute path. Three slashes after `file:`. | `Forui = "file:///home/me/code/forui"` |
+| `"file://<relative>"` | Relative path, resolved against the directory containing **this** `fai.toml`. Two slashes. | `Forui = "file://../../forui"` |
+| `"https://github.com/<owner>/<repo>"` | Public git repo. Cloned shallowly into `~/.fai/cache/git/<host>/<owner>/<repo>/` on first miss; subsequent runs hit the cache. To refresh, delete the cache directory. | `Forui = "https://github.com/forailang/forui"` |
 
-That's the full set today. Notable absences:
+Notable absences:
 
-- **No git URLs.** Forms like `"git:..."`, `"github:owner/repo"`, or
-  `"https://github.com/..."` are silently ignored. To consume a
-  project from git you must clone it locally and point at it with a
-  `file://` path.
-- **No version-only specs.** `"forui" = "0.1.0"` won't resolve —
-  every dep needs a `file://` URI.
+- **No tag/branch/SHA pinning yet.** Git deps always clone the default
+  branch. A future `Name = { url = "...", rev = "..." }` form will land
+  in v0.2.
+- **No version-only specs.** `Forui = "0.1.0"` won't resolve — every
+  dep needs a URL.
 - **No registry.** There is no equivalent of crates.io / npm yet.
 
 ### Path-form gotchas
@@ -414,11 +414,11 @@ That's the full set today. Notable absences:
 ```toml
 [dependencies]
 # Sibling project in the same monorepo — preferred shape for local work
-"file://../../forui" = "0.1.0"
-"file://../../html-forui" = "0.1.0"
+Forui     = "file://../../forui"
+HtmlForui = "file://../../html-forui"
 
-# Absolute path — works but breaks the moment anything moves
-"file:///home/me/projects/forsqlite" = "0.1.0"
+# Public git repo
+Forsqlite = "https://github.com/forailang/forsqlite"
 ```
 
 ---
@@ -460,7 +460,7 @@ source_root = "src"
 target = "wasm-html"
 
 [dependencies]
-"file://../my-server" = "0.1.0"
+MyServer = "file://../my-server"
 
 [remote-interface]
 from = "MyServer"
@@ -495,8 +495,8 @@ target = "wasm-html"
 build_dir = "public"
 
 [dependencies]
-"file://../../forui" = "0.1.0"
-"file://../../html-forui" = "0.1.0"
+Forui     = "file://../../forui"
+HtmlForui = "file://../../html-forui"
 ```
 
 Run `forai build` to produce `public/counter.wasm` + `public/index.html`
@@ -529,9 +529,9 @@ rpc_server = true
 url = "http://localhost:3040"
 
 [dependencies]
-"file://../../forui" = "0.1.0"
-"file://../../html-forui" = "0.1.0"
-"file://../../forsqlite" = "0.1.0"
+Forui     = "file://../../forui"
+HtmlForui = "file://../../html-forui"
+Forsqlite = "file://../../forsqlite"
 
 [remote-interface]
 expose = true

@@ -34,7 +34,8 @@ def doc_external_package
 do
   # fai.toml:
   # [dependencies]
-  # "file:///path/to/forui" = "0.1.0"
+  # Forui = "file:///path/to/forui"
+  # # or: Forui = "https://github.com/forailang/forui"
   #
   # Forui's fai.toml declares name = "Forui", so:
   # use { mount } from Forui                       # top-level (forui/src/forui.fai)

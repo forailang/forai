@@ -1,7 +1,0 @@
-[project]
-name = "forsqlite_query_typed"
-version = "0.1.0"
-source_root = "."
-
-[dependencies]
-"file:///home/bal/forai/forsqlite" = "0.1.0"

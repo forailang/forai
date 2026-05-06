@@ -340,7 +340,7 @@ mod tests {
         fs::write(
             root.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nDep = \"file://{}\"\n",
                 dep_root.display()
             ),
         )
@@ -1855,7 +1855,7 @@ end
 
         // App package depends on Lib
         fs::write(root.join("fai.toml"), format!(
-            "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+            "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nLib = \"file://{}\"\n",
             lib_root.display())).unwrap();
         fs::write(
             app_src.join("main.fai"),

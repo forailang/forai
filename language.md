@@ -667,11 +667,14 @@ all directories under `src/` are visible to both targets by name.
 fai.toml:
 ```toml
 [dependencies]
-"file:///home/user/mylibs/forui" = "0.1.0"
+Forui = "file:///home/user/mylibs/forui"
+# or fetch from a public git repo:
+# Forui = "https://github.com/forailang/forui"
 ```
 
-The package name comes from the dependency's own `fai.toml` `name` field. Import using
-that name (capitalized by convention for packages):
+The LHS is the canonical package name and must match the dep's own
+`[project] name`. Import by that name (capitalized by convention for
+packages):
 
 ```fai
 use { mount } from Forui                  # top-level exports from forui/src/forui.fai

@@ -2078,26 +2078,24 @@ fn locate_peer_interface_hash(
         if !in_deps {
             continue;
         }
-        // `"file:///abs/path" = "0.1.0"` or `"file:../sibling" = "0.1.0"` —
-        // extract the path. Relative paths resolve against the consumer's
-        // project root so the dep doesn't depend on cwd.
-        let Some((k, _v)) = t.split_once('=') else {
+        // `Name = "file://path"` or `Name = "https://..."` — peer name
+        // is on the LHS; skip entries whose LHS doesn't match the peer
+        // we're looking up.
+        let Some(spec) = fai_compiler::dep_url::parse_dep_line(t) else {
             continue;
         };
-        let dep_spec = k.trim().trim_matches('"');
-        let Some(raw_path) = dep_spec.strip_prefix("file://") else {
+        if spec.name != peer_name {
             continue;
-        };
-        let dep_root_buf = if std::path::Path::new(raw_path).is_absolute() {
-            std::path::PathBuf::from(raw_path)
-        } else {
-            consumer_root.join(raw_path)
+        }
+        let Ok(dep_root_buf) = fai_compiler::dep_url::resolve_dep_url(&spec.url, consumer_root)
+        else {
+            continue;
         };
         let path_str = dep_root_buf.to_string_lossy().into_owned();
         let path_str = path_str.as_str();
         let dep_root = dep_root_buf.as_path();
 
-        // Read the dep's project name to match against peer_name.
+        // Confirm the dep's own [project] name matches before trusting it.
         let dep_info =
             read_project_info_full(Some(dep_root.join("src").to_str().unwrap_or(path_str)));
         if dep_info.name != peer_name {
@@ -3935,9 +3933,9 @@ fn cmd_doc(args: &[String]) {
 }
 
 /// Parse `[dependencies]` from a fai.toml string and return
-/// `(package_name, project_root_path)` pairs for `file://` entries.
-/// Relative paths resolve against `project_root` (the dir containing
-/// the fai.toml that holds the dep) so they don't depend on cwd.
+/// `(package_name, project_root_path)` pairs.  Resolves both `file://`
+/// paths and `https://` git URLs (the latter uses the local git cache).
+/// Relative file:// paths resolve against `project_root`.
 fn doc_parse_file_deps(
     toml_content: &str,
     project_root: &std::path::Path,
@@ -3953,29 +3951,27 @@ fn doc_parse_file_deps(
         if !in_deps {
             continue;
         }
-        let Some((k, _v)) = t.split_once('=') else {
+        let Some(spec) = fai_compiler::dep_url::parse_dep_line(t) else {
             continue;
         };
-        let dep_spec = k.trim().trim_matches('"');
-        let Some(raw_path) = dep_spec.strip_prefix("file://") else {
+        let Ok(dep_root) = fai_compiler::dep_url::resolve_dep_url(&spec.url, project_root) else {
             continue;
-        };
-        let dep_root = if std::path::Path::new(raw_path).is_absolute() {
-            std::path::PathBuf::from(raw_path)
-        } else {
-            project_root.join(raw_path)
         };
         let path_str = dep_root.to_string_lossy().into_owned();
         let path_str = path_str.as_str();
         let dep_info =
             read_project_info_full(Some(dep_root.join("src").to_str().unwrap_or(path_str)));
-        let dep_name = if dep_info.name.is_empty() || dep_info.name == "unknown" {
+        // The fai.toml LHS is the canonical name; fall back to the
+        // dep's own [project] name only if the LHS was malformed.
+        let dep_name = if !spec.name.is_empty() {
+            spec.name
+        } else if !dep_info.name.is_empty() && dep_info.name != "unknown" {
+            dep_info.name
+        } else {
             dep_root
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "dep".to_string())
-        } else {
-            dep_info.name
         };
         deps.push((dep_name, dep_root));
     }
@@ -5214,7 +5210,7 @@ mod tests {
         std::fs::write(
             proj.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nWidgetPkg = \"file://{}\"\n",
                 pkg_path
             ),
         ).unwrap();
@@ -5252,7 +5248,7 @@ mod tests {
         std::fs::write(
             proj.join("fai.toml"),
             format!(
-                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nWidgetPkg = \"file://{}\"\n",
                 pkg_path
             ),
         ).unwrap();
@@ -5928,7 +5924,7 @@ mod tests {
         std::fs::write(
             dir.join("fai.toml"),
             format!(
-                "[project]\nname = \"RpcReachable\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\n\"file://{}\" = \"0.1.0\"\n",
+                "[project]\nname = \"RpcReachable\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[dependencies]\nForui = \"file://{}\"\n",
                 forui_pkg.display()
             ),
         )
