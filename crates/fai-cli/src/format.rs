@@ -629,6 +629,202 @@ fn format_type_node(tn: &TypeNode) -> String {
 
 // ── Expression formatting ────────────────────────────────────────────
 
+/// Render a UFCS-chain `Call` whose callee is a `Member` chain on a
+/// `Call` base — `something(args).method(args)` — with each chain
+/// link on its own indented line:
+///
+/// ```text
+/// Label('Title')
+///   .fontSize(24)
+///   .fontWeight('700')
+/// ```
+///
+/// Walks the chain bottom-up: collect every (property, args) link
+/// from outside in, then format the deepest base on the first line
+/// and each `.method(args)` on a new line indented two spaces from
+/// `indent`.
+fn format_chain_call(call: &CallExpr, indent: &str) -> String {
+    // Walk inward, collecting (property, args) pairs from outside in.
+    // `cursor_call` is the current chain link being unwrapped; once
+    // its receiver is no longer a `.method-on-Call` shape, the loop
+    // exits and `cursor_call` is the deepest non-chain Call (the
+    // base).
+    let mut links: Vec<(&str, &[CallArgument])> = Vec::new();
+    let mut cursor_call: &CallExpr = call;
+    loop {
+        if let Expression::Member(m) = &*cursor_call.callee {
+            if let Expression::Call(inner) = &*m.object {
+                links.push((m.property.as_str(), cursor_call.args.as_slice()));
+                cursor_call = inner;
+                continue;
+            }
+        }
+        break;
+    }
+    // Format the base call directly via the non-chain path. The AST
+    // types don't impl Clone, so we render in place rather than
+    // wrapping a clone for `format_expression` to recurse on.
+    let base = format_simple_call(cursor_call, indent);
+    let chain_indent = format!("{}  ", indent);
+    let mut out = base;
+    for (prop, args) in links.iter().rev() {
+        out.push('\n');
+        out.push_str(&chain_indent);
+        out.push('.');
+        out.push_str(prop);
+        // Preserve trailing-closure syntax on chain links —
+        // `make().withAction do ... end`, not
+        // `make().withAction(do ... end)`. Detect the synthetic
+        // do-block as last arg and render with the spaced
+        // `<args> do...end` shape.
+        let has_trailing = args.last().map(|a| {
+            a.label.is_none()
+                && matches!(&a.value, Expression::Function(f) if f.name.starts_with("<block:"))
+        }).unwrap_or(false);
+        if has_trailing {
+            let n = args.len() - 1;
+            let regular = format_call_args(&args[..n], &chain_indent);
+            let closure = match &args[n].value {
+                Expression::Function(f) => f,
+                _ => unreachable!(),
+            };
+            if !regular.is_empty() {
+                out.push('(');
+                out.push_str(&regular);
+                out.push(')');
+            }
+            out.push(' ');
+            out.push_str(&format_do_block(closure, &chain_indent));
+        } else {
+            let args_str = format_call_args(args, &chain_indent);
+            out.push('(');
+            out.push_str(&args_str);
+            out.push(')');
+        }
+    }
+    out
+}
+
+/// Format a Call as `callee(arg, arg, ...)` or
+/// `callee(args) do...end` for the trailing-closure shape — the
+/// inline form. Used by the chain formatter for the chain's base
+/// (which isn't itself a chain link), and by the main Call branch
+/// after it confirmed the call isn't a chain.
+fn format_simple_call(c: &CallExpr, indent: &str) -> String {
+    let has_trailing = c
+        .args
+        .last()
+        .map(|a| {
+            a.label.is_none()
+                && matches!(&a.value, Expression::Function(f) if f.name.starts_with("<block:"))
+        })
+        .unwrap_or(false);
+    if has_trailing {
+        let n = c.args.len() - 1;
+        let regular_args: Vec<String> = c.args[..n]
+            .iter()
+            .map(|a| {
+                if let Some(label) = &a.label {
+                    format!("{}: {}", label, format_expression(&a.value, indent))
+                } else {
+                    format_expression(&a.value, indent)
+                }
+            })
+            .collect();
+        let closure = match &c.args[n].value {
+            Expression::Function(f) => f,
+            _ => unreachable!(),
+        };
+        let args_str = if regular_args.is_empty() {
+            String::new()
+        } else {
+            format!("({})", regular_args.join(", "))
+        };
+        format!(
+            "{}{} {}",
+            format_expression(&c.callee, indent),
+            args_str,
+            format_do_block(closure, indent)
+        )
+    } else {
+        format!(
+            "{}({})",
+            format_expression(&c.callee, indent),
+            format_call_args(&c.args, indent),
+        )
+    }
+}
+
+/// Format a comma-separated argument list. Mirrors the simple
+/// non-trailing-closure path of `Expression::Call`.
+fn format_call_args(args: &[CallArgument], indent: &str) -> String {
+    args.iter()
+        .map(|a| {
+            if let Some(label) = &a.label {
+                format!("{}: {}", label, format_expression(&a.value, indent))
+            } else {
+                format_expression(&a.value, indent)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Operator precedence used by the binary-expression formatter so it
+/// keeps parentheses that are semantically load-bearing.
+///
+/// Without this, the round trip drops parens silently: a parsed
+/// `BinaryExpr{op: *, left: BinaryExpr{op: -, a, 1}, right: b}` (the
+/// AST shape of `(a - 1) * b`) prints as `a - 1 * b`, which the next
+/// parse re-reads as `a - (1 * b)`. Agents have hit this in the wild;
+/// it changes the meaning of arithmetic without warning.
+///
+/// Higher number = tighter binding. Mirrors typical C-family
+/// precedence; if the parser gains new operators, extend this table.
+fn binary_op_precedence(op: &str) -> u8 {
+    match op {
+        "or" => 1,
+        "and" => 2,
+        "==" | "!=" => 3,
+        "<" | ">" | "<=" | ">=" => 4,
+        "+" | "-" => 5,
+        "*" | "/" | "%" => 6,
+        // Unknown operators bind very tightly so we don't accidentally
+        // strip parens around them.
+        _ => 7,
+    }
+}
+
+/// Render the operand of a binary expression, wrapping it in parens
+/// when its own precedence/associativity would otherwise differ from
+/// the source.
+///
+/// All forai binary operators are left-associative, so the right
+/// operand needs parens when its precedence is **less than or
+/// equal** to the parent's (e.g. `a - (b - c)` ≠ `a - b - c`). The
+/// left operand only needs parens when **strictly less** (`a + b * c`
+/// fine, `(a + b) * c` needs them).
+fn format_binary_operand(
+    expr: &Expression,
+    parent_prec: u8,
+    is_right_side: bool,
+    indent: &str,
+) -> String {
+    let formatted = format_expression(expr, indent);
+    if let Expression::Binary(child) = expr {
+        let child_prec = binary_op_precedence(&child.operator);
+        let needs_parens = if is_right_side {
+            child_prec <= parent_prec
+        } else {
+            child_prec < parent_prec
+        };
+        if needs_parens {
+            return format!("({})", formatted);
+        }
+    }
+    formatted
+}
+
 fn format_expression(expr: &Expression, indent: &str) -> String {
     match expr {
         Expression::Identifier(e) => e.name.clone(),
@@ -738,57 +934,19 @@ fn format_expression(expr: &Expression, indent: &str) -> String {
             )
         }
         Expression::Call(c) => {
-            // Detect trailing closure: last unlabeled arg is a synthetic do...end block
-            let has_trailing = c.args.last().map(|a| {
-                a.label.is_none()
-                    && matches!(&a.value, Expression::Function(f) if f.name.starts_with("<block:"))
-            }).unwrap_or(false);
-
-            if has_trailing {
-                let n = c.args.len() - 1;
-                let regular_args: Vec<String> = c.args[..n]
-                    .iter()
-                    .map(|a| {
-                        if let Some(label) = &a.label {
-                            format!("{}: {}", label, format_expression(&a.value, indent))
-                        } else {
-                            format_expression(&a.value, indent)
-                        }
-                    })
-                    .collect();
-                let closure = match &c.args[n].value {
-                    Expression::Function(f) => f,
-                    _ => unreachable!(),
-                };
-                let args_str = if regular_args.is_empty() {
-                    String::new()
-                } else {
-                    format!("({})", regular_args.join(", "))
-                };
-                format!(
-                    "{}{} {}",
-                    format_expression(&c.callee, indent),
-                    args_str,
-                    format_do_block(closure, indent)
-                )
-            } else {
-                let args: Vec<String> = c
-                    .args
-                    .iter()
-                    .map(|a| {
-                        if let Some(label) = &a.label {
-                            format!("{}: {}", label, format_expression(&a.value, indent))
-                        } else {
-                            format_expression(&a.value, indent)
-                        }
-                    })
-                    .collect();
-                format!(
-                    "{}({})",
-                    format_expression(&c.callee, indent),
-                    args.join(", ")
-                )
+            // Chain detection: a Call whose callee is a Member whose
+            // object is itself a Call is a UFCS-chain link
+            // (`something(args).method(args)`). Render each link on
+            // its own indented line so long chains stay readable
+            // and don't blow past the right margin. Bare member-call
+            // shapes like `obj.method(x)` (object is just an
+            // identifier) stay inline — they don't read like chains.
+            if let Expression::Member(member) = &*c.callee {
+                if matches!(&*member.object, Expression::Call(_)) {
+                    return format_chain_call(c, indent);
+                }
             }
+            format_simple_call(c, indent)
         }
         Expression::Member(m) => {
             format!("{}.{}", format_expression(&m.object, indent), m.property)
@@ -820,12 +978,10 @@ fn format_expression(expr: &Expression, indent: &str) -> String {
             format!("{}!", format_expression(inner, indent))
         }
         Expression::Binary(b) => {
-            format!(
-                "{} {} {}",
-                format_expression(&b.left, indent),
-                b.operator,
-                format_expression(&b.right, indent)
-            )
+            let parent_prec = binary_op_precedence(&b.operator);
+            let left = format_binary_operand(&b.left, parent_prec, false, indent);
+            let right = format_binary_operand(&b.right, parent_prec, true, indent);
+            format!("{} {} {}", left, b.operator, right)
         }
         Expression::Index(ix) => {
             format!(
@@ -897,6 +1053,219 @@ mod tests {
     // Build a minimal SourceLocation.
     fn loc() -> SourceLocation {
         SourceLocation { line: 1, column: 1 }
+    }
+
+    /// Helper for binary-expression precedence tests: format an
+    /// expression body and assert it round-trips to `expected`.
+    /// Handles wrapping the body in a function shell.
+    fn rt_expr(body: &str, params: &[&str]) -> String {
+        let param_decls: String = params
+            .iter()
+            .map(|p| format!("    @param {} Int\n", p))
+            .collect();
+        let src = format!(
+            "# F.\ndef f\n{}    @return Int\ndo\n  {}\nend\n",
+            param_decls, body
+        );
+        rt(&src)
+    }
+
+    fn assert_roundtrips(body: &str, params: &[&str]) {
+        let formatted = rt_expr(body, params);
+        assert!(
+            formatted.contains(body),
+            "expected fmt to preserve `{}`, got:\n{}",
+            body,
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_precedence_parens_basic() {
+        // Lower precedence on the left needs parens for the parent's
+        // higher-precedence operator to apply first.
+        // `(a - 1) * b` ≠ `a - 1 * b`.
+        assert_roundtrips("(a - 1) * b", &["a", "b"]);
+        assert_roundtrips("(a + b) * c", &["a", "b", "c"]);
+        assert_roundtrips("(a + b) / c", &["a", "b", "c"]);
+        assert_roundtrips("(a - b) % c", &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_does_not_add_unnecessary_parens() {
+        // Already-correctly-parenthesized expressions shouldn't
+        // grow spurious parens.
+        assert_roundtrips("a - 1 * b", &["a", "b"]);
+        assert_roundtrips("a + b * c", &["a", "b", "c"]);
+        assert_roundtrips("a + b - c", &["a", "b", "c"]);
+        assert_roundtrips("a * b + c", &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_preserves_right_associativity_parens() {
+        // Subtraction is left-associative: `a - b - c == (a - b) - c`,
+        // so `a - (b - c)` is meaningfully different and the parens
+        // must survive.
+        assert_roundtrips("a - (b - c)", &["a", "b", "c"]);
+        assert_roundtrips("a / (b / c)", &["a", "b", "c"]);
+        assert_roundtrips("a / (b * c)", &["a", "b", "c"]);
+        assert_roundtrips("a % (b % c)", &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_left_associativity_no_parens_needed() {
+        // For left-associative operators of equal precedence, the
+        // left operand doesn't need parens.
+        // `(a + b) - c == a + b - c`.
+        assert_roundtrips("a + b - c", &["a", "b", "c"]);
+        assert_roundtrips("a - b + c", &["a", "b", "c"]);
+        assert_roundtrips("a * b / c", &["a", "b", "c"]);
+        assert_roundtrips("a / b * c", &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_preserves_comparison_mixing_parens() {
+        // Comparisons bind looser than arithmetic, so `(a + b) > c`
+        // doesn't need parens, but `a > b + c` already binds correctly
+        // — both should round-trip to their canonical form.
+        assert_roundtrips("a + b > c", &["a", "b", "c"]);
+        assert_roundtrips("a > b + c", &["a", "b", "c"]);
+        // Equality wraps nicely around arithmetic on either side.
+        assert_roundtrips("a + b == c", &["a", "b", "c"]);
+        assert_roundtrips("a == b + c", &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_format_preserves_boolean_op_parens() {
+        // `or` is looser than `and`, so `(a or b) and c` needs parens
+        // but `a and b or c` doesn't.
+        let f = |body: &str| {
+            let src = format!(
+                "# F.\ndef f\n    @param a Bool\n    @param b Bool\n    @param c Bool\n    @return Bool\ndo\n  {}\nend\n",
+                body
+            );
+            rt(&src)
+        };
+        assert!(
+            f("(a or b) and c").contains("(a or b) and c"),
+            "fmt should preserve parens around `or` inside `and`, got:\n{}",
+            f("(a or b) and c")
+        );
+        assert!(
+            f("a or b and c").contains("a or b and c"),
+            "fmt should not add parens to a or b and c, got:\n{}",
+            f("a or b and c")
+        );
+        assert!(
+            f("a and b or c").contains("a and b or c"),
+            "fmt should not add parens to a and b or c, got:\n{}",
+            f("a and b or c")
+        );
+    }
+
+    #[test]
+    fn test_format_chains_method_calls_onto_new_lines() {
+        // User feedback from the agent benchmark: agents (and humans)
+        // read fluent UFCS chains better when each `.method()` link
+        // sits on its own indented line. The inline form pollutes
+        // the line and stretches past the right margin.
+        //
+        // Rule: when a Call's callee is a Member whose object is a
+        // Call (i.e., `something(...).method(...)`), put `.method`
+        // on a new line indented two spaces from the base.
+        let formatted = rt(concat!(
+            "use { Label, padding } from x\n\n",
+            "# Stub.\n",
+            "def Label\n    @param s String\n    @return Int\ndo\n  0\nend\n\n",
+            "# Stub.\n",
+            "def padding\n    @param n Int\n    @param p Int\n    @return Int\ndo\n  n\nend\n\n",
+            "# Build.\n",
+            "def build\n    @return Int\ndo\n  Label('hi').padding(12)\nend\n",
+        ));
+        assert!(
+            formatted.contains("Label('hi')\n    .padding(12)")
+                || formatted.contains("Label('hi')\n  .padding(12)"),
+            "single chain link should break onto new indented line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_format_chains_multiple_links_onto_separate_lines() {
+        // Each link of a multi-chain gets its own line.
+        // `Label('Title').fontSize(24).fontWeight('700')` reads as
+        //   Label('Title')
+        //     .fontSize(24)
+        //     .fontWeight('700')
+        let formatted = rt(concat!(
+            "# Stub.\n",
+            "def Label\n    @param s String\n    @return Int\ndo\n  0\nend\n\n",
+            "# Stub.\n",
+            "def fontSize\n    @param n Int\n    @param s Int\n    @return Int\ndo\n  n\nend\n\n",
+            "# Stub.\n",
+            "def fontWeight\n    @param n Int\n    @param w String\n    @return Int\ndo\n  n\nend\n\n",
+            "# Build.\n",
+            "def build\n    @return Int\ndo\n  Label('Title').fontSize(24).fontWeight('700')\nend\n",
+        ));
+        assert!(
+            formatted.contains(".fontSize(24)\n") && formatted.contains(".fontWeight('700')"),
+            "each chain link should be on its own line, got:\n{}",
+            formatted
+        );
+        // The base `Label('Title')` should not have anything after
+        // it on its line — the next line starts with the chain.
+        let label_line_break = formatted.contains("Label('Title')\n");
+        assert!(
+            label_line_break,
+            "base call should be followed by a newline, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_format_chain_after_trailing_closure_breaks_line() {
+        // The motivating case: `VStack do ... end.padding(12)`
+        // should put `.padding(12)` on a new indented line after
+        // `end` — not appended directly to the closing `end`.
+        let formatted = rt(concat!(
+            "# Stub.\n",
+            "def VStack\n    @param children () -> Int\n    @return Int\ndo\n  children()\nend\n\n",
+            "# Stub.\n",
+            "def padding\n    @param node Int\n    @param p Int\n    @return Int\ndo\n  node\nend\n\n",
+            "# Build.\n",
+            "def build\n    @return Int\ndo\n  VStack do\n      1\n  end.padding(12)\nend\n",
+        ));
+        assert!(
+            !formatted.contains("end.padding(12)"),
+            "fmt should NOT keep `.padding(12)` on the same line as `end`, got:\n{}",
+            formatted
+        );
+        assert!(
+            formatted.contains("end\n") && formatted.contains(".padding(12)"),
+            "after a trailing-closure call, the chain link should sit on its own line, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_format_pagination_offset_regression() {
+        // The exact agent failure: pagination offset computation
+        // `(page - 1) * perPage` was getting silently rewritten by
+        // `fai fmt` to `page - 1 * perPage`, evaluating as
+        // `page - (1 * perPage)` and breaking pagination at runtime.
+        // Captured here to keep the regression locked in.
+        let src = "# Compute offset.\ndef offsetFor\n    @param page Int\n    @param perPage Int\n    @return Int\ndo\n  (page - 1) * perPage\nend\n";
+        let formatted = rt(src);
+        assert!(
+            formatted.contains("(page - 1) * perPage"),
+            "pagination offset must round-trip identically, got:\n{}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("page - 1 * perPage"),
+            "pagination offset must NOT degrade to `page - 1 * perPage`, got:\n{}",
+            formatted
+        );
     }
 
     // Build a simple named TypeNode.

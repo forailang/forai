@@ -1,0 +1,69 @@
+# expect: ok
+# stdout:
+#   12
+# Chain a UFCS modifier on the result of a call with a trailing
+# closure: `Container do ... end.modifier(arg)` parses as
+# `modifier(Container(<closure>), arg)`. Pre-fix, the parser
+# closed the call expression at `end` and then errored on the
+# leading `.` with "Expected expression, found Dot". After the
+# fix, the post-fix loop continues and the chain works.
+# Make a number-bearing record. Trailing closure mutates it.
+
+type def Builder
+    @return Int
+end
+
+# Build a number using a builder closure.
+def Container
+    @param build Builder
+    @return Int
+do
+  build()
+end
+
+# UFCS modifier — multiplies by 12.
+def boost
+    @param n Int
+    @param factor Int
+    @return Int
+do
+  n * factor
+end
+
+test Container
+it 'returns the closure result'
+  let n = Container do
+      1
+  end
+  assert.equals(n, 1)
+end
+end
+
+test boost
+it 'chains on a trailing-closure call'
+  let n = Container do
+      1
+  end
+    .boost(12)
+  assert.equals(n, 12)
+end
+it 'chains on a new line after end'
+  let n = Container do
+      1
+  end
+    .boost(12)
+  assert.equals(n, 12)
+end
+end
+
+# Same-line:  `Container do ... end.boost(12)`.
+# New-line: dot starts the next line.
+def main
+    @return Void
+do
+  let n = Container do
+      1
+  end
+    .boost(12)
+  print(toString(n))
+end

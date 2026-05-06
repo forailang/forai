@@ -81,6 +81,146 @@ mod tests {
     }
 
     #[test]
+    fn test_method_chain_after_trailing_closure_end_parses() {
+        // The actual agent benchmark failure: `VStack do ... end.padding(12)`
+        // where the do-block is a trailing closure on a call. Today
+        // the parser closes the trailing-closure parse at `end` and
+        // doesn't continue with `.method()` chaining on the call's
+        // result. This is the most common forui pattern (UFCS
+        // modifier on a layout container) and agents reach for it
+        // naturally.
+        let src = concat!(
+            "use { ViewNode } from x\n\n",
+            "# Stub.\n",
+            "def Label\n    @param s String\n    @return ViewNode\ndo\n  Label(s: s)\nend\n\n",
+            "# Stub.\n",
+            "def VStack\n    @param children () -> Void\n    @return ViewNode\ndo\n  Label('s')\nend\n\n",
+            "# Stub.\n",
+            "def padding\n    @param node ViewNode\n    @param n Int\n    @return ViewNode\ndo\n  node\nend\n\n",
+            "# Build.\n",
+            "def build\n",
+            "    @return ViewNode\n",
+            "do\n",
+            "  VStack do\n",
+            "      Label('hi')\n",
+            "  end.padding(12)\n",
+            "end\n",
+        );
+        let _ = parse(src).unwrap_or_else(|e| {
+            panic!(
+                "`Call do ... end.method()` (trailing closure + UFCS chain) should parse, got: {}",
+                e
+            )
+        });
+    }
+
+    #[test]
+    fn test_method_chain_after_trailing_closure_end_new_line_parses() {
+        // Same as above but with the chain on its own line.
+        let src = concat!(
+            "use { ViewNode } from x\n\n",
+            "# Stub.\n",
+            "def Label\n    @param s String\n    @return ViewNode\ndo\n  Label(s: s)\nend\n\n",
+            "# Stub.\n",
+            "def VStack\n    @param children () -> Void\n    @return ViewNode\ndo\n  Label('s')\nend\n\n",
+            "# Stub.\n",
+            "def padding\n    @param node ViewNode\n    @param n Int\n    @return ViewNode\ndo\n  node\nend\n\n",
+            "# Build.\n",
+            "def build\n",
+            "    @return ViewNode\n",
+            "do\n",
+            "  VStack do\n",
+            "      Label('hi')\n",
+            "  end\n",
+            "    .padding(12)\n",
+            "end\n",
+        );
+        let _ = parse(src).unwrap_or_else(|e| {
+            panic!(
+                "`Call do ... end\\n  .method()` (trailing closure + new-line UFCS chain) should parse, got: {}",
+                e
+            )
+        });
+    }
+
+    #[test]
+    fn test_method_chain_after_end_same_line_parses() {
+        // Agent benchmark feedback: agents reach for fluent chains
+        // like `VStack do ... end.padding(12)` — natural in
+        // JS/Swift/Kotlin/Rust where you can chain methods directly
+        // off any expression. Today the parser stops at `end` and
+        // sees the leading `.` as a parse error. The do-block should
+        // be a chainable expression like any other call result.
+        let src = concat!(
+            "# Build.\n",
+            "def build\n",
+            "    @return Int\n",
+            "do\n",
+            "  let x = do\n",
+            "      1\n",
+            "  end.toString()\n",
+            "  0\n",
+            "end\n",
+        );
+        let _ = parse(src).unwrap_or_else(|e| {
+            panic!("`end.method()` same-line chain should parse, got: {}", e)
+        });
+    }
+
+    #[test]
+    fn test_method_chain_after_end_new_line_parses() {
+        // Same shape as above but with the chain on its own line —
+        // the more common multi-line layout once an agent realizes
+        // the do-block needs space.
+        let src = concat!(
+            "# Build.\n",
+            "def build\n",
+            "    @return Int\n",
+            "do\n",
+            "  let x = do\n",
+            "      1\n",
+            "  end\n",
+            "    .toString()\n",
+            "  0\n",
+            "end\n",
+        );
+        let _ = parse(src).unwrap_or_else(|e| {
+            panic!("`end\\n  .method()` new-line chain should parse, got: {}", e)
+        });
+    }
+
+    #[test]
+    fn test_inline_if_then_else_emits_actionable_error() {
+        // Regression test for the agent benchmark: agents reach for
+        // `if cond then a else b end` (JS/Rust/Swift ternary shape).
+        // forai's `if` is statement-form, so this fails at the parser.
+        // The error must explain *what* forai expects, not just that
+        // a newline was missing — agents stall when the diagnostic
+        // doesn't show the fix pattern.
+        let err = parse(
+            "if x > 5 then 1 else 0 end",
+        )
+        .expect_err("inline if-then-else should fail to parse");
+        assert!(
+            err.contains("statement-form"),
+            "error should explain that `if` is statement-form, got: {}",
+            err
+        );
+        assert!(
+            err.contains("then"),
+            "error should reference the `then` token agent typed, got: {}",
+            err
+        );
+        assert!(
+            err.contains("var result")
+                || err.contains("multi-line")
+                || err.contains("multi line"),
+            "error should show the lift-to-var fix pattern, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_parse_for_loop() {
         let p = parse_ok("for i in items\n  print(i)\nend");
         assert_eq!(p.statements.len(), 1);

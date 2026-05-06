@@ -1123,6 +1123,25 @@ impl Parser {
     fn parse_if_statement(&mut self) -> Result<Statement, String> {
         let loc = self.location_of_prev();
         let cond = self.parse_expression()?;
+        // Special case `if cond then ... else ... end` — agents
+        // (and humans) reach for this from JS/Rust/Swift. forai's
+        // `if` is statement-form and there's no `then` keyword.
+        // Catch it explicitly with an actionable error rather than
+        // letting the bare "expected newline" message strand them.
+        if self.peek().lexeme == "then" {
+            return Err(format!(
+                "Expected newline after `if` condition at {}:{}, found `then`. \
+                 forai's `if` is statement-form (no `then` keyword, no inline value). \
+                 For a value that depends on a condition, lift to a `var` you assign \
+                 inside a multi-line if:\n\n  \
+                 var result = 0\n  \
+                 if cond\n      result = a\n  \
+                 else\n      result = b\n  \
+                 end",
+                self.peek().line,
+                self.peek().column,
+            ));
+        }
         self.consume(TokenType::Newline, "Expected newline after if condition")?;
         let cloc = cond.location().clone();
         let body = self.parse_block_until(&[TokenType::Else, TokenType::End])?;
@@ -1603,7 +1622,15 @@ impl Parser {
         let mut expr = self.parse_primary()?;
 
         // Trailing do...end without parens: `VStack do ... end` → VStack(do...end)
-        // Only applies to bare identifiers or member access (not to results of calls/indexes)
+        // Only applies to bare identifiers or member access (not to results of calls/indexes).
+        //
+        // Falls through to the postfix-chain loop below instead of
+        // returning, so common patterns like
+        //   `VStack do ... end.padding(12)`
+        // keep parsing — the `.padding(12)` chains on the call's result.
+        // Without this fall-through, agents (and humans) hit "Expected
+        // expression, found Dot" and have to lift the do-block to a
+        // local just to chain a UFCS modifier.
         if self.check(TokenType::Do) {
             let is_call_target = matches!(&expr, Expression::Identifier(_) | Expression::Member(_));
             if is_call_target {
@@ -1619,7 +1646,7 @@ impl Parser {
                     }],
                     location: loc,
                 });
-                return Ok(expr);
+                // Fall through to the postfix loop below. Don't return.
             }
         }
 

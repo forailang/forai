@@ -10,6 +10,73 @@ use crate::environment::Environment;
 use crate::error::CheckError;
 use crate::types::*;
 
+/// One-line rendering of a function signature, used inline in
+/// "missing required argument" / "unknown parameter" errors so an
+/// agent doesn't have to bounce out to `fai doc` to see what the
+/// function expects.
+///
+/// Shape: `name(p1: T1, p2: T2, ...) -> R`. Parameters with default
+/// values are marked `?` after the type. The return type is shown
+/// when it isn't `Void`.
+fn format_function_signature(sig: &FunctionSig) -> String {
+    let params: Vec<String> = sig
+        .params
+        .iter()
+        .map(|p| {
+            let opt = if p.has_default { "?" } else { "" };
+            format!("{}: {}{}", p.name, describe_type(&p.ty), opt)
+        })
+        .collect();
+    let returns_void = matches!(sig.returns.first(), Some(Type::Void));
+    if returns_void || sig.returns.is_empty() {
+        format!("{}({})", sig.name, params.join(", "))
+    } else {
+        let ret = describe_type(&sig.returns[0]);
+        format!("{}({}) -> {}", sig.name, params.join(", "), ret)
+    }
+}
+
+/// Hint suffix appended to argument-type-mismatch errors when the
+/// shape matches the canonical agent footgun:
+/// `useSignal(initial) do loader end` where `initial` was `null`
+/// (or empty) so `useSignal` inferred `T = null` and the loader's
+/// real return type doesn't match. Agents typically try to "fix the
+/// loader" — the actual fix is a typed initial value.
+///
+/// Returns empty string when the call doesn't match the pattern, so
+/// the error is unchanged for unrelated mismatches.
+#[allow(non_snake_case)]
+fn useSignal_loader_hint(
+    fn_name: &str,
+    param_name: &str,
+    expected: &Type,
+    actual: &Type,
+) -> String {
+    if fn_name != "useSignal" || param_name != "loader" {
+        return String::new();
+    }
+    // Expected is `() -> X?` synthesized from initial. If X is null
+    // or empty, the agent passed an untyped default. Show the fix.
+    let expected_str = describe_type(expected);
+    let actual_str = describe_type(actual);
+    let inferred_from_null =
+        expected_str.contains("null") || expected_str.contains("Unknown");
+    if !inferred_from_null {
+        return String::new();
+    }
+    format!(
+        ".\n\n`useSignal(initial)` infers the signal's element type from `initial`. \
+         You passed an untyped or null initial value, so it was inferred as `{}`. \
+         The loader returns `{}`, which doesn't match.\n\n\
+         Pass a typed default that matches the loader's return type:\n\n  \
+         let defaultPost = Post(id: 0, title: '', body: '')\n  \
+         var post = useSignal(defaultPost) do\n      \
+         getPost(slug)\n  \
+         end",
+        expected_str, actual_str
+    )
+}
+
 /// Hint shown after the generic "Cannot access property 'x' on T" error,
 /// tailored to the actual type so agents see the right API to use instead
 /// of guessing (or retrying the same bad pattern). Returned string starts
@@ -242,7 +309,7 @@ impl Checker {
             }
         }?;
 
-        let module_key = self.current_module.clone().unwrap_or_default();
+        let module_key = self.location_key();
         let key = crate::checker::expression_key(expr, module_key);
         self.expression_types.insert(key, ty.clone());
         Ok(ty)
@@ -344,7 +411,7 @@ impl Checker {
                     if let Type::Function(_sig) = &binding.ty {
                         // Found a free function with this name. Rewrite:
                         // x.foo(a, b) => foo(x, a, b)
-                        let module_key = self.current_module.clone().unwrap_or_default();
+                        let module_key = self.location_key();
                         self.ufcs_calls
                             .insert((module_key, ce.location.line, ce.location.column));
                         let mut ufcs_args = Vec::with_capacity(1 + ce.args.len());
@@ -626,7 +693,7 @@ impl Checker {
 
         // Record reordering if needed (named params out of definition order)
         if needs_reorder || (seen_named && ce.args.iter().any(|a| a.label.is_some())) {
-            let module_key = self.current_module.clone().unwrap_or_default();
+            let module_key = self.location_key();
             self.named_param_reorder.insert(
                 (module_key, ce.location.line, ce.location.column),
                 arg_to_param.clone(),
@@ -637,9 +704,16 @@ impl Checker {
             let arg = resolved_args[i];
             if arg.is_none() {
                 if !param.has_default {
+                    // Inline the function's full signature so the
+                    // agent can fix in one turn — without the
+                    // signature they have to round-trip via
+                    // `fai doc <name>` to see what's expected.
+                    let signature = format_function_signature(&sig);
                     return Err(CheckError::new(format!(
-                        "Missing required argument '{}' for '{}'",
-                        param.name, sig.name
+                        "Missing required argument '{}' for '{}'.\n\n  \
+                         {}\n\n\
+                         Run `fai doc {}` for the full signature including defaults.",
+                        param.name, sig.name, signature, sig.name
                     )));
                 }
                 continue;
@@ -649,12 +723,22 @@ impl Checker {
             if !self.accept_builtin_special_case(&sig.name, i, &actual, ce, env) {
                 if !self.bind_and_check_assignable(&actual, &param.ty, &mut generic_bindings) {
                     let expected = apply_generic_bindings(&param.ty, &generic_bindings);
+                    // Targeted hint for the most common Forui shape
+                    // agents trip on: `useSignal(initial) do loader end`.
+                    // When the loader's return type doesn't match the
+                    // signal's element type, the root cause is almost
+                    // always that `initial` was `null` or an untyped
+                    // empty value, so the signal was inferred as
+                    // `null?` / `empty[]`. Tell the agent to pass a
+                    // typed default rather than "fix the loader."
+                    let hint = useSignal_loader_hint(&sig.name, &param.name, &expected, &actual);
                     return Err(CheckError::new(format!(
-                        "Argument '{}' for '{}' expects {}, got {}",
+                        "Argument '{}' for '{}' expects {}, got {}{}",
                         param.name,
                         sig.name,
                         describe_type(&expected),
-                        describe_type(&actual)
+                        describe_type(&actual),
+                        hint,
                     )));
                 }
             }
@@ -739,7 +823,7 @@ impl Checker {
                 })
                 .collect();
             if resolved_names.iter().any(|s| !s.is_empty()) {
-                let module_key = self.current_module.clone().unwrap_or_default();
+                let module_key = self.location_key();
                 self.generic_type_args.insert(
                     (module_key, ce.location.line, ce.location.column),
                     resolved_names,

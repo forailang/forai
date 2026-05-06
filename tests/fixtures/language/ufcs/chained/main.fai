@@ -17,6 +17,7 @@ end
 def main
     @return Void
 do
-  let x = 3.double().double()
+  let x = 3.double()
+    .double()
   print(x)
 end

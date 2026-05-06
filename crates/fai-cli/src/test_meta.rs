@@ -12,10 +12,34 @@ use fai_compiler::PreparedProgram;
 /// One test suite as it reaches the wasm `_fai_run_test` dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestSuiteMeta {
+    /// Bare suite identifier from `test <name>`. Stays unqualified so
+    /// the coverage rule can compare against function names directly.
     pub suite_name: String,
+    /// Module the suite was declared in. `None` for the entry module.
+    /// Combined with `suite_name` to produce `<module>.<suite>` for
+    /// display in test output, keeping same-named suites in different
+    /// modules distinguishable.
+    pub module_name: Option<String>,
     pub case_descriptions: Vec<String>,
     pub has_before_all: bool,
     pub has_after_all: bool,
+    /// Source line of the `test` keyword. 0 when location info isn't
+    /// available (tolerated rather than required so synthetic tests
+    /// don't break the runner).
+    pub line: u32,
+}
+
+impl TestSuiteMeta {
+    /// Display form: `<module>.<suite>` when the suite came from a
+    /// module, plain `<suite>` for the entry program. Used by the
+    /// CLI test output so two `createUser` suites in different
+    /// modules don't collide visually.
+    pub fn display_name(&self) -> String {
+        match &self.module_name {
+            Some(m) => format!("{}.{}", m, self.suite_name),
+            None => self.suite_name.clone(),
+        }
+    }
 }
 
 /// Extraction result: tests to drive, plus candidate function names
@@ -40,7 +64,7 @@ pub struct TestMeta {
 ///   public functions belong to their own target.
 pub fn extract(prepared: &PreparedProgram) -> TestMeta {
     let mut meta = TestMeta::default();
-    collect(&prepared.serde_ast.statements, &mut meta);
+    collect(&prepared.serde_ast.statements, None, &mut meta);
 
     if prepared.is_test {
         for m in &prepared.modules {
@@ -51,7 +75,7 @@ pub fn extract(prepared: &PreparedProgram) -> TestMeta {
                 .map(|c| c.is_uppercase())
                 .unwrap_or(false);
             if !is_external {
-                collect(&m.statements, &mut meta);
+                collect(&m.statements, Some(&m.name), &mut meta);
             }
         }
     }
@@ -59,7 +83,7 @@ pub fn extract(prepared: &PreparedProgram) -> TestMeta {
     meta
 }
 
-fn collect(statements: &[Statement], out: &mut TestMeta) {
+fn collect(statements: &[Statement], module_prefix: Option<&str>, out: &mut TestMeta) {
     for stmt in statements {
         match stmt {
             Statement::FunctionDeclaration(fd) => {
@@ -70,9 +94,11 @@ fn collect(statements: &[Statement], out: &mut TestMeta) {
             Statement::TestDeclaration(td) => {
                 out.suites.push(TestSuiteMeta {
                     suite_name: td.name.clone(),
+                    module_name: module_prefix.map(|m| m.to_string()),
                     case_descriptions: td.cases.iter().map(|c| c.description.clone()).collect(),
                     has_before_all: td.before_all.is_some(),
                     has_after_all: td.after_all.is_some(),
+                    line: td.location.line,
                 });
             }
             _ => {}

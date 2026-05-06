@@ -705,6 +705,180 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
     })
 }
 
+/// Best-effort source-location lookup for a `BuildError`.
+///
+/// The codegen has 30+ `BuildError` raise sites. Threading
+/// per-expression source locations through every site is an
+/// open-ended refactor (plan 108 #1, ongoing); this helper picks
+/// up the cheap wins by walking the AST for the offending name and
+/// returning the first match.
+///
+/// For `UnknownIdentifier(name)` and similar string-bearing variants
+/// we look for the first call-site or identifier matching `name` in
+/// the entry AST or any module. For `UnsupportedStatement` /
+/// `UnsupportedExpression` we currently can't pin down the location
+/// from the variant string alone; those land with no location until
+/// future work threads it through.
+pub fn locate_build_error(
+    err: BuildError,
+    ast: &fai_compiler::ast::Program,
+    modules: &[fai_compiler::compiler::DiscoveredModule],
+) -> crate::LocatedBuildError {
+    use fai_compiler::ast::Statement;
+
+    let target_name: Option<&str> = match &err {
+        BuildError::UnknownIdentifier(name) => Some(name.as_str()),
+        BuildError::ModuleAccessNotYetSupported(name) => Some(name.as_str()),
+        BuildError::UnknownBinaryOp(name) => Some(name.as_str()),
+        BuildError::UnknownUnaryOp(name) => Some(name.as_str()),
+        BuildError::DuplicateModuleName(name) => Some(name.as_str()),
+        _ => None,
+    };
+
+    if let Some(name) = target_name {
+        // Walk modules first — that's where most user code lives.
+        for m in modules {
+            if let Some((line, col, file)) =
+                find_name_in_statements(&m.statements, name, &m.file_paths)
+            {
+                return crate::LocatedBuildError {
+                    err,
+                    file,
+                    line: Some(line),
+                    col: Some(col),
+                    module: Some(m.name.clone()),
+                };
+            }
+        }
+        // Fall back to the entry AST.
+        if let Some((line, col, _)) = find_name_in_statements(&ast.statements, name, &[]) {
+            return crate::LocatedBuildError {
+                err,
+                file: None,
+                line: Some(line),
+                col: Some(col),
+                module: None,
+            };
+        }
+    }
+
+    let _ = Statement::UseStatement; // silence unused-import lint when target_name is None
+    crate::LocatedBuildError::unlocated(err)
+}
+
+/// Walk top-level statements (and one level into function bodies)
+/// looking for a call or identifier matching `name`. Returns the
+/// `(line, col, file)` of the first match, where `file` is pulled
+/// from `file_paths` aligned to the statement that contains the
+/// match.
+fn find_name_in_statements(
+    statements: &[fai_compiler::ast::Statement],
+    name: &str,
+    file_paths: &[Option<String>],
+) -> Option<(u32, u32, Option<String>)> {
+    use fai_compiler::ast::Statement;
+    for (idx, stmt) in statements.iter().enumerate() {
+        let file = file_paths.get(idx).cloned().flatten();
+        if let Some((line, col)) = scan_statement_for_name(stmt, name) {
+            return Some((line, col, file));
+        }
+    }
+    None
+}
+
+fn scan_statement_for_name(
+    stmt: &fai_compiler::ast::Statement,
+    name: &str,
+) -> Option<(u32, u32)> {
+    use fai_compiler::ast::Statement;
+    match stmt {
+        Statement::FunctionDeclaration(fd) => {
+            for body_stmt in &fd.body {
+                if let Some(loc) = scan_statement_for_name(body_stmt, name) {
+                    return Some(loc);
+                }
+            }
+            None
+        }
+        Statement::TestDeclaration(td) => {
+            for case in &td.cases {
+                for body_stmt in &case.body {
+                    if let Some(loc) = scan_statement_for_name(body_stmt, name) {
+                        return Some(loc);
+                    }
+                }
+            }
+            None
+        }
+        Statement::ExpressionStatement(es) => scan_expression_for_name(&es.expression, name),
+        Statement::LetStatement(ls) => scan_expression_for_name(&ls.value, name),
+        Statement::VarStatement(vs) => scan_expression_for_name(&vs.value, name),
+        Statement::ReturnStatement(rs) => rs
+            .value
+            .as_ref()
+            .and_then(|v| scan_expression_for_name(v, name)),
+        Statement::IfStatement(is) => {
+            for branch in &is.branches {
+                if let Some(loc) = scan_expression_for_name(&branch.condition, name) {
+                    return Some(loc);
+                }
+                for body_stmt in &branch.body {
+                    if let Some(loc) = scan_statement_for_name(body_stmt, name) {
+                        return Some(loc);
+                    }
+                }
+            }
+            if let Some(else_branch) = &is.else_branch {
+                for body_stmt in else_branch {
+                    if let Some(loc) = scan_statement_for_name(body_stmt, name) {
+                        return Some(loc);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn scan_expression_for_name(
+    expr: &fai_compiler::ast::Expression,
+    name: &str,
+) -> Option<(u32, u32)> {
+    use fai_compiler::ast::Expression;
+    match expr {
+        Expression::IdentifierExpression(id) if id.name == name => {
+            Some((id.location.line, id.location.column))
+        }
+        Expression::CallExpression(ce) => {
+            if let Expression::IdentifierExpression(id) = &*ce.callee {
+                if id.name == name {
+                    return Some((ce.location.line, ce.location.column));
+                }
+            }
+            scan_expression_for_name(&ce.callee, name).or_else(|| {
+                ce.args
+                    .iter()
+                    .find_map(|a| scan_expression_for_name(&a.value, name))
+            })
+        }
+        Expression::MemberExpression(me) => {
+            if me.property == name {
+                return Some((me.location.line, me.location.column));
+            }
+            scan_expression_for_name(&me.object, name)
+        }
+        Expression::BinaryExpression(be) => scan_expression_for_name(&be.left, name)
+            .or_else(|| scan_expression_for_name(&be.right, name)),
+        Expression::UnaryExpression(ue) => scan_expression_for_name(&ue.expression, name),
+        Expression::IndexExpression(ie) => scan_expression_for_name(&ie.object, name)
+            .or_else(|| scan_expression_for_name(&ie.index, name)),
+        Expression::OptionalCheckExpression(oc) => scan_expression_for_name(&oc.expression, name),
+        Expression::ForceUnwrapExpression(fu) => scan_expression_for_name(&fu.expression, name),
+        _ => None,
+    }
+}
+
 /// Errors the builder surfaces when it sees a construct it doesn't
 /// handle. The production compiler surfaces these as actionable
 /// direct-codegen diagnostics.
@@ -1427,6 +1601,7 @@ pub fn build_function_with_spy(
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        None,
     )
 }
 
@@ -1457,6 +1632,7 @@ pub fn build_function_with_spy_and_offset(
     module_constants: &HashMap<String, fai_compiler::ast::Expression>,
     extern_out_params: &HashMap<String, Vec<bool>>,
     module_vars: &HashMap<String, u32>,
+    file_path: Option<&str>,
 ) -> Result<BuildResult, BuildError> {
     let closures = RefCell::new(Vec::new());
     let ctx = BuildContext {
@@ -1482,9 +1658,19 @@ pub fn build_function_with_spy_and_offset(
     let main = {
         let mut b = Builder::new(fd, &ctx, None);
         if let Some(module_context) = module_context {
-            b.module_key = module_context.to_string();
             b.module_context = Some(module_context.to_string());
         }
+        // Per-call-site keys (UFCS, named-param reorder, expression
+        // types) need to disambiguate by file — two files in one
+        // module can have a call at the same (line, col), and using
+        // the module name alone collides them. Prefer file_path
+        // when known; fall back to module_context. Mirrors
+        // `Checker::location_key()` so checker-recorded entries
+        // round-trip through codegen.
+        b.module_key = file_path
+            .or(module_context)
+            .map(String::from)
+            .unwrap_or_default();
         b.compile_body()?;
         b.finish()
     };
@@ -2020,11 +2206,20 @@ pub fn build_program_full(
     // entry-AST top-level funcs, then each module's funcs prefixed
     // with the module path. Track each decl's module context so
     // unqualified peer calls resolve correctly.
-    let mut decls: Vec<(fai_compiler::ast::FunctionDeclaration, Option<String>)> = Vec::new();
-    decls.push((start_fd, None));
-    decls.push((module_init_fd, None));
-    for per_module in per_module_init_decls {
-        decls.push(per_module);
+    // Decls carry (function, ctx_module, ctx_file). The file path
+    // is plumbed so the per-call-site keys (UFCS, named-param
+    // reorder, expression types) can disambiguate by file —
+    // otherwise two files in one module with calls at the same
+    // (line, col) collide and codegen reads the wrong UFCS bit.
+    let mut decls: Vec<(
+        fai_compiler::ast::FunctionDeclaration,
+        Option<String>,
+        Option<String>,
+    )> = Vec::new();
+    decls.push((start_fd, None, None));
+    decls.push((module_init_fd, None, None));
+    for (fd, ctx_mod) in per_module_init_decls {
+        decls.push((fd, ctx_mod, None));
     }
     let main = ast.statements.iter().find_map(|s| match s {
         fai_compiler::ast::Statement::FunctionDeclaration(fd) if fd.name == "main" => {
@@ -2033,28 +2228,29 @@ pub fn build_program_full(
         _ => None,
     });
     if let Some(fd) = main {
-        decls.push((fd, None));
+        decls.push((fd, None, None));
     }
     for s in &ast.statements {
         if let fai_compiler::ast::Statement::FunctionDeclaration(fd) = s {
             if fd.name != "main" {
-                decls.push((fd.clone(), None));
+                decls.push((fd.clone(), None, None));
             }
         }
     }
     for m in modules {
-        for s in &m.statements {
+        for (idx, s) in m.statements.iter().enumerate() {
             if let fai_compiler::ast::Statement::FunctionDeclaration(fd) = s {
                 let mut prefixed = fd.clone();
                 prefixed.name = format!("{}.{}", m.name, fd.name);
-                decls.push((prefixed, Some(m.name.clone())));
+                let file = m.file_paths.get(idx).cloned().flatten();
+                decls.push((prefixed, Some(m.name.clone()), file));
             }
         }
     }
 
     let infos: Vec<FunctionInfo> = decls
         .iter()
-        .map(|(fd, _)| FunctionInfo {
+        .map(|(fd, _, _)| FunctionInfo {
             name: fd.name.clone(),
             param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
             type_param_count: fd.type_params.len() as u16,
@@ -2094,7 +2290,7 @@ pub fn build_program_full(
     let strings = RefCell::new(StringInterner::default());
     let mut functions: Vec<(FunctionInfo, Function)> = Vec::with_capacity(decls.len());
     let mut closures: Vec<BuiltClosure> = Vec::new();
-    for ((fd, ctx_mod), info) in decls.iter().zip(infos.iter().cloned()) {
+    for ((fd, ctx_mod, ctx_file), info) in decls.iter().zip(infos.iter().cloned()) {
         let result = build_function_with_spy_and_offset(
             fd,
             rt,
@@ -2115,6 +2311,7 @@ pub fn build_program_full(
             &module_constants,
             &extern_out_params,
             &module_vars,
+            ctx_file.as_deref(),
         )?;
         functions.push((info, result.main));
         closures.extend(result.closures);
@@ -2130,21 +2327,26 @@ pub fn build_program_full(
         // Collect TestDeclarations from entry AST and from all
         // modules. Module-scoped tests compile with their
         // module_context so unqualified calls resolve correctly.
-        let mut test_specs: Vec<(&fai_compiler::ast::TestDeclaration, Option<String>)> = Vec::new();
+        let mut test_specs: Vec<(
+            &fai_compiler::ast::TestDeclaration,
+            Option<String>,
+            Option<String>,
+        )> = Vec::new();
         for s in &ast.statements {
             if let fai_compiler::ast::Statement::TestDeclaration(td) = s {
-                test_specs.push((td, None));
+                test_specs.push((td, None, None));
             }
         }
         for m in modules {
-            for s in &m.statements {
+            for (idx, s) in m.statements.iter().enumerate() {
                 if let fai_compiler::ast::Statement::TestDeclaration(td) = s {
-                    test_specs.push((td, Some(m.name.clone())));
+                    let file = m.file_paths.get(idx).cloned().flatten();
+                    test_specs.push((td, Some(m.name.clone()), file));
                 }
             }
         }
 
-        for (suite_idx, (td, ctx_mod)) in test_specs.iter().enumerate() {
+        for (suite_idx, (td, ctx_mod, ctx_file)) in test_specs.iter().enumerate() {
             if let Some(before_all) = &td.before_all {
                 let mut body: Vec<fai_compiler::ast::Statement> = td.setup.clone();
                 body.extend(before_all.clone());
@@ -2188,6 +2390,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    ctx_file.as_deref(),
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -2252,6 +2455,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    ctx_file.as_deref(),
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -2307,6 +2511,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    ctx_file.as_deref(),
                 )?;
                 let function_index = functions.len();
                 functions.push((info, result.main));
@@ -9081,6 +9286,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                None,
             )
             .unwrap_or_else(|e| panic!("direct build failed: {:?}", e));
             top_level.push((info, result.main));
@@ -13904,6 +14110,7 @@ mod tests {
             .map(|m| fai_checker::PreparedModule {
                 name: m.name.clone(),
                 statements: m.statements.clone(),
+                file_paths: m.file_paths.clone(),
                 private_names: m.private_names.clone(),
                 file_path: None,
             })
@@ -15147,6 +15354,7 @@ mod tests {
         fai_compiler::compiler::DiscoveredModule {
             name: name.to_string(),
             statements: Vec::new(),
+            file_paths: Vec::new(),
             private_names: Vec::new(),
         }
     }

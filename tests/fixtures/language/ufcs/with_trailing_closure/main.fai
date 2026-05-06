@@ -38,9 +38,10 @@ end
 test withAction
 it 'invokes the closure passed via UFCS+trailing-closure'
   var fired = false
-  let _ = make().withAction do
-      fired = true
-  end
+  let _ = make()
+    .withAction do
+        fired = true
+    end
   assert.isTrue(fired)
 end
 end
@@ -48,7 +49,8 @@ end
 def main
     @return Void
 do
-  let _y = make().withAction do
-      print('fired')
-  end
+  let _y = make()
+    .withAction do
+        print('fired')
+    end
 end

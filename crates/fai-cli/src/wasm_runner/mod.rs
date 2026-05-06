@@ -109,6 +109,9 @@ pub struct CaseOutcome {
     pub case_desc: String,
     /// `None` on success; `Some(msg)` on trap.
     pub error: Option<String>,
+    /// Source line of the suite's `test` keyword. 0 when unknown.
+    /// Used by the CLI to point a failing test at its source.
+    pub suite_line: u32,
 }
 
 /// Structured summary returned by [`run_wasm_tests`].
@@ -221,9 +224,10 @@ pub fn run_wasm_tests_with_externs(
                         message: None,
                     });
                     CaseOutcome {
-                        suite_name: test.suite_name.clone(),
+                        suite_name: test.display_name(),
                         case_desc: desc.clone(),
                         error: None,
+                        suite_line: test.line,
                     }
                 }
                 Err(e) => {
@@ -240,9 +244,10 @@ pub fn run_wasm_tests_with_externs(
                         message: Some(msg.clone()),
                     });
                     CaseOutcome {
-                        suite_name: test.suite_name.clone(),
+                        suite_name: test.display_name(),
                         case_desc: desc.clone(),
                         error: Some(msg),
+                        suite_line: test.line,
                     }
                 }
             };

@@ -120,12 +120,25 @@ impl Checker {
 
         // Doc enforcement: named functions (not synthetic, not main) must have a doc comment.
         // Matches language.md's "Doc comment required above `def`" rule.
+        //
+        // The error includes a paste-ready example so agents (who
+        // commonly invent Python docstrings, /// rustdoc, or JSDoc)
+        // see the exact `# Description.` shape forai expects without
+        // a trip to the docs.
         if !is_synthetic && !is_main {
             if fd.doc_comment.is_none() {
-                self.collected_errors.push(CheckError::new(format!(
-                    "Function '{}' is missing a required doc comment (line {})",
-                    fd.name, fd.location.line
-                )));
+                let err = CheckError::new(format!(
+                    "Function '{}' is missing a required doc comment. \
+                     Add a `# Description.` line directly above the `def`:\n\n  \
+                     # What this function does.\n  \
+                     def {}\n  \
+                     ...\n\n\
+                     Every named `def`, `remote def`, and `test` block needs one. \
+                     `main` is the only exemption.",
+                    fd.name, fd.name
+                ));
+                self.collected_errors
+                    .push(self.attach_location(err, &fd.location));
             }
         }
 

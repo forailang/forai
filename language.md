@@ -333,6 +333,23 @@ container do
 end
 ```
 
+You can chain UFCS modifiers directly on the result of a
+trailing-closure call (no need to bind the block to a local first):
+
+```
+# Same line:
+let view = VStack do
+    Label('hi')
+end.padding(12)
+
+# Or on a new line for readability:
+let view = VStack do
+    Label('hi')
+end
+  .padding(12)
+  .background('#fafafa')
+```
+
 ### main
 
 `main` is the entry point. It is exempt from the doc comment requirement.

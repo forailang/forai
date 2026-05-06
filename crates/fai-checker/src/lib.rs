@@ -58,6 +58,7 @@ mod tests {
             .map(|m| PreparedModule {
                 name: m.name.clone(),
                 statements: m.statements.clone(),
+                file_paths: Vec::new(),
                 private_names: m.private_names.clone(),
                 file_path: None,
             })
@@ -446,6 +447,40 @@ mod tests {
         check_err(
             "def add\n    @param a Int\n    @param b Int\n    @return Int\ndo\n  a + b\nend\n\ndef main\n    @return Int\ndo\n  add(1, 2)\nend",
             "missing a required doc comment"
+        );
+    }
+
+    #[test]
+    fn test_missing_doc_comment_error_is_actionable() {
+        // Regression test for the agent benchmark: doc-comment errors
+        // are the highest-frequency check failure (10-30 instances per
+        // bad run). The message must show the exact `# Description.`
+        // shape so agents stop inventing Python/JSDoc/rustdoc styles.
+        let mut checker = crate::Checker::new();
+        let prep = fai_compiler::prepare_source(
+            "def add\n    @param a Int\n    @param b Int\n    @return Int\ndo\n  a + b\nend\n",
+            None,
+        )
+        .unwrap();
+        let err = checker
+            .check_program(&prep.serde_ast.statements)
+            .expect_err("missing doc comment should fail");
+        assert!(
+            err.message.contains("# Description.")
+                || err.message.contains("# What this function does"),
+            "error should show the `# Description.` paste-ready example, got:\n{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("`main` is the only exemption")
+                || err.message.contains("main is the only exemption"),
+            "error should call out main exemption so agents don't paper-fix main, got:\n{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("remote def"),
+            "error should remind that `remote def` and `test` need doc comments too, got:\n{}",
+            err.message
         );
     }
 
@@ -2285,6 +2320,7 @@ end
         let module = PreparedModule {
             name: module_name.to_string(),
             statements: mod_prep.serde_ast.statements,
+            file_paths: Vec::new(),
             private_names: vec![],
             file_path: Some(format!("{}.fai", module_name)),
         };
@@ -2302,6 +2338,7 @@ end
         let module = PreparedModule {
             name: module_name.to_string(),
             statements: mod_prep.serde_ast.statements,
+            file_paths: Vec::new(),
             private_names: vec![],
             file_path: Some(format!("{}.fai", module_name)),
         };
@@ -2356,12 +2393,14 @@ end
             PreparedModule {
                 name: "server".to_string(),
                 statements: server_prep.serde_ast.statements,
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: Some("server.fai".to_string()),
             },
             PreparedModule {
                 name: "server.parse".to_string(),
                 statements: parse_prep.serde_ast.statements,
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: Some("parse.fai".to_string()),
             },
@@ -2418,6 +2457,134 @@ end
     }
 
     #[test]
+    fn test_missing_required_argument_includes_signature() {
+        // Regression test: when a call is missing a required arg,
+        // the error today says "Missing required argument 'X' for
+        // 'F'" with no hint of the call's full signature. Agents
+        // hit this on Forsqlite (`query_params(db, sql)` without
+        // the `params` array) and have to make a separate
+        // `fai doc` round-trip to find the shape. Inline the
+        // signature so they fix in one turn.
+        let mut checker = crate::Checker::new();
+        let prep = fai_compiler::prepare_source(
+            concat!(
+                "# Stub external API.\n",
+                "def fetchPost\n",
+                "    @param id Int\n",
+                "    @param includeBody Bool\n",
+                "    @return Int\n",
+                "do\n",
+                "  id\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  fetchPost(id: 42)\n",
+                "end\n",
+            ),
+            None,
+        )
+        .unwrap();
+        let err = checker
+            .check_program(&prep.serde_ast.statements)
+            .expect_err("missing arg should fail");
+        assert!(
+            err.message.contains("includeBody"),
+            "error should name the missing parameter, got:\n{}",
+            err.message
+        );
+        // The new bit: the full signature should be inlined so the
+        // agent sees both required args and their types.
+        assert!(
+            err.message.contains("id: Int"),
+            "error should inline the signature with `id: Int`, got:\n{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("includeBody: Bool"),
+            "error should inline `includeBody: Bool` so agent sees what's missing, got:\n{}",
+            err.message
+        );
+        // Reference to `fai doc` for the canonical full signature
+        // (mirrors the pattern used by other improved messages).
+        assert!(
+            err.message.contains("fai doc fetchPost"),
+            "error should point at `fai doc fetchPost` for the canonical signature, got:\n{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_useSignal_loader_mismatch_shows_typed_default_hint() {
+        // Regression test: `useSignal(null) do getPost() end` — agent
+        // passes null/empty as initial and a real-typed loader, fai
+        // infers signal element as `null?` and the loader return
+        // doesn't match. The error must steer to "pass a typed
+        // default" rather than letting the agent waste turns trying
+        // to make the loader return null.
+        //
+        // We use a minimal stub of useSignal here so the test doesn't
+        // depend on the forui dependency tree being available.
+        let mut checker = crate::Checker::new();
+        let prep = fai_compiler::prepare_source(
+            concat!(
+                "type Post\n  id Int\n  title String\nend\n\n",
+                "# Stub useSignal taking a loader.\n",
+                "def useSignal\n",
+                "    @type T\n",
+                "    @param initial $T\n",
+                "    @param loader () -> $T?\n",
+                "    @return Int\ndo\n  0\nend\n\n",
+                "# Stub.\ndef getPost\n    @return Post\ndo\n  Post(id: 1, title: 'x')\nend\n\n",
+                "def main\n    @return Int\ndo\n  useSignal(null, loader: do getPost() end)\nend",
+            ),
+            None,
+        )
+        .unwrap();
+        let err = checker
+            .check_program(&prep.serde_ast.statements)
+            .expect_err("useSignal(null, ...) should fail when loader returns Post");
+        assert!(
+            err.message.contains("typed default") || err.message.contains("typed initial"),
+            "error should mention passing a typed default, got:\n{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("useSignal(defaultPost)")
+                || err.message.contains("useSignal(default"),
+            "error should show the canonical fix snippet, got:\n{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_module_import_missing_export_hints_fai_doc() {
+        // Regression test: when `Module M does not export X` fires,
+        // the agent has no idea where X actually lives or whether it
+        // exists at all. The error should point at `fai doc <name>`
+        // — agents already use `fai doc` proactively, so the hint
+        // matches their existing instinct.
+        check_err_with_module(
+            "use { nonexistent } from mymod\n\ndef main\n    @return Void\ndo\nend",
+            "mymod",
+            "# Greet.\ndef greet\n    @param name String\n    @return String\ndo\n  'hello ' + name\nend",
+            "fai doc nonexistent",
+        );
+    }
+
+    #[test]
+    fn test_std_module_missing_export_hints_fai_doc() {
+        // Same hint applies to std modules — agents commonly invent
+        // names like `std.string.toLowerCase` (from JS) when forai
+        // exports `toLower`. The error should send them to `fai doc`.
+        check_err(
+            "use { toLowerCase } from std.string\n\ndef main\n    @return Void\ndo\nend",
+            "fai doc toLowerCase",
+        );
+    }
+
+    #[test]
     fn test_module_error_has_file_location() {
         // Errors from check_with_modules should have file location (covers error.rs with_location)
         let main_prep = fai_compiler::prepare_source(
@@ -2433,6 +2600,7 @@ end
         let module = PreparedModule {
             name: "mymod".to_string(),
             statements: mod_prep.serde_ast.statements,
+            file_paths: Vec::new(),
             private_names: vec![],
             file_path: Some("mymod.fai".to_string()),
         };
@@ -2780,12 +2948,14 @@ end
             PreparedModule {
                 name: "mod_a".to_string(),
                 statements: mod_a.serde_ast.statements,
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: None,
             },
             PreparedModule {
                 name: "mod_b".to_string(),
                 statements: mod_b.serde_ast.statements,
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: None,
             },

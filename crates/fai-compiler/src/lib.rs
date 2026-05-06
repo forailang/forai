@@ -208,9 +208,11 @@ fn prepare_source_impl(
     for (name, src) in &synthetic_modules {
         let mod_ast = fai_parser::parse(src)?;
         let serde_program = native_bridge::convert_program(&mod_ast);
+        let stmt_count = serde_program.statements.len();
         modules.push(compiler::DiscoveredModule {
             name: name.clone(),
             statements: serde_program.statements,
+            file_paths: vec![None; stmt_count],
             private_names: Vec::new(),
         });
     }
@@ -1388,6 +1390,7 @@ fn load_module_directory(
     fai_files.sort(); // Alphabetical order, matching TS behavior
 
     let mut all_statements = Vec::new();
+    let mut all_file_paths: Vec<Option<String>> = Vec::new();
     let mut private_names = Vec::new();
     let mut public_names: Vec<(String, String)> = Vec::new(); // (name, file_path)
 
@@ -1430,6 +1433,7 @@ fn load_module_directory(
         for stmt in serde_program.statements {
             if is_test || !matches!(&stmt, crate::ast::Statement::TestDeclaration(_)) {
                 all_statements.push(stmt);
+                all_file_paths.push(Some(file_path.clone()));
             }
         }
     }
@@ -1457,6 +1461,7 @@ fn load_module_directory(
     Ok(DiscoveredModule {
         name: module_name.to_string(),
         statements: all_statements,
+        file_paths: all_file_paths,
         private_names,
     })
 }

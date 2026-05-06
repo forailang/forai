@@ -144,6 +144,30 @@ impl Checker {
         let file = self.current_file.as_deref().unwrap_or("<unknown>");
         err.with_location(file, loc.line, loc.column)
     }
+
+    /// String key used to namespace per-call-site metadata
+    /// (`ufcs_calls`, `named_param_reorder`, `expression_types`,
+    /// `generic_type_args`) by source location.
+    ///
+    /// Prefers `current_file` over `current_module`: a multi-file
+    /// module like `pages/` can have two different files with calls
+    /// at the same `(line, col)` (e.g. `home.fai:37:19`
+    /// `recent.isLoaded()` and `posts.fai:37:19` `length(...)`),
+    /// and using only the module name as a discriminator silently
+    /// stomps one entry on top of the other. Codegen then reads the
+    /// wrong UFCS bit and refuses with a misleading
+    /// `UnknownIdentifier` error. File path is unique-per-call-site
+    /// by construction.
+    ///
+    /// Falls back to `current_module` (or empty string) when no file
+    /// is set — preserves the old behavior for single-file programs
+    /// and tests that don't populate `current_file`.
+    pub(super) fn location_key(&self) -> String {
+        self.current_file
+            .clone()
+            .or_else(|| self.current_module.clone())
+            .unwrap_or_default()
+    }
 }
 
 pub(super) fn apply_generic_bindings(ty: &Type, bindings: &HashMap<String, Type>) -> Type {

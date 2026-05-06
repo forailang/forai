@@ -473,44 +473,11 @@ fn step_check(args: &[String], reporter: &Reporter) {
         None => return,
     };
 
-    // Try the entry point first (for runnable projects with main.fai)
-    if let Some(entry) = resolve_entry_point(&project_root, &src_dir) {
-        check_single_file(&entry.to_string_lossy(), reporter);
-        return;
-    }
-
-    // Library project: no single entry point — check all source files as one module.
-    // prepare_module_directory_for_tests loads all .fai files in the directory
-    // together AND keeps test bodies so cross-file references and test bodies are
-    // both checked. Without `_for_tests` the checker skips test bodies and misses
-    // real type errors that only surface as codegen failures at `fai test` time.
-    let src_path = project_root.join(&src_dir);
-    let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path.to_string_lossy()) {
-        Ok(p) => p,
-        Err(e) => {
-            reporter.error_line(&e);
-            reporter.step(StepStatus::Fail, "check", "compile error");
-            std::process::exit(1);
-        }
-    };
-    let mut checker = fai_checker::Checker::new();
-    match checker.check_with_modules(
-        &prepared.serde_ast.statements,
-        &prepared
-            .modules
-            .iter()
-            .map(|m| fai_checker::PreparedModule {
-                name: m.name.clone(),
-                statements: m.statements.clone(),
-                private_names: m.private_names.clone(),
-                file_path: None,
-            })
-            .collect::<Vec<_>>(),
-    ) {
+    match run_project_check(&project_root, &src_dir) {
         Ok(()) => reporter.step(StepStatus::Ok, "check", "no type errors"),
-        Err(e) => {
-            reporter.error_line(&format_check_errors(&checker, &e));
-            let n = checker.collected_errors.len().max(1);
+        Err((msg, n)) => {
+            reporter.error_line(&msg);
+            let n = n.max(1);
             reporter.step(
                 StepStatus::Fail,
                 "check",
@@ -521,15 +488,88 @@ fn step_check(args: &[String], reporter: &Reporter) {
     }
 }
 
+/// Decide which check strategy applies to a project and run it.
+/// Returns the joined error message when any type errors surface.
+///
+/// Mirrors `step_check`'s decision tree but as a pure function: no
+/// reporter side-effects, no `process::exit`. That makes the decision
+/// logic unit-testable — `step_check` keeps the
+/// reporter/exit-on-error glue.
+///
+/// Three strategies, picked in order:
+/// 1. **Single-entry project** (e.g. `src/main.fai` exists): check the
+///    entry, which transitively pulls in every reachable module.
+/// 2. **Multi-target project** (`[project.X]` sub-projects in
+///    `fai.toml`): check each sub-project's `main` in turn. Mirrors
+///    `step_test`'s sub-project loop. Without this branch, a project
+///    with nested-only `src/` (e.g. `src/auth/`, `src/data/` and no
+///    top-level `.fai`) would fall through to the flat-library path
+///    below and silently check nothing.
+/// 3. **Flat library project**: load every `.fai` file at the source
+///    root into a single module and check it.
+fn run_project_check(
+    project_root: &std::path::Path,
+    src_dir: &str,
+) -> Result<(), (String, usize)> {
+    if let Some(entry) = resolve_entry_point(project_root, src_dir) {
+        return try_check_single_file(&entry.to_string_lossy());
+    }
+
+    // Multi-target project: each [project.<name>] has its own entry,
+    // and the source root may be nested-only (e.g. forui-fullstack,
+    // where src/ contains only `auth/`, `data/`, `pages/`, …, with no
+    // top-level .fai files). Check each sub-project's main in turn so
+    // every reachable module gets walked. Mirrors the sub-project loop
+    // step_test runs for the same reason.
+    let toml = std::fs::read_to_string(project_root.join("fai.toml")).unwrap_or_default();
+    let info = parse_project_info(&toml);
+    if !info.sub_projects.is_empty() {
+        let mut names: Vec<&String> = info.sub_projects.keys().collect();
+        names.sort();
+        for name in names {
+            let sub = &info.sub_projects[name];
+            let Some(main) = &sub.main else {
+                continue;
+            };
+            let main_path = project_root.join(main);
+            if !main_path.exists() {
+                continue;
+            }
+            try_check_single_file(&main_path.to_string_lossy())?;
+        }
+        return Ok(());
+    }
+
+    let src_path = project_root.join(src_dir);
+    let prepared = fai_compiler::prepare_module_directory_for_tests(&src_path.to_string_lossy())
+        .map_err(|e| (e, 1))?;
+    let mut checker = fai_checker::Checker::new();
+    let prepared_modules: Vec<fai_checker::PreparedModule> = prepared
+        .modules
+        .iter()
+        .map(|m| fai_checker::PreparedModule {
+            name: m.name.clone(),
+            statements: m.statements.clone(),
+            file_paths: m.file_paths.clone(),
+            private_names: m.private_names.clone(),
+            file_path: None,
+        })
+        .collect();
+    match checker.check_with_modules(&prepared.serde_ast.statements, &prepared_modules) {
+        Ok(()) => Ok(()),
+        Err(e) => Err((
+            format_check_errors(&checker, &e),
+            checker.collected_errors.len().max(1),
+        )),
+    }
+}
+
 fn check_single_file(path: &str, reporter: &Reporter) {
     match try_check_single_file(path) {
         Ok(()) => reporter.step(StepStatus::Ok, "check", "no type errors"),
-        Err(e) => {
-            reporter.error_line(&e);
-            // Each type error is a full "type error: ..." line in the
-            // joined message; count the distinct error prefixes so the
-            // summary number matches what the user sees above it.
-            let n = e.matches("type error:").count().max(1);
+        Err((msg, n)) => {
+            reporter.error_line(&msg);
+            let n = n.max(1);
             reporter.step(
                 StepStatus::Fail,
                 "check",
@@ -555,9 +595,9 @@ fn check_single_file(path: &str, reporter: &Reporter) {
 ///    dependencies declared in fai.toml are fully resolved (the old
 ///    `prepare_module_directory` path did not do this, causing
 ///    "Unknown type 'X'" errors for any type from an external package).
-fn try_check_single_file(path: &str) -> Result<(), String> {
-    let mut content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
+fn try_check_single_file(path: &str) -> Result<(), (String, usize)> {
+    let mut content = std::fs::read_to_string(path)
+        .map_err(|e| (format!("cannot read '{}': {}", path, e), 1))?;
     let source_root = find_source_root(path);
     let info = read_project_info_full(source_root.as_deref());
     inject_peer_hash(
@@ -580,11 +620,14 @@ fn try_check_single_file(path: &str) -> Result<(), String> {
         synthetic_modules,
         Some(path),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| (e.to_string(), 1))?;
     let mut checker = fai_checker::Checker::new();
     match run_checker(&mut checker, &prepared) {
         Ok(()) => Ok(()),
-        Err(e) => Err(format_check_errors(&checker, &e)),
+        Err(e) => Err((
+            format_check_errors(&checker, &e),
+            checker.collected_errors.len().max(1),
+        )),
     }
 }
 
@@ -672,10 +715,7 @@ fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
     ) {
         Ok(w) => w,
         Err(e) => {
-            reporter.error_line(&format!(
-                "internal error: direct AST→wasm codegen refused this module: {:?}",
-                e,
-            ));
+            reporter.error_line(&format_codegen_error(&e));
             reporter.step(StepStatus::Fail, "test", "compile error");
             std::process::exit(1);
         }
@@ -694,26 +734,15 @@ fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
         .filter(|n| !suite_names.contains(n))
         .collect();
 
-    let mut current_suite: Option<String> = None;
     let externs = extract_externs_from_prepared(&prepared, Some(&src_path_str));
-    let (passed, failed) =
-        match wasm_runner::run_wasm_tests_with_externs(&wasm_bytes, &tests, externs, |outcome| {
-            if current_suite.as_deref() != Some(&outcome.suite_name) {
-                println!("  {}", outcome.suite_name);
-                current_suite = Some(outcome.suite_name.clone());
-            }
-            match &outcome.error {
-                None => println!("    ✓ {}", outcome.case_desc),
-                Some(msg) => println!("    ✗ {} — {}", outcome.case_desc, msg),
-            }
-        }) {
-            Ok(summary) => (summary.passed, summary.failed),
-            Err(e) => {
-                reporter.error_line(&format!("runtime error during test setup: {}", e));
-                reporter.step(StepStatus::Fail, "test", "setup failed");
-                std::process::exit(1);
-            }
-        };
+    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs) {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.error_line(&format!("runtime error during test setup: {}", e));
+            reporter.step(StepStatus::Fail, "test", "setup failed");
+            std::process::exit(1);
+        }
+    };
 
     let missing = uncovered.len();
     let combined_failures = failed + missing;
@@ -743,6 +772,85 @@ fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
 /// Fails if any tests fail OR if any named public function lacks a test
 /// block. Missing tests are counted as test failures (same `[fail] test`
 /// outcome, same exit code) — the scaffold makes coverage mandatory.
+/// Run all test suites against the wasm binary and emit compact
+/// output: one summary line per suite, then a single "Failed tests"
+/// section at the end with each failure's description, source line,
+/// and error message.
+///
+/// Compact form (vs the older per-`it` output) is the difference
+/// between ~3 lines per suite and ~1 — significant when an LLM
+/// agent is iterating on the project. The Failed Tests section
+/// gives the agent enough to grep for the failing case without
+/// re-reading every passing case.
+///
+/// Returns `(passed, failed)` so the caller can build its own
+/// step-status summary.
+fn run_tests_with_compact_output(
+    wasm_bytes: &[u8],
+    tests: &[crate::test_meta::TestSuiteMeta],
+    externs: Vec<wasm_runner::ExternInfo>,
+) -> Result<(usize, usize), String> {
+    let mut current_suite: Option<String> = None;
+    let mut suite_pass: u32 = 0;
+    let mut suite_fail: u32 = 0;
+    let mut failures: Vec<(String, String, u32, String)> = Vec::new();
+
+    let summary =
+        wasm_runner::run_wasm_tests_with_externs(wasm_bytes, tests, externs, |outcome| {
+            if current_suite.as_deref() != Some(&outcome.suite_name) {
+                if let Some(name) = current_suite.take() {
+                    println!("{}", format_suite_line(&name, suite_pass, suite_fail));
+                }
+                current_suite = Some(outcome.suite_name.clone());
+                suite_pass = 0;
+                suite_fail = 0;
+            }
+            match &outcome.error {
+                None => suite_pass += 1,
+                Some(msg) => {
+                    suite_fail += 1;
+                    failures.push((
+                        outcome.suite_name.clone(),
+                        outcome.case_desc.clone(),
+                        outcome.suite_line,
+                        msg.clone(),
+                    ));
+                }
+            }
+        })?;
+    if let Some(name) = current_suite.take() {
+        println!("{}", format_suite_line(&name, suite_pass, suite_fail));
+    }
+    if !failures.is_empty() {
+        println!();
+        println!("Failed tests:");
+        for (suite, case, line, msg) in &failures {
+            println!();
+            println!("  ✗ {} — {}", suite, case);
+            if *line > 0 {
+                println!("    at line {}", line);
+            }
+            for line_text in msg.lines() {
+                println!("    {}", line_text);
+            }
+        }
+    }
+    Ok((summary.passed, summary.failed))
+}
+
+/// One-line summary for a test suite: pass count, fail count, and a
+/// ✓/✗ glyph. `(3 pass)` for clean suites, `(2 pass, 1 fail)` for
+/// mixed, `(2 fail)` when nothing passed.
+fn format_suite_line(suite: &str, pass: u32, fail: u32) -> String {
+    let glyph = if fail == 0 { "✓" } else { "✗" };
+    let counts = match (pass, fail) {
+        (p, 0) => format!("{} pass", p),
+        (0, f) => format!("{} fail", f),
+        (p, f) => format!("{} pass, {} fail", p, f),
+    };
+    format!("  {} {} ({})", glyph, suite, counts)
+}
+
 /// Walk the entry file's directory tree (recursively) and collect
 /// (has_test_blocks, public_fn_names) across every `.fai` file
 /// reachable from it. Used to decide whether the whole target can
@@ -906,10 +1014,7 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
     ) {
         Ok(w) => w,
         Err(e) => {
-            reporter.error_line(&format!(
-                "internal error: direct AST→wasm codegen refused this program: {:?}",
-                e,
-            ));
+            reporter.error_line(&format_codegen_error(&e));
             reporter.step(StepStatus::Fail, "test", "compile error");
             std::process::exit(1);
         }
@@ -929,26 +1034,15 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
         .filter(|n| !suite_names.contains(n))
         .collect();
 
-    let mut current_suite: Option<String> = None;
     let externs = extract_externs_from_prepared(&prepared, source_root.as_deref());
-    let (passed, failed) =
-        match wasm_runner::run_wasm_tests_with_externs(&wasm_bytes, &tests, externs, |outcome| {
-            if current_suite.as_deref() != Some(&outcome.suite_name) {
-                println!("  {}", outcome.suite_name);
-                current_suite = Some(outcome.suite_name.clone());
-            }
-            match &outcome.error {
-                None => println!("    ✓ {}", outcome.case_desc),
-                Some(msg) => println!("    ✗ {} — {}", outcome.case_desc, msg),
-            }
-        }) {
-            Ok(summary) => (summary.passed, summary.failed),
-            Err(e) => {
-                reporter.error_line(&format!("runtime error during test setup: {}", e));
-                reporter.step(StepStatus::Fail, "test", "setup failed");
-                std::process::exit(1);
-            }
-        };
+    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs) {
+        Ok(p) => p,
+        Err(e) => {
+            reporter.error_line(&format!("runtime error during test setup: {}", e));
+            reporter.step(StepStatus::Fail, "test", "setup failed");
+            std::process::exit(1);
+        }
+    };
 
     // Combine assertion failures and missing-test failures into a
     // single failure count so the summary matches the scaffold's
@@ -3168,8 +3262,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-seri
 #app{width:100%;min-width:280px}
 
 /* ── Layout primitives ──────────────────────────────────────── */
-.fai-vstack{display:flex;flex-direction:column;align-items:center;gap:12px}
-.fai-hstack{display:flex;flex-direction:row;align-items:center;gap:8px}
+.fai-vstack{display:flex;flex-direction:column;align-items:center;gap:12px;width:100%}
+.fai-hstack{display:flex;flex-direction:row;align-items:center;gap:8px;width:100%}
 .fai-zstack{position:relative;display:grid}
 .fai-zstack>*{grid-area:1/1}
 .fai-scrollview{overflow:auto}
@@ -3683,29 +3777,68 @@ fn inline_scaffold(project_root: &std::path::Path, project_name: &str) {
 /// individual template — `fai new` overlays them onto every new
 /// project regardless of template source.
 ///
-/// A file the template already ships is preserved (template wins).
-/// Anything missing is filled in with the canonical default.
+/// `AGENTS.md` and `CLAUDE.md` are special: when the template ships
+/// its own copy, the scaffold's language-level guidance is written
+/// first and the template's content is appended below a separator.
+/// This keeps language-level rules (doc comments, testing) visible
+/// while preserving template-specific guidance the user picked.
+///
+/// All other files use last-write-wins semantics: a file the template
+/// already shipped is left alone; anything missing is filled in.
 fn overlay_meta_files(dir: &std::path::Path, project_name: &str) {
     let codex_dir = dir.join(".codex");
     if !codex_dir.exists() {
         let _ = std::fs::create_dir_all(&codex_dir);
     }
 
-    let files: Vec<(std::path::PathBuf, String)> = vec![
-        (dir.join("language.md"), scaffold_language_md()),
+    // Append-on-collision: language scaffold + template-shipped content.
+    let merging: Vec<(std::path::PathBuf, String)> = vec![
         (dir.join("CLAUDE.md"), scaffold_claude_md(project_name)),
         (dir.join("AGENTS.md"), scaffold_agents_md()),
+    ];
+    for (path, scaffold) in &merging {
+        write_with_template_append(path, scaffold);
+    }
+
+    // Fill-only-if-missing: language reference + tool configs.
+    let fill_only: Vec<(std::path::PathBuf, String)> = vec![
+        (dir.join("language.md"), scaffold_language_md()),
         (dir.join(".mcp.json"), scaffold_mcp_json()),
         (dir.join(".codex/config.toml"), scaffold_codex_config()),
     ];
-
-    for (path, content) in &files {
+    for (path, content) in &fill_only {
         if path.exists() {
             continue;
         }
         if let Err(e) = std::fs::write(path, content) {
             eprintln!("warning: could not write {}: {}", path.display(), e);
         }
+    }
+}
+
+/// Write `scaffold` to `path`. If the template already shipped a file
+/// at this path, append its content below a separator so both stay
+/// visible. The scaffold goes first because language-level rules
+/// (e.g. doc-comment requirement) are universal and should be the
+/// first thing an agent reads.
+fn write_with_template_append(path: &std::path::Path, scaffold: &str) {
+    let template_content = if path.exists() {
+        std::fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    let combined = match template_content {
+        Some(t) if !t.trim().is_empty() => {
+            format!(
+                "{}\n---\n\n# Project-specific guidance\n\n{}",
+                scaffold.trim_end(),
+                t.trim_start()
+            )
+        }
+        _ => scaffold.to_string(),
+    };
+    if let Err(e) = std::fs::write(path, combined) {
+        eprintln!("warning: could not write {}: {}", path.display(), e);
     }
 }
 
@@ -3953,6 +4086,15 @@ Any function can be called as a method on its first argument:
 ```fai
 5.add(3)            # same as add(5, 3)
 label.fontSize(14)  # same as fontSize(label, 14) — must be imported!
+```
+
+You can chain UFCS modifiers directly on the result of a `do...end`
+trailing-closure call:
+
+```fai
+let view = VStack do
+    Label('hi')
+end.padding(12).background('#fafafa')
 ```
 
 ### Mutable parameters
@@ -4256,7 +4398,9 @@ fn scaffold_claude_md(project_name: &str) -> String {
 forai treats testing and documentation as first-class — they're enforced by
 the tooling, not optional style. Read this before writing code.
 
-- **Document as you go.** Every `def` needs a doc comment. No exceptions.
+- **Document as you go.** Every named `def`, `remote def`, and `test`
+  block requires a `# Description.` line directly above it. Missing
+  one is a type error: `doc comment required`. `main` is exempt.
 - **Test every function.** `fai test` fails the build if any public
   function is uncovered. Private helpers covered by a tested caller are OK.
 - **Red → green → refactor, one function at a time.** Write the `test`
@@ -4446,7 +4590,9 @@ Guidelines for AI agents working on this forai project.
 forai treats testing and documentation as first-class — they're enforced by
 the tooling, not optional style. Read this before writing code.
 
-- **Document as you go.** Every `def` needs a doc comment. No exceptions.
+- **Document as you go.** Every named `def`, `remote def`, and `test`
+  block requires a `# Description.` line directly above it. Missing
+  one is a type error: `doc comment required`. `main` is exempt.
 - **Test every function.** `fai test` fails the build if any public
   function is uncovered. Private helpers covered by a tested caller are OK.
 - **Red → green → refactor, one function at a time.** Write the `test`
@@ -4742,10 +4888,7 @@ fn compile_fai_to_wasm(
     ) {
         Ok(wasm) => wasm,
         Err(e) => {
-            eprintln!(
-                "internal error: direct AST→wasm codegen refused this program: {:?}",
-                e,
-            );
+            eprintln!("{}", format_codegen_error(&e));
             std::process::exit(1);
         }
     }
@@ -4764,6 +4907,7 @@ fn run_checker(
             .map(|m| fai_checker::PreparedModule {
                 name: m.name.clone(),
                 statements: m.statements.clone(),
+                file_paths: m.file_paths.clone(),
                 private_names: m.private_names.clone(),
                 file_path: None,
             })
@@ -4772,21 +4916,129 @@ fn run_checker(
     }
 }
 
-/// Format one error per line. If the checker accumulated more than one error
-/// during this pass, include them all so users aren't forced to run the
-/// pipeline once per issue. Falls back to the single `Err(CheckError)` when
-/// the accumulator is empty (e.g. Phase 1 failures that short-circuit before
+/// Render a codegen `LocatedBuildError` in the same `Source codegen
+/// errors:` block style the check phase uses, so file:line shows up
+/// the same way. The variant `Debug` form (e.g.
+/// `UnknownIdentifier("length")`) is what surfaces inside the file
+/// section; an unlocated error falls into a `(no file)` bucket.
+///
+/// Errors that point into an **external package** (the module's root
+/// segment starts uppercase — `Forui`, `Forsqlite`, …) get a
+/// dedicated `package: <Name>` heading and an explicit "fix
+/// upstream" note, so the agent doesn't waste turns trying to
+/// resolve a framework-internal failure inside the user's project.
+///
+/// Returns the formatted block — the caller decides how to combine
+/// with its own step status.
+fn format_codegen_error(err: &fai_codegen_wasm::LocatedBuildError) -> String {
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_project_root(&cwd));
+    let display_path = |raw: &str| -> String {
+        if let Some(root) = &project_root {
+            if let Ok(canon) = std::fs::canonicalize(raw) {
+                if let Ok(rel) = canon.strip_prefix(root) {
+                    return rel.display().to_string();
+                }
+            }
+        }
+        raw.to_string()
+    };
+    let mut out = String::from("\nSource codegen errors:\n");
+    let body = match (err.line, err.col) {
+        (Some(l), Some(c)) => format!("  {:?} (line {}:{})\n", err.err, l, c),
+        (Some(l), None) => format!("  {:?} (line {})\n", err.err, l),
+        _ => format!("  {:?}\n", err.err),
+    };
+
+    // Heading priority: module name (always, no conditional on
+    // external vs user) → file path → `(no file)` bucket.
+    if let Some(module) = err.module.as_deref() {
+        out.push('\n');
+        out.push_str(&format!("package: {}\n", module));
+        out.push_str(&body);
+        if err.is_external_package() {
+            out.push_str(
+                "  ** This error is in an external dependency and will need to be fixed there\n",
+            );
+        }
+    } else if let Some(f) = err.file.as_deref() {
+        out.push('\n');
+        out.push_str(&display_path(f));
+        out.push('\n');
+        out.push_str(&body);
+    } else {
+        out.push_str("\n(no file)\n");
+        out.push_str(&body);
+    }
+    out
+}
+
+/// Group check errors by source file under a `Source check errors:`
+/// header. Each file gets a heading followed by indented messages —
+/// no `type error:` prefix on every line, since the section header
+/// already says it. Errors that arrived without file info land in a
+/// trailing `(no file)` bucket. Paths are shown relative to the
+/// project root when one can be located, otherwise as-is.
+///
+/// Falls back to the single `Err(CheckError)` when the accumulator
+/// is empty (e.g. Phase 1 failures that short-circuit before
 /// per-statement collection runs).
 fn format_check_errors(checker: &fai_checker::Checker, first: &fai_checker::CheckError) -> String {
     if checker.collected_errors.is_empty() {
         return first.to_string();
     }
-    checker
-        .collected_errors
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_project_root(&cwd));
+
+    let display_path = |raw: &str| -> String {
+        if let Some(root) = &project_root {
+            if let Ok(canon) = std::fs::canonicalize(raw) {
+                if let Ok(rel) = canon.strip_prefix(root) {
+                    return rel.display().to_string();
+                }
+            }
+        }
+        raw.to_string()
+    };
+
+    let mut by_file: std::collections::BTreeMap<String, Vec<&fai_checker::CheckError>> =
+        std::collections::BTreeMap::new();
+    let mut no_file: Vec<&fai_checker::CheckError> = Vec::new();
+    for err in &checker.collected_errors {
+        match err.file.as_deref() {
+            Some(p) => by_file.entry(display_path(p)).or_default().push(err),
+            None => no_file.push(err),
+        }
+    }
+
+    let mut out = String::from("\nSource check errors:\n");
+    for (file, errs) in &by_file {
+        out.push('\n');
+        out.push_str(file);
+        out.push('\n');
+        for e in errs {
+            out.push_str("  ");
+            out.push_str(&e.message);
+            if let (Some(line), Some(col)) = (e.line, e.column) {
+                out.push_str(&format!(" (line {}:{})", line, col));
+            } else if let Some(line) = e.line {
+                out.push_str(&format!(" (line {})", line));
+            }
+            out.push('\n');
+        }
+    }
+    if !no_file.is_empty() {
+        out.push_str("\n(no file)\n");
+        for e in &no_file {
+            out.push_str("  ");
+            out.push_str(&e.message);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Find project root and source directory from the current working directory.
@@ -5027,6 +5279,64 @@ mod tests {
             err.contains("Widget") || err.contains("Unknown"),
             "error should mention the unknown type; got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_run_project_check_catches_errors_in_multi_target_nested_src() {
+        // Regression test: a multi-target project (fai.toml has
+        // [project.<name>] sub-projects) with a nested-only src/ —
+        // i.e. no top-level .fai files, only subdirectories like
+        // `auth/`, `data/`, `pages/` — used to silently pass
+        // `fai check`. The bug: step_check fell through to its
+        // flat-library mode, which builds a synthetic entry from
+        // top-level `use` lines. With no top-level files those lines
+        // are empty, no modules get discovered, and check_with_modules
+        // walks nothing.
+        //
+        // The fix: detect [project.<name>] sub-projects in
+        // run_project_check and dispatch to per-target check, the
+        // same way step_test already does for tests.
+        let proj = temp_dir("multi_target_nested_check");
+        std::fs::create_dir_all(proj.join("src/auth")).unwrap();
+        std::fs::create_dir_all(proj.join("src/platforms/server")).unwrap();
+        std::fs::write(
+            proj.join("fai.toml"),
+            "[project]\nname = \"App\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\
+             \n[project.server]\ntarget = \"native\"\nsource = \"src\"\n\
+             main = \"src/platforms/server/main.fai\"\n\
+             build_dir = \"build/server\"\n",
+        )
+        .unwrap();
+
+        // Nested file with a deliberate doc-comment violation on a
+        // public function. Doc comments are required language-wide
+        // and `fai check` must surface this.
+        std::fs::write(
+            proj.join("src/auth/login.fai"),
+            "def login\n    @return Bool\ndo\n  true\nend\n",
+        )
+        .unwrap();
+
+        // Server entry that imports from auth.
+        std::fs::write(
+            proj.join("src/platforms/server/main.fai"),
+            "use { login } from auth\n\n\
+             def main\n    @return Void\ndo\n  let _ = login()\nend\n",
+        )
+        .unwrap();
+
+        let result = run_project_check(&proj, "src");
+        assert!(
+            result.is_err(),
+            "fai check should fail on doc-comment violation in a nested src/ \
+             of a multi-target project, got Ok"
+        );
+        let (msg, _count) = result.unwrap_err();
+        assert!(
+            msg.contains("doc comment") && msg.contains("login"),
+            "error should report the missing doc comment on `login`, got:\n{}",
+            msg
         );
     }
 
@@ -6638,16 +6948,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_new_template_can_ship_its_own_meta_files() {
-        // A template that ships e.g. a custom CLAUDE.md (forui-specific
-        // guidance, say) should keep its version — `fai new` only fills
-        // in meta files the template *didn't* provide.
-        let base = temp_dir("cmd_new_meta_override");
+    fn test_cmd_new_appends_template_meta_to_scaffold() {
+        // A template that ships its own CLAUDE.md / AGENTS.md (forui-
+        // specific guidance, say) gets appended below the language-
+        // level scaffold so both are visible. Language-level rules
+        // (doc comments, testing) come first; project-specific
+        // guidance follows under a separator.
+        let base = temp_dir("cmd_new_meta_append");
         let tpl = base.join("tpl");
         std::fs::create_dir_all(tpl.join("src")).unwrap();
         std::fs::write(tpl.join("fai.toml"), "[project]\nname = \"X\"\n").unwrap();
         std::fs::write(tpl.join("src/main.fai"), "def main\n  @return Void\ndo\nend\n").unwrap();
         std::fs::write(tpl.join("CLAUDE.md"), "# Custom guidance\n\nTemplate-owned.\n").unwrap();
+        std::fs::write(tpl.join("AGENTS.md"), "# Custom AGENTS\n\nTemplate-agents.\n").unwrap();
 
         let project_path = base.join("app");
         cmd_new(&[
@@ -6659,12 +6972,30 @@ mod tests {
         let claude = std::fs::read_to_string(project_path.join("CLAUDE.md")).unwrap();
         assert!(
             claude.contains("Template-owned"),
-            "template-supplied CLAUDE.md should be preserved, got:\n{}",
+            "template-supplied CLAUDE.md content should be preserved, got:\n{}",
             claude
         );
-        // But meta files the template *didn't* ship still get filled in.
+        assert!(
+            claude.contains("Project-specific guidance"),
+            "merged CLAUDE.md should carry the separator header, got:\n{}",
+            claude
+        );
+        assert!(
+            claude.find("Template-owned").unwrap()
+                > claude.find("Project-specific guidance").unwrap(),
+            "scaffold should come first, template second:\n{}",
+            claude
+        );
+
+        let agents = std::fs::read_to_string(project_path.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("Template-agents") && agents.contains("doc comment required"),
+            "merged AGENTS.md should carry both scaffold (doc-comment rule) and template content, got:\n{}",
+            agents
+        );
+
+        // Meta files the template *didn't* ship still get filled in.
         assert!(project_path.join("language.md").exists());
-        assert!(project_path.join("AGENTS.md").exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6683,15 +7014,41 @@ mod tests {
     }
 
     #[test]
-    fn overlay_meta_preserves_existing_file() {
-        let base = temp_dir("overlay_preserves");
+    fn overlay_meta_appends_template_content_to_scaffold() {
+        // Existing CLAUDE.md / AGENTS.md gets appended below the
+        // scaffold rather than replaced. Other meta files (e.g.
+        // .mcp.json) still use last-write-wins.
+        let base = temp_dir("overlay_appends");
         let dir = base.join("p");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("CLAUDE.md"), "OWNED").unwrap();
         overlay_meta_files(&dir, "my-app");
+        let merged = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        assert!(merged.contains("OWNED"), "template content kept: {}", merged);
+        assert!(
+            merged.contains("Project-specific guidance"),
+            "separator header present: {}",
+            merged
+        );
+        assert!(
+            merged.find("OWNED").unwrap() > merged.find("Project-specific").unwrap(),
+            "scaffold first, template second: {}",
+            merged
+        );
+    }
+
+    #[test]
+    fn overlay_meta_preserves_non_md_files() {
+        // .mcp.json, .codex/config.toml, language.md keep last-write-wins
+        // semantics — appending doesn't make sense for structured files.
+        let base = temp_dir("overlay_preserves_structured");
+        let dir = base.join("p");
+        std::fs::create_dir_all(dir.join(".codex")).unwrap();
+        std::fs::write(dir.join(".mcp.json"), "{\"custom\":true}").unwrap();
+        overlay_meta_files(&dir, "my-app");
         assert_eq!(
-            std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap(),
-            "OWNED"
+            std::fs::read_to_string(dir.join(".mcp.json")).unwrap(),
+            "{\"custom\":true}"
         );
     }
 

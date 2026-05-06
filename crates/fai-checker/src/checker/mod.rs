@@ -69,7 +69,15 @@ fn expression_location(expr: &Expression) -> &SourceLocation {
 pub struct PreparedModule {
     pub name: String,
     pub statements: Vec<Statement>,
+    /// Per-statement source file path, parallel to `statements`. The
+    /// checker reads this before checking each top-level statement
+    /// to set `Checker::current_file`, so error messages can group
+    /// by file.
+    pub file_paths: Vec<Option<String>>,
     pub private_names: Vec<String>,
+    /// Single file fallback. Kept for callers that build small
+    /// single-file modules in tests; ignored when `file_paths` is
+    /// populated.
     pub file_path: Option<String>,
 }
 

@@ -88,7 +88,11 @@ impl Checker {
             // another file checked earlier in source order. The pre-pass
             // type-checks each initializer and adds the name to env;
             // the main loop below skips bindings that are already there.
-            self.forward_declare_module_bindings(&module.statements, &mut env);
+            self.forward_declare_module_bindings(
+                &module.statements,
+                &module.file_paths,
+                &mut env,
+            );
 
             // Mark the module currently being checked so that any
             // ufcs_calls / named_param_reorder entries get tagged with
@@ -99,14 +103,23 @@ impl Checker {
 
             // Check each statement, accumulating errors per statement so
             // one error in a module doesn't hide the rest (same pattern as
-            // check_top_level_statements below).
-            for stmt in &module.statements {
+            // check_top_level_statements below). `current_file` is
+            // updated per statement so error messages carry the real
+            // file path even though one module's statements span
+            // multiple files.
+            for (idx, stmt) in module.statements.iter().enumerate() {
+                self.current_file = module
+                    .file_paths
+                    .get(idx)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| module.file_path.clone());
                 if let Err(e) = self.check_top_level_statement(stmt, &mut env) {
                     install_failed_binding_placeholders(stmt, &mut env);
                     self.collected_errors.push(e);
                 }
             }
-
+            self.current_file = None;
             self.current_module = None;
 
             // Merge env-derived exports (catches module-level let/var
@@ -453,8 +466,11 @@ impl Checker {
                         .map(|(_, bn)| bn.as_str())
                         .ok_or_else(|| {
                             CheckError::new(format!(
-                                "Standard module '{}' does not export '{}'",
-                                module_name, name
+                                "Standard module '{}' does not export '{}'. \
+                                 Run `fai doc {}` to find which module exports it \
+                                 (or whether it exists at all). \
+                                 `fai doc {}` lists everything '{}' exports.",
+                                module_name, name, name, module_name, module_name
                             ))
                         })?;
                     let ty = self.builtins.get(builtin_name).ok_or_else(|| {
@@ -514,8 +530,11 @@ impl Checker {
                 for name in imported_names {
                     let ty = exports.get(name).ok_or_else(|| {
                         CheckError::new(format!(
-                            "Module '{}' does not export '{}'",
-                            module_name, name
+                            "Module '{}' does not export '{}'. \
+                             Run `fai doc {}` to find which module exports it \
+                             (or whether it exists at all). \
+                             `fai doc {}` lists everything '{}' exports.",
+                            module_name, name, name, module_name, module_name
                         ))
                     })?;
                     // Multiple files in a directory module may import the same name;
@@ -682,9 +701,11 @@ impl Checker {
     fn forward_declare_module_bindings(
         &mut self,
         statements: &[Statement],
+        file_paths: &[Option<String>],
         env: &mut Environment,
     ) {
-        for stmt in statements {
+        for (idx, stmt) in statements.iter().enumerate() {
+            self.current_file = file_paths.get(idx).cloned().flatten();
             match stmt {
                 Statement::VarStatement(vs) => {
                     if let Err(e) =
@@ -707,6 +728,7 @@ impl Checker {
                 _ => {}
             }
         }
+        self.current_file = None;
     }
 
     /// Build a module's public export table purely from its AST, no
@@ -1005,12 +1027,14 @@ mod tests {
             PreparedModule {
                 name: "a".to_string(),
                 statements: vec![],
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: None,
             },
             PreparedModule {
                 name: "b".to_string(),
                 statements: vec![],
+                file_paths: Vec::new(),
                 private_names: vec![],
                 file_path: None,
             },
