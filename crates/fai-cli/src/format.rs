@@ -161,7 +161,7 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
         },
         Statement::Function(f) => format_function_decl(f, indent),
         Statement::Type(t) => {
-            let inner = format!("{}  ", indent);
+            let inner = format!("{}{}", indent, INDENT_STEP);
             let mut lines = Vec::new();
             let remote_prefix = if t.is_remote { "remote " } else { "" };
             lines.push(format!("{}{}type {}", indent, remote_prefix, t.name));
@@ -178,7 +178,7 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             let members: Vec<String> = e
                 .members
                 .iter()
-                .map(|m| format!("{}  {}", indent, m))
+                .map(|m| format!("{}{}{}", indent, INDENT_STEP, m))
                 .collect();
             format!(
                 "{}enum {}\n{}\n{}end",
@@ -235,7 +235,7 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             format!("{}{}", indent, format_expression(&e.expression, indent))
         }
         Statement::ExternBlock(ext) => {
-            let inner = format!("{}  ", indent);
+            let inner = format!("{}{}", indent, INDENT_STEP);
             let mut lines = vec![format!("{}extern {}", indent, ext.library)];
             for t in &ext.types {
                 lines.push(format!("{}type {}", inner, t.name));
@@ -259,7 +259,7 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             lines.join("\n")
         }
         Statement::FunctionTypeDef(ftd) => {
-            let inner = format!("{}    ", indent);
+            let inner = format!("{}{}", indent, INDENT_STEP);
             let mut lines = Vec::new();
             if let Some(doc) = &ftd.doc_comment {
                 for line in doc.lines() {
@@ -353,7 +353,7 @@ fn format_function_decl_old(f: &FunctionDeclaration, indent: &str) -> String {
 
 /// Format a function in new v2 syntax with @type/@param/@return and do...end.
 fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
-    let inner = format!("{}    ", indent);
+    let inner = format!("{}{}", indent, INDENT_STEP);
     let mut lines = Vec::new();
 
     // Doc comment
@@ -427,6 +427,12 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
 }
 
 fn format_test_decl(t: &TestDeclaration, indent: &str) -> String {
+    // `it`, `beforeAll`, `afterAll`, `beforeEach`, `afterEach`, and
+    // any free-standing setup statements all sit one level inside the
+    // `test` block. Their bodies sit one further level in. Without
+    // this, `it` lines and case bodies render flush with `test` /
+    // `end`, which makes the block boundaries hard to see.
+    let inner = format!("{}{}", indent, INDENT_STEP);
     let mut parts = vec![format!("{}test {}", indent, t.name)];
 
     if !t.setup.is_empty() {
@@ -435,42 +441,42 @@ fn format_test_decl(t: &TestDeclaration, indent: &str) -> String {
     if let Some(ba) = &t.before_all {
         parts.push(format!(
             "{}beforeAll\n{}\n{}end",
-            indent,
-            format_block(ba, indent),
-            indent
+            inner,
+            format_block(ba, &inner),
+            inner
         ));
     }
     if let Some(be) = &t.before_each {
         parts.push(format!(
             "{}beforeEach\n{}\n{}end",
-            indent,
-            format_block(be, indent),
-            indent
+            inner,
+            format_block(be, &inner),
+            inner
         ));
     }
     for case in &t.cases {
         parts.push(format!(
             "{}it '{}'\n{}\n{}end",
-            indent,
+            inner,
             case.description,
-            format_block(&case.body, indent),
-            indent
+            format_block(&case.body, &inner),
+            inner
         ));
     }
     if let Some(ae) = &t.after_each {
         parts.push(format!(
             "{}afterEach\n{}\n{}end",
-            indent,
-            format_block(ae, indent),
-            indent
+            inner,
+            format_block(ae, &inner),
+            inner
         ));
     }
     if let Some(aa) = &t.after_all {
         parts.push(format!(
             "{}afterAll\n{}\n{}end",
-            indent,
-            format_block(aa, indent),
-            indent
+            inner,
+            format_block(aa, &inner),
+            inner
         ));
     }
     parts.push(format!("{}end", indent));
@@ -545,8 +551,11 @@ fn format_try_stmt(t: &TryStatement, indent: &str) -> String {
     s
 }
 
+/// One indentation level. Canonical fai style is 4 spaces.
+const INDENT_STEP: &str = "    ";
+
 fn format_block(statements: &[Statement], indent: &str) -> String {
-    let next_indent = format!("{}  ", indent);
+    let next_indent = format!("{}{}", indent, INDENT_STEP);
     statements
         .iter()
         .map(|s| format_statement(s, &next_indent))
@@ -665,7 +674,7 @@ fn format_chain_call(call: &CallExpr, indent: &str) -> String {
     // types don't impl Clone, so we render in place rather than
     // wrapping a clone for `format_expression` to recurse on.
     let base = format_simple_call(cursor_call, indent);
-    let chain_indent = format!("{}  ", indent);
+    let chain_indent = format!("{}{}", indent, INDENT_STEP);
     let mut out = base;
     for (prop, args) in links.iter().rev() {
         out.push('\n');
@@ -878,7 +887,7 @@ fn format_expression(expr: &Expression, indent: &str) -> String {
                         format!("[{}]", items.join(" "))
                     }
                     ArrayLiteralStyle::Vertical => {
-                        let next_indent = format!("{}  ", indent);
+                        let next_indent = format!("{}{}", indent, INDENT_STEP);
                         let needs_commas = a
                             .items
                             .iter()
@@ -900,7 +909,7 @@ fn format_expression(expr: &Expression, indent: &str) -> String {
             if d.entries.is_empty() {
                 "{}".to_string()
             } else {
-                let next_indent = format!("{}  ", indent);
+                let next_indent = format!("{}{}", indent, INDENT_STEP);
                 let entries: Vec<String> = d
                     .entries
                     .iter()
@@ -1029,11 +1038,14 @@ fn format_do_block(f: &FunctionDeclaration, indent: &str) -> String {
             .collect();
         format!(" with {}", params.join(", "))
     };
-    let inner = format!("{}  ", indent);
+    // The do-block body is one level deeper than the line that
+    // opened the block. `format_block` adds one INDENT_STEP, which
+    // is exactly the level we want — don't add a second step here
+    // or every nested do-block doubles the indent.
     format!(
         "do{}\n{}\n{}end",
         params_str,
-        format_block(&f.body, &inner),
+        format_block(&f.body, indent),
         indent
     )
 }
@@ -1172,7 +1184,8 @@ mod tests {
         //
         // Rule: when a Call's callee is a Member whose object is a
         // Call (i.e., `something(...).method(...)`), put `.method`
-        // on a new line indented two spaces from the base.
+        // on a new line indented one INDENT_STEP (four spaces) from
+        // the base.
         let formatted = rt(concat!(
             "use { Label, padding } from x\n\n",
             "# Stub.\n",
@@ -1183,9 +1196,8 @@ mod tests {
             "def build\n    @return Int\ndo\n  Label('hi').padding(12)\nend\n",
         ));
         assert!(
-            formatted.contains("Label('hi')\n    .padding(12)")
-                || formatted.contains("Label('hi')\n  .padding(12)"),
-            "single chain link should break onto new indented line, got:\n{}",
+            formatted.contains("Label('hi')\n        .padding(12)"),
+            "single chain link should break onto a new line indented one step deeper than the surrounding code (def body is at 4 spaces, so the chain link is at 8), got:\n{}",
             formatted
         );
     }
@@ -1358,56 +1370,55 @@ mod tests {
 
     #[test]
     fn test_format_if_else() {
-        let src = "if x > 0\n  print('pos')\nelse\n  print('neg')\nend\n";
+        let src = "if x > 0\n    print('pos')\nelse\n    print('neg')\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_if_only() {
-        let src = "if x > 0\n  print('pos')\nend\n";
+        let src = "if x > 0\n    print('pos')\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_if_else_if() {
-        let src =
-            "if x > 0\n  print('pos')\nelse if x < 0\n  print('neg')\nelse\n  print('zero')\nend\n";
+        let src = "if x > 0\n    print('pos')\nelse if x < 0\n    print('neg')\nelse\n    print('zero')\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_for_range() {
-        let src = "for i in 0..9\n  print(i)\nend\n";
+        let src = "for i in 0..9\n    print(i)\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_while() {
-        let src = "while x > 0\n  x = x - 1\nend\n";
+        let src = "while x > 0\n    x = x - 1\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_case_when_default() {
-        let src = "case x\nwhen 1\n  print('one')\ndefault\n  print('other')\nend\n";
+        let src = "case x\nwhen 1\n    print('one')\ndefault\n    print('other')\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_case_no_default() {
-        let src = "case x\nwhen 1\n  print('one')\nwhen 2\n  print('two')\nend\n";
+        let src = "case x\nwhen 1\n    print('one')\nwhen 2\n    print('two')\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_try_catch() {
-        let src = "try\n  risky()\ncatch e\n  print(e)\nend\n";
+        let src = "try\n    risky()\ncatch e\n    print(e)\nend\n";
         assert_eq!(rt(src), src);
     }
 
     #[test]
     fn test_format_try_catch_finally() {
-        let src = "try\n  risky()\ncatch e\n  print(e)\nfinally\n  cleanup()\nend\n";
+        let src = "try\n    risky()\ncatch e\n    print(e)\nfinally\n    cleanup()\nend\n";
         assert_eq!(rt(src), src);
     }
 
@@ -1425,7 +1436,7 @@ mod tests {
     fn test_format_break() {
         assert_eq!(
             rt("while true\n  break\nend\n"),
-            "while true\n  break\nend\n"
+            "while true\n    break\nend\n"
         );
     }
 
@@ -1433,7 +1444,7 @@ mod tests {
     fn test_format_continue() {
         assert_eq!(
             rt("while true\n  continue\nend\n"),
-            "while true\n  continue\nend\n"
+            "while true\n    continue\nend\n"
         );
     }
 
@@ -1444,7 +1455,7 @@ mod tests {
 
     #[test]
     fn test_format_type_declaration() {
-        let src = "type Point\n  x Int\n  y Int\nend\n";
+        let src = "type Point\n    x Int\n    y Int\nend\n";
         assert_eq!(rt(src), src);
     }
 
@@ -1462,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_format_enum() {
-        let src = "enum Color\n  red\n  green\n  blue\nend\n";
+        let src = "enum Color\n    red\n    green\n    blue\nend\n";
         assert_eq!(rt(src), src);
     }
 
@@ -1789,9 +1800,9 @@ end
         // remote type must survive a round-trip through the formatter.
         let src = "\
 remote type Task
-  id Int
-  text String
-  done Bool
+    id Int
+    text String
+    done Bool
 end
 ";
         assert_eq!(rt(src), src);
@@ -2128,6 +2139,10 @@ end
 
     #[test]
     fn test_format_test_decl_basic() {
+        // `test`, `it`, and the it-body must each indent one step
+        // deeper than their parent. With INDENT_STEP = 4 spaces and
+        // the test block at the file root (indent ""), `it` lands at
+        // 4 spaces and the it-body at 8 spaces.
         let l = loc();
         let t = TestDeclaration {
             name: "Suite".to_string(),
@@ -2144,14 +2159,16 @@ end
             location: l,
         };
         let result = format_statement(&Statement::Test(t), "");
-        assert!(result.starts_with("test Suite"));
-        assert!(result.contains("it 'passes'"));
-        assert!(result.contains("  assertion"));
-        assert!(result.ends_with("end"));
+        let expected = "test Suite\n    it 'passes'\n        assertion\n    end\nend";
+        assert_eq!(result, expected);
     }
 
     #[test]
     fn test_format_test_decl_with_lifecycle() {
+        // Every lifecycle hook (beforeAll, beforeEach, afterEach,
+        // afterAll) is a peer of `it` — same indent as `it`, body
+        // one further step in. Asserts each hook's `<keyword>\n    `
+        // line shape on top of the basic substring presence.
         let l = loc();
         let t = TestDeclaration {
             name: "Full".to_string(),
@@ -2168,11 +2185,12 @@ end
             location: l,
         };
         let result = format_statement(&Statement::Test(t), "");
-        assert!(result.contains("beforeAll"));
-        assert!(result.contains("beforeEach"));
-        assert!(result.contains("afterEach"));
-        assert!(result.contains("afterAll"));
-        assert!(result.contains("it 'case1'"));
+        // Hooks indent one step (4 spaces) inside `test`.
+        assert!(result.contains("\n    beforeAll\n        ba\n    end"));
+        assert!(result.contains("\n    beforeEach\n        be\n    end"));
+        assert!(result.contains("\n    afterEach\n        ae\n    end"));
+        assert!(result.contains("\n    afterAll\n        aa\n    end"));
+        assert!(result.contains("\n    it 'case1'"));
     }
 
     // ── FunctionTypeDef ─────────────────────────────────────────────
@@ -2247,7 +2265,7 @@ end
             location: loc(),
         }))]);
         let result = format_program(&prog);
-        assert_eq!(result, "[\n  1\n  2\n  3\n]\n");
+        assert_eq!(result, "[\n    1\n    2\n    3\n]\n");
     }
 
     #[test]
@@ -2271,7 +2289,7 @@ end
         let result = format_program(&prog);
         assert_eq!(
             result,
-            "[\n  [\n    1\n    2\n  ],\n  [\n    3\n    4\n  ]\n]\n"
+            "[\n    [\n        1\n        2\n    ],\n    [\n        3\n        4\n    ]\n]\n"
         );
     }
 
@@ -2283,7 +2301,7 @@ end
         let file = dir.join("main.fai");
         std::fs::write(
             &file,
-            "def main\n    @return Void\ndo\n  let xs = [1 2 3]\n  print(length(xs))\nend\n",
+            "def main\n    @return Void\ndo\n    let xs = [1 2 3]\n    print(length(xs))\nend\n",
         )
         .unwrap();
         let result = format_path(file.to_str().unwrap(), false).unwrap();
@@ -2291,7 +2309,7 @@ end
         let formatted = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             formatted,
-            "def main\n    @return Void\ndo\n  let xs = [1 2 3]\n  print(length(xs))\nend\n"
+            "def main\n    @return Void\ndo\n    let xs = [1 2 3]\n    print(length(xs))\nend\n"
         );
     }
 
@@ -2303,7 +2321,7 @@ end
         let file = dir.join("main.fai");
         std::fs::write(
             &file,
-            "def main\n    @return Void\ndo\n  let xs = [\n    1\n    2\n    3\n  ]\n  print(length(xs))\nend\n",
+            "def main\n    @return Void\ndo\n    let xs = [\n        1\n        2\n        3\n    ]\n    print(length(xs))\nend\n",
         )
         .unwrap();
         let result = format_path(file.to_str().unwrap(), false).unwrap();
@@ -2311,7 +2329,7 @@ end
         let formatted = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             formatted,
-            "def main\n    @return Void\ndo\n  let xs = [\n    1\n    2\n    3\n  ]\n  print(length(xs))\nend\n"
+            "def main\n    @return Void\ndo\n    let xs = [\n        1\n        2\n        3\n    ]\n    print(length(xs))\nend\n"
         );
     }
 

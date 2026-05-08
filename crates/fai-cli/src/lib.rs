@@ -189,18 +189,56 @@ fn cmd_run(args: &[String]) {
         if is_project_mode {
             pipeline_enter_project(project.as_deref()).require_project();
             print_project_header(&reporter);
+            // wasm-only run path: drive the full build (deps + asset
+            // copy + codegen) through step_build, then execute the
+            // produced .wasm directly. step_build's per-target recursion
+            // runs fmt/check/test for each target, so we don't run
+            // them again at the cmd_run level — duplicating those
+            // steps would just re-do the work the build already did.
+            let mut build_args: Vec<String> = args.iter().cloned().collect();
+            // Strip the ad-hoc positional `<target>` that cmd_run may
+            // have already lifted into `project`; step_build pulls
+            // the same name from `project` and would otherwise treat
+            // the leftover positional as a file path.
+            if let Some(name) = project.as_deref() {
+                build_args.retain(|a| a != name);
+            }
+            step_build(&build_args, project.as_deref(), &reporter);
+            if let Some(wasm) = resolve_target_wasm_artifact(project.as_deref()) {
+                // Run the artifact from inside its build_dir so paths
+                // in the program (server.serveFiles('public'),
+                // env.load('.env.dev'), etc.) resolve against the
+                // self-contained deploy unit instead of the project
+                // root. Asset files declared in fai.toml that need to
+                // be alongside the binary at runtime (env files,
+                // config files) should be listed in
+                // [project.<name>.assets].
+                let wasm_path = std::path::PathBuf::from(&wasm);
+                let run_path = if let Some(parent) = wasm_path.parent() {
+                    let _ = std::env::set_current_dir(parent);
+                    wasm_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or(wasm.clone())
+                } else {
+                    wasm.clone()
+                };
+                let run_args: Vec<String> = vec![run_path];
+                step_run(&run_args, None, &reporter);
+                return;
+            }
+            // Fall through to the legacy in-memory compile-and-run if
+            // the build didn't produce a resolvable artifact (e.g.
+            // single-project mode without a build_dir).
+        } else {
+            // Raw .fai file path — keep the existing in-memory
+            // compile-and-run path. fmt/check/test happen here so
+            // ad-hoc scripts behave the same as before.
+            let target_args = scoped_pipeline_args(&args, project.as_deref());
+            step_fmt(&target_args, &reporter);
+            step_check(&target_args, &reporter);
+            step_test(&target_args, &reporter);
         }
-        // When `--project NAME` points at a sub-project, resolve its
-        // entry file and run fmt/check/test against *that* file — same
-        // way step_build recurses per-target. Without this, fmt/check/
-        // test run in no-target mode (which is a near no-op for multi-
-        // target workspaces where everything lives under src/<name>/)
-        // and miss the target's real tests. Matches the 95/75 tests
-        // `fai build` finds per target.
-        let target_args = scoped_pipeline_args(&args, project.as_deref());
-        step_fmt(&target_args, &reporter);
-        step_check(&target_args, &reporter);
-        step_test(&target_args, &reporter);
     }
     step_run(&args, project.as_deref(), &reporter);
 }
@@ -1453,34 +1491,27 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
             let info = parse_project_info(&toml);
             // New multi-target mode
             if !info.sub_projects.is_empty() {
-                let targets = select_targets(&info, project);
-                if targets.is_empty() && project.is_some() {
-                    std::process::exit(1);
-                }
-                for (name, sub) in &targets {
-                    // Prefer explicit main, fall back to convention
-                    let entry_opt = sub
-                        .main
-                        .as_ref()
-                        .map(|m| root.join(m))
-                        .filter(|p| p.is_file())
-                        .or_else(|| {
-                            sub.source.as_ref().and_then(|src| {
-                                resolve_entry_point_with_hint(&root, src, Some(name))
-                            })
-                        });
-                    if let Some(entry) = entry_opt {
-                        eprintln!("\n▶ building target '{}' ({})", name, entry.display());
-                        let mut build_args = vec![entry.to_string_lossy().into_owned()];
-                        if matches!(sub.target, Some(BuildTarget::WasmHtml)) {
-                            build_args.push("--html".to_string());
+                // Validate the named target exists before planning;
+                // an unknown name should still print the targets list.
+                if let Some(name) = project {
+                    if !info.sub_projects.contains_key(name) {
+                        eprintln!("error: unknown target '{}'. Available targets:", name);
+                        for k in info.sub_projects.keys() {
+                            eprintln!("  - {}", k);
                         }
-                        build_args.push("-o".to_string());
-                        build_args
-                            .push(sub_project_output_path(sub, &root, &entry, name));
-                        cmd_build(&build_args);
-                    } else {
-                        eprintln!("  warning: target '{}' — no entry point found", name);
+                        std::process::exit(1);
+                    }
+                }
+                let order = match plan_build_order(&info, project) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {}", msg);
+                        std::process::exit(1);
+                    }
+                };
+                for name in &order {
+                    if let Some(sub) = info.sub_projects.get(name) {
+                        build_one_subproject(name, sub, &root, &info);
                     }
                 }
                 return;
@@ -1503,30 +1534,22 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
         if let Some(root) = find_project_root(&cwd) {
             let toml = std::fs::read_to_string(root.join("fai.toml")).unwrap_or_default();
             let ws_info = parse_project_info(&toml);
-            if let Some(sub) = ws_info.sub_projects.get(first_arg) {
-                let entry = sub
-                    .main
-                    .as_ref()
-                    .map(|m| root.join(m))
-                    .filter(|p| p.is_file())
-                    .or_else(|| {
-                        sub.source.as_ref().and_then(|src| {
-                            resolve_entry_point_with_hint(&root, src, Some(first_arg))
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        eprintln!("error: could not resolve target '{}'", first_arg);
+            if ws_info.sub_projects.contains_key(first_arg) {
+                // Plan the dep order so any `required_targets` build
+                // before the requested one. Asset copy happens per
+                // target inside `build_one_subproject`.
+                let order = match plan_build_order(&ws_info, Some(first_arg)) {
+                    Ok(o) => o,
+                    Err(msg) => {
+                        eprintln!("error: {}", msg);
                         std::process::exit(1);
-                    });
-                eprintln!("▶ building target '{}' ({})", first_arg, entry.display());
-                let mut build_args = vec![entry.to_string_lossy().into_owned()];
-                if matches!(sub.target, Some(BuildTarget::WasmHtml)) {
-                    build_args.push("--html".to_string());
+                    }
+                };
+                for name in &order {
+                    if let Some(sub) = ws_info.sub_projects.get(name) {
+                        build_one_subproject(name, sub, &root, &ws_info);
+                    }
                 }
-                build_args.push("-o".to_string());
-                build_args
-                    .push(sub_project_output_path(sub, &root, &entry, first_arg));
-                cmd_build(&build_args);
                 return;
             }
         }
@@ -2812,6 +2835,20 @@ struct SubProject {
     /// access) under wasm. The URL comes from the matching
     /// `[project.X.dependencies.<dep>.remote.<env>]` entry.
     rpc_server: bool,
+    /// `[project.<name>] required_targets = [...]` — names of other
+    /// sub-projects whose builds must complete before this one. The
+    /// build planner resolves these into a topological order and runs
+    /// them first (cycle = build error).
+    required_targets: Vec<String>,
+    /// `[project.<name>.assets]` — ordered (from, to) pairs copied
+    /// into this target's `build_dir` after a successful build.
+    /// `from` starting with `$` references another target's
+    /// `build_dir` (e.g. `$web` → that target's output directory);
+    /// otherwise it is project-root-relative. `to` is relative to this
+    /// target's `build_dir` (empty string = copy into the build_dir
+    /// itself). Order is preserved so later entries overwrite earlier
+    /// ones in the same destination.
+    assets: Vec<(String, String)>,
 }
 
 /// Everything `forai build` reads out of the project's `fai.toml` up
@@ -2898,6 +2935,326 @@ fn sub_project_output_path(
         .into_owned()
 }
 
+/// Resolve the on-disk path of the `.wasm` artifact a sub-project
+/// build produces. Used by `cmd_run` in project mode to skip the
+/// in-memory compile and execute the just-built artifact directly.
+/// Returns `None` when the project has no sub-projects, the named
+/// target doesn't exist, or the artifact hasn't been built yet.
+fn resolve_target_wasm_artifact(project: Option<&str>) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = find_project_root(&cwd)?;
+    let toml = std::fs::read_to_string(root.join("fai.toml")).ok()?;
+    let info = parse_project_info(&toml);
+    if info.sub_projects.is_empty() {
+        return None;
+    }
+    let name = match project {
+        Some(n) => n.to_string(),
+        None => {
+            // No explicit target — only resolve when there's exactly
+            // one sub-project. Multi-target with no `--project` is
+            // ambiguous; the existing resolver handles that error.
+            if info.sub_projects.len() == 1 {
+                info.sub_projects.keys().next().cloned()?
+            } else {
+                return None;
+            }
+        }
+    };
+    let sub = info.sub_projects.get(&name)?;
+    let dir = target_build_dir(&name, sub, &root)?;
+    let path = dir.join(format!("{}.wasm", name));
+    if path.exists() {
+        Some(path.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+/// Build a single sub-project: resolve its entry point, dispatch
+/// through `cmd_build` (which runs the per-target fmt/check/test
+/// pipeline + codegen), then copy `[project.<name>.assets]` into the
+/// target's `build_dir`. Returns `true` on success, `false` when no
+/// entry point could be resolved (the per-target message is printed
+/// to stderr; the caller decides whether to continue).
+///
+/// Used by both `step_build` branches (build-all and build-one) and
+/// by `cmd_run`'s build-then-run path. Keeping the build invocation
+/// in one place ensures asset copies happen everywhere a build does.
+fn build_one_subproject(
+    name: &str,
+    sub: &SubProject,
+    root: &std::path::Path,
+    info: &ProjectInfo,
+) -> bool {
+    let entry_opt = sub
+        .main
+        .as_ref()
+        .map(|m| root.join(m))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            sub.source
+                .as_ref()
+                .and_then(|src| resolve_entry_point_with_hint(root, src, Some(name)))
+        });
+    let Some(entry) = entry_opt else {
+        eprintln!("  warning: target '{}' — no entry point found", name);
+        return false;
+    };
+    eprintln!("\n▶ building target '{}' ({})", name, entry.display());
+    let mut build_args = vec![entry.to_string_lossy().into_owned()];
+    if matches!(sub.target, Some(BuildTarget::WasmHtml)) {
+        build_args.push("--html".to_string());
+    }
+    build_args.push("-o".to_string());
+    build_args.push(sub_project_output_path(sub, root, &entry, name));
+    cmd_build(&build_args);
+    copy_target_assets(name, sub, info, root);
+    true
+}
+
+/// Resolve the absolute on-disk directory a target writes its build
+/// artifacts to. Mirrors the rule used by `sub_project_output_path`:
+/// `build_dir` from fai.toml when set, otherwise the directory of the
+/// resolved entry file. Returns `None` when no entry can be resolved.
+fn target_build_dir(
+    name: &str,
+    sub: &SubProject,
+    root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if let Some(bd) = &sub.build_dir {
+        return Some(root.join(bd));
+    }
+    let entry = sub
+        .main
+        .as_ref()
+        .map(|m| root.join(m))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            sub.source
+                .as_ref()
+                .and_then(|src| resolve_entry_point_with_hint(root, src, Some(name)))
+        })?;
+    entry.parent().map(|p| p.to_path_buf())
+}
+
+/// Plan the build order for a set of targets. When `requested` is
+/// `Some(name)`, returns the transitive closure of `name` (including
+/// `name` itself) in dependency-first topological order. When `None`,
+/// returns every sub-project in topological order. Names that don't
+/// exist in `sub_projects` are dropped from `required_targets`
+/// references (with a warning) rather than failing the build — this
+/// keeps the parser permissive about typos in non-essential deps.
+/// Cycles produce `Err(message)`; the caller exits the build.
+fn plan_build_order(
+    info: &ProjectInfo,
+    requested: Option<&str>,
+) -> Result<Vec<String>, String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Topological sort with cycle detection. `visiting` is the
+    // current DFS stack; `visited` is the finished set. Output is
+    // built in post-order so dependencies appear before dependents.
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+
+    // Start set: either the named target or every sub-project. When
+    // walking everything, sort the roots alphabetically for a stable
+    // build order across runs. Sibling subtrees that don't depend on
+    // each other otherwise build in declaration-hash order, which
+    // would be flaky in tests.
+    let roots: Vec<String> = match requested {
+        Some(name) => vec![name.to_string()],
+        None => {
+            let mut names: Vec<String> = info.sub_projects.keys().cloned().collect();
+            names.sort();
+            names
+        }
+    };
+
+    fn visit(
+        name: &str,
+        sub_projects: &HashMap<String, SubProject>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        order: &mut Vec<String>,
+        path: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if visiting.contains(name) {
+            // Reconstruct the cycle for the error message starting
+            // from where `name` first appears in `path`.
+            let cycle_start = path.iter().position(|n| n == name).unwrap_or(0);
+            let mut cycle: Vec<String> = path[cycle_start..].to_vec();
+            cycle.push(name.to_string());
+            return Err(format!(
+                "required_targets cycle: {}",
+                cycle.join(" -> ")
+            ));
+        }
+        let Some(sub) = sub_projects.get(name) else {
+            // The requested name has no sub-project; let downstream
+            // build-resolution surface a clearer error than this
+            // planner can. Drop silently.
+            return Ok(());
+        };
+        visiting.insert(name.to_string());
+        path.push(name.to_string());
+        for dep in &sub.required_targets {
+            if !sub_projects.contains_key(dep) {
+                eprintln!(
+                    "  warning: target '{}' lists required_target '{}' which is not declared in fai.toml — skipping",
+                    name, dep
+                );
+                continue;
+            }
+            visit(dep, sub_projects, visiting, visited, order, path)?;
+        }
+        path.pop();
+        visiting.remove(name);
+        visited.insert(name.to_string());
+        order.push(name.to_string());
+        Ok(())
+    }
+
+    let mut path: Vec<String> = Vec::new();
+    for root in &roots {
+        visit(
+            root,
+            &info.sub_projects,
+            &mut visiting,
+            &mut visited,
+            &mut order,
+            &mut path,
+        )?;
+    }
+    Ok(order)
+}
+
+/// Recursive directory copy that merges into existing destinations
+/// rather than replacing them. Files at the same relative path
+/// overwrite. Used by `copy_target_assets` to layer multiple `assets`
+/// entries that target the same directory (e.g. a generated client
+/// bundle plus a project's authored `public/`).
+fn copy_dir_merge(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if src.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_merge(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy every `[project.<name>.assets]` entry into the target's
+/// `build_dir`. Sources beginning with `$` reference another target's
+/// `build_dir`; everything else is project-root relative. Destinations
+/// are relative to this target's `build_dir` (empty string = the
+/// build_dir itself). Errors print to stderr but don't fail the build —
+/// the build artifact is already on disk and a missing optional asset
+/// shouldn't take it down.
+fn copy_target_assets(
+    name: &str,
+    sub: &SubProject,
+    info: &ProjectInfo,
+    root: &std::path::Path,
+) {
+    if sub.assets.is_empty() {
+        return;
+    }
+    let Some(target_dir) = target_build_dir(name, sub, root) else {
+        eprintln!(
+            "  warning: target '{}' has assets but no resolvable build_dir — skipping copy",
+            name
+        );
+        return;
+    };
+    for (from, to) in &sub.assets {
+        let src_path: std::path::PathBuf = if let Some(target_ref) = from.strip_prefix('$') {
+            match info.sub_projects.get(target_ref).and_then(|s| target_build_dir(target_ref, s, root)) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "  warning: assets source '{}' for target '{}' references unknown target — skipping",
+                        from, name
+                    );
+                    continue;
+                }
+            }
+        } else {
+            root.join(from)
+        };
+        let dst_path = if to.is_empty() {
+            target_dir.clone()
+        } else {
+            target_dir.join(to)
+        };
+        if !src_path.exists() {
+            eprintln!(
+                "  warning: assets source '{}' for target '{}' does not exist at {} — skipping",
+                from,
+                name,
+                src_path.display()
+            );
+            continue;
+        }
+        if let Err(e) = copy_dir_merge(&src_path, &dst_path) {
+            eprintln!(
+                "  warning: copying assets '{}' -> '{}' for target '{}' failed: {}",
+                from,
+                to,
+                name,
+                e
+            );
+        } else {
+            eprintln!(
+                "  copied assets {} -> {}",
+                from,
+                dst_path
+                    .strip_prefix(root)
+                    .unwrap_or(&dst_path)
+                    .display()
+            );
+        }
+    }
+}
+
+/// Parse a single-line TOML string-array literal like `["a", "b"]`.
+/// Returns an empty vec for any input that doesn't open with `[` and
+/// close with `]`. Tolerant of whitespace and trailing commas.
+/// Multi-line arrays are not supported by this hand-rolled TOML pass —
+/// keep `required_targets` to one line.
+fn parse_string_array(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = match trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    inner
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_project_info(content: &str) -> ProjectInfo {
     let mut info = ProjectInfo {
         name: "unknown".into(),
@@ -2942,8 +3299,17 @@ fn parse_project_info(content: &str) -> ProjectInfo {
                     "main" => sub.main = Some(v_unquoted),
                     "build_dir" => sub.build_dir = Some(v_unquoted),
                     "rpc_server" => sub.rpc_server = v_unquoted == "true",
+                    "required_targets" => {
+                        sub.required_targets = parse_string_array(v);
+                    }
                     _ => {}
                 }
+            } else if parts.len() == 2 && parts[1] == "assets" {
+                // [project.client.assets] — ordered "from" = "to" pairs.
+                // The key may be quoted (e.g. `"$web" = "public"`) so
+                // strip surrounding quotes from both sides.
+                let from = k.trim_matches('"').to_string();
+                sub.assets.push((from, v_unquoted));
             } else if parts.len() >= 4 && parts[1] == "dependencies" && parts[3] == "remote" {
                 // [project.client.dependencies.shared.remote.dev]
                 let dep_name = parts[2];
@@ -3188,7 +3554,7 @@ function wireEvents(){{debugLog('FAI wireEvents');document.querySelectorAll('[da
 function handleEvent(id){{const fn=instance.exports.invokeHandler;if(!fn){{console.warn('FAI handleEvent: invokeHandler not exported');return;}}const boxed=BigInt(id)|0x7FFC000400000000n;debugLog('FAI handleEvent',{{id}});try{{fn(boxed)}}catch(e){{console.error('FAI handleEvent failed',{{id,error:e}})}}}}
 function handleInputEvent(id,value){{const fn=instance.exports.invokeChangeHandler;if(!fn){{console.warn('FAI handleInputEvent: invokeChangeHandler not exported');return;}}const boxedId=BigInt(id)|0x7FFC000400000000n;const boxedStr=writeStrToWasm(value);debugLog('FAI handleInputEvent',{{id,value}});try{{fn(boxedId,boxedStr)}}catch(e){{console.error('FAI handleInputEvent failed',{{id,error:e}})}}}}
 function morphDom(root,newHtml,replaceSelf){{var tmp=document.createElement('div');tmp.innerHTML=newHtml;if(replaceSelf&&root.parentNode&&tmp.childNodes.length===1){{morphNode(root,tmp.childNodes[0],root.parentNode);return}}morphChildren(root,tmp)}}
-function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}var used={{}};for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];used[nk]=true;if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}for(var i=oc.length-1;i>=0;i--){{var k=oc[i].nodeType===1?oc[i].getAttribute('data-fai-key'):null;if(k&&!used[k])op.removeChild(oc[i])}}}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
+function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}while(op.childNodes.length>nc.length)op.removeChild(op.lastChild)}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
 function morphNode(o,n,p){{if(o.nodeType!==n.nodeType){{p.replaceChild(n,o);return}}if(o.nodeType===3){{if(o.textContent!==n.textContent)o.textContent=n.textContent;return}}if(o.nodeType===1){{if(o.nodeName!==n.nodeName){{p.replaceChild(n,o);return}}patchAttrs(o,n);if(!/^(INPUT|IMG|BR|HR|META|LINK)$/.test(o.nodeName))morphChildren(o,n)}}}}
 function patchAttrs(o,n){{var isF=o===document.activeElement&&o.tagName==='INPUT';var i,a,rm=[];for(i=0;i<n.attributes.length;i++){{a=n.attributes[i];if(a.name==='value'&&o.tagName==='INPUT'){{if(o.value!==a.value)o.value=a.value;continue;}}if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value)}}for(i=0;i<o.attributes.length;i++){{if(!n.hasAttribute(o.attributes[i].name))rm.push(o.attributes[i].name)}}for(i=0;i<rm.length;i++)o.removeAttribute(rm[i])}}
 const env={{
@@ -3424,7 +3790,7 @@ function handleEvent(id){{faiEventEmit('view:click',jsToWasm({{id:id}}))}}
 function handleInputEvent(id,value){{faiEventEmit('view:input',jsToWasm({{id:id,value:value}}))}}
 function handleSubmitEvent(id){{faiEventEmit('view:submit',jsToWasm({{id:id}}))}}
 function morphDom(root,newHtml,replaceSelf){{var tmp=document.createElement('div');tmp.innerHTML=newHtml;if(replaceSelf&&root.parentNode&&tmp.childNodes.length===1){{morphNode(root,tmp.childNodes[0],root.parentNode);return}}morphChildren(root,tmp)}}
-function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}var used={{}};for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];used[nk]=true;if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}for(var i=oc.length-1;i>=0;i--){{var k=oc[i].nodeType===1?oc[i].getAttribute('data-fai-key'):null;if(k&&!used[k])op.removeChild(oc[i])}}}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
+function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}while(op.childNodes.length>nc.length)op.removeChild(op.lastChild)}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
 function morphNode(o,n,p){{if(o.nodeType!==n.nodeType){{p.replaceChild(n,o);return}}if(o.nodeType===3){{if(o.textContent!==n.textContent)o.textContent=n.textContent;return}}if(o.nodeType===1){{if(o.nodeName!==n.nodeName){{p.replaceChild(n,o);return}}patchAttrs(o,n);if(!/^(INPUT|IMG|BR|HR|META|LINK)$/.test(o.nodeName))morphChildren(o,n)}}}}
 function patchAttrs(o,n){{var isF=o===document.activeElement&&o.tagName==='INPUT';var i,a,rm=[];for(i=0;i<n.attributes.length;i++){{a=n.attributes[i];if(a.name==='value'&&o.tagName==='INPUT'){{if(o.value!==a.value)o.value=a.value;continue;}}if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value)}}for(i=0;i<o.attributes.length;i++){{if(!n.hasAttribute(o.attributes[i].name))rm.push(o.attributes[i].name)}}for(i=0;i<rm.length;i++)o.removeAttribute(rm[i])}}
 function wireEvents(){{document.querySelectorAll('[data-fai-click]').forEach(function(el){{var h=el.getAttribute('data-fai-click');el.onclick=function(){{invokeExport(h);instance.exports._start()}}}})}}
@@ -5150,6 +5516,448 @@ mod tests {
         "  print('hi')\n",
         "end\n",
     );
+
+    #[test]
+    fn test_parse_string_array_inline() {
+        assert_eq!(parse_string_array(r#"["web"]"#), vec!["web".to_string()]);
+        assert_eq!(
+            parse_string_array(r#"["web", "other"]"#),
+            vec!["web".to_string(), "other".to_string()]
+        );
+        // Tolerant of whitespace and a trailing comma.
+        assert_eq!(
+            parse_string_array(r#"[ "a" , "b", ]"#),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // Not an array → empty vec.
+        assert_eq!(parse_string_array("\"web\""), Vec::<String>::new());
+        assert_eq!(parse_string_array("[]"), Vec::<String>::new());
+    }
+
+    /// Build a minimal `ProjectInfo` with a list of (name, deps,
+    /// assets) tuples for the planner / asset tests below. The TOML
+    /// parser is exercised separately; these tests want a fixture
+    /// they can construct cheaply without round-tripping through TOML.
+    fn project_with_targets(
+        targets: &[(&str, Vec<&str>, Vec<(&str, &str)>)],
+    ) -> ProjectInfo {
+        let mut info = ProjectInfo {
+            name: "test".into(),
+            version: "0.0.0".into(),
+            ..Default::default()
+        };
+        for (name, deps, assets) in targets {
+            let mut sub = SubProject::default();
+            sub.required_targets = deps.iter().map(|d| d.to_string()).collect();
+            sub.assets = assets
+                .iter()
+                .map(|(f, t)| (f.to_string(), t.to_string()))
+                .collect();
+            info.sub_projects.insert(name.to_string(), sub);
+        }
+        info
+    }
+
+    #[test]
+    fn test_plan_build_order_single_target_no_deps() {
+        let info = project_with_targets(&[("server", vec![], vec![])]);
+        let order = plan_build_order(&info, Some("server")).unwrap();
+        assert_eq!(order, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_build_order_dep_built_first() {
+        let info = project_with_targets(&[
+            ("web", vec![], vec![]),
+            ("server", vec!["web"], vec![]),
+        ]);
+        let order = plan_build_order(&info, Some("server")).unwrap();
+        assert_eq!(order, vec!["web".to_string(), "server".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_build_order_transitive_chain() {
+        // a → b → c → d (a depends on b which depends on c which …)
+        // Building `a` should produce d, c, b, a in that order.
+        let info = project_with_targets(&[
+            ("a", vec!["b"], vec![]),
+            ("b", vec!["c"], vec![]),
+            ("c", vec!["d"], vec![]),
+            ("d", vec![], vec![]),
+        ]);
+        let order = plan_build_order(&info, Some("a")).unwrap();
+        assert_eq!(
+            order,
+            vec![
+                "d".to_string(),
+                "c".to_string(),
+                "b".to_string(),
+                "a".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_build_order_diamond() {
+        // a → b, a → c, b → d, c → d. d must come first; a must come
+        // last; b and c can be in either order between them. Each
+        // target should appear exactly once (no double-build of d).
+        let info = project_with_targets(&[
+            ("a", vec!["b", "c"], vec![]),
+            ("b", vec!["d"], vec![]),
+            ("c", vec!["d"], vec![]),
+            ("d", vec![], vec![]),
+        ]);
+        let order = plan_build_order(&info, Some("a")).unwrap();
+        assert_eq!(order.len(), 4, "each target builds exactly once");
+        let pos = |t: &str| order.iter().position(|n| n == t).unwrap();
+        assert!(pos("d") < pos("b"));
+        assert!(pos("d") < pos("c"));
+        assert!(pos("b") < pos("a"));
+        assert!(pos("c") < pos("a"));
+    }
+
+    #[test]
+    fn test_plan_build_order_detects_cycle() {
+        let info = project_with_targets(&[
+            ("a", vec!["b"], vec![]),
+            ("b", vec!["a"], vec![]),
+        ]);
+        let err = plan_build_order(&info, Some("a")).unwrap_err();
+        assert!(err.contains("cycle"), "expected cycle error, got: {}", err);
+        assert!(err.contains("a") && err.contains("b"));
+    }
+
+    #[test]
+    fn test_plan_build_order_detects_self_cycle() {
+        let info = project_with_targets(&[("a", vec!["a"], vec![])]);
+        let err = plan_build_order(&info, Some("a")).unwrap_err();
+        assert!(err.contains("cycle"), "expected cycle error, got: {}", err);
+    }
+
+    #[test]
+    fn test_plan_build_order_unknown_dep_skipped() {
+        let info = project_with_targets(&[("server", vec!["nonexistent"], vec![])]);
+        // Unknown deps warn but don't fail planning. `server` still
+        // builds — the warning gives the user a chance to fix the
+        // typo without breaking everyone else's build.
+        let order = plan_build_order(&info, Some("server")).unwrap();
+        assert_eq!(order, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_build_order_build_all_alphabetic_roots() {
+        // No `requested` → walk every sub-project. Roots are sorted
+        // alphabetically for stable ordering across runs. With no
+        // deps, the output is just the sorted target list.
+        let info = project_with_targets(&[
+            ("zeta", vec![], vec![]),
+            ("alpha", vec![], vec![]),
+            ("middle", vec![], vec![]),
+        ]);
+        let order = plan_build_order(&info, None).unwrap();
+        assert_eq!(
+            order,
+            vec![
+                "alpha".to_string(),
+                "middle".to_string(),
+                "zeta".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_plan_build_order_build_all_respects_deps() {
+        // Build-all walks every target alphabetically as a root, but
+        // each root's deps still come before it. Net effect: deps
+        // appear before dependents regardless of alphabetical name.
+        let info = project_with_targets(&[
+            ("server", vec!["web"], vec![]),
+            ("web", vec![], vec![]),
+        ]);
+        let order = plan_build_order(&info, None).unwrap();
+        let pos_web = order.iter().position(|n| n == "web").unwrap();
+        let pos_server = order.iter().position(|n| n == "server").unwrap();
+        assert!(pos_web < pos_server, "web must build before server");
+    }
+
+    #[test]
+    fn test_copy_dir_merge_copies_file_tree() {
+        let tmp = temp_dir("copy_dir_merge_tree");
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), "hello").unwrap();
+        std::fs::write(src.join("nested").join("b.txt"), "world").unwrap();
+
+        copy_dir_merge(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nested").join("b.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[test]
+    fn test_copy_dir_merge_layers_two_sources() {
+        // Two sequential copies into the same destination: the second
+        // overwrites overlapping files but preserves files unique to
+        // the first. This is the exact pattern used by the assets
+        // map to layer a generated bundle and a project's public/.
+        let tmp = temp_dir("copy_dir_merge_layers");
+        let src_a = tmp.join("a");
+        let src_b = tmp.join("b");
+        let dst = tmp.join("dst");
+        std::fs::create_dir_all(&src_a).unwrap();
+        std::fs::create_dir_all(&src_b).unwrap();
+        std::fs::write(src_a.join("only_a.txt"), "from-a").unwrap();
+        std::fs::write(src_a.join("shared.txt"), "a-version").unwrap();
+        std::fs::write(src_b.join("only_b.txt"), "from-b").unwrap();
+        std::fs::write(src_b.join("shared.txt"), "b-version").unwrap();
+
+        copy_dir_merge(&src_a, &dst).unwrap();
+        copy_dir_merge(&src_b, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("only_a.txt")).unwrap(),
+            "from-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("only_b.txt")).unwrap(),
+            "from-b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("shared.txt")).unwrap(),
+            "b-version",
+            "later copy wins on overlap"
+        );
+    }
+
+    #[test]
+    fn test_copy_dir_merge_missing_source_is_noop() {
+        let tmp = temp_dir("copy_dir_merge_missing");
+        let dst = tmp.join("dst");
+        let result = copy_dir_merge(&tmp.join("does_not_exist"), &dst);
+        assert!(result.is_ok());
+        assert!(!dst.exists(), "destination not created when source missing");
+    }
+
+    #[test]
+    fn test_copy_target_assets_resolves_target_ref_and_project_path() {
+        // Set up a tiny project root with a generated `build/web/`
+        // and an authored `public/`, mimicking forailang.com. After
+        // copy_target_assets runs, both directories should be merged
+        // into `build/server/public/`.
+        let root = temp_dir("copy_target_assets");
+        std::fs::create_dir_all(root.join("build/web")).unwrap();
+        std::fs::write(root.join("build/web/web.wasm"), "wasm-bytes").unwrap();
+        std::fs::write(root.join("build/web/forui.css"), "css-bytes").unwrap();
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        std::fs::write(root.join("public/favicon.ico"), "icon-bytes").unwrap();
+        // The server's build_dir must exist (build_one_subproject
+        // would have created it via cmd_build); fake that here.
+        std::fs::create_dir_all(root.join("build/server")).unwrap();
+
+        let mut web = SubProject::default();
+        web.build_dir = Some("build/web".to_string());
+        let mut server = SubProject::default();
+        server.build_dir = Some("build/server".to_string());
+        server.assets = vec![
+            ("$web".to_string(), "public".to_string()),
+            ("public".to_string(), "public".to_string()),
+        ];
+
+        let mut info = ProjectInfo::default();
+        info.sub_projects.insert("web".to_string(), web);
+        info.sub_projects
+            .insert("server".to_string(), server.clone());
+
+        copy_target_assets("server", &server, &info, &root);
+
+        let merged = root.join("build/server/public");
+        assert!(merged.join("web.wasm").exists(), "$web/web.wasm copied");
+        assert!(merged.join("forui.css").exists(), "$web/forui.css copied");
+        assert!(
+            merged.join("favicon.ico").exists(),
+            "project public/favicon.ico copied"
+        );
+    }
+
+    #[test]
+    fn test_copy_target_assets_empty_to_copies_into_build_dir_root() {
+        let root = temp_dir("copy_target_assets_root");
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        std::fs::write(root.join("public/robots.txt"), "user-agent: *").unwrap();
+        std::fs::create_dir_all(root.join("build/server")).unwrap();
+
+        let mut server = SubProject::default();
+        server.build_dir = Some("build/server".to_string());
+        server.assets = vec![("public".to_string(), "".to_string())];
+
+        let mut info = ProjectInfo::default();
+        info.sub_projects.insert("server".to_string(), server.clone());
+
+        copy_target_assets("server", &server, &info, &root);
+
+        // Empty `to` → the public/ contents land directly inside
+        // build/server/, not nested under build/server/public/.
+        assert!(root.join("build/server/robots.txt").exists());
+        assert!(!root.join("build/server/public/robots.txt").exists());
+    }
+
+    #[test]
+    fn test_copy_target_assets_missing_source_does_not_panic() {
+        let root = temp_dir("copy_target_assets_missing");
+        std::fs::create_dir_all(root.join("build/server")).unwrap();
+        let mut server = SubProject::default();
+        server.build_dir = Some("build/server".to_string());
+        server.assets = vec![("public".to_string(), "public".to_string())];
+        let mut info = ProjectInfo::default();
+        info.sub_projects.insert("server".to_string(), server.clone());
+
+        // No `public/` directory exists. We expect a stderr warning,
+        // not a panic — a missing optional asset shouldn't take down
+        // the build.
+        copy_target_assets("server", &server, &info, &root);
+    }
+
+    #[test]
+    fn test_parser_planner_assets_e2e() {
+        // End-to-end: parse a real fai.toml, plan the build order
+        // from it, and run copy_target_assets in dep order. Verifies
+        // the three new pieces (parser additions, planner, asset
+        // copier) compose correctly when fed by the same `ProjectInfo`
+        // they share at runtime — the integration `step_build` does
+        // for real but without invoking the wasm compiler.
+        let root = temp_dir("e2e_pipeline");
+        let toml = concat!(
+            "[project]\n",
+            "name = \"e2eapp\"\n",
+            "\n",
+            "[project.web]\n",
+            "target = \"wasm-html\"\n",
+            "build_dir = \"build/web\"\n",
+            "\n",
+            "[project.server]\n",
+            "target = \"native\"\n",
+            "build_dir = \"build/server\"\n",
+            "required_targets = [\"web\"]\n",
+            "\n",
+            "[project.server.assets]\n",
+            "\"$web\" = \"public\"\n",
+            "\"public\" = \"public\"\n",
+        );
+        std::fs::write(root.join("fai.toml"), toml).unwrap();
+        // Pretend the web build has already deposited its artifacts.
+        // build_one_subproject would do this via cmd_build; the
+        // planner / asset-copy stages don't care how the bytes got
+        // there, only that they exist when the dependent target
+        // tries to copy them.
+        std::fs::create_dir_all(root.join("build/web")).unwrap();
+        std::fs::write(root.join("build/web/web.wasm"), "wasm").unwrap();
+        std::fs::write(root.join("build/web/fai-runtime.js"), "js").unwrap();
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        std::fs::write(root.join("public/favicon.ico"), "icon").unwrap();
+        std::fs::create_dir_all(root.join("build/server")).unwrap();
+
+        let info = parse_project_info(toml);
+        // Planner: dep order is web → server.
+        let order = plan_build_order(&info, Some("server")).unwrap();
+        assert_eq!(order, vec!["web".to_string(), "server".to_string()]);
+
+        // Run asset copy in planned order. Web has no assets so this
+        // is a no-op; server merges $web + public into build/server/public/.
+        for name in &order {
+            let sub = info.sub_projects.get(name).unwrap();
+            copy_target_assets(name, sub, &info, &root);
+        }
+
+        let merged = root.join("build/server/public");
+        assert!(merged.join("web.wasm").exists());
+        assert!(merged.join("fai-runtime.js").exists());
+        assert!(merged.join("favicon.ico").exists());
+    }
+
+    #[test]
+    fn test_resolve_target_wasm_artifact_returns_path_when_present() {
+        // Cargo runs tests in parallel and `current_dir` is
+        // process-global, so any test that mutates cwd must hold the
+        // shared lock for the duration of its cwd window.
+        let _guard = cwd_test_lock();
+        let root = temp_dir("resolve_artifact_present");
+        std::fs::write(
+            root.join("fai.toml"),
+            "[project]\nname = \"app\"\n\n[project.server]\nbuild_dir = \"build/server\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("build/server")).unwrap();
+        std::fs::write(root.join("build/server/server.wasm"), "wasm").unwrap();
+
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let resolved = resolve_target_wasm_artifact(Some("server"));
+        std::env::set_current_dir(&original).unwrap();
+
+        let path = resolved.expect("artifact resolves when present");
+        assert!(path.ends_with("build/server/server.wasm"), "got {}", path);
+    }
+
+    #[test]
+    fn test_resolve_target_wasm_artifact_returns_none_when_not_built() {
+        let _guard = cwd_test_lock();
+        let root = temp_dir("resolve_artifact_missing");
+        std::fs::write(
+            root.join("fai.toml"),
+            "[project]\nname = \"app\"\n\n[project.server]\nbuild_dir = \"build/server\"\n",
+        )
+        .unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let resolved = resolve_target_wasm_artifact(Some("server"));
+        std::env::set_current_dir(&original).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_parse_required_targets_and_assets() {
+        let toml = concat!(
+            "[project]\n",
+            "name = \"app\"\n",
+            "\n",
+            "[project.web]\n",
+            "target = \"wasm-html\"\n",
+            "build_dir = \"build/web\"\n",
+            "\n",
+            "[project.server]\n",
+            "target = \"native\"\n",
+            "build_dir = \"build/server\"\n",
+            "required_targets = [\"web\"]\n",
+            "\n",
+            "[project.server.assets]\n",
+            "\"$web\" = \"public\"\n",
+            "\"public\" = \"public\"\n",
+        );
+        let info = parse_project_info(toml);
+        let server = info
+            .sub_projects
+            .get("server")
+            .expect("server target parsed");
+        assert_eq!(server.required_targets, vec!["web".to_string()]);
+        assert_eq!(
+            server.assets,
+            vec![
+                ("$web".to_string(), "public".to_string()),
+                ("public".to_string(), "public".to_string()),
+            ]
+        );
+        // The web target has no required_targets / assets — just here
+        // to confirm the parser keeps them empty rather than borrowing
+        // them from a sibling section.
+        let web = info.sub_projects.get("web").expect("web target parsed");
+        assert!(web.required_targets.is_empty());
+        assert!(web.assets.is_empty());
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("fai_cli_test_{}", tag));

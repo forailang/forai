@@ -756,6 +756,59 @@ A `remote def` that exists on disk but is not reachable from the server target's
 imports is not exposed by that server. Non-remote helpers in the same module are
 not part of the RPC API.
 
+### 5 — Multi-target build orchestration
+
+When one target's output ships inside another (the typical fullstack
+shape: a server that serves a client wasm bundle), declare the
+relationship in `fai.toml` so `fai build` and `fai run` produce a
+self-contained deploy unit automatically.
+
+```toml
+[project.web]
+target = "wasm-html"
+main = "src/platforms/web/main.fai"
+build_dir = "build/web"
+
+[project.server]
+target = "native"
+main = "src/platforms/server/main.fai"
+build_dir = "build/server"
+required_targets = ["web"]
+
+[project.server.assets]
+"$web"     = "public"        # merge the web target's build_dir into build/server/public/
+"public"   = "public"        # merge project-root public/ on top
+".env.dev" = ".env.dev"      # ship runtime config alongside the wasm
+"db"       = "db"            # ship migrations alongside the wasm
+```
+
+`required_targets = ["a", "b"]` lists other sub-projects whose builds
+must complete before this one. The CLI does a topological build (cycle
+= error) and runs each target's `fmt → check → test → build` pipeline
+in dependency order.
+
+`[project.<name>.assets]` is an ordered map of `from = to` pairs
+copied into this target's `build_dir` after a successful build:
+
+- `from` starting with `$` (e.g. `$web`) resolves to that target's
+  `build_dir`. Other strings are project-root-relative paths.
+- `to` is relative to this target's `build_dir`. An empty string
+  copies into the `build_dir` itself.
+- Order is preserved — later entries overwrite earlier ones at the
+  same destination, which is how a generated client bundle and an
+  authored `public/` merge into one served directory.
+- Missing sources warn but don't fail the build, so optional config
+  files (e.g. an unset `.env.dev`) can stay declared without
+  blocking.
+
+`fai run <target>` does **build → cd into the target's build_dir →
+run the produced `.wasm`**. Because the program runs from inside its
+build directory, every project-relative path the program opens at
+runtime (`server.serveFiles(r, 'public')`, `env.load('.env.dev')`,
+`migrate(db, 'db/migrations')`) resolves against the deploy unit, not
+the project root. Anything the program needs at runtime belongs in
+the assets map.
+
 ### Visibility
 
 Declarations are public by default. Use `private:` to mark subsequent declarations as

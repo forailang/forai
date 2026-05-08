@@ -33,7 +33,7 @@ The CLI binary is available as `fai` / `forai`. `forai <file.fai>` is shorthand 
 - **fai-compiler** - Source preparation, serde AST conversion, module/dependency resolution, synthetic modules, named params, UFCS metadata, and FFI metadata.
 - **fai-checker** - Type checker. Validates types, generics, mutability, doc requirements, imports, UFCS calls, named parameter reorderings, stdlib metadata, and test syntax.
 - **fai-codegen-wasm** - Direct AST-to-WASM code generator plus runtime helper module layout.
-- **fai-cli** - Main user interface. Commands include `fmt`, `check`, `test`, `run`, `build`, `new`, `doc`, `interface`, and `mcp`.
+- **fai-cli** - Main user interface. Commands include `fmt`, `check`, `test`, `run`, `build`, `new`, `doc`, `interface`, and `mcp`. Multi-target builds (`fai.toml` `[project.<name>]` sub-projects) go through a topological build planner that honors `required_targets`, copies declared `[project.<name>.assets]` into the target's `build_dir` after each build, and runs the produced `.wasm` from inside that dir so program-relative paths resolve against the deploy unit.
 - **fai-core** - Shared runtime value/type infrastructure.
 - **fai-ffi** - Foreign function interface support for calling C libraries.
 - **fai-feature-tests** - End-to-end language fixture harness under `tests/fixtures/language`.
