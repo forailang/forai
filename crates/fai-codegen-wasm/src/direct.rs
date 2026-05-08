@@ -5924,16 +5924,25 @@ impl<'a, 'c> Builder<'a, 'c> {
     ///    in a fresh local. We can't write to memory yet because
     ///    `compile_expr` may itself bump `__heap_ptr` (e.g., for
     ///    String literals via `RT_ALLOC_STRING`).
-    /// 2. Allocate an 8-byte `NativeFn` object and stamp it with
-    ///    `(tag, method_id)`. This bumps `__heap_ptr` by 8.
-    /// 3. Snapshot `__heap_ptr` as `args_base`. Any later allocation
-    ///    (including the method's result) bumps past this point, so
-    ///    writes here survive until `RT_CALL_NATIVE` reads them
-    ///    into locals at dispatch entry.
+    /// 2. Allocate one block sized to fit both the NativeFn header
+    ///    AND the args buffer in one shot: `8 + arity * 8` bytes. A
+    ///    single `RT_ALLOC` call ensures the args region is part of
+    ///    the same committed allocation, which is the load-bearing
+    ///    detail — splitting it into "alloc 8 for the header, then
+    ///    write args past it" traps when `__heap_ptr` lands close
+    ///    enough to the linear-memory boundary that the 8-byte
+    ///    header fits without growing memory but the args writes
+    ///    spill past `mem_size`.
+    /// 3. Stamp the NativeFn header at the block's start, then
+    ///    `args_base = nfn_addr + 8`. Both regions are inside the
+    ///    block we just allocated, so writes are guaranteed to land
+    ///    in committed memory.
     /// 4. Write each arg local into `args_base + i*8`.
     /// 5. Push (NativeFn boxed, args_base, arg_count); call
     ///    `RT_CALL_NATIVE`. Its return lands on the stack as the
-    ///    expression's value.
+    ///    expression's value. RT_CALL_NATIVE reads the args into
+    ///    locals at dispatch entry, so subsequent allocations
+    ///    overwriting the buffer are safe.
     fn compile_native_method(
         &mut self,
         method_id: i32,
@@ -5956,10 +5965,15 @@ impl<'a, 'c> Builder<'a, 'c> {
             arg_locals.push(local);
         }
 
-        // Allocate NativeFn heap object: [tag=6, method_id]. Size
-        // rounded to 8 so the args buffer sits on an 8-byte boundary.
+        // Allocate the NativeFn header AND the args buffer in one
+        // `RT_ALLOC` call so the underlying `memory.grow` covers both
+        // regions. Splitting this into two — alloc 8 for the header,
+        // then write args past it — traps when `__heap_ptr` lands
+        // close enough to the memory boundary that the 8-byte alloc
+        // fits without growing but the args writes don't.
         let nfn_addr = self.alloc_i32_local();
-        self.emit(Instruction::I32Const(8));
+        let block_size = 8 + (arity as i32) * 8;
+        self.emit(Instruction::I32Const(block_size));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(nfn_addr));
         self.emit(Instruction::LocalGet(nfn_addr));
@@ -5969,9 +5983,12 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(method_id));
         self.emit(Instruction::I32Store(mem_off(4)));
 
-        // args_base = __heap_ptr (now above the NativeFn).
+        // args_base = nfn_addr + 8 — sits inside the same allocated
+        // block, so writes are guaranteed to land in committed memory.
         let args_base = self.alloc_i32_local();
-        self.emit(Instruction::GlobalGet(0));
+        self.emit(Instruction::LocalGet(nfn_addr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::I32Add);
         self.emit(Instruction::LocalSet(args_base));
 
         // Write args to memory.
@@ -9486,9 +9503,16 @@ mod tests {
         let main_func_idx = top_level_base;
 
         // ── exports ──
+        // `_start`, `memory`, and `__heap_ptr` are the three the
+        // production build emits and the runtime tests rely on. The
+        // heap-pointer global is exposed so heap-boundary regression
+        // tests can pre-position it before invoking `_start` to
+        // exercise allocation patterns that only show up when the
+        // heap is near a page boundary.
         let mut exports = ExportSection::new();
         exports.export("_start", ExportKind::Func, main_func_idx);
         exports.export("memory", ExportKind::Memory, 0);
+        exports.export("__heap_ptr", ExportKind::Global, 0);
         module.section(&exports);
 
         // ── elements ──
@@ -12704,6 +12728,104 @@ mod tests {
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_BOOL as u64);
         assert_eq!(result, expected);
+    }
+
+    /// Regression: native method dispatch must allocate space for the
+    /// args buffer along with the NativeFn header, in a single
+    /// `RT_ALLOC` call. The original code allocated 8 bytes for the
+    /// header, then wrote args past `__heap_ptr` without separately
+    /// allocating that region. When `__heap_ptr` sits close enough to
+    /// the current memory boundary that the 8-byte header fits
+    /// without growing memory but the args writes don't, the writes
+    /// trap. (`RT_ALLOC` grows in 1 MiB chunks, so once a grow
+    /// happens, there's plenty of slack — the bug only surfaces when
+    /// the header alloc fits without grow.)
+    ///
+    /// We pre-position `__heap_ptr` so the program's allocations
+    /// (`'hello world'` → 24 bytes, `'world'` → 16 bytes, NativeFn
+    /// header → 8 bytes) all fit without growing memory and land the
+    /// post-header pointer at `mem_size - 8`. The buggy code then
+    /// writes arg[0] at `mem_size - 8` (in-bounds) and arg[1] at
+    /// `mem_size` (OOB, traps). The fix sizes the single alloc to
+    /// cover both header and args, so the grow covers everything.
+    #[test]
+    fn direct_native_method_at_heap_page_boundary() {
+        use wasmtime::{Engine, Linker, Module as RuntimeModule, Store, Val};
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "use std.string\n",
+            "\n",
+            "def main\n",
+            "    @return Bool\n",
+            "do\n",
+            "  string.contains('hello world', 'world')\n",
+            "end\n",
+        )));
+        // Run the module ourselves so we can pin `__heap_ptr` to the
+        // memory boundary before invoking `_start`. If we used
+        // `run_module`, the program would never allocate enough on
+        // its own to reach the boundary.
+        let engine = Engine::default();
+        let module = RuntimeModule::new(&engine, &wasm).expect("valid wasm");
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        use wasmtime::{FuncType, ValType as WtValType};
+        fn conv(v: wasm_encoder::ValType) -> WtValType {
+            match v {
+                wasm_encoder::ValType::I32 => WtValType::I32,
+                wasm_encoder::ValType::I64 => WtValType::I64,
+                wasm_encoder::ValType::F32 => WtValType::F32,
+                wasm_encoder::ValType::F64 => WtValType::F64,
+                _ => WtValType::I32,
+            }
+        }
+        for (name, params, results) in runtime::import_signatures() {
+            let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
+            let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
+            let results_clone = results.clone();
+            linker
+                .func_new(
+                    "env",
+                    name,
+                    FuncType::new(&engine, wt_params, wt_results),
+                    move |_caller, _args, rets| {
+                        for (slot, ty) in rets.iter_mut().zip(results_clone.iter()) {
+                            *slot = match ty {
+                                wasm_encoder::ValType::I32 => Val::I32(0),
+                                wasm_encoder::ValType::I64 => Val::I64(0),
+                                wasm_encoder::ValType::F32 => Val::F32(0),
+                                wasm_encoder::ValType::F64 => Val::F64(0),
+                                _ => Val::I32(0),
+                            };
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
+        // Pre-position `__heap_ptr` so the program's three allocs
+        // (24 + 16 + 8 = 48 bytes) all fit without growing memory and
+        // leave the post-NativeFn-alloc pointer at `mem_size - 8`.
+        // The buggy code's args[1] write at `mem_size` then traps.
+        let memory = instance.get_memory(&mut store, "memory").expect("memory");
+        let mem_size = memory.data_size(&mut store) as u32;
+        let heap = instance
+            .get_global(&mut store, "__heap_ptr")
+            .expect("__heap_ptr global");
+        let target = (mem_size - 56) & !7;
+        heap.set(&mut store, Val::I32(target as i32))
+            .expect("set heap_ptr");
+        let start = instance
+            .get_typed_func::<(), i64>(&mut store, "_start")
+            .expect("_start export");
+        let result = start.call(&mut store, ()).expect("run") as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_BOOL as u64) | 1;
+        assert_eq!(
+            result, expected,
+            "string.contains must succeed even when heap_ptr lands at the page boundary",
+        );
     }
 
     #[test]
