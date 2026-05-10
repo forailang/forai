@@ -4,11 +4,11 @@
 def main
     @return Void
 do
-  let u = User(name: 'Alice')
-  print(u.email == null)
+    let u = User(name: 'Alice')
+    print(u.email == null)
 end
 
 type User
-  name String
-  email String? = null
+    name String
+    email String? = null
 end

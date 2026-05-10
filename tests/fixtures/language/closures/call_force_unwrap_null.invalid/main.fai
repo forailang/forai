@@ -8,6 +8,6 @@ end
 def main
     @return Void
 do
-  var maybeCb Callback? = null
-  maybeCb!()
+    var maybeCb Callback? = null
+    maybeCb!()
 end

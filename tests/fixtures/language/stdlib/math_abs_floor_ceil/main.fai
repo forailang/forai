@@ -9,8 +9,8 @@ use std.math
 def main
     @return Void
 do
-  print(math.abs(-5.0))
-  print(math.floor(3.7))
-  print(math.ceil(3.2))
-  print(math.round(3.6))
+    print(math.abs(-5.0))
+    print(math.floor(3.7))
+    print(math.ceil(3.2))
+    print(math.round(3.6))
 end

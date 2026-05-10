@@ -12,23 +12,23 @@ def apply
     @param value Int
     @return Int
 do
-  cb(value)
+    cb(value)
 end
 
 test apply
-it 'typechecks'
-  let r = apply(do with n Int
-      n * 2
-  end, 3)
-  assert.equal(r, 6)
-end
+    it 'typechecks'
+        let r = apply(do with n Int
+            n * 2
+        end, 3)
+        assert.equal(r, 6)
+    end
 end
 
 def main
     @return Void
 do
-  let r = apply(do
-      'wrong return type'
-  end, 5)
-  print(r)
+    let r = apply(do
+        'wrong return type'
+    end, 5)
+    print(r)
 end

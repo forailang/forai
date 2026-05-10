@@ -13,29 +13,29 @@ def runPair
     @param b Block
     @return Void
 do
-  a()
-  b()
+    a()
+    b()
 end
 
 test runPair
-it 'runs'
-  runPair(do
+    it 'runs'
+        runPair(do
 
-  end) do
+        end) do
 
-  end
-  assert.isTrue(true)
-end
+        end
+        assert.isTrue(true)
+    end
 end
 
 def main
     @return Void
 do
-  var total = 0
-  runPair(do
-      total = total + 1
-  end) do
-      total = total + 2
-  end
-  print(total)
+    var total = 0
+    runPair(do
+        total = total + 1
+    end) do
+        total = total + 2
+    end
+    print(total)
 end

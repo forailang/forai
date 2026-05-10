@@ -5,10 +5,10 @@
 def main
     @return Void
 do
-  let x = 'outer'
-  if true
-    let x = 'inner'
+    let x = 'outer'
+    if true
+        let x = 'inner'
+        print(x)
+    end
     print(x)
-  end
-  print(x)
 end

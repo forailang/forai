@@ -6,17 +6,17 @@ def describe
     @param name String
     @return String
 do
-  name + ' is ' + toString(age)
+    name + ' is ' + toString(age)
 end
 
 test describe
-it 'formats'
-  assert.equal(describe(name: 'Alice', age: 30), 'Alice is 30')
-end
+    it 'formats'
+        assert.equal(describe(name: 'Alice', age: 30), 'Alice is 30')
+    end
 end
 
 def main
     @return Void
 do
-  print(describe(name: 'Alice', age: 30))
+    print(describe(name: 'Alice', age: 30))
 end

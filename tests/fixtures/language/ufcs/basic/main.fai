@@ -5,18 +5,18 @@ def double
     @param n Int
     @return Int
 do
-  n * 2
+    n * 2
 end
 
 test double
-it 'doubles'
-  assert.equal(double(5), 10)
-end
+    it 'doubles'
+        assert.equal(double(5), 10)
+    end
 end
 
 def main
     @return Void
 do
-  let x = 5.double()
-  print(x)
+    let x = 5.double()
+    print(x)
 end

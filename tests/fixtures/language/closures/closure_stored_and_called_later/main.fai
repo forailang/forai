@@ -10,13 +10,13 @@ end
 def main
     @return Void
 do
-  var n = 3
-  let increment Block = do
-      n = n + 1
-  end
-  increment()
-  increment()
-  increment()
-  increment()
-  print(n)
+    var n = 3
+    let increment Block = do
+        n = n + 1
+    end
+    increment()
+    increment()
+    increment()
+    increment()
+    print(n)
 end

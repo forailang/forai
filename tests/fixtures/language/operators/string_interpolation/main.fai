@@ -5,8 +5,8 @@
 def main
     @return Void
 do
-  let name = 'world'
-  let x = 42
-  print("hello {{name}}")
-  print("x is {{x}}")
+    let name = 'world'
+    let x = 42
+    print("hello {{name}}")
+    print("x is {{x}}")
 end

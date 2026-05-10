@@ -6,5 +6,5 @@ use std.string
 def main
     @return Void
 do
-  print(string.substring('hello', 1, 4))
+    print(string.substring('hello', 1, 4))
 end

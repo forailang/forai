@@ -7,5 +7,5 @@ var counter Int = 42
 def main
     @return Void
 do
-  print(counter)
+    print(counter)
 end

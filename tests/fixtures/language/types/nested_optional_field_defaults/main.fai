@@ -6,19 +6,19 @@
 def main
     @return Void
 do
-  let p = Person(name: 'Alice')
-  print(p.address.city)
-  print(p.nickname)
-  print(p.note == null)
+    let p = Person(name: 'Alice')
+    print(p.address.city)
+    print(p.nickname)
+    print(p.note == null)
 end
 
 type Person
-  name String
-  address Address = Address()
-  nickname String? = 'friend'
-  note String?
+    name String
+    address Address = Address()
+    nickname String? = 'friend'
+    note String?
 end
 
 type Address
-  city String = 'Paris'
+    city String = 'Paris'
 end

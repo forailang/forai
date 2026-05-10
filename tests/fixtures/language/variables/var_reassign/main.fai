@@ -5,8 +5,8 @@
 def main
     @return Void
 do
-  var x = 1
-  print(x)
-  x = 2
-  print(x)
+    var x = 1
+    print(x)
+    x = 2
+    print(x)
 end

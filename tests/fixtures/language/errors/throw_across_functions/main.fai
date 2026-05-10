@@ -11,51 +11,51 @@ use std.error
 def explode
     @return Void
 do
-  throw Error('helper-thrown')
+    throw Error('helper-thrown')
 end
 
 test explode
-it 'unwinds across one function frame into the caller try/catch'
-  var caught = ''
-  try
-    explode()
-  catch e
-    caught = e.message
-  end
-  assert.equals(caught, 'helper-thrown')
-end
+    it 'unwinds across one function frame into the caller try/catch'
+        var caught = ''
+        try
+            explode()
+        catch e
+            caught = e.message
+        end
+        assert.equals(caught, 'helper-thrown')
+    end
 end
 
 # Outermost frame of a 2-deep chain — `deepThrow → innerThrow → throw`.
 def deepThrow
     @return Void
 do
-  innerThrow()
+    innerThrow()
 end
 
 # Inner thrower — the actual `throw` site.
 def innerThrow
     @return Void
 do
-  throw Error('deep')
+    throw Error('deep')
 end
 
 test deepThrow
-it 'unwinds across two function frames'
-  var caught = ''
-  try
-    deepThrow()
-  catch e
-    caught = e.message
-  end
-  assert.equals(caught, 'deep')
-end
+    it 'unwinds across two function frames'
+        var caught = ''
+        try
+            deepThrow()
+        catch e
+            caught = e.message
+        end
+        assert.equals(caught, 'deep')
+    end
 end
 
 test innerThrow
-it 'is exercised by deepThrow'
-  print('placeholder')
-end
+    it 'is exercised by deepThrow'
+        print('placeholder')
+    end
 end
 
 # Returns normally — the post-call propagation must not fire false
@@ -63,30 +63,30 @@ end
 def returnNormally
     @return String
 do
-  'fine'
+    'fine'
 end
 
 test returnNormally
-it 'returns normally without tripping the propagation check'
-  assert.equals(returnNormally(), 'fine')
-end
+    it 'returns normally without tripping the propagation check'
+        assert.equals(returnNormally(), 'fine')
+    end
 end
 
 def main
     @return Void
 do
-  try
-    explode()
-  catch e
-    print('caught: ' + e.message)
-  end
-  try
-    deepThrow()
-  catch e
-    print('caught-deep: ' + e.message)
-  end
-  if returnNormally() == 'fine'
-    print('not thrown')
-  end
-  print('done')
+    try
+        explode()
+    catch e
+        print('caught: ' + e.message)
+    end
+    try
+        deepThrow()
+    catch e
+        print('caught-deep: ' + e.message)
+    end
+    if returnNormally() == 'fine'
+        print('not thrown')
+    end
+    print('done')
 end

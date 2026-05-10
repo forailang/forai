@@ -3,10 +3,10 @@
 def main
     @return Void
 do
-  let xs = [
-    1
-    2
-    3
-  ]
-  print(xs['a'])
+    let xs = [
+        1
+        2
+        3
+    ]
+    print(xs['a'])
 end

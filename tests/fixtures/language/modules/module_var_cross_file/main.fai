@@ -14,6 +14,6 @@ use { bumpA, readB } from modlib
 def main
     @return Void
 do
-  print(bumpA())
-  print(readB())
+    print(bumpA())
+    print(readB())
 end

@@ -5,17 +5,17 @@ def add
     @param b Int
     @return Int
 do
-  a + b
+    a + b
 end
 
 test add
-it 'ok'
-  assert.equal(add(1, 2), 3)
-end
+    it 'ok'
+        assert.equal(add(1, 2), 3)
+    end
 end
 
 def main
     @return Void
 do
-  print(add(a: 1, wrong: 2))
+    print(add(a: 1, wrong: 2))
 end

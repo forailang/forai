@@ -11,25 +11,25 @@ def call
     @param p Producer
     @return Int
 do
-  p()
+    p()
 end
 
 test call
-it 'invokes the block and returns its value'
-  let r = call do
-      42
-  end
-  assert.equal(r, 42)
-end
+    it 'invokes the block and returns its value'
+        let r = call do
+            42
+        end
+        assert.equal(r, 42)
+    end
 end
 
 def main
     @return Void
 do
-  let r = call do
-      7
-  end
-  if r == 7
-    print('hi')
-  end
+    let r = call do
+        7
+    end
+    if r == 7
+        print('hi')
+    end
 end

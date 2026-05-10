@@ -5,9 +5,9 @@
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-  }
-  print(hasKey(d, 'name'))
-  print(hasKey(d, 'missing'))
+    let d = {
+        name: 'Alice'
+    }
+    print(hasKey(d, 'name'))
+    print(hasKey(d, 'missing'))
 end

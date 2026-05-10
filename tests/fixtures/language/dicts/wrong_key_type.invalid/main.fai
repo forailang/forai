@@ -3,8 +3,8 @@
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-  }
-  print(getString(d, 42))
+    let d = {
+        name: 'Alice'
+    }
+    print(getString(d, 42))
 end

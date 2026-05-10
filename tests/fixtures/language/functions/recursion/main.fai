@@ -5,21 +5,21 @@ def fib
     @param n Int
     @return Int
 do
-  if n <= 1
-    n
-  else
-    fib(n - 1) + fib(n - 2)
-  end
+    if n <= 1
+        n
+    else
+        fib(n - 1) + fib(n - 2)
+    end
 end
 
 test fib
-it 'computes fib(10)'
-  assert.equal(fib(10), 55)
-end
+    it 'computes fib(10)'
+        assert.equal(fib(10), 55)
+    end
 end
 
 def main
     @return Void
 do
-  print(fib(10))
+    print(fib(10))
 end

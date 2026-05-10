@@ -7,7 +7,7 @@ use std.string
 def main
     @return Void
 do
-  let s = 'Hello'
-  print(string.toUpper(s))
-  print(string.toLower(s))
+    let s = 'Hello'
+    print(string.toUpper(s))
+    print(string.toLower(s))
 end

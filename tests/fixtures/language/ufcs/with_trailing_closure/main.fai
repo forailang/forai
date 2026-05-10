@@ -16,7 +16,7 @@ end
 def make
     @return Int
 do
-  1
+    1
 end
 
 # Run an action on a number, returning the same number.
@@ -25,32 +25,32 @@ def withAction
     @param a Action
     @return Int
 do
-  a()
-  n
+    a()
+    n
 end
 
 test make
-it 'returns 1'
-  assert.equals(make(), 1)
-end
+    it 'returns 1'
+        assert.equals(make(), 1)
+    end
 end
 
 test withAction
-it 'invokes the closure passed via UFCS+trailing-closure'
-  var fired = false
-  let _ = make()
-    .withAction do
-        fired = true
+    it 'invokes the closure passed via UFCS+trailing-closure'
+        var fired = false
+        let _ = make()
+            .withAction do
+                fired = true
+            end
+        assert.isTrue(fired)
     end
-  assert.isTrue(fired)
-end
 end
 
 def main
     @return Void
 do
-  let _y = make()
-    .withAction do
-        print('fired')
-    end
+    let _y = make()
+        .withAction do
+            print('fired')
+        end
 end

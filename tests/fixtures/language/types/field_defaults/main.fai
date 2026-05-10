@@ -5,12 +5,12 @@
 def main
     @return Void
 do
-  let c = Config()
-  print(c.debug)
-  print(c.port)
+    let c = Config()
+    print(c.debug)
+    print(c.port)
 end
 
 type Config
-  debug Bool = false
-  port Int = 8080
+    debug Bool = false
+    port Int = 8080
 end

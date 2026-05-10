@@ -3,11 +3,11 @@
 #   3
 
 extern m
-  def sqrt(x: Float) -> Float
+    def sqrt(x: Float) -> Float
 end
 
 def main
     @return Void
 do
-  print(sqrt(9.0))
+    print(sqrt(9.0))
 end

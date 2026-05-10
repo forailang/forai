@@ -4,8 +4,8 @@
 def main
     @return Void
 do
-  let x Int? = null
-  if !x? or x! > 0
-    print('safe')
-  end
+    let x Int? = null
+    if !x? or x! > 0
+        print('safe')
+    end
 end

@@ -6,17 +6,17 @@ def add
     @param b Int
     @return Int
 do
-  a + b
+    a + b
 end
 
 test add
-it 'sums two ints'
-  assert.equal(add(3, 4), 7)
-end
+    it 'sums two ints'
+        assert.equal(add(3, 4), 7)
+    end
 end
 
 def main
     @return Void
 do
-  print(add(3, 4))
+    print(add(3, 4))
 end

@@ -8,21 +8,21 @@ def swap
     @return first Int
     @return second Int
 do
-  b, a
+    b, a
 end
 
 test swap
-it 'swaps'
-  let x, y = swap(2, 1)
-  assert.equal(x, 1)
-  assert.equal(y, 2)
-end
+    it 'swaps'
+        let x, y = swap(2, 1)
+        assert.equal(x, 1)
+        assert.equal(y, 2)
+    end
 end
 
 def main
     @return Void
 do
-  let x, y = swap(2, 1)
-  print(x)
-  print(y)
+    let x, y = swap(2, 1)
+    print(x)
+    print(y)
 end

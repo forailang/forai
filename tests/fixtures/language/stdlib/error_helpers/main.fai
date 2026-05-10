@@ -9,8 +9,8 @@ use std.error
 def main
     @return Void
 do
-  let e = error.Error('boom')
-  print(error.message(e))
-  print(error.isError(e))
-  print(error.kind(e))
+    let e = error.Error('boom')
+    print(error.message(e))
+    print(error.isError(e))
+    print(error.kind(e))
 end

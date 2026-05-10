@@ -4,8 +4,8 @@
 def main
     @return Void
 do
-  let d = {
-    greeting: 'hello'
-  }
-  print(getString(d, 'greeting'))
+    let d = {
+        greeting: 'hello'
+    }
+    print(getString(d, 'greeting'))
 end

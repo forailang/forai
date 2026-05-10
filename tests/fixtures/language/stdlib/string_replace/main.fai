@@ -6,5 +6,5 @@ use std.string
 def main
     @return Void
 do
-  print(string.replace('hello world', 'hello', 'hi'))
+    print(string.replace('hello world', 'hello', 'hi'))
 end

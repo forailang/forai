@@ -12,6 +12,6 @@ use std.convert
 def main
     @return Void
 do
-  let response = request.post('/__fai_fixture/http-post', 'payload')
-  browser.setHtml('<div id="http-result">' + convert.toString(response.status) + ' ' + response.body + '</div>')
+    let response = request.post('/__fai_fixture/http-post', 'payload')
+    browser.setHtml('<div id="http-result">' + convert.toString(response.status) + ' ' + response.body + '</div>')
 end

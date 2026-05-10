@@ -3,7 +3,7 @@
 def main
     @return Void
 do
-  if 42
-    print('nope')
-  end
+    if 42
+        print('nope')
+    end
 end

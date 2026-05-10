@@ -11,9 +11,9 @@ end
 def main
     @return Void
 do
-  let addOne Adder = do with n Int
-      n + 1
-  end
-  print(addOne(5))
-  print(addOne(6))
+    let addOne Adder = do with n Int
+        n + 1
+    end
+    print(addOne(5))
+    print(addOne(6))
 end

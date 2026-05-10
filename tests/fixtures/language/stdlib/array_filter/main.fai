@@ -7,16 +7,16 @@ use std.array
 def main
     @return Void
 do
-  let evens = array.filter([
-    1
-    2
-    3
-    4
-    5
-  ]) do with n Int
-      n % 2 == 0
-  end
-  for x in evens
-    print(x)
-  end
+    let evens = array.filter([
+        1
+        2
+        3
+        4
+        5
+    ]) do with n Int
+        n % 2 == 0
+    end
+    for x in evens
+        print(x)
+    end
 end

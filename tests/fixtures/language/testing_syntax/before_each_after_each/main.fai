@@ -8,24 +8,24 @@ do
 end
 
 test noop
-  var counter = 0
-beforeEach
-  counter = 0
-end
-it 'starts at 0'
-  assert.equals(counter, 0)
-end
-it 'is reset between tests'
-  counter = 42
-  assert.equals(counter, 42)
-end
-afterEach
-  counter = -1
-end
+    var counter = 0
+    beforeEach
+        counter = 0
+    end
+    it 'starts at 0'
+        assert.equals(counter, 0)
+    end
+    it 'is reset between tests'
+        counter = 42
+        assert.equals(counter, 42)
+    end
+    afterEach
+        counter = -1
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

@@ -6,5 +6,5 @@ use std.string
 def main
     @return Void
 do
-  print(string.trim('   hi   '))
+    print(string.trim('   hi   '))
 end

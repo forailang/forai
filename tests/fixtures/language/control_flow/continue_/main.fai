@@ -5,10 +5,10 @@
 def main
     @return Void
 do
-  for i in 0..4
-    if i == 0 or i == 2
-      continue
+    for i in 0..4
+        if i == 0 or i == 2
+            continue
+        end
+        print(i)
     end
-    print(i)
-  end
 end

@@ -10,13 +10,13 @@
 def main
     @return Void
 do
-  let params Unknown[] = [
-    1
-    'hello'
-    false
-  ]
-  print(length(params))
-  print(toString(params[0]))
-  print(toString(params[1]))
-  print(toString(params[2]))
+    let params Unknown[] = [
+        1
+        'hello'
+        false
+    ]
+    print(length(params))
+    print(toString(params[0]))
+    print(toString(params[1]))
+    print(toString(params[2]))
 end

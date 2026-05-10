@@ -9,8 +9,8 @@ use std.string
 def main
     @return Void
 do
-  print(string.contains('hello world', 'world'))
-  print(string.contains('hello world', 'planet'))
-  print(string.startsWith('hello', 'he'))
-  print(string.endsWith('hello', 'lo'))
+    print(string.contains('hello world', 'world'))
+    print(string.contains('hello world', 'planet'))
+    print(string.startsWith('hello', 'he'))
+    print(string.endsWith('hello', 'lo'))
 end

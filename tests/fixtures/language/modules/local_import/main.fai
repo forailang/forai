@@ -6,5 +6,5 @@ use { double } from mathlib
 def main
     @return Void
 do
-  print(double(21))
+    print(double(21))
 end

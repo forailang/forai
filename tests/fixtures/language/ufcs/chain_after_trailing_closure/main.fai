@@ -18,7 +18,7 @@ def Container
     @param build Builder
     @return Int
 do
-  build()
+    build()
 end
 
 # UFCS modifier — multiplies by 12.
@@ -27,33 +27,33 @@ def boost
     @param factor Int
     @return Int
 do
-  n * factor
+    n * factor
 end
 
 test Container
-it 'returns the closure result'
-  let n = Container do
-      1
-  end
-  assert.equals(n, 1)
-end
+    it 'returns the closure result'
+        let n = Container do
+            1
+        end
+        assert.equals(n, 1)
+    end
 end
 
 test boost
-it 'chains on a trailing-closure call'
-  let n = Container do
-      1
-  end
-    .boost(12)
-  assert.equals(n, 12)
-end
-it 'chains on a new line after end'
-  let n = Container do
-      1
-  end
-    .boost(12)
-  assert.equals(n, 12)
-end
+    it 'chains on a trailing-closure call'
+        let n = Container do
+            1
+        end
+            .boost(12)
+        assert.equals(n, 12)
+    end
+    it 'chains on a new line after end'
+        let n = Container do
+            1
+        end
+            .boost(12)
+        assert.equals(n, 12)
+    end
 end
 
 # Same-line:  `Container do ... end.boost(12)`.
@@ -61,9 +61,9 @@ end
 def main
     @return Void
 do
-  let n = Container do
-      1
-  end
-    .boost(12)
-  print(toString(n))
+    let n = Container do
+        1
+    end
+        .boost(12)
+    print(toString(n))
 end

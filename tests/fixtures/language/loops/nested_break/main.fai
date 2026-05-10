@@ -7,15 +7,15 @@
 def main
     @return Void
 do
-  for i in 0..3
-    for j in 0..3
-      if j == 2
-        break
-      end
-      print("{{i}},{{j}}")
+    for i in 0..3
+        for j in 0..3
+            if j == 2
+                break
+            end
+            print("{{i}},{{j}}")
+        end
+        if i == 1
+            break
+        end
     end
-    if i == 1
-      break
-    end
-  end
 end

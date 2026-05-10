@@ -8,7 +8,7 @@
 # field round-trip.
 
 type Box
-  value $T
+    value $T
 end
 
 # Build a Box carrying v.
@@ -17,19 +17,19 @@ def mkBox
     @param v $T
     @return Box
 do
-  Box(value: v)
+    Box(value: v)
 end
 
 def main
     @return Void
 do
-  let b = mkBox(42)
-  print(b.value)
+    let b = mkBox(42)
+    print(b.value)
 end
 
 test mkBox
-it 'stores the generic arg in the struct field'
-  let b = mkBox(42)
-  assert.equals(b.value, 42)
-end
+    it 'stores the generic arg in the struct field'
+        let b = mkBox(42)
+        assert.equals(b.value, 42)
+    end
 end

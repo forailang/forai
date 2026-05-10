@@ -5,23 +5,23 @@ def double
     @param n Int
     @return Int
 do
-  n * 2
+    n * 2
 end
 
 test double
-it 'doubles 0'
-  assert.equals(double(0), 0)
-end
-it 'doubles positive'
-  assert.equals(double(3), 6)
-end
-it 'doubles negative'
-  assert.equals(double(-4), -8)
-end
+    it 'doubles 0'
+        assert.equals(double(0), 0)
+    end
+    it 'doubles positive'
+        assert.equals(double(3), 6)
+    end
+    it 'doubles negative'
+        assert.equals(double(-4), -8)
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

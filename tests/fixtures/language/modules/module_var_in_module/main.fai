@@ -8,7 +8,7 @@ use { bump, getCount } from modlib
 def main
     @return Void
 do
-  print(bump())
-  print(bump())
-  print(getCount())
+    print(bump())
+    print(bump())
+    print(getCount())
 end

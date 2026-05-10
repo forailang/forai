@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let myBool Bool = false
-  print(myBool)
+    let myBool Bool = false
+    print(myBool)
 end

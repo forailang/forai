@@ -6,5 +6,5 @@ use { greet } from mymod.inner
 def main
     @return Void
 do
-  print(greet())
+    print(greet())
 end

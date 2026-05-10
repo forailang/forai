@@ -5,17 +5,17 @@ def isPositive
     @param n Int
     @return Bool
 do
-  n > 0
+    n > 0
 end
 
 test isPositive
-it 'true for 5'
-  assert.isTrue(isPositive(5))
-end
+    it 'true for 5'
+        assert.isTrue(isPositive(5))
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

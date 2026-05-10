@@ -8,6 +8,6 @@ use { toUpper, contains } from std.string
 def main
     @return Void
 do
-  print(toUpper('hello'))
-  print(contains('hello world', 'world'))
+    print(toUpper('hello'))
+    print(contains('hello world', 'world'))
 end

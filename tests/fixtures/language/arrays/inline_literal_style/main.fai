@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let myList = [1 2 3 4 5]
-  print(length(myList))
+    let myList = [1 2 3 4 5]
+    print(length(myList))
 end

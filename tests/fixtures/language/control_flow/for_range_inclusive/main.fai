@@ -7,7 +7,7 @@
 def main
     @return Void
 do
-  for i in 0...3
-    print(i)
-  end
+    for i in 0...3
+        print(i)
+    end
 end

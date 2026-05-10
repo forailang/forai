@@ -4,10 +4,10 @@
 def main
     @return Void
 do
-  let xs = [
-    10
-    20
-    30
-  ]
-  print(length(xs))
+    let xs = [
+        10
+        20
+        30
+    ]
+    print(length(xs))
 end

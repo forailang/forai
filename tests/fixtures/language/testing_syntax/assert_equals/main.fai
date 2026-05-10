@@ -6,17 +6,17 @@ def add
     @param b Int
     @return Int
 do
-  a + b
+    a + b
 end
 
 test add
-it 'adds'
-  assert.equals(add(1, 2), 3)
-end
+    it 'adds'
+        assert.equals(add(1, 2), 3)
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

@@ -12,24 +12,24 @@ def call
     @param b Block
     @return Void
 do
-  b()
+    b()
 end
 
 test call
-it 'calls'
-  call do
+    it 'calls'
+        call do
 
-  end
-  assert.isTrue(true)
-end
+        end
+        assert.isTrue(true)
+    end
 end
 
 def main
     @return Void
 do
-  var fired = false
-  call do
-      fired = true
-  end
-  print(fired)
+    var fired = false
+    call do
+        fired = true
+    end
+    print(fired)
 end

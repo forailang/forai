@@ -4,5 +4,5 @@
 def main
     @return Void
 do
-  print(parseInt('42'))
+    print(parseInt('42'))
 end

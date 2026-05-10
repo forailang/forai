@@ -5,6 +5,6 @@
 def main
     @return Void
 do
-  print(not true)
-  print(not false)
+    print(not true)
+    print(not false)
 end

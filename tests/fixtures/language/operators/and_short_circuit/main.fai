@@ -4,9 +4,9 @@
 def main
     @return Void
 do
-  let x Int? = null
-  if x? and x! > 0
-    print('unreachable')
-  end
-  print('safe')
+    let x Int? = null
+    if x? and x! > 0
+        print('unreachable')
+    end
+    print('safe')
 end

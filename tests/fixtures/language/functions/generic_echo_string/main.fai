@@ -9,17 +9,17 @@ def echo
     @param v $T
     @return $T
 do
-  v
+    v
 end
 
 def main
     @return Void
 do
-  print(echo('hello'))
+    print(echo('hello'))
 end
 
 test echo
-it 'returns its string argument'
-  assert.equals(echo('hello'), 'hello')
-end
+    it 'returns its string argument'
+        assert.equals(echo('hello'), 'hello')
+    end
 end

@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let myInt Int = 42.0
-  print(myInt)
+    let myInt Int = 42.0
+    print(myInt)
 end

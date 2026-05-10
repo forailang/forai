@@ -1,17 +1,17 @@
 type Point
-  x Int
-  y Int
+    x Int
+    y Int
 end
 
 type Line
-  start Point
-  end_ Point
+    start Point
+    end_ Point
 end
 
 def main
     @return Void
 do
-  let l = Line(start: Point(x: 1, y: 2), end_: Point(x: 3, y: 4))
-  print(l.end_.x)
-  print(l.end_.y)
+    let l = Line(start: Point(x: 1, y: 2), end_: Point(x: 3, y: 4))
+    print(l.end_.x)
+    print(l.end_.y)
 end

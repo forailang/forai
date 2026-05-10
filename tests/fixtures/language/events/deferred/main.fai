@@ -15,16 +15,16 @@ var calls String[] = []
 def resetState
     @return Void
 do
-  calls = []
-  events.clearAll()
-  events.drain()
+    calls = []
+    events.clearAll()
+    events.drain()
 end
 
 test resetState
-it 'wipes registry and queue so each case starts clean'
-  resetState()
-  assert.equals(events.queueLen(), 0)
-end
+    it 'wipes registry and queue so each case starts clean'
+        resetState()
+        assert.equals(events.queueLen(), 0)
+    end
 end
 
 # emitDeferred queues without dispatching; the subscriber doesn't fire
@@ -32,73 +32,73 @@ end
 def queueOne
     @return Void
 do
-  resetState()
-  events.on('q') do with e Event
-      calls = array.append(calls, 'fired')
-  end
-  events.emitDeferred('q', 'payload')
+    resetState()
+    events.on('q') do with e Event
+        calls = array.append(calls, 'fired')
+    end
+    events.emitDeferred('q', 'payload')
 end
 
 test queueOne
-it 'emitDeferred enqueues without dispatching'
-  queueOne()
-  assert.equals(length(calls), 0)
-  assert.equals(events.queueLen(), 1)
-end
-it 'drain dispatches what was queued, in order'
-  queueOne()
-  events.drain()
-  assert.equals(length(calls), 1)
-  assert.equals(calls[0], 'fired')
-  assert.equals(events.queueLen(), 0)
-end
+    it 'emitDeferred enqueues without dispatching'
+        queueOne()
+        assert.equals(length(calls), 0)
+        assert.equals(events.queueLen(), 1)
+    end
+    it 'drain dispatches what was queued, in order'
+        queueOne()
+        events.drain()
+        assert.equals(length(calls), 1)
+        assert.equals(calls[0], 'fired')
+        assert.equals(events.queueLen(), 0)
+    end
 end
 
 # Drain of an empty queue is a silent no-op.
 def emptyDrain
     @return Void
 do
-  resetState()
-  events.drain()
+    resetState()
+    events.drain()
 end
 
 test emptyDrain
-it 'draining an empty queue is a no-op'
-  emptyDrain()
-  assert.equals(length(calls), 0)
-  assert.equals(events.queueLen(), 0)
-end
+    it 'draining an empty queue is a no-op'
+        emptyDrain()
+        assert.equals(length(calls), 0)
+        assert.equals(events.queueLen(), 0)
+    end
 end
 
 # Multiple deferred emits dispatch in FIFO order on drain.
 def queueThree
     @return Void
 do
-  resetState()
-  events.on('multi') do with e Event
-      calls = array.append(calls, getString(e.data, 'tag')!)
-  end
-  events.emitDeferred('multi', {
-    tag: 'a'
-  })
-  events.emitDeferred('multi', {
-    tag: 'b'
-  })
-  events.emitDeferred('multi', {
-    tag: 'c'
-  })
+    resetState()
+    events.on('multi') do with e Event
+        calls = array.append(calls, getString(e.data, 'tag')!)
+    end
+    events.emitDeferred('multi', {
+        tag: 'a'
+    })
+    events.emitDeferred('multi', {
+        tag: 'b'
+    })
+    events.emitDeferred('multi', {
+        tag: 'c'
+    })
 end
 
 test queueThree
-it 'drains in emit order'
-  queueThree()
-  assert.equals(events.queueLen(), 3)
-  events.drain()
-  assert.equals(length(calls), 3)
-  assert.equals(calls[0], 'a')
-  assert.equals(calls[1], 'b')
-  assert.equals(calls[2], 'c')
-end
+    it 'drains in emit order'
+        queueThree()
+        assert.equals(events.queueLen(), 3)
+        events.drain()
+        assert.equals(length(calls), 3)
+        assert.equals(calls[0], 'a')
+        assert.equals(calls[1], 'b')
+        assert.equals(calls[2], 'c')
+    end
 end
 
 # A subscriber that calls emitDeferred during drain — the new entry
@@ -106,26 +106,26 @@ end
 def fanOut
     @return Void
 do
-  resetState()
-  events.on('seed') do with e Event
-      calls = array.append(calls, 'seed')
-      events.emitDeferred('follow', 'x')
-  end
-  events.on('follow') do with e Event
-      calls = array.append(calls, 'follow')
-  end
-  events.emitDeferred('seed', 'x')
+    resetState()
+    events.on('seed') do with e Event
+        calls = array.append(calls, 'seed')
+        events.emitDeferred('follow', 'x')
+    end
+    events.on('follow') do with e Event
+        calls = array.append(calls, 'follow')
+    end
+    events.emitDeferred('seed', 'x')
 end
 
 test fanOut
-it 'subscribers can emitDeferred during drain — same pass picks them up'
-  fanOut()
-  events.drain()
-  assert.equals(length(calls), 2)
-  assert.equals(calls[0], 'seed')
-  assert.equals(calls[1], 'follow')
-  assert.equals(events.queueLen(), 0)
-end
+    it 'subscribers can emitDeferred during drain — same pass picks them up'
+        fanOut()
+        events.drain()
+        assert.equals(length(calls), 2)
+        assert.equals(calls[0], 'seed')
+        assert.equals(calls[1], 'follow')
+        assert.equals(events.queueLen(), 0)
+    end
 end
 
 # A throwing subscriber doesn't abort the drain — the error is
@@ -133,33 +133,33 @@ end
 def throwingDuringDrain
     @return Void
 do
-  resetState()
-  events.on('topic') do with e Event
-      calls = array.append(calls, 'before-throw')
-      throw Error('subscriber-failed')
-  end
-  events.on('topic') do with e Event
-      calls = array.append(calls, 'after-throw')
-  end
-  events.on('events:error') do with e Event
-      calls = array.append(calls, 'recovered:' + getString(e.data, 'message')!)
-  end
-  events.emitDeferred('topic', 'x')
+    resetState()
+    events.on('topic') do with e Event
+        calls = array.append(calls, 'before-throw')
+        throw Error('subscriber-failed')
+    end
+    events.on('topic') do with e Event
+        calls = array.append(calls, 'after-throw')
+    end
+    events.on('events:error') do with e Event
+        calls = array.append(calls, 'recovered:' + getString(e.data, 'message')!)
+    end
+    events.emitDeferred('topic', 'x')
 end
 
 test throwingDuringDrain
-it 'subscriber throw becomes events:error and drain continues'
-  throwingDuringDrain()
-  events.drain()
-  assert.isTrue(length(calls) >= 2)
-  assert.equals(calls[0], 'before-throw')
-  let last = calls[length(calls) - 1]
-  assert.isTrue(string.startsWith(last, 'recovered:'))
-end
+    it 'subscriber throw becomes events:error and drain continues'
+        throwingDuringDrain()
+        events.drain()
+        assert.isTrue(length(calls) >= 2)
+        assert.equals(calls[0], 'before-throw')
+        let last = calls[length(calls) - 1]
+        assert.isTrue(string.startsWith(last, 'recovered:'))
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

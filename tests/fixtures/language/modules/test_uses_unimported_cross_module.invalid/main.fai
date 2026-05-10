@@ -8,5 +8,5 @@ use { compareNodes } from diff
 def main
     @return Void
 do
-  print('ok')
+    print('ok')
 end

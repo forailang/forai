@@ -10,19 +10,19 @@
 def explode
     @return Void
 do
-  throw Error('boom')
+    throw Error('boom')
 end
 
 test explode
-it 'placeholder so coverage sees a test for explode'
-  print('placeholder')
-end
+    it 'placeholder so coverage sees a test for explode'
+        print('placeholder')
+    end
 end
 
 def main
     @return Void
 do
-  print('before')
-  explode()
-  print('after')
+    print('before')
+    explode()
+    print('after')
 end

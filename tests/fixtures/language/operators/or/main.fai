@@ -7,8 +7,8 @@
 def main
     @return Void
 do
-  print(true or true)
-  print(true or false)
-  print(false or true)
-  print(false or false)
+    print(true or true)
+    print(true or false)
+    print(false or true)
+    print(false or false)
 end

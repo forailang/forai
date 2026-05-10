@@ -6,5 +6,5 @@ use { something } from nonexistent
 def main
     @return Void
 do
-  print(something())
+    print(something())
 end

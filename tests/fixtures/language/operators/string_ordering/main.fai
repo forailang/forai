@@ -9,10 +9,10 @@
 def main
     @return Void
 do
-  print('apple' < 'banana')
-  print('apple' <= 'apple')
-  print('banana' > 'apple')
-  print('banana' >= 'banana')
-  print('banana' < 'apple')
-  print('apple' > 'banana')
+    print('apple' < 'banana')
+    print('apple' <= 'apple')
+    print('banana' > 'apple')
+    print('banana' >= 'banana')
+    print('banana' < 'apple')
+    print('apple' > 'banana')
 end

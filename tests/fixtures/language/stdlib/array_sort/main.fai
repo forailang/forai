@@ -8,12 +8,12 @@ use std.array
 def main
     @return Void
 do
-  let sorted = array.sort([
-    3
-    1
-    2
-  ])
-  for x in sorted
-    print(x)
-  end
+    let sorted = array.sort([
+        3
+        1
+        2
+    ])
+    for x in sorted
+        print(x)
+    end
 end

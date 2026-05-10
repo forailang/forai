@@ -4,5 +4,5 @@
 def main
     @return Void
 do
-  print(42)
+    print(42)
 end

@@ -5,12 +5,12 @@
 def main
     @return Void
 do
-  let xs = [
-    1
-    2
-    3
-  ]
-  let ys = append(xs, 4)
-  print(length(xs))
-  print(length(ys))
+    let xs = [
+        1
+        2
+        3
+    ]
+    let ys = append(xs, 4)
+    print(length(xs))
+    print(length(ys))
 end

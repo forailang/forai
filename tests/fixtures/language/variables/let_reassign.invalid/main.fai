@@ -3,7 +3,7 @@
 def main
     @return Void
 do
-  let x = 1
-  x = 2
-  print(x)
+    let x = 1
+    x = 2
+    print(x)
 end

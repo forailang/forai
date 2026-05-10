@@ -10,22 +10,22 @@ var counter Int = 0
 def bump
     @return Int
 do
-  counter = counter + 1
-  counter
+    counter = counter + 1
+    counter
 end
 
 def main
     @return Void
 do
-  print(bump())
-  print(bump())
-  print(bump())
+    print(bump())
+    print(bump())
+    print(bump())
 end
 
 test bump
-it 'increments the module-level counter'
-  counter = 0
-  assert.equal(bump(), 1)
-  assert.equal(bump(), 2)
-end
+    it 'increments the module-level counter'
+        counter = 0
+        assert.equal(bump(), 1)
+        assert.equal(bump(), 2)
+    end
 end

@@ -3,11 +3,11 @@
 #   8
 
 extern m
-  def pow(base: Float, exp: Float) -> Float
+    def pow(base: Float, exp: Float) -> Float
 end
 
 def main
     @return Void
 do
-  print(pow(2.0, 3.0))
+    print(pow(2.0, 3.0))
 end

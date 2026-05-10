@@ -8,7 +8,7 @@ var counter Int = 0
 def main
     @return Void
 do
-  print(counter)
-  counter = 7
-  print(counter)
+    print(counter)
+    counter = 7
+    print(counter)
 end

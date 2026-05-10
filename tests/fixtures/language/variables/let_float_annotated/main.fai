@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let myFloat Float = 1.23
-  print(myFloat)
+    let myFloat Float = 1.23
+    print(myFloat)
 end

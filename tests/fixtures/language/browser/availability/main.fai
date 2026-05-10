@@ -16,22 +16,22 @@ def boolText
     @param value Bool
     @return String
 do
-  if value
-    'true'
-  else
-    'false'
-  end
+    if value
+        'true'
+    else
+        'false'
+    end
 end
 
 test boolText
-it 'renders booleans'
-  assert.equal(boolText(true), 'true')
-  assert.equal(boolText(false), 'false')
-end
+    it 'renders booleans'
+        assert.equal(boolText(true), 'true')
+        assert.equal(boolText(false), 'false')
+    end
 end
 
 def main
     @return Void
 do
-  browser.setHtml('<div id="availability-result">net=' + boolText(net.available()) + ' ffi=' + boolText(ffi.available('c')) + ' file=' + boolText(file.exists('/tmp/anything')) + '</div>')
+    browser.setHtml('<div id="availability-result">net=' + boolText(net.available()) + ' ffi=' + boolText(ffi.available('c')) + ' file=' + boolText(file.exists('/tmp/anything')) + '</div>')
 end

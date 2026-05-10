@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let x Int? = null
-  print(x == null)
+    let x Int? = null
+    print(x == null)
 end

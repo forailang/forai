@@ -10,12 +10,12 @@ use std.convert
 def main
     @return Void
 do
-  let port Int = convert.toInt('3040')
-  print(toString(port))
-  let n Int = toInt('42')
-  print(toString(n))
-  let truncated Int = convert.toInt(7.9)
-  print(toString(truncated))
-  let parsed Float = convert.toFloat('2.5')
-  print(toString(parsed))
+    let port Int = convert.toInt('3040')
+    print(toString(port))
+    let n Int = toInt('42')
+    print(toString(n))
+    let truncated Int = convert.toInt(7.9)
+    print(toString(truncated))
+    let parsed Float = convert.toFloat('2.5')
+    print(toString(parsed))
 end

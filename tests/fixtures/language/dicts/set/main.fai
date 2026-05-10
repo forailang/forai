@@ -4,9 +4,9 @@
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-  }
-  let d2 = set(d, 'email', 'a@b.com')
-  print(getString(d2, 'email'))
+    let d = {
+        name: 'Alice'
+    }
+    let d2 = set(d, 'email', 'a@b.com')
+    print(getString(d2, 'email'))
 end

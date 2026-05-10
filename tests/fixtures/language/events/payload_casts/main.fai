@@ -19,32 +19,32 @@ def consumeRpcBeforeCall
     @param e Event
     @return Void
 do
-  let call RpcCall = from_dict(e.data)
-  seenFn = array.append(seenFn, call.fnName)
-  seenArgs = array.append(seenArgs, call.args)
+    let call RpcCall = from_dict(e.data)
+    seenFn = array.append(seenFn, call.fnName)
+    seenArgs = array.append(seenArgs, call.args)
 end
 
 test consumeRpcBeforeCall
-it 'reads fnName and args off the rpc:beforeCall payload'
-  events.clearAll()
-  seenFn = []
-  seenArgs = []
-  let _sub = events.on('rpc:beforeCall') do with e Event
-      consumeRpcBeforeCall(e)
-  end
-  events.emit('rpc:beforeCall', {
-    fnName: 'getTasks'
-    args: '[]'
-  })
-  events.emit('rpc:beforeCall', {
-    fnName: 'addTask'
-    args: '["buy milk"]'
-  })
-  assert.equals(length(seenFn), 2)
-  assert.equals(seenFn[0], 'getTasks')
-  assert.equals(seenFn[1], 'addTask')
-  assert.equals(seenArgs[1], '["buy milk"]')
-end
+    it 'reads fnName and args off the rpc:beforeCall payload'
+        events.clearAll()
+        seenFn = []
+        seenArgs = []
+        let _sub = events.on('rpc:beforeCall') do with e Event
+            consumeRpcBeforeCall(e)
+        end
+        events.emit('rpc:beforeCall', {
+            fnName: 'getTasks'
+            args: '[]'
+        })
+        events.emit('rpc:beforeCall', {
+            fnName: 'addTask'
+            args: '["buy milk"]'
+        })
+        assert.equals(length(seenFn), 2)
+        assert.equals(seenFn[0], 'getTasks')
+        assert.equals(seenFn[1], 'addTask')
+        assert.equals(seenArgs[1], '["buy milk"]')
+    end
 end
 
 # Same shape for ServerStarted — http:listening payload carries
@@ -53,26 +53,26 @@ def consumeServerStarted
     @param e Event
     @return Void
 do
-  let started ServerStarted = from_dict(e.data)
-  seenPort = started.port
+    let started ServerStarted = from_dict(e.data)
+    seenPort = started.port
 end
 
 test consumeServerStarted
-it 'reads port off the http:listening payload'
-  events.clearAll()
-  seenPort = 0
-  let _sub = events.on('http:listening') do with e Event
-      consumeServerStarted(e)
-  end
-  events.emit('http:listening', {
-    port: 3040
-  })
-  assert.equals(seenPort, 3040)
-end
+    it 'reads port off the http:listening payload'
+        events.clearAll()
+        seenPort = 0
+        let _sub = events.on('http:listening') do with e Event
+            consumeServerStarted(e)
+        end
+        events.emit('http:listening', {
+            port: 3040
+        })
+        assert.equals(seenPort, 3040)
+    end
 end
 
 def main
     @return Void
 do
-  print('done')
+    print('done')
 end

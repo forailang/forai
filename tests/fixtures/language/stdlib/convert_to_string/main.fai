@@ -6,7 +6,7 @@
 def main
     @return Void
 do
-  print(toString(42))
-  print(toString(3.14))
-  print(toString(true))
+    print(toString(42))
+    print(toString(3.14))
+    print(toString(true))
 end

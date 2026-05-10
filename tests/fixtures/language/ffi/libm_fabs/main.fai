@@ -3,11 +3,11 @@
 #   5.5
 
 extern m
-  def fabs(x: Float) -> Float
+    def fabs(x: Float) -> Float
 end
 
 def main
     @return Void
 do
-  print(fabs(-5.5))
+    print(fabs(-5.5))
 end

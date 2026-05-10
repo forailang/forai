@@ -6,5 +6,5 @@ use { publicFn } from lib
 def main
     @return Void
 do
-  print(publicFn())
+    print(publicFn())
 end

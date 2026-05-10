@@ -4,7 +4,7 @@
 def main
     @return Void
 do
-  if true
-    print('yes')
-  end
+    if true
+        print('yes')
+    end
 end

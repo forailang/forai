@@ -4,18 +4,18 @@
 def returnsInt
     @return Int
 do
-  42
+    42
 end
 
 test returnsInt
-it 'returns 42'
-  assert.equal(returnsInt(), 42)
-end
+    it 'returns 42'
+        assert.equal(returnsInt(), 42)
+    end
 end
 
 def main
     @return Void
 do
-  let myInt Int = returnsInt()
-  print(myInt)
+    let myInt Int = returnsInt()
+    print(myInt)
 end

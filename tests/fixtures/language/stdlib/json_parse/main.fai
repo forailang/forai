@@ -6,6 +6,6 @@ use std.json
 def main
     @return Void
 do
-  let d = json.parse('{"name":"Alice","age":30}')
-  print(getString(d, 'name'))
+    let d = json.parse('{"name":"Alice","age":30}')
+    print(getString(d, 'name'))
 end

@@ -4,12 +4,12 @@
 #   7
 
 extern c
-  def abs(n: Int) -> Int
+    def abs(n: Int) -> Int
 end
 
 def main
     @return Void
 do
-  print(abs(-42))
-  print(abs(7))
+    print(abs(-42))
+    print(abs(7))
 end

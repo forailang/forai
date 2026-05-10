@@ -5,10 +5,10 @@
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-    age: 30
-  }
-  print(getString(d, 'name'))
-  print(getInt(d, 'age'))
+    let d = {
+        name: 'Alice'
+        age: 30
+    }
+    print(getString(d, 'name'))
+    print(getInt(d, 'age'))
 end

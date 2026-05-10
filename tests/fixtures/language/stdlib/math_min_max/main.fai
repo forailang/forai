@@ -7,6 +7,6 @@ use std.math
 def main
     @return Void
 do
-  print(math.min(1.0, 5.0))
-  print(math.max(1.0, 5.0))
+    print(math.min(1.0, 5.0))
+    print(math.max(1.0, 5.0))
 end

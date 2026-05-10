@@ -3,6 +3,6 @@
 def main
     @return Void
 do
-  break
-  print('unreachable')
+    break
+    print('unreachable')
 end

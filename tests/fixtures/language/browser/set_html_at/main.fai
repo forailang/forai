@@ -8,6 +8,6 @@ use std.browser
 def main
     @return Void
 do
-  browser.setHtml('<main><div id="slot"></div></main>')
-  browser.setHtmlAt('#slot', '<section id="slot">Rendered in slot</section>')
+    browser.setHtml('<main><div id="slot"></div></main>')
+    browser.setHtmlAt('#slot', '<section id="slot">Rendered in slot</section>')
 end

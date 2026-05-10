@@ -4,6 +4,6 @@
 def main
     @return Void
 do
-  let myString = 'hello'
-  print(myString)
+    let myString = 'hello'
+    print(myString)
 end

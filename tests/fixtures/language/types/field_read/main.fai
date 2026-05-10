@@ -4,11 +4,11 @@
 def main
     @return Void
 do
-  let p = Point(x: 5, y: 10)
-  print(p.x)
+    let p = Point(x: 5, y: 10)
+    print(p.x)
 end
 
 type Point
-  x Int
-  y Int
+    x Int
+    y Int
 end

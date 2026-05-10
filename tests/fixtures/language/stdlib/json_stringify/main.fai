@@ -6,9 +6,9 @@ use std.json
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-    age: 30
-  }
-  print(json.stringify(d))
+    let d = {
+        name: 'Alice'
+        age: 30
+    }
+    print(json.stringify(d))
 end

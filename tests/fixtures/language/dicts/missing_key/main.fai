@@ -4,12 +4,12 @@
 def main
     @return Void
 do
-  let d = {
-    name: 'Alice'
-  }
-  if hasKey(d, 'email')
-    print(getString(d, 'email'))
-  else
-    print('fallback')
-  end
+    let d = {
+        name: 'Alice'
+    }
+    if hasKey(d, 'email')
+        print(getString(d, 'email'))
+    else
+        print('fallback')
+    end
 end

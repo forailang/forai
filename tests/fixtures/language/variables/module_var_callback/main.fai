@@ -14,7 +14,7 @@ def onEvent
     @param cb Callback
     @return Void
 do
-  listener = cb
+    listener = cb
 end
 
 # Fire the registered callback if any. Mirrors the `navigateListener!()`
@@ -22,37 +22,37 @@ end
 def notify
     @return Void
 do
-  if listener != null
-    listener!()
-  end
+    if listener != null
+        listener!()
+    end
 end
 
 def main
     @return Void
 do
-  var count = 0
-  onEvent do
-      count = count + 1
-      print(count)
-  end
-  notify()
-  notify()
+    var count = 0
+    onEvent do
+        count = count + 1
+        print(count)
+    end
+    notify()
+    notify()
 end
 
 test notify
-it 'does nothing when no listener is registered'
-  listener = null
-  notify()
-  assert.equals(listener, null)
-end
+    it 'does nothing when no listener is registered'
+        listener = null
+        notify()
+        assert.equals(listener, null)
+    end
 end
 
 test onEvent
-it 'stores the callback in the module-level var'
-  listener = null
-  onEvent do
+    it 'stores the callback in the module-level var'
+        listener = null
+        onEvent do
 
-  end
-  assert.equals(listener != null, true)
-end
+        end
+        assert.equals(listener != null, true)
+    end
 end

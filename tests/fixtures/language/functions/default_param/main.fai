@@ -6,21 +6,21 @@ def greet
     @param name String, default: 'world'
     @return String
 do
-  'hello ' + name
+    'hello ' + name
 end
 
 test greet
-it 'uses default'
-  assert.equal(greet(), 'hello world')
-end
-it 'uses provided'
-  assert.equal(greet('Alice'), 'hello Alice')
-end
+    it 'uses default'
+        assert.equal(greet(), 'hello world')
+    end
+    it 'uses provided'
+        assert.equal(greet('Alice'), 'hello Alice')
+    end
 end
 
 def main
     @return Void
 do
-  print(greet())
-  print(greet('Alice'))
+    print(greet())
+    print(greet('Alice'))
 end

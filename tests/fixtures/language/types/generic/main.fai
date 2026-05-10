@@ -1,13 +1,13 @@
 type Box
-  @type T
-  value $T
+    @type T
+    value $T
 end
 
 def main
     @return Void
 do
-  let a = Box(value: 42)
-  let b = Box(value: 'hello')
-  print(a.value)
-  print(b.value)
+    let a = Box(value: 42)
+    let b = Box(value: 'hello')
+    print(a.value)
+    print(b.value)
 end

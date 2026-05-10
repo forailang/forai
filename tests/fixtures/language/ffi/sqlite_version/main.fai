@@ -5,16 +5,16 @@
 use std.string
 
 extern sqlite3
-  def sqlite3_libversion() -> String
+    def sqlite3_libversion() -> String
 end
 
 def main
     @return Void
 do
-  let v = sqlite3_libversion()
-  if string.startsWith(v, '3.')
-    print("prefix=ok")
-  else
-    print("prefix=bad: {{v}}")
-  end
+    let v = sqlite3_libversion()
+    if string.startsWith(v, '3.')
+        print("prefix=ok")
+    else
+        print("prefix=bad: {{v}}")
+    end
 end

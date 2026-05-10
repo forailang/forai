@@ -6,11 +6,11 @@ def isEven
     @param n Int
     @return Bool
 do
-  if n == 0
-    true
-  else
-    isOdd(n - 1)
-  end
+    if n == 0
+        true
+    else
+        isOdd(n - 1)
+    end
 end
 
 # IsOdd.
@@ -18,28 +18,28 @@ def isOdd
     @param n Int
     @return Bool
 do
-  if n == 0
-    false
-  else
-    isEven(n - 1)
-  end
+    if n == 0
+        false
+    else
+        isEven(n - 1)
+    end
 end
 
 test isEven
-it 'works'
-  assert.equal(isEven(4), true)
-end
+    it 'works'
+        assert.equal(isEven(4), true)
+    end
 end
 
 test isOdd
-it 'works'
-  assert.equal(isOdd(4), false)
-end
+    it 'works'
+        assert.equal(isOdd(4), false)
+    end
 end
 
 def main
     @return Void
 do
-  print(isEven(4))
-  print(isOdd(4))
+    print(isEven(4))
+    print(isOdd(4))
 end
