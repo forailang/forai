@@ -1,0 +1,18 @@
+# expect: ok
+# stdout:
+#   42
+#   3
+#   Ada
+
+use * from std.math
+
+use * from util
+
+def main
+    @return Void
+do
+    print(double(21))
+    print(floor(3.9))
+    let user = User(name: 'Ada')
+    print(describe(user))
+end

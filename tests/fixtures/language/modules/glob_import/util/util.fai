@@ -1,0 +1,31 @@
+type User
+    name String
+end
+
+# Double a number.
+def double
+    @param n Int
+    @return Int
+do
+    n * 2
+end
+
+test double
+    it 'doubles'
+        assert.equal(double(2), 4)
+    end
+end
+
+# Describe a user.
+def describe
+    @param user User
+    @return String
+do
+    user.name
+end
+
+test describe
+    it 'returns the name'
+        assert.equal(describe(User(name: 'Ada')), 'Ada')
+    end
+end

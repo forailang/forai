@@ -75,6 +75,8 @@ pub struct UseStatement {
     pub module_path: Vec<String>,
     pub imported_names: Option<Vec<String>>,
     #[serde(default)]
+    pub import_all: bool,
+    #[serde(default)]
     pub is_remote: bool,
     pub location: SourceLocation,
 }

@@ -193,6 +193,17 @@ impl Parser {
         let loc = self.location_of_prev();
         // use remote <name>
         let is_remote = self.match_t(TokenType::Remote);
+        if self.match_t(TokenType::Star) {
+            self.consume(TokenType::From, "Expected 'from' after '*' in glob import")?;
+            let path = self.parse_module_path()?;
+            return Ok(Statement::Use(UseStatement {
+                module_path: path,
+                imported_names: None,
+                import_all: true,
+                is_remote,
+                location: loc,
+            }));
+        }
         if self.match_t(TokenType::LeftBrace) {
             let mut names = Vec::new();
             loop {
@@ -211,6 +222,7 @@ impl Parser {
             return Ok(Statement::Use(UseStatement {
                 module_path: path,
                 imported_names: Some(names),
+                import_all: false,
                 is_remote,
                 location: loc,
             }));
@@ -219,6 +231,7 @@ impl Parser {
         Ok(Statement::Use(UseStatement {
             module_path: path,
             imported_names: None,
+            import_all: false,
             is_remote,
             location: loc,
         }))

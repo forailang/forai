@@ -2360,6 +2360,7 @@ fn rewrite_remote_def_bodies(
                         fai_compiler::ast::UseStatement {
                             module_path: vec!["std".to_string(), "json".to_string()],
                             imported_names: None,
+                            import_all: false,
                             is_remote: false,
                             location: zero,
                         },

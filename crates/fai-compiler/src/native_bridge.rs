@@ -16,6 +16,7 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
         n::Statement::Use(u) => s::Statement::UseStatement(s::UseStatement {
             module_path: u.module_path.clone(),
             imported_names: u.imported_names.clone(),
+            import_all: u.import_all,
             is_remote: u.is_remote,
             location: loc(&u.location),
         }),

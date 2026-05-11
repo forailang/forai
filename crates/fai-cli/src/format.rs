@@ -112,7 +112,9 @@ fn format_program(program: &Program) -> String {
 fn format_statement(stmt: &Statement, indent: &str) -> String {
     match stmt {
         Statement::Use(u) => {
-            if let Some(names) = &u.imported_names {
+            if u.import_all {
+                format!("{}use * from {}", indent, u.module_path.join("."))
+            } else if let Some(names) = &u.imported_names {
                 format!(
                     "{}use {{ {} }} from {}",
                     indent,
@@ -686,10 +688,13 @@ fn format_chain_call(call: &CallExpr, indent: &str) -> String {
         // `make().withAction(do ... end)`. Detect the synthetic
         // do-block as last arg and render with the spaced
         // `<args> do...end` shape.
-        let has_trailing = args.last().map(|a| {
-            a.label.is_none()
-                && matches!(&a.value, Expression::Function(f) if f.name.starts_with("<block:"))
-        }).unwrap_or(false);
+        let has_trailing = args
+            .last()
+            .map(|a| {
+                a.label.is_none()
+                    && matches!(&a.value, Expression::Function(f) if f.name.starts_with("<block:"))
+            })
+            .unwrap_or(false);
         if has_trailing {
             let n = args.len() - 1;
             let regular = format_call_args(&args[..n], &chain_indent);
@@ -1385,6 +1390,11 @@ mod tests {
             rt("use { foo, bar } from mymod.utils\n"),
             "use { foo, bar } from mymod.utils\n"
         );
+    }
+
+    #[test]
+    fn test_format_use_glob() {
+        assert_eq!(rt("use * from Forui.view\n"), "use * from Forui.view\n");
     }
 
     #[test]

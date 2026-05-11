@@ -1854,6 +1854,19 @@ pub fn build_program_full(
         }
     }
 
+    let mut module_function_exports: HashMap<String, Vec<String>> = HashMap::new();
+    for m in modules {
+        let mut names = Vec::new();
+        for s in &m.statements {
+            if let fai_compiler::ast::Statement::FunctionDeclaration(fd) = s {
+                if !m.private_names.iter().any(|n| n == &fd.name) {
+                    names.push(fd.name.clone());
+                }
+            }
+        }
+        module_function_exports.insert(m.name.clone(), names);
+    }
+
     // Named-import map: `use { X, Y } from app.models` in the entry
     // (or in any module) lets bare `X(...)` calls resolve to
     // `app.models.X`. Gathered from both the entry AST and every
@@ -1864,11 +1877,31 @@ pub fn build_program_full(
         out: &mut HashMap<String, String>,
         stmts: &[fai_compiler::ast::Statement],
         current_module_name: Option<&str>,
+        module_function_exports: &HashMap<String, Vec<String>>,
         insert_policy: fn(&mut HashMap<String, String>, String, String),
     ) {
         for s in stmts {
             if let fai_compiler::ast::Statement::UseStatement(u) = s {
-                if let Some(names) = &u.imported_names {
+                let qualified_prefix =
+                    qualify_module_path_for_codegen(current_module_name, &u.module_path);
+                if u.import_all {
+                    if fai_checker::std_modules::is_std_module(&u.module_path) {
+                        let std_exports = fai_checker::std_modules::std_module_exports();
+                        if let Some(exports) = std_exports.get(&qualified_prefix) {
+                            for (n, _) in exports {
+                                insert_policy(
+                                    out,
+                                    n.clone(),
+                                    format!("{}.{}", qualified_prefix, n),
+                                );
+                            }
+                        }
+                    } else if let Some(names) = module_function_exports.get(&qualified_prefix) {
+                        for n in names {
+                            insert_policy(out, n.clone(), format!("{}.{}", qualified_prefix, n));
+                        }
+                    }
+                } else if let Some(names) = &u.imported_names {
                     let qualified_prefix =
                         qualify_module_path_for_codegen(current_module_name, &u.module_path);
                     for n in names {
@@ -1878,14 +1911,21 @@ pub fn build_program_full(
             }
         }
     }
-    record_named_imports(&mut named_imports, &ast.statements, None, |m, k, v| {
-        m.insert(k, v);
-    });
+    record_named_imports(
+        &mut named_imports,
+        &ast.statements,
+        None,
+        &module_function_exports,
+        |m, k, v| {
+            m.insert(k, v);
+        },
+    );
     for m in modules {
         record_named_imports(
             &mut named_imports,
             &m.statements,
             Some(&m.name),
+            &module_function_exports,
             |m, k, v| {
                 m.entry(k).or_insert(v);
             },
@@ -2542,7 +2582,7 @@ fn collect_module_aliases_from(
     let mut aliases = HashMap::new();
     for s in stmts {
         if let fai_compiler::ast::Statement::UseStatement(u) = s {
-            if u.imported_names.is_some() {
+            if u.import_all || u.imported_names.is_some() {
                 continue;
             }
             if let Some(last) = u.module_path.last() {
@@ -9326,7 +9366,7 @@ mod tests {
         let mut aliases = HashMap::new();
         for s in stmts {
             if let fai_compiler::ast::Statement::UseStatement(u) = s {
-                if u.imported_names.is_some() {
+                if u.import_all || u.imported_names.is_some() {
                     continue;
                 }
                 if let Some(last) = u.module_path.last() {
@@ -14620,6 +14660,79 @@ mod tests {
             ),
         )
         .expect("cross-module call should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_glob_import_user_module_call() {
+        let wasm = try_compile_with_module(
+            concat!(
+                "use * from mypkg.helpers\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  double(21)\n",
+                "end\n",
+            ),
+            "mypkg.helpers",
+            concat!(
+                "# Double.\ndef double\n",
+                "    @param x Int\n",
+                "    @return Int\n",
+                "do\n",
+                "  x * 2\n",
+                "end\n",
+            ),
+        )
+        .expect("glob-imported user function should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_glob_import_user_module_ufcs_call() {
+        let wasm = try_compile_with_module(
+            concat!(
+                "use * from mypkg.helpers\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  21.double()\n",
+                "end\n",
+            ),
+            "mypkg.helpers",
+            concat!(
+                "# Double.\ndef double\n",
+                "    @param x Int\n",
+                "    @return Int\n",
+                "do\n",
+                "  x * 2\n",
+                "end\n",
+            ),
+        )
+        .expect("glob-imported UFCS function should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_glob_import_std_call() {
+        let wasm = try_compile_via_production(concat!(
+            "use * from std.math\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  floor(42.9)\n",
+            "end\n",
+        ))
+        .expect("glob-imported std function should compile via direct");
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
         assert_eq!(result, expected);

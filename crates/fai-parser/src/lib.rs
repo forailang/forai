@@ -277,6 +277,7 @@ mod tests {
         assert_eq!(p.statements.len(), 1);
         if let Statement::Use(u) = &p.statements[0] {
             assert_eq!(u.module_path, vec!["std", "io"]);
+            assert!(!u.import_all);
         } else {
             panic!("expected use statement");
         }
@@ -289,6 +290,20 @@ mod tests {
         if let Statement::Use(u) = &p.statements[0] {
             assert_eq!(u.module_path, vec!["std", "array"]);
             assert_eq!(u.imported_names.as_ref().unwrap(), &vec!["map", "filter"]);
+            assert!(!u.import_all);
+        } else {
+            panic!("expected use statement");
+        }
+    }
+
+    #[test]
+    fn test_parse_use_glob_from() {
+        let p = parse_ok("use * from std.math");
+        assert_eq!(p.statements.len(), 1);
+        if let Statement::Use(u) = &p.statements[0] {
+            assert_eq!(u.module_path, vec!["std", "math"]);
+            assert!(u.imported_names.is_none());
+            assert!(u.import_all);
         } else {
             panic!("expected use statement");
         }

@@ -45,6 +45,7 @@ pub enum Statement {
 pub struct UseStatement {
     pub module_path: Vec<String>,
     pub imported_names: Option<Vec<String>>,
+    pub import_all: bool,
     pub is_remote: bool,
     pub location: SourceLocation,
 }

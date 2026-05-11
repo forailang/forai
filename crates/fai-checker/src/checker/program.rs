@@ -88,11 +88,7 @@ impl Checker {
             // another file checked earlier in source order. The pre-pass
             // type-checks each initializer and adds the name to env;
             // the main loop below skips bindings that are already there.
-            self.forward_declare_module_bindings(
-                &module.statements,
-                &module.file_paths,
-                &mut env,
-            );
+            self.forward_declare_module_bindings(&module.statements, &module.file_paths, &mut env);
 
             // Mark the module currently being checked so that any
             // ufcs_calls / named_param_reorder entries get tagged with
@@ -457,6 +453,24 @@ impl Checker {
             .get(&module_name)
             .ok_or_else(|| CheckError::new(format!("Unknown standard module '{}'", module_name)))?;
 
+        if use_stmt.import_all {
+            for (export_name, builtin_name) in exports {
+                let ty = self.builtins.get(builtin_name).ok_or_else(|| {
+                    CheckError::new(format!(
+                        "Standard module '{}' export '{}' is not implemented",
+                        module_name, export_name
+                    ))
+                })?;
+                env.define(export_name, ty.clone(), false).map_err(|_| {
+                    CheckError::new(format!(
+                        "Glob import from '{}' conflicts with existing name '{}'",
+                        module_name, export_name
+                    ))
+                })?;
+            }
+            return Ok(());
+        }
+
         if let Some(imported_names) = &use_stmt.imported_names {
             if !imported_names.is_empty() {
                 for name in imported_names {
@@ -524,6 +538,21 @@ impl Checker {
                 return Ok(());
             }
         };
+
+        if use_stmt.import_all {
+            let mut names: Vec<&String> = exports.keys().collect();
+            names.sort();
+            for name in names {
+                let ty = exports.get(name).unwrap();
+                env.define(name, ty.clone(), false).map_err(|_| {
+                    CheckError::new(format!(
+                        "Glob import from '{}' conflicts with existing name '{}'",
+                        module_name, name
+                    ))
+                })?;
+            }
+            return Ok(());
+        }
 
         if let Some(imported_names) = &use_stmt.imported_names {
             if !imported_names.is_empty() {

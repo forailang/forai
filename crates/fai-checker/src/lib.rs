@@ -812,6 +812,11 @@ end
         );
     }
 
+    #[test]
+    fn test_glob_import_from_std_module_ok() {
+        check_ok("use * from std.math\n\ndef main\n    @return Int\ndo\n  floor(3.7)\nend");
+    }
+
     // ── Multi-return functions ───────────────────────────────────────
 
     #[test]
@@ -2443,6 +2448,25 @@ end
             "use mymod\n\ndef main\n    @return String\ndo\n  mymod.greet('world')\nend",
             "mymod",
             "# Greet.\ndef greet\n    @param name String\n    @return String\ndo\n  'hello ' + name\nend",
+        );
+    }
+
+    #[test]
+    fn test_module_glob_import_ok() {
+        check_ok_with_module(
+            "use * from mymod\n\ndef main\n    @return String\ndo\n  greet('world')\nend",
+            "mymod",
+            "# Greet.\ndef greet\n    @param name String\n    @return String\ndo\n  'hello ' + name\nend",
+        );
+    }
+
+    #[test]
+    fn test_module_glob_import_collision_errors() {
+        check_err_with_module(
+            "use { greet } from mymod\nuse * from mymod\n\ndef main\n    @return Void\ndo\nend",
+            "mymod",
+            "# Greet.\ndef greet\n    @return String\ndo\n  'hello'\nend",
+            "conflicts with existing name",
         );
     }
 

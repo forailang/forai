@@ -647,6 +647,7 @@ use { App } from client                    # all files in client/ → client mod
 use { Nav, Section } from client.components
 use { HomePage, TasksPage } from client.pages
 use { isLoggedIn } from client.state
+use * from client.widgets                  # import all public exports into this file's scope
 
 # WRONG — you cannot import a single file
 use { App } from client.app               # ERROR: looks for client/app/ directory
@@ -679,13 +680,16 @@ packages):
 ```fai
 use { mount } from Forui                  # top-level exports from forui/src/forui.fai
 use { Label, Button, VStack } from Forui.view    # sub-module forui/src/view/
+use * from Forui.view                            # all public view exports in file scope
 use { useSignal, isLoading } from Forui.signal   # sub-module forui/src/signal/
 use { navigate, Link } from Forui.router         # sub-module forui/src/router/
 ```
 
-**Every function used via UFCS (e.g. `node.fontSize(14)`) must be explicitly imported.**
-The import is per-file — there is no global namespace. If the checker reports
-`'fontSize' is not in scope`, add it to the `use { ... } from Forui.view` line in that file.
+**Every function used via UFCS (e.g. `node.fontSize(14)`) must be in file scope.**
+Use an explicit named import (`use { fontSize } from Forui.view`) or an explicit
+glob import (`use * from Forui.view`). Imports are per-file — there is no global
+namespace. If the checker reports `'fontSize' is not in scope`, add it to an
+import in that file.
 
 Common Forui imports for client pages:
 
