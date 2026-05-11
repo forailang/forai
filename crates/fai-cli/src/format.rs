@@ -1260,6 +1260,30 @@ mod tests {
     }
 
     #[test]
+    fn test_format_chain_after_trailing_closure_with_dot_on_next_line() {
+        // The formatter should also canonicalize the human-written
+        // shape where the chained dot already starts the next line,
+        // but is not indented as a continuation yet.
+        let formatted = rt(concat!(
+            "# Stub.\n",
+            "def VStack\n    @param children () -> Int\n    @return Int\ndo\n  children()\nend\n\n",
+            "# Stub.\n",
+            "def padding\n    @param node Int\n    @param p Int\n    @return Int\ndo\n  node\nend\n\n",
+            "# Stub.\n",
+            "def somebody\n    @return Int\ndo\n  1\nend\n\n",
+            "# Build.\n",
+            "def build\n    @return Int\ndo\nlet view = VStack do\nsomebody()\nend\n.padding(12)\nview\nend\n",
+        ));
+        assert!(
+            formatted.contains(
+                "let view = VStack do\n        somebody()\n    end\n        .padding(12)"
+            ),
+            "dot-on-next-line chain should be indented as a continuation, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
     fn test_format_pagination_offset_regression() {
         // The exact agent failure: pagination offset computation
         // `(page - 1) * perPage` was getting silently rewritten by
