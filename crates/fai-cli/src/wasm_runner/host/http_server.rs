@@ -8,7 +8,7 @@
 //! wasm via `__indirect_function_table`.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::Duration;
 
 use wasmtime::*;
@@ -359,9 +359,27 @@ fn try_serve_static_from_router(router_id: u32, path: &str) -> Option<Vec<u8>> {
 }
 
 /// Write a raw byte response directly to the TCP stream.
-fn write_raw_response(mut stream: TcpStream, response: Vec<u8>) {
-    let _ = stream.write_all(&response);
+fn write_raw_response(stream: TcpStream, response: Vec<u8>) {
+    finish_response(stream, &response);
+}
+
+/// Write the response bytes and shut the connection down gracefully.
+///
+/// `write_all` only guarantees the bytes hit the kernel send buffer;
+/// dropping the `TcpStream` immediately afterwards calls `close()`,
+/// which under load-balancer-fronted setups (Fly's edge proxy is
+/// one such) can drop the in-flight tail of the response — the
+/// client sees a `Content-Length` mismatch and Chrome surfaces
+/// `ERR_HTTP2_PROTOCOL_ERROR`. The explicit `shutdown(Write)` sends
+/// a clean FIN only after all queued data has been buffered, so the
+/// kernel won't deliver the FIN until the tail is acknowledged and
+/// the peer always sees a graceful end-of-stream. `set_nodelay`
+/// keeps the final segment from sitting in Nagle's buffer.
+fn finish_response(mut stream: TcpStream, response: &[u8]) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.write_all(response);
     let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
 }
 
 /// Read a UTF-8 string from guest memory at (ptr, len).
@@ -647,7 +665,7 @@ fn is_options_request(stream: &TcpStream) -> bool {
     }
 }
 
-fn write_cors_preflight(mut stream: TcpStream) {
+fn write_cors_preflight(stream: TcpStream) {
     let resp = "HTTP/1.1 204 No Content\r\n\
         Access-Control-Allow-Origin: *\r\n\
         Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
@@ -655,8 +673,7 @@ fn write_cors_preflight(mut stream: TcpStream) {
         Access-Control-Max-Age: 86400\r\n\
         Content-Length: 0\r\n\
         Connection: close\r\n\r\n";
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
+    finish_response(stream, resp.as_bytes());
 }
 
 /// Parse the incoming request into a `{method, path, body, headers, query}`
@@ -761,11 +778,12 @@ fn parse_http_request_into_guest(
 /// line each; headers contribute extra header lines after the
 /// built-ins. Mirrors the VM's `write_http_response` for the legacy
 /// fields.
-fn write_http_response(caller: &mut Caller<'_, ()>, mut stream: TcpStream, response_val: i64) {
+fn write_http_response(caller: &mut Caller<'_, ()>, stream: TcpStream, response_val: i64) {
     let val = response_val as u64;
     // Must be an object pointer.
     if (val & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
-        let _ = stream.write_all(
+        finish_response(
+            stream,
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         return;
@@ -805,8 +823,7 @@ fn write_http_response(caller: &mut Caller<'_, ()>, mut stream: TcpStream, respo
     }
     response.push_str("\r\n");
     response.push_str(&body);
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    finish_response(stream, response.as_bytes());
 }
 
 fn status_text(status: i32) -> &'static str {
@@ -1270,5 +1287,76 @@ mod tests {
     fn status_text_falls_back_to_ok_for_unknown_codes() {
         assert_eq!(status_text(418), "OK");
         assert_eq!(status_text(599), "OK");
+    }
+
+    // ── finish_response: graceful shutdown ──────────────────────────
+    //
+    // Regression coverage for the Content-Length truncation bug seen
+    // through Fly's edge proxy: the response would arrive with
+    // Content-Length: N but a body shorter than N bytes, because
+    // dropping the TcpStream right after write_all called close(2)
+    // before the kernel had drained the send buffer. The fix is
+    // set_linger + explicit shutdown(Write); these tests pin that
+    // contract on a real loopback socket.
+
+    use std::io::Read as _;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).expect("connect loopback");
+        let (server, _peer) = listener.accept().expect("accept");
+        (server, client)
+    }
+
+    #[test]
+    fn finish_response_delivers_full_body() {
+        let (server, mut client) = loopback_pair();
+        // Larger than a single send-buffer chunk to exercise the
+        // partial-write window where the truncation bug used to land.
+        let payload = vec![b'x'; 256 * 1024];
+        let writer = thread::spawn({
+            let payload = payload.clone();
+            move || finish_response(server, &payload)
+        });
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).expect("read_to_end");
+        writer.join().expect("writer thread");
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn finish_response_signals_eof_to_peer() {
+        // shutdown(Write) is what lets the peer's read_to_end return
+        // cleanly — without it some proxies wait until close() then
+        // race the FIN against the buffered payload. Assert that
+        // after finish_response returns, a subsequent read on the
+        // peer sees EOF (0 bytes) rather than blocking.
+        let (server, mut client) = loopback_pair();
+        finish_response(server, b"hello");
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).expect("read_to_end");
+        assert_eq!(buf, b"hello");
+
+        // A second read after EOF should immediately return 0 bytes
+        // (Read::read on a closed half-stream).
+        let mut tail = [0u8; 4];
+        let n = client.read(&mut tail).expect("post-eof read");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn finish_response_handles_empty_body() {
+        // Preflight / 204 paths pass an empty body — make sure the
+        // shutdown sequence still works and the peer sees a clean EOF.
+        let (server, mut client) = loopback_pair();
+        finish_response(server, b"");
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).expect("read_to_end");
+        assert!(buf.is_empty());
     }
 }
