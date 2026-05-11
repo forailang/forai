@@ -266,6 +266,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     if is_options_request(&stream) {
+                        drain_request(&stream);
                         write_cors_preflight(stream);
                         continue;
                     }
@@ -277,6 +278,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             if let Some(static_response) =
                                 try_serve_static_from_router(id as u32, path)
                             {
+                                drain_request(&stream);
                                 write_raw_response(stream, static_response);
                                 continue;
                             }
@@ -325,6 +327,43 @@ fn peek_request_method_path(stream: &TcpStream) -> Option<(String, String)> {
     let raw_path = parts.next()?;
     let (path, _) = raw_path.split_once('?').unwrap_or((raw_path, ""));
     Some((method, path.to_string()))
+}
+
+/// Consume the request line, headers, and any declared body off the
+/// stream so the kernel's receive buffer is empty by the time the
+/// response writer closes the socket. Required for the static-file
+/// and CORS-preflight paths — they don't otherwise read the request,
+/// and on Linux `close()` on a socket with unread receive-buffer data
+/// sends a RST instead of a FIN. Behind Fly's edge proxy that RST
+/// arrives mid-stream and the client sees a truncated body with a
+/// Content-Length mismatch (Chrome: `ERR_HTTP2_PROTOCOL_ERROR`).
+/// Errors are ignored — we're only draining to clean up TCP, the
+/// response has already been resolved at the call site.
+fn drain_request(stream: &TcpStream) {
+    let mut reader = BufReader::new(stream);
+    let mut content_length: usize = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+    }
 }
 
 /// Look up static file for the given request path in the router's serveFiles dir.
@@ -1347,6 +1386,57 @@ mod tests {
         let mut tail = [0u8; 4];
         let n = client.read(&mut tail).expect("post-eof read");
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn drain_request_consumes_headers_so_close_sends_fin_not_rst() {
+        // The root truncation bug: static-file responses never read
+        // the request bytes, so on Linux close(2) saw unread data in
+        // the recv buffer and sent RST instead of FIN. Fly's edge
+        // proxy treats RST as "abort the stream" and stops forwarding
+        // bytes to the client mid-body. Drain the request first and
+        // close becomes graceful.
+        let (server, mut client) = loopback_pair();
+
+        // Simulate Fly's proxy: send a normal HTTP request then read
+        // the response back. If the server's close sends RST instead
+        // of FIN, read_to_end on the client side will surface
+        // ECONNRESET via Err(...) rather than the full body.
+        client
+            .write_all(
+                b"GET /fai-runtime.js HTTP/1.1\r\n\
+                  Host: forailang.com\r\n\
+                  User-Agent: probe\r\n\r\n",
+            )
+            .expect("write request");
+
+        drain_request(&server);
+        // Imitate the static-file path: write a large body then
+        // shutdown(Write).
+        let payload = vec![b'A'; 64 * 1024];
+        finish_response(server, &payload);
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).expect("read_to_end");
+        assert_eq!(received.len(), payload.len());
+    }
+
+    #[test]
+    fn drain_request_handles_post_body() {
+        let (server, mut client) = loopback_pair();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\n\
+                  Host: x\r\n\
+                  Content-Length: 11\r\n\r\n\
+                  hello world",
+            )
+            .expect("write request");
+        drain_request(&server);
+        finish_response(server, b"ok");
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).expect("read_to_end");
+        assert_eq!(buf, b"ok");
     }
 
     #[test]
