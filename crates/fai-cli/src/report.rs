@@ -76,10 +76,6 @@ impl Reporter {
         }
     }
 
-    pub fn verbose(&self) -> bool {
-        self.verbose
-    }
-
     /// Print the top-level banner once per `cmd_*` invocation.
     /// Example: `checking 14 .fai files in partners ...`.
     pub fn header(&self, file_count: usize, project_name: &str) {

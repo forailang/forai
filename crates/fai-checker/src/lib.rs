@@ -411,23 +411,6 @@ mod tests {
 
     // ── Doc comment enforcement ─────────────────────────────────
 
-    /// Helper: check that source produces a specific warning.
-    fn check_warns(source: &str, expected_warning: &str) {
-        let prepared = fai_compiler::prepare_source(source, None)
-            .unwrap_or_else(|e| panic!("prepare error: {}", e));
-        let mut checker = Checker::new();
-        let _ = checker.check_program(&prepared.serde_ast.statements);
-        let has_warning = checker
-            .warnings
-            .iter()
-            .any(|w| w.to_lowercase().contains(&expected_warning.to_lowercase()));
-        assert!(
-            has_warning,
-            "expected warning containing '{}', got: {:?}",
-            expected_warning, checker.warnings
-        );
-    }
-
     /// Helper: check that source produces no warnings.
     fn check_no_warns(source: &str) {
         let prepared = fai_compiler::prepare_source(source, None)
@@ -2419,7 +2402,7 @@ end
         let mut checker = Checker::new();
         checker
             .check_with_modules(&entry_prep.serde_ast.statements, &modules)
-            .unwrap_or_else(|e| {
+            .unwrap_or_else(|_e| {
                 panic!(
                     "cyclic imports between 'server' and 'server.parse' should type-check. \
                  All collected errors:\n{}",
@@ -2583,7 +2566,7 @@ end
     }
 
     #[test]
-    fn test_useSignal_loader_mismatch_shows_typed_default_hint() {
+    fn test_use_signal_loader_mismatch_shows_typed_default_hint() {
         // Regression test: `useSignal(null) do getPost() end` — agent
         // passes null/empty as initial and a real-typed loader, fai
         // infers signal element as `null?` and the loader return

@@ -413,8 +413,7 @@ enum ProjectContext {
     /// A single project — no CWD change, pipeline steps should run.
     SingleProject,
     /// Entered a workspace member directory; pipeline steps should run.
-    /// The contained PathBuf is the previous CWD (held for its Drop side-effect).
-    WorkspaceMember(std::path::PathBuf),
+    WorkspaceMember,
     /// Workspace root with no -p given — pipeline steps should be skipped.
     /// The overall command handles building all members itself.
     WorkspaceNone,
@@ -479,9 +478,8 @@ fn pipeline_enter_project(project_name: Option<&str>) -> ProjectContext {
             .unwrap_or(member.as_str());
         if member_name == name || member.as_str() == name {
             if member_dir.is_dir() {
-                let prev = std::env::current_dir().unwrap();
                 std::env::set_current_dir(&member_dir).unwrap();
-                return ProjectContext::WorkspaceMember(prev);
+                return ProjectContext::WorkspaceMember;
             }
         }
     }
@@ -1148,27 +1146,6 @@ fn collect_public_function_names(statements: &[fai_parser::ast::Statement]) -> V
     names
 }
 
-/// Collect all .fai files in a directory (non-recursive, sorted).
-fn collect_fai_files(dir: &str) -> Vec<String> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut files: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("fai") {
-                Some(p.to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        })
-        .collect();
-    files.sort();
-    files
-}
-
 fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
     // Phase D: `--wasm` is no longer a toggle — wasm is the only run
     // path. Accept the flag for back-compat with scripts that pass it;
@@ -1336,8 +1313,8 @@ fn extract_extern_info_full(
     };
 
     let mut externs = Vec::new();
-    let mut push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
-                          externs: &mut Vec<wasm_runner::ExternInfo>| {
+    let push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
+                      externs: &mut Vec<wasm_runner::ExternInfo>| {
         let library = resolve_lib(&block.library);
         for decl in &block.functions {
             let param_types: Vec<wasm_runner::FfiType> = decl
@@ -1392,8 +1369,8 @@ fn extract_externs_from_prepared(
             .unwrap_or_else(|| block_name.to_string())
     };
     let mut externs = Vec::new();
-    let mut push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
-                          externs: &mut Vec<wasm_runner::ExternInfo>| {
+    let push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
+                      externs: &mut Vec<wasm_runner::ExternInfo>| {
         let library = resolve_lib(&block.library);
         for decl in &block.functions {
             let param_types: Vec<wasm_runner::FfiType> = decl
@@ -1433,23 +1410,6 @@ fn compiler_typenode_to_ffi_type(
     tn: &fai_compiler::ast::TypeNode,
     is_out: bool,
 ) -> wasm_runner::FfiType {
-    use wasm_runner::FfiType;
-    if is_out {
-        return FfiType::OutPtr;
-    }
-    let name = tn.name.as_deref().unwrap_or("");
-    match name {
-        "Int" => FfiType::Int,
-        "Float" => FfiType::Double,
-        "String" => FfiType::String,
-        "Bool" => FfiType::Bool,
-        "Ptr" => FfiType::Pointer,
-        "Void" => FfiType::Void,
-        _ => FfiType::Pointer,
-    }
-}
-
-fn typenode_to_ffi_type(tn: &fai_parser::ast::TypeNode, is_out: bool) -> wasm_runner::FfiType {
     use wasm_runner::FfiType;
     if is_out {
         return FfiType::OutPtr;
@@ -2652,6 +2612,7 @@ fn resolve_entry_point_with_hint(
 /// Returns (target_name, sub_project) pairs.
 /// - No args: all targets (for build) or the single target (for run)
 /// - Named arg: just that target
+#[cfg(test)]
 fn select_targets<'a>(
     info: &'a ProjectInfo,
     target_name: Option<&str>,
@@ -3395,6 +3356,7 @@ fn read_project_info_full(source_root: Option<&str>) -> ProjectInfo {
     parse_project_info(&content)
 }
 
+#[cfg(test)]
 fn generate_html_loader_old(wasm_filename: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -3496,6 +3458,7 @@ WebAssembly.instantiateStreaming(fetch('/{}'), {{ env }}).then(result => {{
     )
 }
 
+#[cfg(test)]
 fn generate_html_loader(wasm_filename: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -5493,14 +5456,6 @@ mod tests {
         "    @return Void\n",
         "do\n",
         "  print('hello')\n",
-        "end\n",
-    );
-
-    const TEST_FAI: &str = concat!(
-        "def main\n",
-        "    @return Void\n",
-        "do\n",
-        "  print('testing')\n",
         "end\n",
     );
 

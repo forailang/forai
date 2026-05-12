@@ -1058,7 +1058,6 @@ fn format_do_block(f: &FunctionDeclaration, indent: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fai_parser::ast::*;
 
     // Round-trip helper: parse FAI source and re-format it.
     fn rt(src: &str) -> String {
@@ -1882,7 +1881,7 @@ end
     #[test]
     fn test_format_function_decl_v2_with_type_param() {
         let l = loc();
-        let mut tp = TypeParamDeclaration {
+        let tp = TypeParamDeclaration {
             name: "T".to_string(),
             doc_comment: Some("The value type.".to_string()),
             location: l.clone(),

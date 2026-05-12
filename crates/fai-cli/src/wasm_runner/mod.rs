@@ -80,6 +80,7 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
 }
 
 /// Output captured from a single [`run_wasm_capturing`] invocation.
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 pub struct CapturedOutput {
     pub stdout: String,
@@ -92,6 +93,7 @@ pub struct CapturedOutput {
 ///
 /// The capture is scoped to this call. If `run_wasm` is called concurrently
 /// from another thread, those writes are unaffected (capture is thread-local).
+#[cfg(test)]
 pub fn run_wasm_capturing(wasm_bytes: &[u8]) -> Result<CapturedOutput, String> {
     let guard = output::CaptureGuard::new();
     let run_result = run_wasm(wasm_bytes);
@@ -130,12 +132,14 @@ const TEST_HOOK_BEFORE_ALL_CASE_IDX: i32 = u16::MAX as i32;
 const TEST_HOOK_AFTER_ALL_CASE_IDX: i32 = (u16::MAX - 1) as i32;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SuiteReport {
     pub suite_name: String,
     pub cases: Vec<CaseReport>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CaseReport {
     pub description: String,
     pub passed: bool,
@@ -149,10 +153,11 @@ pub struct CaseReport {
 ///
 /// `on_case` is invoked per case so the caller can print ✓/✗ lines as
 /// they happen, which is what the existing CLI UX expects.
+#[cfg(test)]
 pub fn run_wasm_tests(
     wasm_bytes: &[u8],
     tests: &[crate::test_meta::TestSuiteMeta],
-    mut on_case: impl FnMut(&CaseOutcome),
+    on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
     run_wasm_tests_with_externs(wasm_bytes, tests, Vec::new(), on_case)
 }

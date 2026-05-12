@@ -1020,7 +1020,6 @@ name = \"WebName\"
 
     #[cfg(feature = "http-client")]
     fn build_targz_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        use std::io::Write;
         let mut compressed = Vec::new();
         {
             let gz = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());

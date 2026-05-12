@@ -45,7 +45,6 @@ pub const RT_LT: u32 = 16;
 pub const RT_LE: u32 = 17;
 pub const RT_GT: u32 = 18;
 pub const RT_GE: u32 = 19;
-pub const RT_PRINT_VAL: u32 = 20;
 pub const RT_ITOA: u32 = 21;
 pub const RT_ALLOC: u32 = 22;
 pub const RT_MAKE_OBJ: u32 = 23;
@@ -61,7 +60,6 @@ pub const RT_GET_FIELD: u32 = 31;
 pub const RT_SET_FIELD: u32 = 32;
 pub const RT_PRINT_VAL_NEW: u32 = 33;
 pub const RT_VALUE_TO_STR: u32 = 34;
-pub const RT_IMPORT_MODULE: u32 = 35;
 pub const RT_CALL_NATIVE: u32 = 36;
 pub const RT_PARSE_INT: u32 = 37;
 pub const RT_PARSE_FLOAT: u32 = 38;
@@ -225,7 +223,6 @@ pub const IMPORT_SLEEP_MS: u32 = 5;
 pub const IMPORT_CALL_FFI: u32 = 6;
 pub const IMPORT_RUN_ALL: u32 = 7;
 pub const IMPORT_SPAWN: u32 = 8;
-pub const IMPORT_HTTP_POST: u32 = 9;
 pub const IMPORT_SET_HTML: u32 = 10;
 pub const IMPORT_SET_HTML_AT: u32 = 11;
 pub const IMPORT_JSON_PARSE: u32 = 12;
@@ -427,19 +424,9 @@ pub const IMPORT_COUNT: u32 = 89;
 /// `None` means all imports available (native/test). The returned
 /// vec has one bool per import index (0..IMPORT_COUNT).
 ///
-/// Kept for backwards-compatible callers that don't need spy
-/// filtering; defaults to "test build" so spy imports are always
-/// declared. Non-test callers that produce standalone wasm (e.g.
-/// native binaries) should use `available_imports_with_test_flag`.
-pub fn available_imports(target: Option<&str>) -> Vec<bool> {
-    available_imports_with_test_flag(target, true)
-}
-
-/// Same as [`available_imports`] but with explicit `is_test`
-/// gating. Spy/mock imports (`spy_*`) are only declared in
-/// test-mode builds; standalone native/browser builds strip them
-/// so the module can instantiate against a host that doesn't
-/// provide the test framework.
+/// Spy/mock imports (`spy_*`) are only declared in test-mode builds;
+/// standalone native/browser builds strip them so the module can
+/// instantiate against a host that doesn't provide the test framework.
 pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> Vec<bool> {
     let mut avail = vec![true; IMPORT_COUNT as usize];
     match target {
@@ -499,10 +486,6 @@ pub fn emit_import_call(f: &mut Function, import_idx: u32, import_remap: &[Optio
 /// These are appended after the string pool data.
 #[derive(Clone, Default)]
 pub struct KnownStrings {
-    pub std_array: (u32, u32),   // "std.array"
-    pub std_math: (u32, u32),    // "std.math"
-    pub std_string: (u32, u32),  // "std.string"
-    pub std_convert: (u32, u32), // "std.convert"
     pub length: (u32, u32),      // "length"
     pub abs: (u32, u32),         // "abs"
     pub min: (u32, u32),         // "min"
@@ -514,9 +497,6 @@ pub struct KnownStrings {
     pub str_true: (u32, u32),    // "true"
     pub str_false: (u32, u32),   // "false"
     pub str_null: (u32, u32),    // "null"
-    pub std_file: (u32, u32),    // "std.file"
-    pub std_time: (u32, u32),    // "std.time"
-    pub std_cli: (u32, u32),     // "std.cli"
     pub read: (u32, u32),        // "read"
     pub write: (u32, u32),       // "write"
     pub exists: (u32, u32),      // "exists"
@@ -524,7 +504,6 @@ pub struct KnownStrings {
     pub unix: (u32, u32),        // "unix"
     pub random: (u32, u32),      // "random"
     pub sleep: (u32, u32),       // "sleep"
-    pub std_json: (u32, u32),    // "std.json"
     pub parse: (u32, u32),       // "parse"
     pub stringify: (u32, u32),   // "stringify"
     pub round: (u32, u32),       // "round"
@@ -722,7 +701,6 @@ fn emit_make_bool() -> Function {
 
 #[derive(Clone, Copy)]
 enum IntOp {
-    Add,
     Sub,
     Mul,
 }
@@ -746,7 +724,6 @@ fn emit_binop_int_float(base: u32, op: IntOp) -> Function {
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32WrapI64);
         match op {
-            IntOp::Add => f.instruction(&Instruction::I32Add),
             IntOp::Sub => f.instruction(&Instruction::I32Sub),
             IntOp::Mul => f.instruction(&Instruction::I32Mul),
         };
@@ -760,7 +737,6 @@ fn emit_binop_int_float(base: u32, op: IntOp) -> Function {
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
         match op {
-            IntOp::Add => f.instruction(&Instruction::F64Add),
             IntOp::Sub => f.instruction(&Instruction::F64Sub),
             IntOp::Mul => f.instruction(&Instruction::F64Mul),
         };

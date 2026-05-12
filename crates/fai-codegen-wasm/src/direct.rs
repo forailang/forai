@@ -776,7 +776,6 @@ fn find_name_in_statements(
     name: &str,
     file_paths: &[Option<String>],
 ) -> Option<(u32, u32, Option<String>)> {
-    use fai_compiler::ast::Statement;
     for (idx, stmt) in statements.iter().enumerate() {
         let file = file_paths.get(idx).cloned().flatten();
         if let Some((line, col)) = scan_statement_for_name(stmt, name) {
@@ -2645,18 +2644,14 @@ enum SpyTarget {
     /// The compiler-assigned `fn_id` is opaque — it just needs to
     /// match between the mock setup call and the module-call
     /// interception site.
-    StdMethod {
-        canonical: String,
-        method: String,
-        fn_id: u32,
-    },
+    StdMethod(u32),
 }
 
 impl SpyTarget {
     fn fn_id(&self) -> u32 {
         match self {
             SpyTarget::UserFn(id) => *id,
-            SpyTarget::StdMethod { fn_id, .. } => *fn_id,
+            SpyTarget::StdMethod(fn_id) => *fn_id,
         }
     }
 }
@@ -2702,11 +2697,7 @@ fn resolve_mock_target_full(
                             *next_std_fn_id += 1;
                             id
                         });
-                        return Some(SpyTarget::StdMethod {
-                            canonical: canonical.clone(),
-                            method: me.property.clone(),
-                            fn_id,
-                        });
+                        return Some(SpyTarget::StdMethod(fn_id));
                     }
                 }
             }
@@ -8708,21 +8699,6 @@ mod tests {
 
     fn compile_tail_expression_shape(src: &str) -> ValueShape {
         with_tail_expression_builder(src, |builder, expression| {
-            builder
-                .compile_expr(expression)
-                .expect("compile expression")
-        })
-    }
-
-    fn compile_tail_expression_shape_after_prefix(src: &str) -> ValueShape {
-        with_tail_expression_builder(src, |builder, expression| {
-            let last = builder.fd.body.len() - 1;
-            let prefix: Vec<Statement> = builder.fd.body[..last].to_vec();
-            for stmt in &prefix {
-                builder
-                    .compile_stmt(stmt)
-                    .expect("compile prefix statement");
-            }
             builder
                 .compile_expr(expression)
                 .expect("compile expression")

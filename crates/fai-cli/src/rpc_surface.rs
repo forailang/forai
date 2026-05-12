@@ -22,8 +22,6 @@ pub(crate) struct RpcFunction {
 #[derive(Debug, Clone)]
 pub(crate) struct RpcType {
     pub module: Option<String>,
-    pub name: String,
-    pub key: String,
     pub declaration: TypeDeclaration,
 }
 
@@ -141,8 +139,6 @@ fn collect_statements(
                 }
                 surface.types.push(RpcType {
                     module: module.map(str::to_string),
-                    name: td.name.clone(),
-                    key,
                     declaration: td.clone(),
                 });
             }
@@ -226,7 +222,13 @@ mod tests {
         assert_eq!(surface.functions[0].name, "getTasks");
         assert_eq!(surface.functions[0].key, "data.tasks.getTasks");
         assert_eq!(surface.types.len(), 1);
-        assert_eq!(surface.types[0].key, "data.tasks.Task");
+        assert_eq!(
+            rpc_key(
+                surface.types[0].module.as_deref(),
+                &surface.types[0].declaration.name
+            ),
+            "data.tasks.Task"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

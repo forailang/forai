@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 thread_local! {
@@ -17,6 +18,7 @@ thread_local! {
 enum Sink {
     Stdout,
     Stderr,
+    #[cfg(test)]
     Buffer(Arc<Mutex<Vec<u8>>>),
 }
 
@@ -31,6 +33,7 @@ impl Sink {
                 let mut err = std::io::stderr().lock();
                 let _ = writeln!(err, "{}", s);
             }
+            #[cfg(test)]
             Sink::Buffer(buf) => {
                 if let Ok(mut b) = buf.lock() {
                     b.extend_from_slice(s.as_bytes());
@@ -53,6 +56,7 @@ pub(crate) fn stderr_line(s: &str) {
 
 /// RAII capture guard. While held, host stdout/stderr writes are appended to
 /// internal buffers. Dropping the guard restores the previous sinks.
+#[cfg(test)]
 pub struct CaptureGuard {
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -60,6 +64,7 @@ pub struct CaptureGuard {
     prev_stderr: Option<Sink>,
 }
 
+#[cfg(test)]
 impl CaptureGuard {
     pub fn new() -> Self {
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
@@ -95,6 +100,7 @@ impl CaptureGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for CaptureGuard {
     fn drop(&mut self) {
         if let Some(prev) = self.prev_stdout.take() {

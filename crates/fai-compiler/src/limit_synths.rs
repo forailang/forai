@@ -17,7 +17,7 @@
 //! The boundary-parity test then exercises it on both backends
 //! automatically.
 
-use fai_core::limits::{self, ResourceLimit};
+use fai_core::limits::ResourceLimit;
 
 /// Build a program that uses exactly `n` of the resource described by
 /// `limit`. Pass `limit.cap` to build an at-cap sample (should compile)
@@ -169,6 +169,7 @@ fn call_depth(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fai_core::limits;
 
     #[test]
     fn synthesizer_exists_for_every_non_static_limit() {

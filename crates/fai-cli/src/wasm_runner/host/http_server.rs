@@ -471,7 +471,7 @@ fn dispatch_router_request(caller: &mut Caller<'_, ()>, router_id: u32, request_
             .unwrap_or_default()
     });
 
-    for (route_method, pattern, handler, static_dir) in &routes {
+    for (route_method, pattern, handler, _static_dir) in &routes {
         let method_matches = route_method == &method || route_method == "*";
         if !method_matches {
             continue;
@@ -510,32 +510,6 @@ fn dispatch_router_request(caller: &mut Caller<'_, ()>, router_id: u32, request_
     // 404
     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
     build_response_dict(caller, &mem, KIND_TEXT, 404, "Not Found")
-}
-
-/// Try to serve a static file; returns Some(NaN-boxed Dict) if the file exists.
-/// Only serves paths with a file extension — extensionless paths are page routes
-/// handled by the SSR catch-all.
-fn try_serve_static_guest(caller: &mut Caller<'_, ()>, dir: &str, path: &str) -> Option<i64> {
-    let rel = path.trim_start_matches('/');
-    if !rel.contains('.') {
-        return None;
-    }
-    let file_path = format!("{}/{}", dir, rel);
-    let content = std::fs::read(&file_path).ok()?;
-    let content_type = mime_for_path(&file_path);
-    let body = String::from_utf8_lossy(&content).into_owned();
-    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-    let key_status = wasm_alloc_str(caller, &mem, "status");
-    let key_body = wasm_alloc_str(caller, &mem, "body");
-    let key_ct = wasm_alloc_str(caller, &mem, "contentType");
-    let v_status = (QNAN | TAG_INT | 200u64) as i64;
-    let v_body = wasm_alloc_str(caller, &mem, &body);
-    let v_ct = wasm_alloc_str(caller, &mem, content_type);
-    Some(alloc_dict(
-        caller,
-        &mem,
-        &[(key_status, v_status), (key_body, v_body), (key_ct, v_ct)],
-    ))
 }
 
 fn mime_for_path(path: &str) -> &'static str {
@@ -1338,7 +1312,6 @@ mod tests {
     // set_linger + explicit shutdown(Write); these tests pin that
     // contract on a real loopback socket.
 
-    use std::io::Read as _;
     use std::net::TcpListener;
     use std::thread;
 

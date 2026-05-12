@@ -133,6 +133,7 @@ impl MarshaledArgs {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.args.len()
     }
@@ -186,6 +187,16 @@ fn convert_pointer_return(raw: usize, ptr_tracker: &mut PtrTracker) -> Value {
     } else {
         let handle = ptr_tracker.track(ptr);
         Value::int(handle as i32)
+    }
+}
+
+fn convert_word_return(raw: usize, return_type: &FfiType, ptr_tracker: &mut PtrTracker) -> Value {
+    match return_type {
+        FfiType::Int => convert_int_return(raw),
+        FfiType::Bool => convert_bool_return(raw),
+        FfiType::String => unsafe { convert_string_return(raw) },
+        FfiType::Pointer => convert_pointer_return(raw, ptr_tracker),
+        _ => convert_int_return(raw),
     }
 }
 
@@ -353,13 +364,7 @@ unsafe fn ffi_call_all_words(
         n => return Err(format!("unsupported arg count {} (max 8)", n)),
     };
 
-    match return_type {
-        FfiType::Int => Ok(convert_int_return(raw)),
-        FfiType::Bool => Ok(convert_bool_return(raw)),
-        FfiType::String => Ok(convert_string_return(raw)),
-        FfiType::Pointer => Ok(convert_pointer_return(raw, ptr_tracker)),
-        _ => Ok(convert_int_return(raw)),
-    }
+    Ok(convert_word_return(raw, return_type, ptr_tracker))
 }
 
 /// Slow path: at least one float arg. We handle the most common patterns:
@@ -383,7 +388,7 @@ unsafe fn ffi_call_with_floats(
             } else {
                 let func: extern "C" fn(f64) -> usize = std::mem::transmute(fn_ptr);
                 let raw = func(f);
-                return Ok(convert_int_return(raw));
+                return Ok(convert_word_return(raw, return_type, ptr_tracker));
             }
         }
     }
@@ -398,7 +403,7 @@ unsafe fn ffi_call_with_floats(
                     return Ok(convert_float_return(func(f0, f1)));
                 } else {
                     let func: extern "C" fn(f64, f64) -> usize = std::mem::transmute(fn_ptr);
-                    return Ok(convert_int_return(func(f0, f1)));
+                    return Ok(convert_word_return(func(f0, f1), return_type, ptr_tracker));
                 }
             }
             (CArg::Word(w), CArg::Float(f)) => {
@@ -407,7 +412,7 @@ unsafe fn ffi_call_with_floats(
                     return Ok(convert_float_return(func(w, f)));
                 } else {
                     let func: extern "C" fn(usize, f64) -> usize = std::mem::transmute(fn_ptr);
-                    return Ok(convert_int_return(func(w, f)));
+                    return Ok(convert_word_return(func(w, f), return_type, ptr_tracker));
                 }
             }
             (CArg::Float(f), CArg::Word(w)) => {
@@ -416,7 +421,7 @@ unsafe fn ffi_call_with_floats(
                     return Ok(convert_float_return(func(f, w)));
                 } else {
                     let func: extern "C" fn(f64, usize) -> usize = std::mem::transmute(fn_ptr);
-                    return Ok(convert_int_return(func(f, w)));
+                    return Ok(convert_word_return(func(f, w), return_type, ptr_tracker));
                 }
             }
             _ => {} // both words — shouldn't reach here
@@ -426,12 +431,6 @@ unsafe fn ffi_call_with_floats(
     // Three-arg patterns with one float
     if n == 3 {
         let (a0, a1, a2) = (args.args[0], args.args[1], args.args[2]);
-        macro_rules! dispatch3 {
-            ($func_type:ty, $($arg:expr),+) => {{
-                let func: $func_type = std::mem::transmute(fn_ptr);
-                func($($arg),+)
-            }};
-        }
         let raw: usize = match (a0, a1, a2) {
             (CArg::Float(f0), CArg::Float(f1), CArg::Float(f2)) => {
                 if matches!(return_type, FfiType::Double) {
@@ -467,7 +466,7 @@ unsafe fn ffi_call_with_floats(
             }
             _ => return Err("unsupported FFI 3-arg pattern".to_string()),
         };
-        return Ok(convert_int_return(raw));
+        return Ok(convert_word_return(raw, return_type, ptr_tracker));
     }
 
     Err(format!(
