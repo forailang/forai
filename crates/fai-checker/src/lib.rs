@@ -2462,11 +2462,54 @@ end
 
     #[test]
     fn test_module_glob_import_collision_errors() {
-        check_err_with_module(
-            "use { greet } from mymod\nuse * from mymod\n\ndef main\n    @return Void\ndo\nend",
-            "mymod",
+        let entry = fai_compiler::prepare_source(
+            "use { greet } from mymod\nuse * from other\n\ndef main\n    @return Void\ndo\nend",
+            None,
+        )
+        .expect("prepare entry");
+        let mymod = fai_compiler::prepare_source(
             "# Greet.\ndef greet\n    @return String\ndo\n  'hello'\nend",
-            "conflicts with existing name",
+            None,
+        )
+        .expect("prepare mymod");
+        let other = fai_compiler::prepare_source(
+            "# Greet.\ndef greet\n    @return Int\ndo\n  1\nend",
+            None,
+        )
+        .expect("prepare other");
+        let modules = vec![
+            PreparedModule {
+                name: "mymod".to_string(),
+                statements: mymod.serde_ast.statements,
+                file_paths: Vec::new(),
+                private_names: vec![],
+                file_path: Some("mymod.fai".to_string()),
+            },
+            PreparedModule {
+                name: "other".to_string(),
+                statements: other.serde_ast.statements,
+                file_paths: Vec::new(),
+                private_names: vec![],
+                file_path: Some("other.fai".to_string()),
+            },
+        ];
+        let mut checker = Checker::new();
+        let err = checker
+            .check_with_modules(&entry.serde_ast.statements, &modules)
+            .expect_err("glob import should reject incompatible duplicate names");
+        assert!(
+            err.message.contains("already in scope"),
+            "expected collision message, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_module_glob_import_duplicate_same_type_ok() {
+        check_ok_with_module(
+            "use { greet } from mymod\nuse * from mymod\n\ndef main\n    @return String\ndo\n  greet('world')\nend",
+            "mymod",
+            "# Greet.\ndef greet\n    @param name String\n    @return String\ndo\n  'hello ' + name\nend",
         );
     }
 

@@ -461,12 +461,7 @@ impl Checker {
                         module_name, export_name
                     ))
                 })?;
-                env.define(export_name, ty.clone(), false).map_err(|_| {
-                    CheckError::new(format!(
-                        "Glob import from '{}' conflicts with existing name '{}'",
-                        module_name, export_name
-                    ))
-                })?;
+                self.install_glob_name(env, &module_name, export_name, ty)?;
             }
             return Ok(());
         }
@@ -544,12 +539,7 @@ impl Checker {
             names.sort();
             for name in names {
                 let ty = exports.get(name).unwrap();
-                env.define(name, ty.clone(), false).map_err(|_| {
-                    CheckError::new(format!(
-                        "Glob import from '{}' conflicts with existing name '{}'",
-                        module_name, name
-                    ))
-                })?;
+                self.install_glob_name(env, &module_name, name, ty)?;
             }
             return Ok(());
         }
@@ -585,6 +575,31 @@ impl Checker {
             false,
         );
         Ok(())
+    }
+
+    fn install_glob_name(
+        &self,
+        env: &mut Environment,
+        module_name: &str,
+        name: &str,
+        ty: &Type,
+    ) -> Result<(), CheckError> {
+        if let Ok(existing) = env.get(name) {
+            if same_type(&existing.ty, ty) {
+                // Multiple files in one directory module often import the same UI
+                // helpers. Treat repeated same-type imports as idempotent, matching
+                // explicit named-import behavior.
+                return Ok(());
+            }
+            return Err(CheckError::new(format!(
+                "Glob import from '{}' cannot import '{}' because a different '{}' is already in scope. \
+                 This usually means another import or declaration in this module uses the same name. \
+                 Fix it by replacing `use * from {}` with an explicit `use {{ ... }} from {}` list \
+                 that omits '{}', or rename the local declaration.",
+                module_name, name, name, module_name, module_name, name
+            )));
+        }
+        env.define(name, ty.clone(), false)
     }
 
     fn qualify_module_path(current_module_name: Option<&str>, module_path: &[String]) -> String {
