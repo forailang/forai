@@ -3637,6 +3637,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-seri
 
 /* ── Typography ─────────────────────────────────────────────── */
 .fai-label{line-height:1.4}
+.fai-paragraph{display:block;align-self:stretch;line-height:1.6;text-align:left}
+.fai-heading{display:block;align-self:stretch;line-height:1.15;font-weight:700;text-align:left}
 
 /* ── Controls ───────────────────────────────────────────────── */
 .fai-button{
