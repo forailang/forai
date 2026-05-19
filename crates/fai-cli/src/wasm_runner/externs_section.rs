@@ -82,7 +82,11 @@ pub fn embed_externs(wasm: &mut Vec<u8>, externs: &[ExternInfo]) {
         .map(|e| OnDisk {
             library: e.library.clone(),
             function: e.function.clone(),
-            param_types: e.param_types.iter().map(|t| ffi_type_to_str(t).to_string()).collect(),
+            param_types: e
+                .param_types
+                .iter()
+                .map(|t| ffi_type_to_str(t).to_string())
+                .collect(),
             return_type: ffi_type_to_str(&e.return_type).to_string(),
         })
         .collect();

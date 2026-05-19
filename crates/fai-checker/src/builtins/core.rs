@@ -14,8 +14,11 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     ins(
         b,
         "append",
-        &[p("items", Type::Unknown), p("item", Type::Unknown)],
-        &[Type::Void],
+        &[
+            p("items", array_of(type_parameter("T"))),
+            p("item", type_parameter("T")),
+        ],
+        &[array_of(type_parameter("T"))],
     );
 
     // Conversion
@@ -35,7 +38,7 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         b,
         "unwrap",
         &[p("value", Type::Unknown), p("fallback", Type::Unknown)],
-        &[Type::Void],
+        &[Type::Unknown],
     );
 
     // Type introspection
@@ -85,6 +88,19 @@ mod tests {
     }
 
     #[test]
+    fn test_append_signature_returns_array() {
+        let b = fresh();
+        match b.get("append").unwrap() {
+            Type::Function(sig) => {
+                assert_eq!(sig.params.len(), 2);
+                assert!(matches!(sig.params[0].ty, Type::Array(_)));
+                assert!(matches!(sig.returns[0], Type::Array(_)));
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
     fn test_conversion_builtins() {
         let b = fresh();
         for name in &[
@@ -104,6 +120,18 @@ mod tests {
         let b = fresh();
         for name in &["Error", "message", "kind", "isError", "unwrap"] {
             assert!(b.contains_key(*name), "missing: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_unwrap_signature_is_expression_value() {
+        let b = fresh();
+        match b.get("unwrap").unwrap() {
+            Type::Function(sig) => {
+                assert_eq!(sig.params.len(), 2);
+                assert!(!matches!(sig.returns[0], Type::Void));
+            }
+            _ => panic!("expected Function"),
         }
     }
 

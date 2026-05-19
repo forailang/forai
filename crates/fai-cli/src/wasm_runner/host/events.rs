@@ -298,11 +298,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap(
             "env",
             "event_on",
-            |mut caller: Caller<'_, ()>,
-             name_ptr: i32,
-             name_len: i32,
-             closure_val: i64|
-             -> i64 {
+            |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, closure_val: i64| -> i64 {
                 let name = read_name(&mut caller, name_ptr, name_len);
                 let id = register(&name, closure_val, false);
                 build_subscription(&mut caller, id, &name)
@@ -315,11 +311,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap(
             "env",
             "event_once",
-            |mut caller: Caller<'_, ()>,
-             name_ptr: i32,
-             name_len: i32,
-             closure_val: i64|
-             -> i64 {
+            |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, closure_val: i64| -> i64 {
                 let name = read_name(&mut caller, name_ptr, name_len);
                 let id = register(&name, closure_val, true);
                 build_subscription(&mut caller, id, &name)

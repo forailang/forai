@@ -65,7 +65,14 @@ pub fn parse_template_ref(s: &str) -> Result<TemplateRef, ParseError> {
     let (base, git_ref) = match s.find('#') {
         Some(i) => {
             let r = &s[i + 1..];
-            (&s[..i], if r.is_empty() { None } else { Some(r.to_string()) })
+            (
+                &s[..i],
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.to_string())
+                },
+            )
         }
         None => (s, None),
     };
@@ -405,12 +412,7 @@ pub fn make_temp_dir(tag: &str) -> std::io::Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "fai-{}-{}-{}",
-        tag,
-        std::process::id(),
-        nanos
-    ));
+    let path = std::env::temp_dir().join(format!("fai-{}-{}-{}", tag, std::process::id(), nanos));
     std::fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -931,11 +933,7 @@ name = \"WebName\"
 
         std::fs::create_dir_all(tpl.join(".git")).unwrap();
         std::fs::write(tpl.join(".git/HEAD"), "ref").unwrap();
-        std::fs::write(
-            tpl.join("fai.toml"),
-            "[project]\nname = \"Old\"\n",
-        )
-        .unwrap();
+        std::fs::write(tpl.join("fai.toml"), "[project]\nname = \"Old\"\n").unwrap();
 
         scaffold_from_local(&ScaffoldOptions {
             template_root: &tpl,

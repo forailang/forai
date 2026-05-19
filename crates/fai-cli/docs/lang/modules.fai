@@ -1,113 +1,168 @@
 # A module is a directory of .fai files. Import by directory name, not filename.
 # All public declarations in all .fai files in that directory are exported together.
-# Modules can be nested (subdirectories are sub-modules).
+# Modules can be nested with subdirectories.
+#
+# ```text
+# # File layout:
+# # src/
+# #   client/
+# #     app.fai          # exports App
+# #     components/
+# #       nav.fai        # exports Nav
+# #       section.fai    # exports Section
+#
+# # From any file inside src/client:
+# use { App } from client
+# use { Nav, Section } from client.components
+#
+# # Wrong: this looks for a client/app directory, not app.fai.
+# use { App } from client.app
+# ```
 def doc_same_project
     @return Void
 do
-  # File layout:
-  # src/
-  #   client/
-  #     app.fai          # exports: App
-  #     components/
-  #       nav.fai        # exports: Nav
-  #       section.fai    # exports: Section
-  #     pages/
-  #       home.fai       # exports: HomePage
-  #     state/
-  #       auth.fai       # exports: isLoggedIn
-  #
-  # From any file inside src/client/:
-  # use { App } from client                    # all files in client/ → client module
-  # use { Nav, Section } from client.components
-  # use { HomePage } from client.pages
-  # use { isLoggedIn } from client.state
-  #
-  # WRONG — you cannot import a file by name:
-  # use { App } from client.app               # ERROR: looks for client/app/ directory
+
+end
+
+test doc_same_project
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
 end
 
 # External packages are declared in fai.toml [dependencies].
 # The package name comes from the package's own fai.toml `name` field.
-# Sub-modules are subdirectories inside the package's source root.
+# Submodules are subdirectories inside the package source root.
+#
+# UFCS functions must be in file scope. Import the specific functions you use,
+# or use an explicit glob import when the module is intentionally broad, such
+# as Forui.view in UI files.
+#
+# ```toml
+# [dependencies]
+# Forui = "file:///path/to/forui"
+# # or:
+# Forui = "https://github.com/forailang/forui"
+# ```
+#
+# ```fai
+# use { mount } from Forui
+# use * from Forui.view
+# use { useSignal, isLoading } from Forui.signal
+# use { navigate, Link } from Forui.router
+#
+# # This works because fontSize is in file scope from the glob import.
+# Label('Hi').fontSize(18)
+# ```
 def doc_external_package
     @return Void
 do
-  # fai.toml:
-  # [dependencies]
-  # Forui = "file:///path/to/forui"
-  # # or: Forui = "https://github.com/forailang/forui"
-  #
-  # Forui's fai.toml declares name = "Forui", so:
-  # use { mount } from Forui                       # top-level (forui/src/forui.fai)
-  # use { Label, Button, VStack } from Forui.view  # forui/src/view/
-  # use { useSignal, isLoading } from Forui.signal # forui/src/signal/
-  # use { navigate, Link } from Forui.router       # forui/src/router/
-  #
-  # IMPORTANT: every UFCS function must be explicitly imported per file.
-  # There is no global namespace. The error "'fontSize' is not in scope" means
-  # it is missing from your use { ... } from Forui.view line in this file.
+
 end
 
-# Cross-target imports: when both client and server share source = "src" in fai.toml,
-# all directories under src/ are visible to both targets.
+test doc_external_package
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
+end
+
+# Cross-target imports: when client and server targets share `source = "src"` in
+# fai.toml, all directories under `src` are visible to both targets.
+#
+# ```text
+# # src/platforms/server/main.fai importing client UI for SSR:
+# use { App } from platforms.web
+# ```
 def doc_cross_target
     @return Void
 do
-  # src/server/main.fai importing the client UI for server-side rendering:
-  # use { App } from client    # resolves to src/client/
+
 end
 
-# In multi-target fullstack projects the client imports an auto-generated Server
-# module that proxies all `remote def` functions from the server target.
-# This module is generated automatically by `fai build` — never write it yourself.
+test doc_cross_target
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
+end
+
+# In multi-target fullstack projects, client code imports remote functions from
+# their real module path. The build replaces client-target calls to reachable
+# `remote def` functions with generated RPC stubs.
+#
+# ```text
+# use { Task, getTasks, addTask } from data.tasks
+#
+# var tasks = useSignal([]) do
+#     getTasks()
+# end
+# ```
 def doc_rpc_client
     @return Void
 do
-  # src/client/pages/tasks.fai:
-  # use { Task, getTasks, addTask } from Server
+
 end
 
-# The server exposes functions by marking them `remote def` and types `remote type`.
-# `addRpcRoutes` is injected automatically — do NOT define it yourself.
-# `use { handleRpcRequest } from Forui.rpc` must be present in the server entry file.
+test doc_rpc_client
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
+end
+
+# The server exposes functions by marking them `remote def` and types
+# `remote type`. The generated RPC route installer is injected automatically;
+# do not define it
+# yourself. Import the modules containing remote functions from the server
+# entry so they are reachable.
+#
+# ```text
+# use std.http.server
+# use { handleRpcRequest } from Forui.rpc
+# use { getTasks, addTask } from data.tasks
+#
+# def main
+#     @return Void
+# do
+#     var r = server.router()
+#     # Register generated RPC routes here after a full project build.
+#     server.listen(r, 3040)
+# end
+# ```
 def doc_rpc_server
     @return Void
 do
-  # src/server/main.fai:
-  # use { handleRpcRequest } from Forui.rpc   # required
-  #
-  # remote type Task
-  #   id Int
-  #   text String
-  # end
-  #
-  # remote def getTasks
-  #     @param token String
-  #     @return Task[]
-  # do
-  #   # implementation
-  # end
-  #
-  # def main
-  #     @return Void
-  # do
-  #   var r = server.router()
-  #   addRpcRoutes(r)            # auto-generated — do NOT define this
-  #   server.listen(r, 3040)
-  # end
+
+end
+
+test doc_rpc_server
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
 end
 
 # Declarations are public by default. The `private:` keyword makes all
 # subsequent declarations in that file unexported.
+#
+# ```text
+# def publicFn
+#     @return Void
+# do
+# end
+#
+# private:
+#
+# def helper
+#     @return Void
+# do
+# end
+# ```
 def doc_visibility
     @return Void
 do
-  # def publicFn           # exported
-  #     @return Void
-  # do end
-  #
-  # private:               # everything below is NOT exported
-  # def helper
-  #     @return Void
-  # do end
+
+end
+
+test doc_visibility
+    it 'is documentation only'
+        assert.equals(true, true)
+    end
 end

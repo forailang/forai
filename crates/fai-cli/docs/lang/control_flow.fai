@@ -2,117 +2,136 @@
 def doc_if
     @return Void
 do
-  let x = 5
-  if x > 10
-    print('big')
-  else if x > 0
-    print('small')
-  else
-    print('zero or negative')
-  end
+    let x = 5
+    if x > 10
+        print('big')
+    else if x > 0
+        print('small')
+    else
+        print('zero or negative')
+    end
 end
 
 test doc_if
-it 'if selects the matching branch'
-  var result = 'none'
-  let x = 5
-  if x > 10
-    result = 'big'
-  else if x > 0
-    result = 'small'
-  else
-    result = 'other'
-  end
-  assert.equals(result, 'small')
-end
+    it 'if selects the matching branch'
+        var result = 'none'
+        let x = 5
+        if x > 10
+            result = 'big'
+        else if x > 0
+            result = 'small'
+        else
+            result = 'other'
+        end
+        assert.equals(result, 'small')
+    end
 end
 
 # while — loop while condition is true.
 def doc_while
     @return Void
 do
-  var i = 0
-  while i < 5
-    print(i)
-    i = i + 1
-  end
+    var i = 0
+    while i < 5
+        print(i)
+        i = i + 1
+    end
 end
 
 test doc_while
-it 'while accumulates correctly'
-  var sum = 0
-  var i = 1
-  while i <= 4
-    sum = sum + i
-    i = i + 1
-  end
-  assert.equals(sum, 10)
-end
+    it 'while accumulates correctly'
+        var sum = 0
+        var i = 1
+        while i <= 4
+            sum = sum + i
+            i = i + 1
+        end
+        assert.equals(sum, 10)
+    end
 end
 
-# for — iterate over an array or a range (0..n means 0 inclusive to n inclusive).
+# for — iterate over an array or a range.
+# `0..n` is exclusive of the upper bound; `0...n` is inclusive.
 def doc_for
     @return Void
 do
-  for item in ['a', 'b', 'c']
-    print(item)
-  end
-
-  for i in 0...4    # 0, 1, 2, 3, 4
-    print(i)
-  end
+    for item in ['a' 'b' 'c']
+        print(item)
+    end
+    for i in 0..4
+        print(i)
+    end
+    for i in 0...4
+        print(i)
+    end
 end
 
 test doc_for
-it 'for range produces correct count'
-  var count = 0
-  for i in 0...4
-    count = count + 1
-  end
-  assert.equals(count, 5)
-end
+    it 'exclusive range excludes the upper bound'
+        var count = 0
+        for i in 0..4
+            count = count + 1
+        end
+        assert.equals(count, 4)
+    end
+    it 'inclusive range includes the upper bound'
+        var count = 0
+        for i in 0...4
+            count = count + 1
+        end
+        assert.equals(count, 5)
+    end
 end
 
 # break exits the nearest loop. continue skips to the next iteration.
 def doc_break_continue
     @return Void
 do
-  var found = false
-  for i in 0..9
-    if i == 3
-      continue    # skip 3
+    var found = false
+    for i in 0..9
+        if i == 3
+            continue
+        end
+        if i == 7
+            found = true
+            break
+        end
+        print(i)
     end
-    if i == 7
-      found = true
-      break       # stop at 7
-    end
-    print(i)      # prints 0 1 2 4 5 6
-  end
 end
 
 test doc_break_continue
-it 'break exits the loop early'
-  var last = 0
-  for i in 0..9
-    if i == 5
-      break
+    it 'break exits the loop early'
+        var last = 0
+        for i in 0..9
+            if i == 5
+                break
+            end
+            last = i
+        end
+        assert.equals(last, 4)
     end
-    last = i
-  end
-  assert.equals(last, 4)
-end
 end
 
 # case matches a value against literal patterns. `default` catches everything else.
 def doc_case
     @return Void
 do
-  # case status
-  # when 'active'
-  #   print('running')
-  # when 'paused'
-  #   print('waiting')
-  # default
-  #   print('unknown')
-  # end
+
+end
+
+test doc_case
+    it 'case selects the matching branch'
+        let status = 'paused'
+        var result = 'unknown'
+        case status
+        when 'active'
+            result = 'running'
+        when 'paused'
+            result = 'waiting'
+        default
+            result = 'unknown'
+        end
+        assert.equals(result, 'waiting')
+    end
 end

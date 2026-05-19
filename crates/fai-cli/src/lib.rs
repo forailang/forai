@@ -543,10 +543,7 @@ fn step_check(args: &[String], reporter: &Reporter) {
 ///    below and silently check nothing.
 /// 3. **Flat library project**: load every `.fai` file at the source
 ///    root into a single module and check it.
-fn run_project_check(
-    project_root: &std::path::Path,
-    src_dir: &str,
-) -> Result<(), (String, usize)> {
+fn run_project_check(project_root: &std::path::Path, src_dir: &str) -> Result<(), (String, usize)> {
     if let Some(entry) = resolve_entry_point(project_root, src_dir) {
         return try_check_single_file(&entry.to_string_lossy());
     }
@@ -632,8 +629,8 @@ fn check_single_file(path: &str, reporter: &Reporter) {
 ///    `prepare_module_directory` path did not do this, causing
 ///    "Unknown type 'X'" errors for any type from an external package).
 fn try_check_single_file(path: &str) -> Result<(), (String, usize)> {
-    let mut content = std::fs::read_to_string(path)
-        .map_err(|e| (format!("cannot read '{}': {}", path, e), 1))?;
+    let mut content =
+        std::fs::read_to_string(path).map_err(|e| (format!("cannot read '{}': {}", path, e), 1))?;
     let source_root = find_source_root(path);
     let info = read_project_info_full(source_root.as_deref());
     inject_peer_hash(
@@ -1589,17 +1586,14 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
         .as_deref()
         .and_then(|sr| std::path::Path::new(sr).parent().map(|p| p.to_path_buf()));
     let rpc_proxy_substitution: Option<(String, String)> = match active_sub {
-        Some(sub) if !sub.rpc_server => sub
-            .remote_deps
-            .iter()
-            .find_map(|(dep_name, envs)| {
-                let cfg = envs.get("dev").or_else(|| envs.values().next())?;
-                let hash = project_root_for_hash
-                    .as_ref()
-                    .and_then(|root| find_dependency_hash(root, dep_name, &info))
-                    .unwrap_or_default();
-                Some((cfg.url.clone(), hash))
-            }),
+        Some(sub) if !sub.rpc_server => sub.remote_deps.iter().find_map(|(dep_name, envs)| {
+            let cfg = envs.get("dev").or_else(|| envs.values().next())?;
+            let hash = project_root_for_hash
+                .as_ref()
+                .and_then(|root| find_dependency_hash(root, dep_name, &info))
+                .unwrap_or_default();
+            Some((cfg.url.clone(), hash))
+        }),
         _ => None,
     };
 
@@ -2271,10 +2265,7 @@ fn rewrite_remote_def_bodies(
                 let parsed = match fai_parser::parse(&proxy_src) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!(
-                            "error: failed to parse rewritten proxy for {}: {}",
-                            key, e
-                        );
+                        eprintln!("error: failed to parse rewritten proxy for {}: {}", key, e);
                         std::process::exit(1);
                     }
                 };
@@ -2316,15 +2307,13 @@ fn rewrite_remote_def_bodies(
                 let zero = fai_compiler::ast::SourceLocation { line: 0, column: 0 };
                 module.statements.insert(
                     0,
-                    fai_compiler::ast::Statement::UseStatement(
-                        fai_compiler::ast::UseStatement {
-                            module_path: vec!["std".to_string(), "json".to_string()],
-                            imported_names: None,
-                            import_all: false,
-                            is_remote: false,
-                            location: zero,
-                        },
-                    ),
+                    fai_compiler::ast::Statement::UseStatement(fai_compiler::ast::UseStatement {
+                        module_path: vec!["std".to_string(), "json".to_string()],
+                        imported_names: None,
+                        import_all: false,
+                        is_remote: false,
+                        location: zero,
+                    }),
                 );
             }
         }
@@ -3008,10 +2997,7 @@ fn target_build_dir(
 /// references (with a warning) rather than failing the build — this
 /// keeps the parser permissive about typos in non-essential deps.
 /// Cycles produce `Err(message)`; the caller exits the build.
-fn plan_build_order(
-    info: &ProjectInfo,
-    requested: Option<&str>,
-) -> Result<Vec<String>, String> {
+fn plan_build_order(info: &ProjectInfo, requested: Option<&str>) -> Result<Vec<String>, String> {
     use std::collections::{HashMap, HashSet};
 
     // Topological sort with cycle detection. `visiting` is the
@@ -3052,10 +3038,7 @@ fn plan_build_order(
             let cycle_start = path.iter().position(|n| n == name).unwrap_or(0);
             let mut cycle: Vec<String> = path[cycle_start..].to_vec();
             cycle.push(name.to_string());
-            return Err(format!(
-                "required_targets cycle: {}",
-                cycle.join(" -> ")
-            ));
+            return Err(format!("required_targets cycle: {}", cycle.join(" -> ")));
         }
         let Some(sub) = sub_projects.get(name) else {
             // The requested name has no sub-project; let downstream
@@ -3133,12 +3116,7 @@ fn copy_dir_merge(src: &std::path::Path, dst: &std::path::Path) -> std::io::Resu
 /// build_dir itself). Errors print to stderr but don't fail the build —
 /// the build artifact is already on disk and a missing optional asset
 /// shouldn't take it down.
-fn copy_target_assets(
-    name: &str,
-    sub: &SubProject,
-    info: &ProjectInfo,
-    root: &std::path::Path,
-) {
+fn copy_target_assets(name: &str, sub: &SubProject, info: &ProjectInfo, root: &std::path::Path) {
     if sub.assets.is_empty() {
         return;
     }
@@ -3151,7 +3129,11 @@ fn copy_target_assets(
     };
     for (from, to) in &sub.assets {
         let src_path: std::path::PathBuf = if let Some(target_ref) = from.strip_prefix('$') {
-            match info.sub_projects.get(target_ref).and_then(|s| target_build_dir(target_ref, s, root)) {
+            match info
+                .sub_projects
+                .get(target_ref)
+                .and_then(|s| target_build_dir(target_ref, s, root))
+            {
                 Some(p) => p,
                 None => {
                     eprintln!(
@@ -3181,19 +3163,13 @@ fn copy_target_assets(
         if let Err(e) = copy_dir_merge(&src_path, &dst_path) {
             eprintln!(
                 "  warning: copying assets '{}' -> '{}' for target '{}' failed: {}",
-                from,
-                to,
-                name,
-                e
+                from, to, name, e
             );
         } else {
             eprintln!(
                 "  copied assets {} -> {}",
                 from,
-                dst_path
-                    .strip_prefix(root)
-                    .unwrap_or(&dst_path)
-                    .display()
+                dst_path.strip_prefix(root).unwrap_or(&dst_path).display()
             );
         }
     }
@@ -4002,14 +3978,20 @@ fn scaffold_from_template_ref(
                 std::process::exit(1);
             }
             overlay_meta_files(project_root, project_name);
-            println!(
-                "scaffolded {} from {}",
-                project_name,
-                path.display()
-            );
+            println!("scaffolded {} from {}", project_name, path.display());
         }
-        templates::TemplateRef::Github { owner, repo, git_ref } => {
-            scaffold_from_github(&owner, &repo, git_ref.as_deref(), project_root, project_name);
+        templates::TemplateRef::Github {
+            owner,
+            repo,
+            git_ref,
+        } => {
+            scaffold_from_github(
+                &owner,
+                &repo,
+                git_ref.as_deref(),
+                project_root,
+                project_name,
+            );
         }
         templates::TemplateRef::Url { .. } => {
             eprintln!("error: arbitrary URL templates are not yet supported");
@@ -4190,6 +4172,10 @@ fn cmd_doc(args: &[String]) {
                 for (dep_name, dep_path) in doc_parse_file_deps(&toml_content, &project_root) {
                     // Package function docs
                     all_entries.extend(doc::collect_dependency_docs(&dep_path, &dep_name));
+                    // Package sub-module overview docs (`src/<module>/docs.md`)
+                    all_entries.extend(doc::collect_dependency_module_overviews(
+                        &dep_path, &dep_name,
+                    ));
                     // Package overview doc (from the `docs` attribute in the package's fai.toml)
                     if let Some(overview) = doc::collect_package_overview(&dep_path, &dep_name) {
                         all_entries.push(overview);
@@ -4210,18 +4196,42 @@ fn cmd_doc(args: &[String]) {
     // An empty query now lists all top-level namespaces (lang, std, packages, project).
     if let Some(namespaces) = doc::query_child_namespaces(&all_entries, query) {
         doc::render_namespace_listing(&namespaces);
-        // For root-level entries (overview text) also print their doc when drilling in.
+        // If the namespace has an overview, print it after the child list so
+        // intermediate pages like `std.http` are useful without hiding their
+        // drill-down paths.
         if !query.is_empty() {
             // Show the overview entry for this namespace if one exists.
             let overview: Vec<_> = all_entries
                 .iter()
-                .filter(|e| e.full_path == query && e.namespace.is_empty())
+                .filter(|e| {
+                    e.full_path == query && matches!(e.kind, doc::EntryKind::PackageOverview)
+                })
                 .collect();
             if !overview.is_empty() {
                 println!();
                 doc::render_docs(&overview);
             }
         }
+        return;
+    }
+
+    // Leaf namespace with an overview: render the prose first, then the declarations.
+    let namespace_prefix = format!("{}.", query);
+    let overview: Vec<_> = all_entries
+        .iter()
+        .filter(|e| e.full_path == query && matches!(e.kind, doc::EntryKind::PackageOverview))
+        .collect();
+    let namespace_entries: Vec<_> = all_entries
+        .iter()
+        .filter(|e| {
+            (e.namespace == query || e.full_path.starts_with(&namespace_prefix))
+                && !matches!(e.kind, doc::EntryKind::PackageOverview)
+        })
+        .collect();
+    if !overview.is_empty() && !namespace_entries.is_empty() {
+        doc::render_docs(&overview);
+        println!();
+        doc::render_docs(&namespace_entries);
         return;
     }
 
@@ -4261,7 +4271,7 @@ fn cmd_doc(args: &[String]) {
         }
         std::process::exit(1);
     }
-    doc::render_docs(&results);
+    doc::render_search_results(&results);
 }
 
 /// Parse `[dependencies]` from a fai.toml string and return
@@ -5496,9 +5506,7 @@ mod tests {
     /// assets) tuples for the planner / asset tests below. The TOML
     /// parser is exercised separately; these tests want a fixture
     /// they can construct cheaply without round-tripping through TOML.
-    fn project_with_targets(
-        targets: &[(&str, Vec<&str>, Vec<(&str, &str)>)],
-    ) -> ProjectInfo {
+    fn project_with_targets(targets: &[(&str, Vec<&str>, Vec<(&str, &str)>)]) -> ProjectInfo {
         let mut info = ProjectInfo {
             name: "test".into(),
             version: "0.0.0".into(),
@@ -5525,10 +5533,8 @@ mod tests {
 
     #[test]
     fn test_plan_build_order_dep_built_first() {
-        let info = project_with_targets(&[
-            ("web", vec![], vec![]),
-            ("server", vec!["web"], vec![]),
-        ]);
+        let info =
+            project_with_targets(&[("web", vec![], vec![]), ("server", vec!["web"], vec![])]);
         let order = plan_build_order(&info, Some("server")).unwrap();
         assert_eq!(order, vec!["web".to_string(), "server".to_string()]);
     }
@@ -5577,10 +5583,7 @@ mod tests {
 
     #[test]
     fn test_plan_build_order_detects_cycle() {
-        let info = project_with_targets(&[
-            ("a", vec!["b"], vec![]),
-            ("b", vec!["a"], vec![]),
-        ]);
+        let info = project_with_targets(&[("a", vec!["b"], vec![]), ("b", vec!["a"], vec![])]);
         let err = plan_build_order(&info, Some("a")).unwrap_err();
         assert!(err.contains("cycle"), "expected cycle error, got: {}", err);
         assert!(err.contains("a") && err.contains("b"));
@@ -5629,10 +5632,8 @@ mod tests {
         // Build-all walks every target alphabetically as a root, but
         // each root's deps still come before it. Net effect: deps
         // appear before dependents regardless of alphabetical name.
-        let info = project_with_targets(&[
-            ("server", vec!["web"], vec![]),
-            ("web", vec![], vec![]),
-        ]);
+        let info =
+            project_with_targets(&[("server", vec!["web"], vec![]), ("web", vec![], vec![])]);
         let order = plan_build_order(&info, None).unwrap();
         let pos_web = order.iter().position(|n| n == "web").unwrap();
         let pos_server = order.iter().position(|n| n == "server").unwrap();
@@ -5754,7 +5755,8 @@ mod tests {
         server.assets = vec![("public".to_string(), "".to_string())];
 
         let mut info = ProjectInfo::default();
-        info.sub_projects.insert("server".to_string(), server.clone());
+        info.sub_projects
+            .insert("server".to_string(), server.clone());
 
         copy_target_assets("server", &server, &info, &root);
 
@@ -5772,7 +5774,8 @@ mod tests {
         server.build_dir = Some("build/server".to_string());
         server.assets = vec![("public".to_string(), "public".to_string())];
         let mut info = ProjectInfo::default();
-        info.sub_projects.insert("server".to_string(), server.clone());
+        info.sub_projects
+            .insert("server".to_string(), server.clone());
 
         // No `public/` directory exists. We expect a stderr warning,
         // not a panic — a missing optional asset shouldn't take down
@@ -7720,9 +7723,21 @@ mod tests {
         let tpl = base.join("tpl");
         std::fs::create_dir_all(tpl.join("src")).unwrap();
         std::fs::write(tpl.join("fai.toml"), "[project]\nname = \"X\"\n").unwrap();
-        std::fs::write(tpl.join("src/main.fai"), "def main\n  @return Void\ndo\nend\n").unwrap();
-        std::fs::write(tpl.join("CLAUDE.md"), "# Custom guidance\n\nTemplate-owned.\n").unwrap();
-        std::fs::write(tpl.join("AGENTS.md"), "# Custom AGENTS\n\nTemplate-agents.\n").unwrap();
+        std::fs::write(
+            tpl.join("src/main.fai"),
+            "def main\n  @return Void\ndo\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tpl.join("CLAUDE.md"),
+            "# Custom guidance\n\nTemplate-owned.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tpl.join("AGENTS.md"),
+            "# Custom AGENTS\n\nTemplate-agents.\n",
+        )
+        .unwrap();
 
         let project_path = base.join("app");
         cmd_new(&[
@@ -7786,7 +7801,11 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "OWNED").unwrap();
         overlay_meta_files(&dir, "my-app");
         let merged = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
-        assert!(merged.contains("OWNED"), "template content kept: {}", merged);
+        assert!(
+            merged.contains("OWNED"),
+            "template content kept: {}",
+            merged
+        );
         assert!(
             merged.contains("Project-specific guidance"),
             "separator header present: {}",

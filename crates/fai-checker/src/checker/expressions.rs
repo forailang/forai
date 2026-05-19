@@ -59,8 +59,7 @@ fn useSignal_loader_hint(
     // or empty, the agent passed an untyped default. Show the fix.
     let expected_str = describe_type(expected);
     let actual_str = describe_type(actual);
-    let inferred_from_null =
-        expected_str.contains("null") || expected_str.contains("Unknown");
+    let inferred_from_null = expected_str.contains("null") || expected_str.contains("Unknown");
     if !inferred_from_null {
         return String::new();
     }
@@ -159,8 +158,8 @@ impl Checker {
                 let mut element_type = self.check_expression(&ae.items[0], env)?;
                 for item in &ae.items[1..] {
                     let item_type = self.check_expression(item, env)?;
-                    element_type = unify_branch_type(&element_type, &item_type)
-                        .unwrap_or(Type::Unknown);
+                    element_type =
+                        unify_branch_type(&element_type, &item_type).unwrap_or(Type::Unknown);
                 }
                 Ok(array_of(element_type))
             }

@@ -68,6 +68,18 @@ pub fn collect_stdlib_docs() -> Vec<DocEntry> {
     let type_map = install_builtins();
     let mut entries = Vec::new();
 
+    for overview in stdlib_module_overviews() {
+        entries.push(DocEntry {
+            namespace: "std".to_string(),
+            name: overview.name.to_string(),
+            full_path: format!("std.{}", overview.name),
+            signature: String::new(),
+            doc: overview.doc.trim().to_string(),
+            source: DocSource::Stdlib,
+            kind: EntryKind::PackageOverview,
+        });
+    }
+
     for doc in all_builtin_docs() {
         if let Some(Type::Function(sig)) = type_map.get(doc.builtin_name) {
             let signature = render_builtin_sig(doc.name, sig);
@@ -84,6 +96,629 @@ pub fn collect_stdlib_docs() -> Vec<DocEntry> {
     }
 
     entries
+}
+
+struct StdlibModuleOverview {
+    name: &'static str,
+    doc: &'static str,
+}
+
+fn stdlib_module_overviews() -> &'static [StdlibModuleOverview] {
+    &[
+        StdlibModuleOverview {
+            name: "array",
+            doc: r#"
+`std.array` contains helpers for reading, transforming, and building arrays.
+Most helpers return a new array or value; `append(items, item)` returns the
+array with the item added, so assign the result when you want to keep it.
+
+```fai
+use std.array
+
+let numbers = [1 2 3 4]
+
+let doubled = array.map(numbers) do with n Int
+    n * 2
+end
+
+let even = array.filter(numbers) do with n Int
+    n % 2 == 0
+end
+
+let firstLarge = array.find(numbers) do with n Int
+    n > 2
+end
+
+let more = array.append(numbers, 5)
+let middle = array.slice(numbers, 1, 3)
+```
+
+`slice(items, start, end)` uses an exclusive end index. `find`, `first`, and
+`last` return optional values, so check with `?` or unwrap before use.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "dictionary",
+            doc: r#"
+`std.dictionary` reads and updates dictionary values. Use typed getters when you
+know the expected value type, and use `get` when the value may be any type.
+
+```fai
+use std.dictionary
+
+var user = {
+    name: 'Ada'
+    age: 37
+}
+
+user = dictionary.set(user, 'active', true)
+
+let name = dictionary.getString(user, 'name')!
+let age = dictionary.getInt(user, 'age')!
+let active = dictionary.getBool(user, 'active')!
+```
+
+`set` returns an updated dictionary. Assign it back when you want to keep the
+change.
+
+Dictionary field syntax is convenient for fixed identifier keys, for example
+`user.name`. Use `get`, `getString`, `getInt`, `getBool`, and `set` for dynamic
+keys, keys with punctuation such as `'x-api-key'`, or data parsed from JSON.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "string",
+            doc: r#"
+`std.string` contains string search, splitting, joining, slicing, replacement,
+case conversion, and trimming helpers.
+
+```fai
+use std.string
+
+let raw = '  ada,lovelace  '
+let clean = string.trim(raw)
+let parts = string.split(clean, ',')
+let display = string.join([
+    string.toUpper(parts[0])
+    string.toLower(parts[1])
+], ' ')
+
+let first = string.substring(display, 0, 3)
+let updated = string.replace(display, 'ADA', 'Ada')
+```
+
+`substring(text, start, end)` uses an exclusive end index. `indexOf` returns the
+first matching index or `-1` when the search text is not found.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "convert",
+            doc: r#"
+`std.convert` converts unknown or loosely typed values into common scalar types.
+Use it at boundaries such as environment variables, route params, form values,
+and parsed JSON.
+
+```fai
+use std.convert
+
+let port = convert.parseInt('3040')
+let ratio = convert.parseFloat('0.75')
+let label = convert.toString(port)
+```
+
+`parseInt` and `parseFloat` parse strings and return `null` for invalid input.
+Guard the result before using it in code that might receive bad data.
+
+```fai
+let id = convert.parseInt(rawId)
+if id?
+    loadUser(id!)
+else
+    print('invalid id')
+end
+```
+
+`toInt`, `toFloat`, `toBool`, and `toString` coerce existing values. Prefer the
+parse helpers when converting user-provided strings where invalid input is
+expected.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "json",
+            doc: r#"
+`std.json` parses and stringifies JSON. `json.parse` returns `Unknown`, usually
+a dictionary for JSON objects and an array for JSON arrays. Reconstruct typed
+records manually using dictionary accessors.
+
+```fai
+use std.json
+use std.dictionary
+
+type User
+    id Int
+    name String
+end
+
+let parsed = json.parse('{"id":1,"name":"Ada"}')
+let user = User(
+    id: dictionary.getInt(parsed, 'id')!,
+    name: dictionary.getString(parsed, 'name')!
+)
+```
+
+`json.stringify(value)` serializes Forai values back to JSON. `requireString`
+is a small convenience for extracting a required string field from a dictionary;
+it returns `String?`, so handle the missing case.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "http",
+            doc: r#"
+`std.http` is split into client request helpers and server router helpers:
+
+- `std.http.request` sends HTTP requests and returns `Response` dictionaries.
+- `std.http.server` builds responses and runs a small router.
+
+Use `fai doc std.http.request` and `fai doc std.http.server` for the concrete
+APIs and examples.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "http.request",
+            doc: r#"
+`std.http.request` sends synchronous HTTP requests. Each helper returns a
+`Response` shaped like a dictionary with `status`, `body`, and `headers`.
+
+```fai
+use std.http.request
+use std.dictionary
+use std.json
+
+var headers = {}
+headers = dictionary.set(headers, 'accept', 'application/json')
+headers = dictionary.set(headers, 'x-api-key', apiKey)
+
+let res = request.get('https://api.example.com/users/1', headers)
+if res.status == 200
+    let body = json.parse(res.body)
+    let name = dictionary.getString(body, 'name')!
+end
+```
+
+For JSON POST/PUT/PATCH requests, stringify the body yourself and pass a
+content-type header.
+
+```fai
+var headers = {}
+headers = dictionary.set(headers, 'content-type', 'application/json')
+
+let payload = json.stringify({ name: 'Ada' })
+let res = request.post('https://api.example.com/users', payload, headers)
+```
+
+Transport failures return `null` in current WASM/native host paths rather than
+a `Response`, so guard when calling unreliable networks. HTTP error statuses
+still return a response with the server status and body.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "http.server",
+            doc: r#"
+`std.http.server` creates a router, registers route handlers, builds responses,
+serves static files, and starts listening on a port.
+
+```fai
+use std.http.server
+
+def main
+    @return Void
+do
+    var r = server.router()
+
+    server.get(r, '/') do with req HttpRequest
+        server.html(200, '<h1>Hello</h1>')
+    end
+
+    server.post(r, '/api/echo') do with req HttpRequest
+        server.json(200, { body: req.body })
+    end
+
+    server.serveFiles(r, 'build/web')
+    server.listen(r, 3040)
+end
+```
+
+Route handlers receive an `HttpRequest` with fields such as `method`, `path`,
+`body`, `headers`, and cookies, and must return an `HttpResponse`. Use
+`server.text`, `server.html`, `server.json`, `server.redirect`, or `server.ok`
+to build responses.
+
+`server.listen` blocks the current program. If a port cannot be bound, the host
+prints an error and returns from the listen call.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "net",
+            doc: r#"
+`std.net` contains low-level networking helpers. Use `net.available()` to check
+whether the current runtime reports networking support, then use the TCP or UDP
+submodules for socket work.
+
+```fai
+use std.net
+
+if net.available()
+    print('networking is available')
+end
+```
+
+Use `std.http.request` for normal HTTP calls. Use `std.net.tcp` and
+`std.net.udp` only when you need raw socket protocols.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "net.tcp",
+            doc: r#"
+`std.net.tcp` exposes raw TCP listener and connection handles. Handle-returning
+functions return an `Int`; close every listener or connection handle when done.
+
+```fai
+use std.net.tcp
+use std.dictionary
+
+let conn = tcp.connect('127.0.0.1', 9000)
+if conn >= 0
+    tcp.write(conn, 'ping\n')
+    let line = tcp.readLine(conn)
+    tcp.close(conn)
+end
+```
+
+Server-side TCP accepts return a dictionary containing `handle` and `address`:
+
+```fai
+let listener = tcp.listen(9000)
+let accepted = tcp.accept(listener)
+let conn = dictionary.getInt(accepted, 'handle')!
+let addr = dictionary.getString(accepted, 'address')!
+tcp.write(conn, 'hello ' + addr + '\n')
+tcp.close(conn)
+tcp.close(listener)
+```
+
+In the WASM host path, `listen`, `connect`, and `write` return `-1` on failure;
+`accept`, `read`, `readLine`, and `address` return `null` on failure; `close`
+returns `Void` and ignores invalid handles.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "net.udp",
+            doc: r#"
+`std.net.udp` exposes raw UDP socket handles. Bind a socket, send datagrams,
+receive dictionaries, and close the socket when done.
+
+```fai
+use std.net.udp
+use std.dictionary
+
+let sock = udp.bind(9001)
+if sock >= 0
+    udp.send(sock, '127.0.0.1', 9002, 'hello')
+    udp.close(sock)
+end
+```
+
+`udp.receive(socket)` returns a dictionary with `data`, `host`, and `port`:
+
+```fai
+let packet = udp.receive(sock)
+let data = dictionary.getString(packet, 'data')!
+let host = dictionary.getString(packet, 'host')!
+let port = dictionary.getInt(packet, 'port')!
+```
+
+In the WASM host path, `bind` and `send` return `-1` on failure, `receive`
+returns `null` on failure, and `close`/`broadcast` return `Void` while ignoring
+invalid handles. Enable broadcast with `udp.broadcast(sock, true)` before
+sending to a broadcast address.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "env",
+            doc: r#"
+`std.env` reads process environment variables and can load dotenv-style files.
+Call `env.load(path)` before `env.get(key)` when using a local `.env` file.
+
+```fai
+use std.env
+use std.convert
+
+env.load('.env.dev')
+
+let port = if env.get('SERVER_PORT')?
+    convert.parseInt(env.get('SERVER_PORT')!)
+else
+    3040
+end
+```
+
+`env.get` returns `String?`. `env.load` returns `true` when the file was read
+and merged, or `false` when it is missing or unreadable. Browser builds use
+stubs, so server/native code should own environment-dependent behavior.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "file",
+            doc: r#"
+`std.file` reads, writes, checks, and lists files relative to the process
+working directory unless you pass an absolute path.
+
+```fai
+use std.file
+
+if file.exists('data/config.json')
+    let raw = file.read('data/config.json')
+    print(raw)
+end
+
+let ok = file.write('/tmp/report.txt', 'done\n')
+let names = file.list('data')
+```
+
+`file.read` returns the file contents as a string. `file.write` returns `Bool`
+for success. `file.list` returns entry names in the directory; join them with
+`std.path.join` when you need full paths.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "path",
+            doc: r#"
+`std.path` provides small path string helpers. Use it with `std.file` when
+building paths from directory and filename pieces.
+
+```fai
+use std.path
+
+let full = path.join('data', 'users.json')
+let dir = path.dirname(full)
+let name = path.basename(full)
+let ext = path.extname(full)
+```
+
+These helpers operate on path strings; they do not check whether the path
+exists. Use `std.file.exists` when you need filesystem state.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "storage",
+            doc: r#"
+`std.storage` is a simple string key/value store. Browser builds use
+`localStorage`; native/test host paths use a process-local store.
+
+```fai
+use std.storage
+
+storage.storageSet('theme', 'dark')
+
+let theme = storage.storageGet('theme')
+if theme?
+    print('theme: ' + theme!)
+end
+
+storage.storageRemove('theme')
+```
+
+Values are strings. Use `std.json.stringify` before storing structured data and
+`std.json.parse` after reading it. `storageClear()` removes all entries in the
+current store and is useful for tests.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "browser",
+            doc: r#"
+`std.browser` exposes browser/runtime bridge functions used by adapters such as
+`HtmlForui`. Most app code should use Forui and HtmlForui APIs instead of
+calling this module directly.
+
+```fai
+use std.browser
+
+let path = browser.getLocationPath()
+browser.pushHistoryState('/settings')
+browser.setHtmlAt('#app', '<p>Updated</p>')
+```
+
+`setHtml` and `setHtmlAt` replace DOM content. `getLocationPath` and
+`pushHistoryState` back router integration. `remoteCall` is the low-level RPC
+transport used by generated remote stubs.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "events",
+            doc: r#"
+`std.events` is a synchronous in-process event bus. Register handlers with
+`on`, emit events with `emit`, and cancel handlers with `off`.
+
+```fai
+use std.events
+
+let sub = events.on('task:created') do with e Event
+    print('created: ' + toString(e.data))
+end
+
+events.emit('task:created', { id: 1 })
+events.off(sub)
+```
+
+`once` registers a handler that removes itself after the first event.
+`subscribers(name)` returns the current active count. `clear(name)` and
+`clearAll()` are useful for test cleanup. Handlers run synchronously in
+registration order against a snapshot of subscribers.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "time",
+            doc: r#"
+`std.time` reads the current clock.
+
+```fai
+use std.time
+
+let startedMs = time.now()
+let startedSec = time.unix()
+```
+
+`time.now()` returns a `Float` milliseconds-since-Unix-epoch timestamp.
+`time.unix()` returns whole Unix seconds as `Int`.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "cli",
+            doc: r#"
+`std.cli` contains terminal input and output helpers for command-line programs.
+
+```fai
+use std.cli
+
+let name = cli.readLine('Name: ')
+cli.writeLine('Hello, ' + name)
+```
+
+`write` prints without a trailing newline. `writeLine` appends a newline.
+`clear` clears the terminal screen, and `moveTo(row, column)` moves the cursor
+for simple terminal UIs.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "log",
+            doc: r#"
+`std.log` writes leveled log messages through the host runtime.
+
+```fai
+use std.log
+
+log.info('server started')
+log.warn('cache miss')
+log.error('request failed')
+```
+
+The functions accept `Unknown`, so strings, numbers, dictionaries, and other
+values can be logged without converting first.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "ffi",
+            doc: r#"
+`std.ffi` currently exposes availability checks for native libraries. Use it
+before calling code that depends on a system C library.
+
+```fai
+use std.ffi
+
+if ffi.available('sqlite3')
+    print('sqlite is available')
+else
+    print('sqlite is missing')
+end
+```
+
+Native host paths check pkg-config and common library directories. Browser
+builds report unavailable.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "math",
+            doc: r#"
+`std.math` provides basic numeric helpers. Most functions operate on `Float`;
+rounding helpers return `Int`.
+
+```fai
+use std.math
+
+let n = math.random()
+let rounded = math.round(n * 100.0)
+let root = math.sqrt(81.0)
+let clamped = math.max(0.0, math.min(1.0, n))
+```
+
+`random()` returns a `Float` from `0.0` up to but not including `1.0`.
+`floor`, `ceil`, and `round` return integer values.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "error",
+            doc: r#"
+`std.error` creates and inspects Error values. Use `throw Error(message)` for
+explicit failures and `try ... catch` to recover.
+
+```fai
+use std.error
+
+try
+    throw Error('missing user')
+catch e
+    print(error.message(e))
+end
+```
+
+`isError(value)` checks whether an unknown value is an Error. `message(err)` and
+`kind(err)` read fields from an Error. `unwrap(value, fallback)` returns
+`fallback` when the value is `null` or an Error; otherwise it returns the value.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "io",
+            doc: r#"
+`std.io` currently exposes `print`, the simplest stdout helper.
+
+```fai
+use std.io
+
+io.print('hello')
+io.print({ status: 'ok' })
+```
+
+For command-line programs that need prompts, no-newline writes, cursor movement,
+or screen clearing, use `std.cli`.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "html",
+            doc: r#"
+`std.html` provides small HTML string helpers.
+
+```fai
+use std.html
+
+let safe = html.escape(userInput)
+```
+
+Use `escape` before embedding untrusted text in hand-built HTML strings. For
+Forui apps, prefer normal `Forui.view` components and `HtmlForui` rendering so
+the adapter owns HTML generation.
+"#,
+        },
+        StdlibModuleOverview {
+            name: "test",
+            doc: r#"
+`std.test` contains the assertion primitives behind test blocks. In normal test
+code, prefer the built-in `assert` namespace methods.
+
+```fai
+test mathExample
+    it 'adds numbers'
+        assert.equals(2 + 2, 4)
+        assert.isTrue(4 > 2)
+    end
+end
+```
+
+The exported `std.test.assert` and `std.test.equal` functions are low-level
+forms. Test blocks automatically provide the more ergonomic `assert.equals`,
+`assert.isTrue`, `assert.isFalse`, `assert.isNull`, and related helpers.
+"#,
+        },
+    ]
 }
 
 /// Collect documentation entries from all public functions in a project source directory.
@@ -103,6 +738,21 @@ pub fn collect_dependency_docs(dep_path: &Path, dep_name: &str) -> Vec<DocEntry>
         &full_src,
         dep_name,
         DocSource::Dependency(dep_name.to_string()),
+    )
+}
+
+/// Collect `docs.md` overview entries from dependency source subdirectories.
+///
+/// A dependency can add `src/view/docs.md`; it will render as `fai doc Forui.view`
+/// before the declaration list for that namespace.
+pub fn collect_dependency_module_overviews(dep_path: &Path, dep_name: &str) -> Vec<DocEntry> {
+    let src_dir = dep_source_dir(dep_path);
+    let full_src = dep_path.join(&src_dir);
+    collect_module_overviews_recursive(
+        &full_src,
+        dep_name,
+        dep_name,
+        DocSource::PackageOverview(dep_name.to_string()),
     )
 }
 
@@ -265,6 +915,61 @@ fn collect_docs_from_dir(dir: &Path, namespace: &str, source: DocSource) -> Vec<
     entries
 }
 
+fn collect_module_overviews_recursive(
+    dir: &Path,
+    namespace: &str,
+    dep_name: &str,
+    source: DocSource,
+) -> Vec<DocEntry> {
+    let mut entries = Vec::new();
+
+    let docs_path = dir.join("docs.md");
+    if namespace != dep_name {
+        if let Ok(text) = std::fs::read_to_string(&docs_path) {
+            let parent = namespace
+                .rsplit_once('.')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            let name = namespace
+                .rsplit('.')
+                .next()
+                .unwrap_or(namespace)
+                .to_string();
+            entries.push(DocEntry {
+                namespace: parent,
+                name,
+                full_path: namespace.to_string(),
+                signature: String::new(),
+                doc: text.trim().to_string(),
+                source: source.clone(),
+                kind: EntryKind::PackageOverview,
+            });
+        }
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return entries;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if dir_name.starts_with('.') {
+                continue;
+            }
+            let child_ns = format!("{}.{}", namespace, dir_name);
+            entries.extend(collect_module_overviews_recursive(
+                &path,
+                &child_ns,
+                dep_name,
+                source.clone(),
+            ));
+        }
+    }
+
+    entries
+}
+
 /// Render a type declaration as a compact signature showing all fields.
 fn render_type_sig(td: &fai_parser::ast::TypeDeclaration) -> String {
     // Always multi-line `type Name\n  fields\nend` — this is used as the
@@ -306,6 +1011,8 @@ pub fn collect_lang_docs() -> Vec<DocEntry> {
         ("rpc", include_str!("../docs/lang/rpc.fai")),
         ("signals", include_str!("../docs/lang/signals.fai")),
         ("storage", include_str!("../docs/lang/storage.fai")),
+        ("env", include_str!("../docs/lang/env.fai")),
+        ("events", include_str!("../docs/lang/events.fai")),
         ("limits", include_str!("../docs/lang/limits.fai")),
     ];
 
@@ -776,6 +1483,30 @@ pub fn render_docs(entries: &[&DocEntry]) {
     }
 }
 
+/// Print search results. Multiple results include exact follow-up commands so
+/// ambiguous name searches are easy to refine.
+pub fn render_search_results(entries: &[&DocEntry]) {
+    if entries.len() > 1 {
+        println!("Multiple matches. Try:");
+        for command in suggested_doc_commands(entries) {
+            println!("- `{}`", command);
+        }
+        println!();
+    }
+    render_docs(entries);
+}
+
+fn suggested_doc_commands(entries: &[&DocEntry]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut commands = Vec::new();
+    for entry in entries {
+        if seen.insert(entry.full_path.as_str()) {
+            commands.push(format!("fai doc {}", entry.full_path));
+        }
+    }
+    commands
+}
+
 fn render_detail(entry: &DocEntry, _use_color: bool) {
     // Pure markdown — same output on terminal and via MCP. Agents reliably
     // parse markdown structure (headings, fenced code blocks, lists); the
@@ -828,6 +1559,14 @@ fn render_detail(entry: &DocEntry, _use_color: bool) {
     }
 
     let cleaned = clean_doc(&entry.doc);
+    if matches!(entry.kind, EntryKind::PackageOverview) {
+        if !cleaned.trim().is_empty() {
+            println!("{}", cleaned.trim_end());
+            println!();
+        }
+        return;
+    }
+
     let (prose, example) = split_example(&cleaned);
     if !prose.trim().is_empty() {
         println!("{}", prose.trim_end());
@@ -961,7 +1700,10 @@ fn split_example(doc: &str) -> (String, Option<String>) {
 /// Generate the forai import statement for a doc entry, or None if no import is needed
 /// (project-local functions, language docs, package overviews).
 fn import_line_for(entry: &DocEntry) -> Option<String> {
-    // Language docs and package overviews are not imported.
+    // Language docs and overview pages are not imported.
+    if matches!(entry.kind, EntryKind::PackageOverview) {
+        return None;
+    }
     match &entry.source {
         DocSource::Language | DocSource::PackageOverview(_) => return None,
         _ => {}
@@ -1046,6 +1788,9 @@ fn render_list(entries: &[&DocEntry], _use_color: bool) {
                 // Prepend `def` so the listing reads as forai, not C —
                 // e.g. `def fontSize(node: ViewNode, size: Int) -> ViewNode`.
                 println!("- def {}", e.signature);
+                if let Some(summary) = doc_summary(&e.doc) {
+                    println!("  {}", summary);
+                }
             }
             println!();
         }
@@ -1088,6 +1833,32 @@ fn render_list(entries: &[&DocEntry], _use_color: bool) {
             }
             println!();
         }
+    }
+}
+
+fn doc_summary(doc: &str) -> Option<String> {
+    let cleaned = clean_doc(doc);
+    let (prose, _) = split_example(&cleaned);
+    let mut paragraph = Vec::new();
+
+    for line in prose.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with("```") {
+            continue;
+        }
+        paragraph.push(trimmed);
+    }
+
+    if paragraph.is_empty() {
+        None
+    } else {
+        Some(paragraph.join(" "))
     }
 }
 
@@ -1416,15 +2187,59 @@ mod tests {
 
     #[test]
     fn test_search_prefix_match() {
-        let entries = collect_stdlib_docs();
-        let results = search_docs(&entries, "std.array");
+        let entries = vec![
+            DocEntry {
+                namespace: "std.demo".to_string(),
+                name: "first".to_string(),
+                full_path: "std.demo.first".to_string(),
+                signature: "first() -> Void".to_string(),
+                doc: String::new(),
+                source: DocSource::Stdlib,
+                kind: EntryKind::Function,
+            },
+            DocEntry {
+                namespace: "std.demo".to_string(),
+                name: "second".to_string(),
+                full_path: "std.demo.second".to_string(),
+                signature: "second() -> Void".to_string(),
+                doc: String::new(),
+                source: DocSource::Stdlib,
+                kind: EntryKind::Function,
+            },
+        ];
+        let results = search_docs(&entries, "std.demo");
         assert!(
             results.len() > 1,
-            "prefix match should return multiple results"
+            "prefix match should return multiple results for intermediate namespaces"
         );
-        assert!(results
+        assert!(results.iter().all(|e| e.full_path.starts_with("std.demo.")));
+    }
+
+    #[test]
+    fn test_stdlib_module_overview_entries_exist() {
+        let entries = collect_stdlib_docs();
+        let array = entries
             .iter()
-            .all(|e| e.full_path.starts_with("std.array.")));
+            .find(|e| e.full_path == "std.array" && matches!(e.kind, EntryKind::PackageOverview));
+        assert!(array.is_some(), "std.array overview should exist");
+        assert_eq!(
+            import_line_for(array.unwrap()),
+            None,
+            "stdlib module overviews should not show function-style imports"
+        );
+        assert!(
+            array.unwrap().doc.contains("array.map"),
+            "std.array overview should include examples"
+        );
+
+        let json = entries
+            .iter()
+            .find(|e| e.full_path == "std.json" && matches!(e.kind, EntryKind::PackageOverview));
+        assert!(json.is_some(), "std.json overview should exist");
+        assert!(
+            json.unwrap().doc.contains("json.parse"),
+            "std.json overview should explain parsing"
+        );
     }
 
     #[test]
@@ -1444,10 +2259,60 @@ mod tests {
 
     #[test]
     fn test_search_namespace_match() {
-        let entries = collect_stdlib_docs();
-        let results = search_docs(&entries, "std.math");
+        let entries = vec![DocEntry {
+            namespace: "std.demo".to_string(),
+            name: "first".to_string(),
+            full_path: "std.demo.first".to_string(),
+            signature: "first() -> Void".to_string(),
+            doc: String::new(),
+            source: DocSource::Stdlib,
+            kind: EntryKind::Function,
+        }];
+        let results = search_docs(&entries, "std.demo");
         assert!(!results.is_empty());
-        assert!(results.iter().all(|e| e.namespace == "std.math"));
+        assert!(results.iter().all(|e| e.namespace == "std.demo"));
+    }
+
+    #[test]
+    fn test_suggested_doc_commands_use_exact_paths() {
+        let entries = vec![
+            DocEntry {
+                namespace: "Forui.view".to_string(),
+                name: "Button".to_string(),
+                full_path: "Forui.view.Button".to_string(),
+                signature: "Button(text: String) -> ViewNode".to_string(),
+                doc: String::new(),
+                source: DocSource::Dependency("Forui".to_string()),
+                kind: EntryKind::Function,
+            },
+            DocEntry {
+                namespace: "HtmlForui.html".to_string(),
+                name: "renderButton".to_string(),
+                full_path: "HtmlForui.html.renderButton".to_string(),
+                signature: "renderButton() -> String".to_string(),
+                doc: String::new(),
+                source: DocSource::Dependency("HtmlForui".to_string()),
+                kind: EntryKind::Function,
+            },
+        ];
+        let refs: Vec<&DocEntry> = entries.iter().collect();
+        assert_eq!(
+            suggested_doc_commands(&refs),
+            vec![
+                "fai doc Forui.view.Button".to_string(),
+                "fai doc HtmlForui.html.renderButton".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_doc_summary_uses_first_prose_paragraph() {
+        let doc =
+            "Build a button view.\nUse this for primary actions.\n\n```fai\nButton('Save')\n```";
+        assert_eq!(
+            doc_summary(doc),
+            Some("Build a button view. Use this for primary actions.".to_string())
+        );
     }
 
     #[test]
@@ -1577,8 +2442,8 @@ mod tests {
         let e = e.unwrap();
         assert!(e.doc.contains("remote def"), "should explain remote def");
         assert!(
-            e.doc.contains("addRpcRoutes"),
-            "should mention addRpcRoutes"
+            e.doc.contains("generated RPC route installer"),
+            "should mention generated RPC route installation"
         );
     }
 
@@ -1629,6 +2494,8 @@ mod tests {
         assert!(children.iter().any(|c| c.path == "lang.variables"));
         assert!(children.iter().any(|c| c.path == "lang.modules"));
         assert!(children.iter().any(|c| c.path == "lang.functions"));
+        assert!(children.iter().any(|c| c.path == "lang.env"));
+        assert!(children.iter().any(|c| c.path == "lang.events"));
     }
 
     // ── Type and recursive scan tests ─────────────────────────────────
@@ -1697,6 +2564,61 @@ mod tests {
             "sub-directory functions get pkg.sub namespace"
         );
         assert_eq!(sub.unwrap().full_path, "pkg.sub.subFn");
+    }
+
+    #[test]
+    fn test_collect_dependency_module_overviews_scans_subdirectories() {
+        let dir = make_tmp("dep_module_overview");
+        std::fs::create_dir_all(dir.join("src/view")).unwrap();
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"Pkg\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/view/docs.md"), "# View\n\nOverview text.").unwrap();
+
+        let entries = collect_dependency_module_overviews(&dir, "Pkg");
+        let overview = entries.iter().find(|e| e.full_path == "Pkg.view");
+        assert!(overview.is_some(), "Pkg.view docs.md should be indexed");
+        let overview = overview.unwrap();
+        assert_eq!(overview.namespace, "Pkg");
+        assert_eq!(overview.name, "view");
+        assert!(matches!(overview.kind, EntryKind::PackageOverview));
+        assert!(overview.doc.contains("Overview text"));
+    }
+
+    #[test]
+    fn test_collect_dependency_docs_hides_private_declarations() {
+        let dir = make_tmp("dep_private_docs");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"Pkg\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/api.fai"),
+            "# Public API.\ndef publicApi\n    @return Void\ndo\nend\n\nprivate:\n\n# Private helper.\ndef privateHelper\n    @return Void\ndo\nend\n\ntype Secret\n    value String\nend\n\nenum HiddenState\n    ready\nend\n",
+        )
+        .unwrap();
+
+        let entries = collect_dependency_docs(&dir, "Pkg");
+        assert!(
+            entries.iter().any(|e| e.full_path == "Pkg.publicApi"),
+            "public dependency declarations should be indexed"
+        );
+        assert!(
+            !entries.iter().any(|e| e.full_path == "Pkg.privateHelper"),
+            "private dependency functions should be hidden"
+        );
+        assert!(
+            !entries.iter().any(|e| e.full_path == "Pkg.Secret"),
+            "private dependency types should be hidden"
+        );
+        assert!(
+            !entries.iter().any(|e| e.full_path == "Pkg.HiddenState"),
+            "private dependency enums should be hidden"
+        );
     }
 
     #[test]

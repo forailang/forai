@@ -87,18 +87,9 @@ pub fn generate_dispatch_for_functions(
         // We build this with string concat to avoid needing escaped quotes in fai.
         let err_prefix = r#"'{"ok":false,"error":"'"#;
         let err_suffix = r#"'"}'"#;
-        let before_payload = format!(
-            "{{ fnName: '{}' args: argsJson }}",
-            fd.name
-        );
-        let after_payload = format!(
-            "{{ fnName: '{}' value: __rpcResult }}",
-            fd.name
-        );
-        let error_payload = format!(
-            "{{ fnName: '{}' message: __e.message }}",
-            fd.name
-        );
+        let before_payload = format!("{{ fnName: '{}' args: argsJson }}", fd.name);
+        let after_payload = format!("{{ fnName: '{}' value: __rpcResult }}", fd.name);
+        let error_payload = format!("{{ fnName: '{}' message: __e.message }}", fd.name);
         if fd.params.is_empty() {
             out.push_str(&format!("{}  var __rpcResult = ''\n", indent));
             out.push_str(&format!("{}  try\n", indent));
@@ -310,7 +301,9 @@ mod tests {
             result
         );
         assert!(
-            result.contains("events.emit('rpc:afterCall', { fnName: 'getTasks' value: __rpcResult })"),
+            result.contains(
+                "events.emit('rpc:afterCall', { fnName: 'getTasks' value: __rpcResult })"
+            ),
             "should emit rpc:afterCall after getTasks. Got:\n{}",
             result
         );
@@ -321,13 +314,15 @@ mod tests {
             result
         );
         assert!(
-            result.contains("events.emit('rpc:afterCall', { fnName: 'addTask' value: __rpcResult })"),
+            result
+                .contains("events.emit('rpc:afterCall', { fnName: 'addTask' value: __rpcResult })"),
             "should emit rpc:afterCall after addTask. Got:\n{}",
             result
         );
         // error emit fires inside the catch arm of each function.
         assert!(
-            result.contains("events.emit('rpc:error', { fnName: 'getTasks' message: __e.message })"),
+            result
+                .contains("events.emit('rpc:error', { fnName: 'getTasks' message: __e.message })"),
             "should emit rpc:error in getTasks catch. Got:\n{}",
             result
         );

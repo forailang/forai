@@ -95,7 +95,7 @@ pub struct BuiltinDoc {
 pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
     &[
         // std.array
-        BuiltinDoc { module: "std.array", name: "append",   builtin_name: "append",       doc: "Append an item to an array in place." },
+        BuiltinDoc { module: "std.array", name: "append",   builtin_name: "append",       doc: "Return a new array with the item appended." },
         BuiltinDoc { module: "std.array", name: "length",   builtin_name: "length",        doc: "Return the number of items in an array." },
         BuiltinDoc { module: "std.array", name: "isEmpty",  builtin_name: "isEmpty",       doc: "Return true if the array is empty." },
         BuiltinDoc { module: "std.array", name: "first",    builtin_name: "first",         doc: "Return the first item, or null if empty." },
@@ -209,7 +209,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.events", name: "clearAll",    builtin_name: "eventClearAll",    doc: "Remove every subscription across every event name. Test cleanup helper." },
 
         // std.time
-        BuiltinDoc { module: "std.time", name: "now",  builtin_name: "timeNow",  doc: "Return the current time as an ISO 8601 string." },
+        BuiltinDoc { module: "std.time", name: "now",  builtin_name: "timeNow",  doc: "Return the current time as milliseconds since the Unix epoch." },
         BuiltinDoc { module: "std.time", name: "unix", builtin_name: "timeUnix", doc: "Return the current Unix timestamp in seconds." },
 
         // std.log

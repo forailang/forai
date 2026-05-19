@@ -473,18 +473,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         .header("Content-Type", "application/json")
                         .send(body.as_bytes())
                     {
-                        Err(e) => signal_remote_call_error(
-                            &mut caller,
-                            &format!("network error: {}", e),
-                        ),
+                        Err(e) => {
+                            signal_remote_call_error(&mut caller, &format!("network error: {}", e))
+                        }
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let resp_body = resp.into_body().read_to_string().unwrap_or_default();
                             if !(200..300).contains(&status) {
-                                signal_remote_call_error(
-                                    &mut caller,
-                                    &format!("HTTP {}", status),
-                                )
+                                signal_remote_call_error(&mut caller, &format!("HTTP {}", status))
                             } else {
                                 match serde_json::from_str::<serde_json::Value>(&resp_body) {
                                     Ok(parsed) => {

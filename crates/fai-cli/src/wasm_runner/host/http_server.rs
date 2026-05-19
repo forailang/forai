@@ -288,11 +288,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                         parse_http_request_into_guest(&mut caller, &mem, &stream)
                     };
-                    super::events::dispatch_event(
-                        &mut caller,
-                        "http:beforeRequest",
-                        request_val,
-                    );
+                    super::events::dispatch_event(&mut caller, "http:beforeRequest", request_val);
                     let response = dispatch_router_request(&mut caller, id as u32, request_val);
                     let pair = build_request_response(&mut caller, request_val, response);
                     super::events::dispatch_event(&mut caller, "http:afterResponse", pair);
@@ -963,7 +959,11 @@ fn read_extra_headers(
     if inner_addr + 8 > data.len() {
         return Vec::new();
     }
-    let tag = i32::from_le_bytes(data[inner_addr..inner_addr + 4].try_into().unwrap_or([0; 4]));
+    let tag = i32::from_le_bytes(
+        data[inner_addr..inner_addr + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
     if tag != OBJ_TAG_DICT {
         return Vec::new();
     }
@@ -1013,7 +1013,12 @@ fn read_array_count(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize) -> O
     Some(i32::from_le_bytes(data[addr + 4..addr + 8].try_into().ok()?) as usize)
 }
 
-fn read_array_item(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize, i: usize) -> Option<i64> {
+fn read_array_item(
+    mem: &Memory,
+    caller: &mut Caller<'_, ()>,
+    addr: usize,
+    i: usize,
+) -> Option<i64> {
     let data = mem.data(&*caller);
     let off = addr + 8 + i * 8;
     if off + 8 > data.len() {
@@ -1022,10 +1027,17 @@ fn read_array_item(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize, i: us
     Some(i64::from_le_bytes(data[off..off + 8].try_into().ok()?))
 }
 
-fn read_dict_bool(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize, key: &str) -> Option<bool> {
+fn read_dict_bool(
+    mem: &Memory,
+    caller: &mut Caller<'_, ()>,
+    addr: usize,
+    key: &str,
+) -> Option<bool> {
     let val = dict_lookup(mem, caller, addr, key)?;
     let v = val as u64;
-    if (v & (QNAN | SIGN_BIT | 0x0007_0000_0000_0000)) == (QNAN | crate::wasm_runner::nan_box::TAG_BOOL) {
+    if (v & (QNAN | SIGN_BIT | 0x0007_0000_0000_0000))
+        == (QNAN | crate::wasm_runner::nan_box::TAG_BOOL)
+    {
         Some((v & 1) == 1)
     } else {
         None
