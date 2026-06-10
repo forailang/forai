@@ -477,7 +477,42 @@ pub const IMPORT_REMOTE_BEGIN: u32 = 102;
 /// sets `__error_flag`/`__error_value` and returns null) stored by the
 /// `remote_begin` for `task_id`.
 pub const IMPORT_REMOTE_RESULT: u32 = 103;
-pub const IMPORT_COUNT: u32 = 104;
+/// `env.__fai_trap_report(code, a, b) -> void` — stash a structured trap
+/// reason host-side immediately before an `unreachable`. The host decodes
+/// `(code, a, b)` (see `TRAP_*` codes below; `a`/`b` carry a NaN-boxed
+/// value, an address, or a count depending on the code) into a readable
+/// message — e.g. `over-release (rc -1) of String "id" at 0x3fa38` — and
+/// surfaces it when the trap unwinds. Browser hosts log the same message
+/// via `console.error` before the trap kills the task. Plan 116 phase 1.
+pub const IMPORT_TRAP_REPORT: u32 = 104;
+pub const IMPORT_COUNT: u32 = 105;
+
+// ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
+// The host renders these into human-readable trap reasons. Keep in
+// sync with `wasm_runner/host/io.rs::format_trap_report` and the JS
+// twins in `fai-cli/src/lib.rs`.
+/// Retain of a freed (poisoned) object. `a` = boxed value, `b` = rc-slot addr.
+pub const TRAP_RC_RETAIN_POISON: i32 = 1;
+/// Release of a freed (poisoned) object. `a` = boxed value, `b` = obj addr.
+pub const TRAP_RC_RELEASE_POISON: i32 = 2;
+/// Refcount went negative (double-free / over-release). `a` = boxed value,
+/// `b` = the new (negative) rc.
+pub const TRAP_RC_OVER_RELEASE: i32 = 3;
+/// `memory.grow` failed in `rt_alloc`. `a` = requested logical size,
+/// `b` = heap pointer the allocation needed to reach.
+pub const TRAP_OOM: i32 = 4;
+/// Async task table full. `a` = task count, `b` = capacity.
+pub const TRAP_TASK_OVERFLOW: i32 = 5;
+/// `x!` force-unwrap saw null. `a`/`b` unused.
+pub const TRAP_FORCE_UNWRAP_NULL: i32 = 6;
+/// Uncaught `throw` reached the outermost frame. `a` = boxed error value.
+pub const TRAP_UNCAUGHT_ERROR: i32 = 7;
+/// Scheduler stall guard: the poll ready-loop ran an absurd number of
+/// iterations without quiescing (livelock — e.g. a task re-readying
+/// itself forever, the self-await bug class). `a` = iterations run,
+/// `b` = the task id that was about to be resumed. Plan 116 phase 2:
+/// converts a silent 100%-CPU hang into a reportable trap.
+pub const TRAP_SCHED_STALL: i32 = 8;
 
 /// Return which imports are available for a given build target.
 /// `None` means all imports available (native/test). The returned
@@ -558,6 +593,23 @@ pub fn emit_import_call(f: &mut Function, import_idx: u32, import_remap: &[Optio
             f.instruction(&Instruction::Unreachable);
         }
     }
+}
+
+/// Emit a `__fai_trap_report(code, a, b)` call followed by `unreachable`.
+/// `push_a`/`push_b` must each leave exactly one i64 on the stack. The
+/// host turns `(code, a, b)` into a readable trap reason (plan 116).
+fn emit_trap_report_unreachable(
+    f: &mut Function,
+    import_remap: &[Option<u32>],
+    code: i32,
+    push_a: impl FnOnce(&mut Function),
+    push_b: impl FnOnce(&mut Function),
+) {
+    f.instruction(&Instruction::I32Const(code));
+    push_a(f);
+    push_b(f);
+    emit_import_call(f, IMPORT_TRAP_REPORT, import_remap);
+    f.instruction(&Instruction::Unreachable);
 }
 
 /// Known constant string offsets in the data section (set by module.rs).
@@ -676,7 +728,7 @@ pub fn emit_all(
         emit_cmp(base, CmpOp::Ge),              // rt_ge
         emit_print_val(base, import_remap),     // rt_print_val (legacy, primitives only)
         emit_itoa(),                            // rt_itoa
-        emit_alloc(freelist_global, live_count_global, bucket_base), // rt_alloc
+        emit_alloc(freelist_global, live_count_global, bucket_base, import_remap), // rt_alloc
         emit_make_obj(),                        // rt_make_obj
         emit_obj_addr(),                        // rt_obj_addr
         emit_is_obj(),                          // rt_is_obj
@@ -696,8 +748,8 @@ pub fn emit_all(
         emit_parse_float(base),                    // rt_parse_float
         emit_free(freelist_global, live_count_global, bucket_base), // rt_free
         emit_copy_deep(base),                      // rt_copy_deep
-        emit_retain(base),                         // rt_retain
-        emit_release(base),                        // rt_release
+        emit_retain(base, import_remap),           // rt_retain
+        emit_release(base, import_remap),          // rt_release
         emit_live_objects(live_count_global),      // rt_live_objects
     ]
 }
@@ -1631,7 +1683,12 @@ fn emit_itoa() -> Function {
 // ── $rt_alloc(size: i32) -> i32 ───────────────────────────────────
 // Bump allocate `size` bytes (aligned to 8). Returns address.
 
-fn emit_alloc(freelist_global: u32, live_count_global: u32, bucket_base: u32) -> Function {
+fn emit_alloc(
+    freelist_global: u32,
+    live_count_global: u32,
+    bucket_base: u32,
+    import_remap: &[Option<u32>],
+) -> Function {
     // locals: 1=addr, 2=new_ptr, 3=mem_bytes, 4=prev/bucket_addr, 5=cur/head,
     // 6=orig_size, 7=bucket_idx (all i32)
     let mut f = Function::new([(7, ValType::I32)]);
@@ -1809,7 +1866,19 @@ fn emit_alloc(freelist_global: u32, live_count_global: u32, bucket_base: u32) ->
         f.instruction(&Instruction::I32Const(-1));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        f.instruction(&Instruction::Unreachable);
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_OOM,
+            |f| {
+                f.instruction(&Instruction::LocalGet(6)); // requested size
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(2)); // needed heap ptr
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
         f.instruction(&Instruction::End);
         // mem_bytes += 16 * 65536 = 1 MiB
         f.instruction(&Instruction::LocalGet(3));
@@ -2451,7 +2520,7 @@ fn emit_concat_fn(base: u32) -> Function {
 // ── $rt_retain(v: i64) -> i64 — reference-count increment (plan 113) ──
 // Bump the count in the 8-byte prefix at obj_addr-8; no-op + passthrough for
 // primitives. Returns `v` so call sites can retain inline.
-fn emit_retain(base: u32) -> Function {
+fn emit_retain(base: u32, import_remap: &[Option<u32>]) -> Function {
     // param 0: v (i64). local 1 = rc slot address (i32).
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let mut f = Function::new([(1, ValType::I32)]);
@@ -2472,7 +2541,18 @@ fn emit_retain(base: u32) -> Function {
         f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(empty));
-        f.instruction(&Instruction::Unreachable);
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_RC_RETAIN_POISON,
+            |f| {
+                f.instruction(&Instruction::LocalGet(0)); // boxed value
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(1)); // rc-slot addr
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
         f.instruction(&Instruction::End);
     }
     // mem[rc_slot] = mem[rc_slot] + 1
@@ -2494,7 +2574,7 @@ fn emit_retain(base: u32) -> Function {
 // counts drop too) and free the block via the per-tag child traversal. No-op on
 // primitives (the `is_obj` guard). The acyclic owned graph guarantees the
 // recursion terminates.
-fn emit_release(base: u32) -> Function {
+fn emit_release(base: u32, import_remap: &[Option<u32>]) -> Function {
     // param 0: v. locals: 1=addr, 2=tag, 3=count, 4=i, 5=size, 6=entry, 7=rc.
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let mut f = Function::new([(7, ValType::I32)]);
@@ -2520,7 +2600,18 @@ fn emit_release(base: u32) -> Function {
         f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(empty));
-        f.instruction(&Instruction::Unreachable);
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_RC_RELEASE_POISON,
+            |f| {
+                f.instruction(&Instruction::LocalGet(0)); // boxed value
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(1)); // obj addr
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
         f.instruction(&Instruction::End);
     }
     // rc = mem[addr-8] - 1 ; mem[addr-8] = rc ; if rc != 0 { return }
@@ -2543,7 +2634,18 @@ fn emit_release(base: u32) -> Function {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::I32LtS);
         f.instruction(&Instruction::If(empty));
-        f.instruction(&Instruction::Unreachable);
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_RC_OVER_RELEASE,
+            |f| {
+                f.instruction(&Instruction::LocalGet(0)); // boxed value
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(7)); // new (negative) rc
+                f.instruction(&Instruction::I64ExtendI32S);
+            },
+        );
         f.instruction(&Instruction::End);
     }
     f.instruction(&Instruction::LocalGet(7));
@@ -8000,6 +8102,66 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_REMOTE_RESULT: (task_id) -> i64 (NaN-boxed value)
         ("remote_result", vec![ValType::I32], vec![ValType::I64]),
+        // IMPORT_TRAP_REPORT: (code, a, b) -> void — structured trap reason,
+        // stashed host-side right before the guest executes `unreachable`.
+        (
+            "__fai_trap_report",
+            vec![ValType::I32, ValType::I64, ValType::I64],
+            vec![],
+        ),
+    ]
+}
+
+/// Names of the runtime helper functions, in the order [`emit_all`]
+/// emits them (index = `RT_*` constant). Used by the module assemblers
+/// to emit the wasm `name` section so backtraces show `rt_alloc`
+/// instead of `wasm-function[NNN]`.
+pub fn rt_fn_names() -> [&'static str; RT_COUNT as usize] {
+    [
+        "rt_is_int",
+        "rt_is_float",
+        "rt_as_number",
+        "rt_make_int",
+        "rt_make_float",
+        "rt_make_bool",
+        "rt_add",
+        "rt_sub",
+        "rt_mul",
+        "rt_div",
+        "rt_idiv",
+        "rt_mod",
+        "rt_pow",
+        "rt_neg",
+        "rt_eq",
+        "rt_ne",
+        "rt_lt",
+        "rt_le",
+        "rt_gt",
+        "rt_ge",
+        "rt_print_val",
+        "rt_itoa",
+        "rt_alloc",
+        "rt_make_obj",
+        "rt_obj_addr",
+        "rt_is_obj",
+        "rt_str_eq",
+        "rt_str_cmp",
+        "rt_alloc_string",
+        "rt_concat",
+        "rt_get_index",
+        "rt_get_field",
+        "rt_set_field",
+        "rt_print_val_new",
+        "rt_value_to_str",
+        "rt_import_module",
+        "rt_call_native",
+        "rt_parse_int",
+        "rt_parse_float",
+        "rt_free",
+        "rt_copy_deep",
+        "rt_retain",
+        "rt_release",
+        "rt_live_objects",
     ]
 }
 
@@ -8048,7 +8210,9 @@ mod alloc_free_tests {
         exports.export("free", ExportKind::Func, 1);
         exports.export("heap", ExportKind::Global, 0);
         let mut code = CodeSection::new();
-        code.function(&emit_alloc(fl, live, bucket_base));
+        // No imports in this fixture module — an empty remap makes the
+        // OOM trap-report degrade to a bare `unreachable`, which is fine.
+        code.function(&emit_alloc(fl, live, bucket_base, &[]));
         code.function(&emit_free(fl, live, bucket_base));
         let mut m = Module::new();
         m.section(&types);

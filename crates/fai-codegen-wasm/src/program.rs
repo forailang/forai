@@ -6,7 +6,7 @@
 
 /// Per-function metadata the wasm backend needs to build signatures,
 /// exports, and the test dispatcher. Nothing bytecode-shaped.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FunctionInfo {
     /// Function name as declared in source (or compiler-synthesised
     /// placeholder for closures / script bodies). Exported from the
@@ -27,4 +27,11 @@ pub struct FunctionInfo {
     /// codegen emits the default expression in its place. Ordered the
     /// same as the function's declared parameters.
     pub param_defaults: Vec<Option<fai_compiler::ast::Expression>>,
+    /// Source file the function was declared in, when known. Entry-AST
+    /// functions and compiler-synthesised wrappers carry `None`.
+    pub source_file: Option<String>,
+    /// 1-based declaration line in `source_file`. 0 = unknown
+    /// (synthesised functions). Feeds the `fai-dbg` debug side-table
+    /// so trap backtraces can show `name (file:line)` (plan 116).
+    pub source_line: u32,
 }

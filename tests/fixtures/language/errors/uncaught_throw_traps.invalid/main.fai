@@ -1,5 +1,5 @@
 # expect: runtime_error
-# error: unreachable
+# error: uncaught error
 # Top-level uncaught throw must terminate the program. Pre-fix this
 # trapped via `Drop + Unreachable`. After cross-function throw landed,
 # the new path stashes into `error_flag`/`error_value` and `Return`s —

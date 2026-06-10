@@ -128,6 +128,10 @@ pub struct SchedLayout {
     /// busy-poll: the task parks with `O_WAKE < 0` (poll won't promote it) and
     /// the host calls `__fai_resume_task` after `ms`. `None` → native busy-poll.
     pub set_timer: Option<u32>,
+    /// Optional `__fai_trap_report(code, a, b)` import index (post-remap).
+    /// When set, scheduler guards report a structured reason before
+    /// trapping (plan 116); `None` → bare `unreachable`.
+    pub trap_report: Option<u32>,
 }
 
 /// Number of scheduler helper functions emitted by [`emit_scheduler_functions`],
@@ -238,6 +242,14 @@ fn emit_spawn(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(l.capacity));
     f.instruction(&Instruction::I32GeS);
     f.instruction(&Instruction::If(BlockType::Empty));
+    if let Some(trap_report) = l.trap_report {
+        // Report "task table full (count, capacity)" before trapping.
+        f.instruction(&Instruction::I32Const(crate::runtime::TRAP_TASK_OVERFLOW));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::I64Const(l.capacity as i64));
+        f.instruction(&Instruction::Call(trap_report));
+    }
     f.instruction(&Instruction::Unreachable);
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::GlobalGet(l.g_count));
@@ -434,9 +446,18 @@ fn emit_notify_waiter(l: &SchedLayout) -> Function {
     f
 }
 
+/// Ready-loop iteration bound for one `poll()` invocation. A healthy
+/// program resumes each ready task once (plus chains it unlocks); a
+/// loop that re-readies the same task forever (self-await class) spins
+/// here without returning — in the browser that's a silent 100%-CPU
+/// hang the host can't interrupt. A million resumes without quiescing
+/// is far beyond anything legitimate (the table caps at 4096 live
+/// tasks), so trip a `TRAP_SCHED_STALL` report instead of spinning.
+pub const STALL_GUARD_LIMIT: i32 = 1_000_000;
+
 fn emit_poll(l: &SchedLayout) -> Function {
-    // -> i32; locals: i = 0, id = 1
-    let mut f = Function::new([(2, ValType::I32)]);
+    // -> i32; locals: i = 0, id = 1, stall counter = 2
+    let mut f = Function::new([(3, ValType::I32)]);
 
     // timer promotion: for i in 0..count
     f.instruction(&Instruction::I32Const(0));
@@ -487,6 +508,26 @@ fn emit_poll(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(-1));
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::BrIf(1));
+    // Stall guard (plan 116 phase 2): counter++ per resumed task; trap
+    // with a report once a single poll() has resumed STALL_GUARD_LIMIT
+    // tasks without quiescing.
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(2));
+    f.instruction(&Instruction::I32Const(STALL_GUARD_LIMIT));
+    f.instruction(&Instruction::I32GeS);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    if let Some(trap_report) = l.trap_report {
+        f.instruction(&Instruction::I32Const(crate::runtime::TRAP_SCHED_STALL));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::LocalGet(1)); // task about to resume
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::Call(trap_report));
+    }
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::I32Const(ST_RUNNING));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
@@ -861,6 +902,7 @@ mod tests {
             root_frame_size: 16,
             module_init: None,
             set_timer: None,
+            trap_report: None,
         };
 
         let mut module = Module::new();
@@ -1146,5 +1188,36 @@ mod tests {
         // poll; parent resumes and completes with the child's result.
         assert_eq!(start.call(&mut store, ()).unwrap(), 2);
         assert_eq!(result.call(&mut store, 0).unwrap(), 99);
+    }
+
+    #[test]
+    fn stall_guard_traps_a_livelocked_ready_loop() {
+        CLOCK_MS.with(|c| c.set(0.0));
+        let (_, layout) = test_module(vec![Function::new([])]);
+        // A resume body that re-readies itself forever — the self-await
+        // bug class: each resume pushes the current task straight back
+        // onto the ready queue, so the poll loop never quiesces. Without
+        // the stall guard this spins at 100% CPU until killed (plan 116
+        // phase 2); with it, poll traps after STALL_GUARD_LIMIT resumes.
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::GlobalGet(layout.g_current));
+        body.instruction(&Instruction::Call(layout.resume_task));
+        body.instruction(&Instruction::Drop);
+        body.instruction(&Instruction::End);
+        let wasm = test_module(vec![body]).0;
+        let (mut store, inst) = instantiate(&wasm);
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .unwrap();
+        let err = start
+            .call(&mut store, ())
+            .expect_err("the stall guard should trap instead of spinning forever");
+        // The test layout wires no `__fai_trap_report` import, so the
+        // guard degrades to a bare `unreachable` — trapping at all (vs.
+        // hanging this test forever) is the assertion.
+        assert!(
+            format!("{:#}", err).contains("unreachable"),
+            "unexpected trap: {err:#}",
+        );
     }
 }

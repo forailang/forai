@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use wasmtime::*;
 
+mod debug_table;
 pub(crate) mod externs_section;
 mod heap;
 mod host;
 mod nan_box;
 pub mod output;
+mod post_mortem;
 mod print;
 
 pub use fai_ffi::FfiType;
@@ -27,6 +29,78 @@ pub use host::util::{ExternGuard, ExternInfo};
 fn shared_engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(Engine::default)
+}
+
+/// Engine with epoch interruption enabled, used only for watchdog runs
+/// (plan 116 phase 2). Separate from [`shared_engine`] so normal runs
+/// pay zero epoch-check overhead.
+fn watchdog_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        Engine::new(&config).expect("watchdog engine config is valid")
+    })
+}
+
+/// Per-run execution options.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunOptions {
+    /// Kill the run with a post-mortem dump (task table + heap stats)
+    /// if it hasn't completed after this many seconds. Converts the
+    /// worst failure mode — a silent 100%-CPU hang — into a report.
+    /// `None` = no watchdog (the default; servers legitimately run
+    /// forever). Armed by `fai run --watchdog [secs]` / `--debug`.
+    pub watchdog_secs: Option<u64>,
+}
+
+impl RunOptions {
+    /// Read options from the environment (`FAI_WATCHDOG=<secs>`), the
+    /// channel the CLI flags use so options survive the call chain
+    /// without threading parameters through every compile step.
+    pub fn from_env() -> Self {
+        Self {
+            watchdog_secs: std::env::var("FAI_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+        }
+    }
+}
+
+/// Background thread bumping the watchdog engine's epoch every 100ms
+/// while a watchdog run is in flight; stops (and joins) on drop. The
+/// store's epoch deadline is `secs * 10` ticks, so a guest stuck in a
+/// wasm loop traps ~`secs` seconds in.
+struct EpochTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: &Engine) -> Self {
+        let engine = engine.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                engine.increment_epoch();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Format a wasmtime error with its full cause chain. The alternate formatter
@@ -50,14 +124,38 @@ pub fn run_wasm(wasm_bytes: &[u8]) -> Result<(), String> {
     run_wasm_with_externs(wasm_bytes, externs)
 }
 
+/// [`run_wasm`] with explicit [`RunOptions`] (auto-discovered externs).
+pub fn run_wasm_opts(wasm_bytes: &[u8], opts: RunOptions) -> Result<(), String> {
+    let externs = externs_section::extract_externs(wasm_bytes);
+    run_wasm_with_externs_opts(wasm_bytes, externs, opts)
+}
+
 /// Same as [`run_wasm`], but populates the extern-function table the
 /// host's `call_ffi` import reads. Pass an empty `Vec` when the guest
 /// has no `extern` blocks. Guard is scoped to this call — the next
-/// run starts with a fresh table.
+/// run starts with a fresh table. Options come from the environment
+/// (`FAI_WATCHDOG`); use [`run_wasm_with_externs_opts`] to pass them
+/// explicitly.
 pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Result<(), String> {
+    run_wasm_with_externs_opts(wasm_bytes, externs, RunOptions::from_env())
+}
+
+/// Full-control variant of [`run_wasm_with_externs`].
+pub fn run_wasm_with_externs_opts(
+    wasm_bytes: &[u8],
+    externs: Vec<ExternInfo>,
+    opts: RunOptions,
+) -> Result<(), String> {
     let _extern_guard = ExternGuard::set(externs);
-    let engine = shared_engine();
+    let engine = if opts.watchdog_secs.is_some() {
+        watchdog_engine()
+    } else {
+        shared_engine()
+    };
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
+    // Debug side-table (plan 116): function index → name/file/line,
+    // used to decorate trap backtraces. Empty for pre-116 binaries.
+    let dbg = debug_table::DbgTable::from_wasm(wasm_bytes);
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
@@ -66,6 +164,35 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
     let instance = linker
         .instantiate(&mut store, &module)
         .map_err(|e| fmt_err("WASM instantiation error", e))?;
+
+    // Watchdog (plan 116 phase 2): a deadline of `secs` (in 100ms epoch
+    // ticks) plus a ticker thread converts a guest stuck inside wasm —
+    // the silent 100%-CPU hang — into an interrupt trap we can report.
+    let _ticker = opts.watchdog_secs.map(|secs| {
+        store.set_epoch_deadline(secs.saturating_mul(10));
+        EpochTicker::start(engine)
+    });
+
+    // Failure rendering: decorated backtrace + trap reason, then the
+    // post-mortem state dump (task table + heap stats).
+    let fail = |context: &str,
+                e: &wasmtime::Error,
+                store: &mut Store<()>|
+     -> String {
+        let mut trap_msg = host::take_trap_msg();
+        if trap_msg.is_none() && matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt)) {
+            trap_msg = Some(format!(
+                "watchdog: still running after {}s — interrupted",
+                opts.watchdog_secs.unwrap_or(0),
+            ));
+        }
+        let mut msg = dbg.render_trap(context, e, trap_msg);
+        if let Some(pm) = post_mortem::render(&instance, store, &dbg) {
+            msg.push('\n');
+            msg.push_str(&pm);
+        }
+        msg
+    };
 
     if let Some(start_async) = instance
         .get_typed_func::<(), i32>(&mut store, "_start_async")
@@ -78,14 +205,33 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
             .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
             .map_err(|e| fmt_err("missing __fai_task_result export", e))?;
 
-        let mut status = start_async
-            .call(&mut store, ())
-            .map_err(|e| fmt_err("WASM async start error", e))?;
+        let started = std::time::Instant::now();
+        let mut status = match start_async.call(&mut store, ()) {
+            Ok(s) => s,
+            Err(e) => return Err(fail("WASM async start error", &e, &mut store)),
+        };
         while status != 2 && status != 3 {
+            // Watchdog: poll keeps returning "working" but the program
+            // never completes (e.g. a task forever WAITING on a child
+            // that never finishes). Dump state and bail.
+            if let Some(secs) = opts.watchdog_secs {
+                if started.elapsed() >= Duration::from_secs(secs) {
+                    let mut msg = format!(
+                        "WASM watchdog: no completion after {}s — killing the run",
+                        secs,
+                    );
+                    if let Some(pm) = post_mortem::render(&instance, &mut store, &dbg) {
+                        msg.push('\n');
+                        msg.push_str(&pm);
+                    }
+                    return Err(msg);
+                }
+            }
             std::thread::sleep(Duration::from_millis(1));
-            status = poll
-                .call(&mut store, ())
-                .map_err(|e| fmt_err("WASM async poll error", e))?;
+            status = match poll.call(&mut store, ()) {
+                Ok(s) => s,
+                Err(e) => return Err(fail("WASM async poll error", &e, &mut store)),
+            };
         }
         if status == 3 {
             let result = task_result
@@ -108,9 +254,10 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
         .get_typed_func::<(), i64>(&mut store, "_start")
         .map_err(|e| fmt_err("missing _start export", e))?;
 
-    let result = start
-        .call(&mut store, ())
-        .map_err(|e| fmt_err("WASM execution error", e))?;
+    let result = match start.call(&mut store, ()) {
+        Ok(r) => r,
+        Err(e) => return Err(fail("WASM execution error", &e, &mut store)),
+    };
 
     print::print_return_value(result, &instance, &mut store);
 

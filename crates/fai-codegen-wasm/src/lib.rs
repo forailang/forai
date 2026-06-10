@@ -15,9 +15,17 @@ pub mod async_engine;
 mod async_emit_spec;
 pub mod async_runtime;
 mod async_wait_codegen;
+pub mod debug_info;
 pub mod direct;
 mod program;
 mod runtime;
+
+// Trap-report codes (plan 116): shared with the CLI runner, which
+// renders them into readable trap reasons.
+pub use runtime::{
+    TRAP_FORCE_UNWRAP_NULL, TRAP_OOM, TRAP_RC_OVER_RELEASE, TRAP_RC_RELEASE_POISON,
+    TRAP_RC_RETAIN_POISON, TRAP_SCHED_STALL, TRAP_TASK_OVERFLOW, TRAP_UNCAUGHT_ERROR,
+};
 
 /// Try compiling `ast` through the direct AST→wasm builder in one
 /// shot. Returns `Some(wasm)` on success; `None` is an internal
@@ -157,15 +165,35 @@ pub fn codegen_direct_full_reasoned(
     target: Option<&str>,
     is_test: bool,
 ) -> Result<Vec<u8>, LocatedBuildError> {
+    codegen_direct_full_reasoned_with_entry_file(ast, modules, checker, target, is_test, None)
+}
+
+/// Same as [`codegen_direct_full_reasoned`] but also records
+/// `entry_file` (the entry source path) in the debug side-table so
+/// trap backtraces show `main (main.fai:3)` rather than `main (line 3)`
+/// for entry-AST functions. Plan 116.
+pub fn codegen_direct_full_reasoned_with_entry_file(
+    ast: &fai_compiler::ast::Program,
+    modules: &[fai_compiler::compiler::DiscoveredModule],
+    checker: &direct::CheckerInfo,
+    target: Option<&str>,
+    is_test: bool,
+    entry_file: Option<&str>,
+) -> Result<Vec<u8>, LocatedBuildError> {
     let async_analysis = async_analysis::analyze(ast, modules);
     // Real async engine (R2+): handles the shapes it supports through the
     // guest scheduler + resumable lowering. Only runs for non-test builds
     // for now; unsupported shapes return None and fall through to the
     // facade below.
     if !is_test {
-        if let Some(wasm) =
-            direct::try_codegen_async_engine(ast, modules, checker, target, &async_analysis)
-        {
+        if let Some(wasm) = direct::try_codegen_async_engine(
+            ast,
+            modules,
+            checker,
+            target,
+            &async_analysis,
+            entry_file,
+        ) {
             return Ok(wasm);
         }
     }
@@ -191,6 +219,7 @@ pub fn codegen_direct_full_reasoned(
         &type_indices,
         &import_remap,
         is_test,
+        entry_file,
     )
     .map_err(|err| direct::locate_build_error(err, ast, modules))?;
     Ok(direct::assemble_wasm_module_with_test_flag(

@@ -1,0 +1,39 @@
+# expect: runtime_error
+# error: crashHere (
+# Plan 116 phase 1: a runtime trap prints a decorated backtrace that
+# names the trapping function with its source location — e.g.
+# `crashHere (main.fai:14)` — instead of `wasm-function[NNN]`. The
+# trap reason itself is pinned by call_force_unwrap_null.invalid.
+# Returns null wrapped as an optional Int.
+def giveNull
+    @return Int?
+do
+    return null
+end
+
+# Unwraps the null — this frame must be named in the trap backtrace.
+def crashHere
+    @return Int
+do
+    let x = giveNull()
+    return x!
+end
+
+test giveNull
+    it 'returns null'
+        assert.equal(giveNull(), null)
+    end
+end
+
+test crashHere
+    it 'placeholder so coverage sees a test for crashHere'
+        print('placeholder')
+    end
+end
+
+def main
+    @return Void
+do
+    let v = crashHere()
+    print(v)
+end

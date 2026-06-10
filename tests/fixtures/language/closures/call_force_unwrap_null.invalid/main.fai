@@ -1,5 +1,5 @@
 # expect: runtime_error
-# error: unreachable
+# error: force-unwrap
 
 type def Callback
     @return Void

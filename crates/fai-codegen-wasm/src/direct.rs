@@ -33,6 +33,7 @@ use crate::runtime::{
     IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START, IMPORT_PROCESS_STOP,
     IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM, IMPORT_READ_FILE,
     IMPORT_REMOTE_CALL, IMPORT_SET_HTML, IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN,
+    IMPORT_TRAP_REPORT,
     IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET,
     IMPORT_TCP_ACCEPT, IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN,
     IMPORT_TCP_READ, IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_UDP_BIND, IMPORT_UDP_BROADCAST,
@@ -1832,6 +1833,7 @@ pub fn build_program_with_modules(
         fai_func_type_indices,
         import_remap,
         false,
+        None,
     )
 }
 
@@ -1839,6 +1841,12 @@ pub fn build_program_with_modules(
 /// wrapper functions when `is_test` is true. The module assembler
 /// reads `BuiltProgram.test_cases` to emit a `_fai_run_test`
 /// dispatcher keyed on `(suite_idx, case_idx)`.
+///
+/// `entry_file` is the path of the entry source file, used only for
+/// the debug side-table (plan 116) — entry-AST functions have no
+/// per-decl file path the way module functions do, so trap backtraces
+/// would otherwise show `main (line 3)` instead of `main (main.fai:3)`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_program_full(
     ast: &fai_compiler::ast::Program,
     modules: &[fai_compiler::compiler::DiscoveredModule],
@@ -1847,6 +1855,7 @@ pub fn build_program_full(
     fai_func_type_indices: &HashMap<u16, u32>,
     import_remap: &[Option<u32>],
     is_test: bool,
+    entry_file: Option<&str>,
 ) -> Result<BuiltProgram, BuildError> {
     // Reject canonical module-name collisions up front. A local
     // `src/Forui/` directory and a dependency package also named
@@ -2335,8 +2344,19 @@ pub fn build_program_full(
 
     let infos: Vec<FunctionInfo> = decls
         .iter()
-        .map(|(fd, _, _)| FunctionInfo {
+        .map(|(fd, ctx_mod, ctx_file)| FunctionInfo {
             name: fd.name.clone(),
+            // Module functions carry their own file; entry-AST functions
+            // (no module context, real location) fall back to the entry
+            // file. Synthesised wrappers (line 0) stay file-less.
+            source_file: ctx_file.clone().or_else(|| {
+                if ctx_mod.is_none() && fd.location.line > 0 {
+                    entry_file.map(String::from)
+                } else {
+                    None
+                }
+            }),
+            source_line: fd.location.line,
             param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
             type_param_count: fd.type_params.len() as u16,
             include_in_coverage: fd.name != "main",
@@ -2455,6 +2475,8 @@ pub fn build_program_full(
                     type_param_count: 0,
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
+                    source_line: wrapper.location.line,
+                    ..Default::default()
                 };
                 let result = build_function_with_spy_and_offset(
                     &wrapper,
@@ -2521,6 +2543,8 @@ pub fn build_program_full(
                     type_param_count: 0,
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
+                    source_line: wrapper.location.line,
+                    ..Default::default()
                 };
                 let result = build_function_with_spy_and_offset(
                     &wrapper,
@@ -2578,6 +2602,8 @@ pub fn build_program_full(
                     type_param_count: 0,
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
+                    source_line: wrapper.location.line,
+                    ..Default::default()
                 };
                 let result = build_function_with_spy_and_offset(
                     &wrapper,
@@ -3314,6 +3340,12 @@ pub fn assemble_wasm_module_with_test_flag(
         ExportKind::Global,
         5 + program.module_var_count,
     );
+    // Heap overflow free-list head — post-mortem heap stats walk it.
+    exports.export(
+        "__free_list",
+        ExportKind::Global,
+        4 + program.module_var_count,
+    );
     exports.export("__env_ptr", ExportKind::Global, 1);
     exports.export("__error_flag", ExportKind::Global, GLOBAL_ERROR_FLAG);
     exports.export("__error_value", ExportKind::Global, GLOBAL_ERROR_VALUE);
@@ -3407,6 +3439,50 @@ pub fn assemble_wasm_module_with_test_flag(
         data.active(0, &ConstExpr::i32_const(0), extended.iter().copied());
         module.section(&data);
     }
+
+    // ── debug metadata (plan 116): name section + fai-dbg table ──
+    let mut dbg: Vec<crate::debug_info::FnDebugEntry> = Vec::new();
+    for (i, (name, _, _)) in import_sigs.iter().enumerate() {
+        if let Some(idx) = import_remap.get(i).copied().flatten() {
+            dbg.push(crate::debug_info::FnDebugEntry::unlocated(idx, *name));
+        }
+    }
+    for (k, n) in crate::runtime::rt_fn_names().iter().enumerate() {
+        dbg.push(crate::debug_info::FnDebugEntry::unlocated(
+            actual_import_count + k as u32,
+            *n,
+        ));
+    }
+    for (i, (info, _)) in program.functions.iter().enumerate() {
+        dbg.push(crate::debug_info::FnDebugEntry {
+            index: top_level_base + i as u32,
+            name: info.name.clone(),
+            file: info.source_file.clone(),
+            line: info.source_line,
+        });
+    }
+    for (i, c) in program.closures.iter().enumerate() {
+        dbg.push(crate::debug_info::FnDebugEntry {
+            index: closure_base + i as u32,
+            name: c.info.name.clone(),
+            file: c.info.source_file.clone(),
+            line: c.info.source_line,
+        });
+    }
+    if test_runner_type_idx.is_some() {
+        dbg.push(crate::debug_info::FnDebugEntry::unlocated(
+            test_runner_func_idx,
+            "_fai_run_test",
+        ));
+    }
+    crate::debug_info::append_debug_sections(
+        &mut module,
+        &dbg,
+        &crate::debug_info::DbgMeta {
+            bucket_base: Some(bucket_base),
+            bucket_count: crate::runtime::NUM_FREE_BUCKETS,
+        },
+    );
 
     module.finish()
 }
@@ -6169,6 +6245,7 @@ pub fn try_codegen_async_engine(
     checker: &CheckerInfo,
     target: Option<&str>,
     analysis: &crate::async_analysis::AsyncAnalysis,
+    entry_file: Option<&str>,
 ) -> Option<Vec<u8>> {
     use crate::async_engine::{self, SchedLayout};
     use crate::runtime::{self, IMPORT_NOW_MS, RT_ALLOC, RT_COUNT, RT_FREE};
@@ -6599,6 +6676,10 @@ pub fn try_codegen_async_engine(
         } else {
             None
         },
+        trap_report: import_remap
+            .get(crate::runtime::IMPORT_TRAP_REPORT as usize)
+            .copied()
+            .flatten(),
     };
     let start_async_idx = sb + 8;
 
@@ -6694,6 +6775,14 @@ pub fn try_codegen_async_engine(
             type_param_count: fd.type_params.len() as u16,
             include_in_coverage: false,
             param_defaults: param_defaults_for(fd),
+            // Same fallback policy as `build_program_full`: entry-AST
+            // functions (no module context) get the entry file.
+            source_file: match fn_ctx.get(&fd.name) {
+                Some((_, Some(f))) => Some(f.clone()),
+                Some((None, None)) if fd.location.line > 0 => entry_file.map(String::from),
+                _ => None,
+            },
+            source_line: fd.location.line,
         })
         .collect();
     let ctx = BuildContext {
@@ -6986,6 +7075,11 @@ pub fn try_codegen_async_engine(
     globals.global(i32mut, &ConstExpr::i32_const(0));
     module.section(&globals);
 
+    // Heap free-list / live-count globals, appended after fixed+sched+
+    // module-var globals (also referenced by the export section below).
+    let freelist_global = 12 + module_var_count;
+    let live_count_global = freelist_global + 1;
+
     let mut exports = ExportSection::new();
     exports.export("_start_async", ExportKind::Func, start_async_idx);
     exports.export("__fai_poll", ExportKind::Func, sb + 7);
@@ -7026,15 +7120,21 @@ pub fn try_codegen_async_engine(
     exports.export("__error_flag", ExportKind::Global, GLOBAL_ERROR_FLAG);
     exports.export("__error_value", ExportKind::Global, GLOBAL_ERROR_VALUE);
     exports.export("__indirect_function_table", ExportKind::Table, 0);
+    // Scheduler-introspection globals (plan 116 phase 2): always exported
+    // so the runner's post-mortem dump can walk the task table on a trap
+    // or watchdog timeout without a special debug build.
+    exports.export("__dbg_count", ExportKind::Global, layout.g_count);
+    exports.export("__dbg_root", ExportKind::Global, layout.g_root);
+    exports.export("__dbg_live", ExportKind::Global, layout.g_live);
+    exports.export("__dbg_current", ExportKind::Global, layout.g_current);
+    exports.export("__dbg_table_base", ExportKind::Global, layout.g_table_base);
+    exports.export("__dbg_free_head", ExportKind::Global, layout.g_free_head);
+    exports.export("__dbg_head", ExportKind::Global, layout.g_head);
+    exports.export("__dbg_tail", ExportKind::Global, layout.g_tail);
+    // Heap overflow free-list head (blocks too large for the size
+    // buckets) — the post-mortem heap stats walk it.
+    exports.export("__free_list", ExportKind::Global, freelist_global);
     if std::env::var("FAI_ASYNC_DEBUG").is_ok() {
-        exports.export("__dbg_count", ExportKind::Global, layout.g_count);
-        exports.export("__dbg_root", ExportKind::Global, layout.g_root);
-        exports.export("__dbg_live", ExportKind::Global, layout.g_live);
-        exports.export("__dbg_current", ExportKind::Global, layout.g_current);
-        exports.export("__dbg_table_base", ExportKind::Global, layout.g_table_base);
-        exports.export("__dbg_free_head", ExportKind::Global, layout.g_free_head);
-        exports.export("__dbg_head", ExportKind::Global, layout.g_head);
-        exports.export("__dbg_tail", ExportKind::Global, layout.g_tail);
         // TEMP brain: nextSignalId=g16, registeredSignals=g18, routerPathSignal=g28
         if module_var_count > 17 {
             exports.export("__dbg_g16", ExportKind::Global, 16);
@@ -7065,8 +7165,6 @@ pub fn try_codegen_async_engine(
     module.section(&elements);
 
     let mut code = CodeSection::new();
-    let freelist_global = 12 + module_var_count; // appended after fixed+sched+module-var globals
-    let live_count_global = freelist_global + 1;
     for f in runtime::emit_all(
         actual_import_count,
         &import_remap,
@@ -7094,6 +7192,76 @@ pub fn try_codegen_async_engine(
         data.active(0, &ConstExpr::i32_const(0), extended.iter().copied());
         module.section(&data);
     }
+
+    // ── debug metadata (plan 116): name section + fai-dbg table ──
+    let mut dbg: Vec<crate::debug_info::FnDebugEntry> = Vec::new();
+    for (i, (name, _, _)) in import_sigs.iter().enumerate() {
+        if let Some(idx) = import_remap.get(i).copied().flatten() {
+            dbg.push(crate::debug_info::FnDebugEntry::unlocated(idx, *name));
+        }
+    }
+    for (k, n) in runtime::rt_fn_names().iter().enumerate() {
+        dbg.push(crate::debug_info::FnDebugEntry::unlocated(
+            actual_import_count + k as u32,
+            *n,
+        ));
+    }
+    for (proto, fd) in ordered.iter().enumerate() {
+        let info = &infos[proto];
+        let name = if async_set.contains(&fd.name) {
+            format!("{}#resume", fd.name)
+        } else {
+            fd.name.clone()
+        };
+        dbg.push(crate::debug_info::FnDebugEntry {
+            index: user_fn_base + proto as u32,
+            name,
+            file: info.source_file.clone(),
+            line: info.source_line,
+        });
+    }
+    // Scheduler helpers, in `emit_scheduler_functions` order.
+    for (k, n) in [
+        "sched_ready_push",
+        "sched_ready_pop",
+        "sched_spawn",
+        "sched_complete",
+        "sched_fail",
+        "sched_sleep",
+        "sched_notify_waiter",
+        "sched_poll",
+        "sched_start_async",
+        "sched_resume_task",
+        "sched_task_result",
+        "sched_await",
+        "sched_drive_closure",
+    ]
+    .iter()
+    .enumerate()
+    {
+        dbg.push(crate::debug_info::FnDebugEntry::unlocated(sb + k as u32, *n));
+    }
+    for (i, c) in async_closures.iter().chain(sync_closures.iter()).enumerate() {
+        let name = if c.is_async {
+            format!("{}#resume", c.info.name)
+        } else {
+            c.info.name.clone()
+        };
+        dbg.push(crate::debug_info::FnDebugEntry {
+            index: closure_base + i as u32,
+            name,
+            file: c.info.source_file.clone(),
+            line: c.info.source_line,
+        });
+    }
+    crate::debug_info::append_debug_sections(
+        &mut module,
+        &dbg,
+        &crate::debug_info::DbgMeta {
+            bucket_base: Some(bucket_base),
+            bucket_count: runtime::NUM_FREE_BUCKETS,
+        },
+    );
 
     if std::env::var("FAI_ASYNC_DEBUG").is_ok() {
         for (proto, fd) in ordered.iter().enumerate() {
@@ -8313,7 +8481,12 @@ impl<'a, 'c> Builder<'a, 'c> {
             // with `error_flag` still set; trap instead so an
             // uncaught throw terminates the program (the pre-fix
             // behaviour from before cross-function throw landed).
-            // See forai#4.
+            // See forai#4. Report the error value first so the trap
+            // names it (plan 116).
+            self.emit(Instruction::I32Const(crate::runtime::TRAP_UNCAUGHT_ERROR));
+            self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
+            self.emit(Instruction::I64Const(0));
+            self.emit_import_call(IMPORT_TRAP_REPORT);
             self.emit(Instruction::Unreachable);
         } else {
             // Push the saved result and return — it's a placeholder
@@ -11366,11 +11539,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
-    /// `x!` — force-unwrap. On `null`, trap via `unreachable`; any
-    /// other value flows through unchanged. The trap deliberately
-    /// doesn't set a custom message — matches translate.rs's
-    /// simplest unwrap path. Callers relying on a specific error
-    /// message should use `unwrap(x, fallback)` instead.
+    /// `x!` — force-unwrap. On `null`, report a "force-unwrap of
+    /// null" trap reason and trap via `unreachable`; any other value
+    /// flows through unchanged. Callers wanting a recoverable path
+    /// should use `unwrap(x, fallback)` instead.
     fn compile_force_unwrap(&mut self, inner: &Expression) -> Result<(), BuildError> {
         self.compile_expr(inner)?;
         let tmp = self.alloc_local();
@@ -11379,6 +11551,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I64Const(VAL_NULL));
         self.emit(Instruction::I64Eq);
         self.emit_open(Instruction::If(BlockType::Empty));
+        self.emit(Instruction::I32Const(crate::runtime::TRAP_FORCE_UNWRAP_NULL));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Const(0));
+        self.emit_import_call(IMPORT_TRAP_REPORT);
         self.emit(Instruction::Unreachable);
         self.emit_close();
         self.emit(Instruction::LocalGet(tmp));
@@ -12867,6 +13043,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 type_param_count: fd.type_params.len() as u16,
                 include_in_coverage: false,
                 param_defaults: param_defaults_for(fd),
+                source_line: fd.location.line,
+                ..Default::default()
             },
             function: inner_fn,
             proto_index: table_idx,
@@ -13525,6 +13703,7 @@ mod tests {
             type_param_count: main.type_params.len() as u16,
             include_in_coverage: false,
             param_defaults: param_defaults_for(&main),
+            ..Default::default()
         }];
         let type_indices = build_fai_type_indices();
         let module_aliases = HashMap::new();
@@ -14132,6 +14311,8 @@ mod tests {
                 type_param_count: fd.type_params.len() as u16,
                 include_in_coverage: fd.name != "main",
                 param_defaults: param_defaults_for(fd),
+                source_line: fd.location.line,
+                ..Default::default()
             })
             .collect();
         let rt = RtOffsets {
@@ -14472,6 +14653,42 @@ mod tests {
             module.section(&data);
         }
 
+        // ── debug metadata (plan 116): name section + fai-dbg table ──
+        let mut dbg: Vec<crate::debug_info::FnDebugEntry> = Vec::new();
+        for (i, (name, _, _)) in import_sigs.iter().enumerate() {
+            dbg.push(crate::debug_info::FnDebugEntry::unlocated(i as u32, *name));
+        }
+        for (k, n) in runtime::rt_fn_names().iter().enumerate() {
+            dbg.push(crate::debug_info::FnDebugEntry::unlocated(
+                import_count + k as u32,
+                *n,
+            ));
+        }
+        for (i, (info, _)) in program.top_level.iter().enumerate() {
+            dbg.push(crate::debug_info::FnDebugEntry {
+                index: top_level_base + i as u32,
+                name: info.name.clone(),
+                file: info.source_file.clone(),
+                line: info.source_line,
+            });
+        }
+        for (i, c) in program.closures.iter().enumerate() {
+            dbg.push(crate::debug_info::FnDebugEntry {
+                index: closure_base + i as u32,
+                name: c.info.name.clone(),
+                file: c.info.source_file.clone(),
+                line: c.info.source_line,
+            });
+        }
+        crate::debug_info::append_debug_sections(
+            &mut module,
+            &dbg,
+            &crate::debug_info::DbgMeta {
+                bucket_base: Some(bucket_base),
+                bucket_count: runtime::NUM_FREE_BUCKETS,
+            },
+        );
+
         module.finish()
     }
 
@@ -14487,6 +14704,7 @@ mod tests {
                     type_param_count: 0,
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
+                    ..Default::default()
                 },
                 main_fn,
             )],
@@ -15347,6 +15565,7 @@ mod tests {
                     type_param_count: fd.type_params.len() as u16,
                     include_in_coverage: fd.name != "main",
                     param_defaults: param_defaults_for(fd),
+                    ..Default::default()
                 });
                 if fd.name == "main" {
                     main = Some(fd.clone());
@@ -16118,6 +16337,7 @@ mod tests {
             type_param_count: 0,
             include_in_coverage: false,
             param_defaults: Vec::new(),
+            ..Default::default()
         };
         build_function(
             &main,
@@ -20544,6 +20764,7 @@ mod tests {
             &type_indices,
             &import_remap,
             false,
+            None,
         )
     }
 

@@ -111,6 +111,9 @@ fn print_usage() {
     eprintln!("  -p, --project <name>    Select a project in a workspace");
     eprintln!("  build --html            Emit browser HTML runtime with wasm output");
     eprintln!("  build -o <path>         Write build output to a specific path");
+    eprintln!("  run --watchdog[=secs]   Kill a hung run after secs (default 10) with a");
+    eprintln!("                          post-mortem dump (task table + heap stats)");
+    eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
     eprintln!();
     eprintln!("Shorthand:");
     eprintln!("  forai <file.fai>        Same as 'forai run <file.fai>'");
@@ -727,12 +730,13 @@ fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
     };
-    let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned(
+    let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
         &prepared.modules,
         &info,
         None,
         true,
+        Some(&src_path_str),
     ) {
         Ok(w) => w,
         Err(e) => {
@@ -1026,12 +1030,13 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
     };
-    let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned(
+    let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
         &prepared.modules,
         &info,
         None,
         true,
+        Some(path),
     ) {
         Ok(w) => w,
         Err(e) => {
@@ -1138,6 +1143,24 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
     // the top of `positional` still skips it.
     let _use_wasm = args.iter().any(|a| a == "--wasm");
 
+    // Plan 116 phase 2: `--watchdog[=secs]` / `--debug` arm the hang
+    // watchdog — if the program hasn't completed after the deadline,
+    // the runner interrupts it and prints a post-mortem dump (async
+    // task table + heap stats). Equals-form only: positional-arg
+    // detection above treats a bare value after `--watchdog` as a
+    // target name. `FAI_WATCHDOG=<secs>` works as an env fallback.
+    let watchdog_secs = args
+        .iter()
+        .find_map(|a| {
+            if a == "--watchdog" || a == "--debug" {
+                Some(10)
+            } else {
+                a.strip_prefix("--watchdog=").and_then(|v| v.parse().ok())
+            }
+        })
+        .or(wasm_runner::RunOptions::from_env().watchdog_secs);
+    let run_opts = wasm_runner::RunOptions { watchdog_secs };
+
     // Check if the first positional arg is a target name or a file path.
     // If no positional arg, try project-based resolution from cwd.
     let positional: Vec<&str> = args
@@ -1185,7 +1208,7 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = wasm_runner::run_wasm(&wasm_bytes) {
+        if let Err(e) = wasm_runner::run_wasm_opts(&wasm_bytes, run_opts) {
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -1243,7 +1266,7 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
         None,
     );
     let externs = extract_extern_info_full(&content, &path, synthetic_modules);
-    if let Err(e) = wasm_runner::run_wasm_with_externs(&wasm_bytes, externs) {
+    if let Err(e) = wasm_runner::run_wasm_with_externs_opts(&wasm_bytes, externs, run_opts) {
         reporter.error_line(&e);
         reporter.step(StepStatus::Fail, "run", "runtime error");
         std::process::exit(1);
@@ -1671,6 +1694,17 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
             reporter.step(StepStatus::Fail, "build", "write error");
             std::process::exit(1);
         }
+    }
+
+    // Plan 116: extract the `fai-dbg` debug side-table (function index →
+    // name/file/line) to `<out>.dbg.json` next to the wasm, so external
+    // tools (browser harnesses, profilers) can map trap frames to source
+    // without parsing the binary. The same data stays embedded in the
+    // wasm for the native runner. Best-effort: a write failure is not a
+    // build failure.
+    if let Some(dbg_json) = extract_dbg_section(&wasm_bytes) {
+        let dbg_path = format!("{}.dbg.json", output_path.trim_end_matches(".wasm"));
+        let _ = std::fs::write(&dbg_path, dbg_json);
     }
 
     // Plan 101: If the target graph has remote functions/types, write
@@ -3409,7 +3443,9 @@ const env = {{
   event_clear_all(){{}},
   event_emit_deferred(){{}},
   event_drain(){{}},
-  event_queue_len(){{return 0}}
+  event_queue_len(){{return 0}},
+  __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
+  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}}
 }};
 let instance;
 let asyncRootDone = false;
@@ -3556,7 +3592,9 @@ const env={{
   event_clear_all(){{}},
   event_emit_deferred(){{}},
   event_drain(){{}},
-  event_queue_len(){{return 0}}
+  event_queue_len(){{return 0}},
+  __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
+  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
@@ -3713,6 +3751,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-seri
 "#.to_string()
 }
 
+/// Pull the raw `fai-dbg` custom-section payload (JSON) out of a wasm
+/// binary, if present. See `fai-codegen-wasm/src/debug_info.rs` for the
+/// shape. Returns `None` for pre-plan-116 binaries.
+fn extract_dbg_section(wasm: &[u8]) -> Option<Vec<u8>> {
+    use wasmparser::{Parser, Payload};
+    for payload in Parser::new(0).parse_all(wasm) {
+        if let Ok(Payload::CustomSection(reader)) = payload {
+            if reader.name() == fai_codegen_wasm::debug_info::DBG_SECTION_NAME {
+                return Some(reader.data().to_vec());
+            }
+        }
+    }
+    None
+}
+
 fn generate_runtime_js(wasm_filename: &str) -> String {
     format!(
         r#"const app=document.getElementById('app'),output=document.getElementById('output');
@@ -3856,7 +3909,27 @@ var env={{
   cli_write_line:function(p,l){{output.style.display='block';output.textContent+=readStr(p,l)+'\n'}},
   cli_clear:function(){{output.textContent=''}},
   cli_move_to:function(){{}},
-  __fai_set_trap_msg:function(p,l){{console.error(readStr(p,l))}}
+  __fai_set_trap_msg:function(p,l){{var m=readStr(p,l);window.__FAI_TRAP_MSG=m;console.error('FAI trap:',m)}},
+  __fai_trap_report:function(code,a,b){{
+    // Plan 116: structured trap reason, mirrored from the native host
+    // (wasm_runner/host/io.rs::format_trap_report). Logged before the
+    // guest executes `unreachable`, so the reason survives the trap.
+    function describeVal(v){{try{{var s=readNanBoxedStr(v);if(s)return 'String "'+s.slice(0,40)+'"';var j=wasmToJs(v);return j===null?'null':(typeof j==='object'?JSON.stringify(j).slice(0,80):String(j))}}catch(e){{return '<value 0x'+BigInt.asUintN(64,BigInt(v)).toString(16)+'>'}}}}
+    function addrOf(v){{return '0x'+(BigInt.asUintN(64,BigInt(v))&0x0000FFFFFFFFFFFFn).toString(16)}}
+    var msg;
+    switch(code){{
+      case 1: msg='rc-check: retain of freed object at '+addrOf(a); break;
+      case 2: msg='rc-check: release of freed object at '+addrOf(a); break;
+      case 3: msg='rc-check: over-release (rc '+b+') of '+describeVal(a)+' at '+addrOf(a); break;
+      case 4: msg='out of memory: failed to grow linear memory ('+a+' bytes requested, heap needs 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
+      case 5: msg='async task table full ('+a+' of '+b+' slots used)'; break;
+      case 6: msg='force-unwrap (`!`) of null'; break;
+      case 7: msg='uncaught error: '+describeVal(a); break;
+      case 8: msg='scheduler stall: poll resumed '+a+' tasks without quiescing (livelock; task t'+b+' was about to run again)'; break;
+      default: msg='trap report (code '+code+', a=0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+', b=0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')';
+    }}
+    window.__FAI_TRAP_MSG=msg;console.error('FAI trap:',msg);
+  }}
 }};
 fetch('/{}').then(function(r){{return r.arrayBuffer()}}).then(function(b){{return WebAssembly.instantiate(b,{{env:env}})}}).then(function(r){{
   instance=r.instance;window.__fai_dbg=r.instance;startFai();
@@ -5267,12 +5340,13 @@ fn compile_fai_to_wasm(
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
     };
-    match fai_codegen_wasm::codegen_direct_full_reasoned(
+    match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
         &prepared.modules,
         &info,
         target,
         is_test,
+        Some(path),
     ) {
         Ok(wasm) => wasm,
         Err(e) => {
@@ -5984,6 +6058,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── Plan 116 phase 2: watchdog + post-mortem dump ──
+
+    /// Compile a source string written to `<temp>/main.fai`.
+    fn compile_snippet(tag: &str, src: &str) -> Vec<u8> {
+        let dir = temp_dir(tag);
+        let path = dir.join("main.fai");
+        std::fs::write(&path, src).unwrap();
+        compile_fai_to_wasm(src, path.to_str().unwrap(), false, Vec::new(), None, None)
+    }
+
+    #[test]
+    fn watchdog_dump_names_the_waiting_tasks() {
+        // `main` awaits `never`, which parks on a 60s timer in a loop —
+        // the run can't complete. The watchdog must kill it and the
+        // post-mortem dump must name the parked task and its waiter.
+        let wasm = compile_snippet(
+            "watchdog_dump",
+            concat!(
+                "# Parks forever: sleeps in a loop and never returns.\n",
+                "def never\n",
+                "    @return Int\n",
+                "do\n",
+                "    while true\n",
+                "        sleep(60000)\n",
+                "    end\n",
+                "    return 1\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    let x = never()\n",
+                "    print(x)\n",
+                "end\n",
+            ),
+        );
+        let err = wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions {
+                watchdog_secs: Some(1),
+            },
+        )
+        .expect_err("watchdog should kill the parked program");
+        // Two watchdog paths can fire first: the elapsed check between
+        // polls ("no completion after Ns") or the epoch interrupt
+        // landing mid-poll ("still running after Ns — interrupted").
+        // Either way the dump must name the parked task and its waiter.
+        assert!(err.contains("watchdog"), "{err}");
+        assert!(err.contains("never#resume"), "{err}");
+        assert!(err.contains("WAITING"), "{err}");
+        assert!(err.contains("t1"), "{err}");
+    }
+
+    #[test]
+    fn watchdog_interrupts_a_sync_infinite_loop() {
+        // A sync `while true` never reaches a host call, so only epoch
+        // interruption can break it. The report carries the watchdog
+        // reason plus the post-mortem heap stats.
+        let wasm = compile_snippet(
+            "watchdog_spin",
+            concat!(
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    var i = 0\n",
+                "    while true\n",
+                "        i = i + 1\n",
+                "        if i > 1000000\n",
+                "            i = 0\n",
+                "        end\n",
+                "    end\n",
+                "end\n",
+            ),
+        );
+        let err = wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions {
+                watchdog_secs: Some(1),
+            },
+        )
+        .expect_err("watchdog should interrupt the spinning program");
+        assert!(
+            err.contains("watchdog: still running after 1s — interrupted"),
+            "{err}",
+        );
+        assert!(err.contains("post-mortem:"), "{err}");
+    }
+
+    #[test]
+    fn trap_in_async_run_includes_post_mortem_task_table() {
+        // A trap inside an async program appends the task-table dump to
+        // the decorated backtrace — no watchdog involved.
+        let wasm = compile_snippet(
+            "trap_post_mortem",
+            concat!(
+                "# Sleeps then unwraps null.\n",
+                "def crashLater\n",
+                "    @return Int\n",
+                "do\n",
+                "    var x Int? = null\n",
+                "    return x!\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    sleep(5)\n",
+                "    let v = crashLater()\n",
+                "    print(v)\n",
+                "end\n",
+            ),
+        );
+        let err = wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions::default(),
+        )
+        .expect_err("force-unwrap of null should trap");
+        assert!(err.contains("force-unwrap"), "{err}");
+        // The frame carries the (temp-dir-qualified) file and line.
+        assert!(err.contains("crashLater ("), "{err}");
+        assert!(err.contains("main.fai:"), "{err}");
+        assert!(err.contains("post-mortem:"), "{err}");
+        assert!(err.contains("main#resume"), "{err}");
     }
 
     /// Shared mutex for tests that call `set_current_dir` — CWD is
