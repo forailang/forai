@@ -85,6 +85,30 @@ pub(crate) fn reserve(caller: &mut Caller<'_, ()>, mem: &Memory, logical_size: u
     logical
 }
 
+/// Release a guest object the host owns, via the exported `__fai_release`
+/// (→ `rt_release`: refcount decrement, deep-free at zero). The host calls
+/// this on per-request graphs it built (request/response/event dicts) once
+/// it's done with them. A missing export is loud — silently skipping it is
+/// how sync-built servers leaked their whole request graph (plan 116).
+pub(crate) fn host_release_value(caller: &mut Caller<'_, ()>, val: i64) {
+    match caller
+        .get_export("__fai_release")
+        .and_then(|e| e.into_func())
+    {
+        Some(f) => {
+            if let Err(e) = f.call(&mut *caller, &[wasmtime::Val::I64(val)], &mut []) {
+                crate::wasm_runner::output::stderr_line(&format!(
+                    "[host-release] release call failed: {:#}",
+                    e
+                ));
+            }
+        }
+        None => crate::wasm_runner::output::stderr_line(
+            "[host-release] __fai_release export missing — host-built objects will leak",
+        ),
+    }
+}
+
 /// Bump the refcount prefix of `v` if it is a heap object (RC, plan 113 R1).
 /// Host-side mirror of the guest `rt_retain`: the count lives in the 8-byte
 /// prefix at `addr-8`. Primitive (non-object) NaN-box values carry no count and

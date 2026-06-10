@@ -197,13 +197,22 @@ pub(super) fn dispatch_event(caller: &mut Caller<'_, ()>, name: &str, data_val: 
     if snapshot.is_empty() {
         return;
     }
+    // The Event dict is HOST-owned for the duration of the dispatch:
+    // `build_event` retains `data_val` (the dict co-owns it alongside the
+    // caller), so releasing the event afterwards frees the wrapper plus its
+    // key/name strings and returns `data_val` to the caller's ref. Without
+    // this release every dispatch leaked one Event dict — two per request
+    // on a server with beforeRequest/afterResponse subscribers (plan 116).
+    // A subscriber that stashed the event keeps it alive via its own
+    // retain. On a subscriber error we stop dispatching but still release.
     let event_val = build_event(caller, name, data_val);
     for sub in &snapshot {
         invoke_handler(caller, sub.closure_val, event_val);
         if get_error_flag(caller) != 0 {
-            return;
+            break;
         }
     }
+    super::super::heap::host_release_value(caller, event_val);
 }
 
 /// Drain every queued deferred event in FIFO order. Subscribers can
@@ -226,6 +235,9 @@ pub(super) fn drain_queue(caller: &mut Caller<'_, ()>) {
     set_draining(true);
     while let Some(ev) = pop_next_deferred() {
         dispatch_event(caller, &ev.name, ev.data_val);
+        // The queue's co-ownership of the payload (retained at
+        // `event_emit_deferred`) ends now that dispatch is done.
+        super::super::heap::host_release_value(caller, ev.data_val);
         if get_error_flag(caller) != 0 {
             // A subscriber threw during deferred dispatch. Clear the
             // flag, capture the error, and emit `events:error` so
@@ -234,6 +246,8 @@ pub(super) fn drain_queue(caller: &mut Caller<'_, ()>) {
             let message = take_error_message(caller);
             let err_val = build_events_error_payload(caller, &ev.name, &message);
             dispatch_event(caller, "events:error", err_val);
+            // The error payload is host-owned; its dispatch is over.
+            super::super::heap::host_release_value(caller, err_val);
             // The events:error subscriber itself might have thrown —
             // in that case we do bail out (no second-order recovery).
             if get_error_flag(caller) != 0 {
@@ -395,6 +409,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "event_emit_deferred",
             |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, data_val: i64| {
                 let name = read_name(&mut caller, name_ptr, name_len);
+                // The queue CO-OWNS the payload until drained: the emitter's
+                // own ref can be released before `drain` runs (its scope
+                // ends), so an un-retained queue entry would dangle.
+                // `drain_queue` releases this ref after dispatch.
+                if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    super::super::heap::host_retain(mem.data_mut(&mut caller), data_val);
+                }
                 enqueue_deferred(&name, data_val);
             },
         )
@@ -440,12 +461,16 @@ fn build_subscription(caller: &mut Caller<'_, ()>, id: i64, name: &str) -> i64 {
     alloc_dict(caller, &mem, &[(key_id, v_id), (key_name, v_name)])
 }
 
-/// Allocate an `Event { name, data }` Dict on the guest heap.
+/// Allocate an `Event { name, data }` Dict on the guest heap. The dict
+/// CO-OWNS `data_val` (host_retain) — `dispatch_event` releases the whole
+/// event after the subscribers run, which deep-decrements `data` back to
+/// the caller's ref instead of freeing something the caller still owns.
 fn build_event(caller: &mut Caller<'_, ()>, name: &str, data_val: i64) -> i64 {
     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
     let key_name = wasm_alloc_str(caller, &mem, "name");
     let key_data = wasm_alloc_str(caller, &mem, "data");
     let v_name = wasm_alloc_str(caller, &mem, name);
+    super::super::heap::host_retain(mem.data_mut(&mut *caller), data_val);
     alloc_dict(caller, &mem, &[(key_name, v_name), (key_data, data_val)])
 }
 

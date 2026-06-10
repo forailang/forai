@@ -49,7 +49,7 @@ use crate::runtime::{
     RT_AS_NUMBER, RT_CALL_NATIVE, RT_CONCAT, RT_COUNT, RT_DIV, RT_EQ, RT_GE, RT_GET_FIELD,
     RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE, RT_LT, RT_MAKE_BOOL,
     RT_LIVE_OBJECTS, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL, RT_NE, RT_NEG,
-    RT_OBJ_ADDR, RT_RELEASE, RT_RETAIN,
+    RT_FREE, RT_OBJ_ADDR, RT_RELEASE, RT_RETAIN,
     RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_SET_FIELD, RT_STR_EQ, RT_SUB,
     RT_VALUE_TO_STR, TAG_BOOL, TAG_INT, VAL_FALSE, VAL_NULL, VAL_VOID,
 };
@@ -3332,6 +3332,16 @@ pub fn assemble_wasm_module_with_test_flag(
     if closure_count > 0 {
         exports.export("__indirect_function_table", ExportKind::Table, 0);
     }
+    // Host-callable refcount release: the HTTP host reclaims per-request
+    // guest object graphs (request/response/event dicts it built) through
+    // this after writing the response. The async assembler exports it too;
+    // without it `host_release_value` silently no-ops and a sync-built
+    // server leaks the full request graph per request (plan 116).
+    exports.export(
+        "__fai_release",
+        ExportKind::Func,
+        actual_import_count + RT_RELEASE,
+    );
     exports.export("__heap_ptr", ExportKind::Global, 0);
     // Live-object counter (plan 113) — the host leak oracle reads this by name
     // after a run. Index = free-list (4 + module vars) + 1.
@@ -10806,6 +10816,22 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::LocalGet(content_len));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
         self.emit_close();
+        // Free the scratch buffer — RT_ALLOC_STRING copied the bytes out, so
+        // the block is dead. Without this every `file.read` leaked 64 KiB
+        // (plan 116). RT_FREE pops its own (ptr, size); the boxed result
+        // stays on the stack beneath.
+        self.emit(Instruction::LocalGet(buf_ptr));
+        self.emit(Instruction::I32Const(65536));
+        self.emit(Instruction::Call(self.rt().base + RT_FREE));
+        // Release an OWNED path temp (a fresh literal / concat — the common
+        // `file.read('config/app.toml')` shape leaked the path string per
+        // call). A borrowed path (identifier) is aliased by VALUE_TO_STR
+        // and stays the caller's — skip. Stack-neutral above the result.
+        if self.expr_transfers_ownership(&call_args[0].value) {
+            self.emit(Instruction::LocalGet(path_addr));
+            self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
         Ok(())
     }
 
@@ -10878,6 +10904,17 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::LocalGet(value_len));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
         self.emit_close();
+        // Free the scratch buffer (mirrors `compile_file_read`) — without
+        // this every `storage.get` leaked 64 KiB (plan 116).
+        self.emit(Instruction::LocalGet(buf_ptr));
+        self.emit(Instruction::I32Const(65536));
+        self.emit(Instruction::Call(self.rt().base + RT_FREE));
+        // Release an OWNED key temp (mirrors `compile_file_read`).
+        if self.expr_transfers_ownership(&call_args[0].value) {
+            self.emit(Instruction::LocalGet(key_addr));
+            self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
         Ok(())
     }
 
@@ -11028,9 +11065,23 @@ impl<'a, 'c> Builder<'a, 'c> {
         let dict_local = self.alloc_local();
         self.emit(Instruction::LocalSet(dict_local));
         self.compile_from_dict_local_value(type_name, dict_local)?;
+        // An OWNED source temp (e.g. `from_dict(json.parse(s))`) is consumed
+        // by the materialization — the record retained every field it kept,
+        // so the source's ref can go. A borrowed source (`from_dict(e.data)`)
+        // stays the caller's.
+        if self.expr_transfers_ownership(&dict_expr) {
+            self.emit(Instruction::LocalGet(dict_local));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
         let local = self.alloc_local();
         self.emit(Instruction::LocalSet(local));
         self.bind(binding_name, local);
+        // The materialized record is a fresh owned dict — release at scope
+        // exit like any `let` (this binding path bypasses `compile_bindings`'
+        // tail, which is where note_droppable normally happens; without it
+        // every `let x T = from_dict(d)` leaked the record — one per request
+        // in brain's beforeRequest listener, plan 116).
+        self.note_droppable(local);
         Ok(())
     }
 
@@ -11296,6 +11347,15 @@ impl<'a, 'c> Builder<'a, 'c> {
         let local = self.alloc_local();
         self.emit(Instruction::LocalSet(local));
         self.bind(binding_name, local);
+        // The raw rows array (query_params' owned +1 result) was consumed by
+        // the materialization above — every field a typed record kept was
+        // retained, so the source rows can go. Without this every
+        // `query_typed` leaked the row dicts per query (plan 116).
+        self.emit(Instruction::LocalGet(rows_local));
+        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        // The typed array is a fresh owned binding — release at scope exit
+        // (this path bypasses `compile_bindings`' note_droppable tail).
+        self.note_droppable(local);
         Ok(())
     }
 
@@ -13379,6 +13439,13 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if Self::is_fresh_builtin_call(name) {
                     return true;
                 }
+                // Extern FFI call — results are primitives or fresh
+                // host-allocated strings (`encode_return_for_guest`), both
+                // safe to transfer. Classified borrowed they get over-
+                // retained per call (the per-request DB-row leak, plan 116).
+                if self.ctx.extern_fn_indices.contains_key(name) {
+                    return true;
+                }
                 // A callable bound name is a closure value (closures return +1).
                 if self.resolve(name).is_some() {
                     return true;
@@ -13414,6 +13481,28 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             Expression::MemberExpression(me) => {
                 let m = me.property.as_str();
+                // `alias.method(...)` — a user-module function or a std host
+                // call verified to return a fresh owned value. Checked BEFORE
+                // the bare-global heuristics: `env.get(...)` is a module
+                // call, not the borrowed dict-`get` builtin of the same
+                // spelling (compile_call dispatches module aliases first for
+                // the same reason). Only fires when the object is a module
+                // alias not shadowed by a local binding.
+                if let Expression::IdentifierExpression(obj_id) = &*me.object {
+                    if self.resolve(&obj_id.name).is_none() {
+                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name).cloned() {
+                            if self
+                                .function_by_name
+                                .contains_key(&format!("{}.{}", canon, me.property))
+                            {
+                                return true;
+                            }
+                            if Self::is_fresh_std_module_call(&canon, m) {
+                                return true;
+                            }
+                        }
+                    }
+                }
                 if Self::is_borrowed_bare_global(m) {
                     return false;
                 }
@@ -13422,19 +13511,29 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if Self::is_fresh_builtin_call(m) {
                     return true;
                 }
-                // `alias.method(...)` into a user-module function.
-                if let Expression::IdentifierExpression(obj_id) = &*me.object {
-                    if self.resolve(&obj_id.name).is_none() {
-                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name).cloned() {
-                            let full = format!("{}.{}", canon, me.property);
-                            return self.function_by_name.contains_key(&full);
-                        }
-                    }
-                }
                 false
             }
             _ => false,
         }
+    }
+
+    /// Std-module host calls verified to return a FRESH owned (+1) object
+    /// graph (each call allocates anew on the guest heap — host `reserve`
+    /// or guest `RT_ALLOC_STRING`; a null result is a primitive no-op for
+    /// RC). Classifying these as borrowed over-retains the result on bind
+    /// and skips the operand mop-up — one leaked graph per call (the
+    /// per-request `json.parse` / response-dict leak on servers, plan 116).
+    /// Curated: only entries whose host/lowering code was checked. Methods
+    /// returning borrowed views (array element reads, dict gets) must stay
+    /// out.
+    fn is_fresh_std_module_call(canon: &str, method: &str) -> bool {
+        matches!(
+            (canon, method),
+            ("std.json", "parse" | "stringify")
+                | ("std.env", "get")
+                | ("std.file", "read")
+                | ("std.http.server", "ok" | "text" | "html" | "json" | "redirect")
+        )
     }
 
     /// RC transfer test (plan 113 R2): does compiling `expr` leave an OWNED (+1)

@@ -117,6 +117,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     match invoke_handler(&mut caller, handler_val, request_val) {
                         Some(response_val) => {
                             write_http_response(&mut caller, stream, response_val);
+                            // Reclaim the per-request graph (plan 116):
+                            // request + response are host-owned sole refs.
+                            host_release_value(&mut caller, response_val);
                         }
                         None => {
                             let body = "Handler error";
@@ -128,6 +131,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             let _ = (&stream).write_all(resp.as_bytes());
                         }
                     }
+                    host_release_value(&mut caller, request_val);
                 }
             },
         )
@@ -266,6 +270,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // up before main called `server.listen`.
                 let started = build_server_started(&mut caller, port);
                 super::events::dispatch_event(&mut caller, "http:listening", started);
+                // The payload is host-owned; its dispatch is over.
+                host_release_value(&mut caller, started);
                 for conn in listener.incoming() {
                     let stream = match conn {
                         Ok(s) => s,
@@ -413,18 +419,9 @@ fn write_raw_response(stream: TcpStream, response: Vec<u8>) {
     finish_response(stream, &response);
 }
 
-/// Release a guest object the host owns, via the exported `__fai_release`
-/// (RT_RELEASE) — decrement its refcount and deep-free at zero. Used to reclaim
-/// per-request guest allocations the host built (plan 115). No-op if the export
-/// is missing (older modules) or the call traps.
-fn host_release_value(caller: &mut Caller<'_, ()>, val: i64) {
-    if let Some(f) = caller
-        .get_export("__fai_release")
-        .and_then(|e| e.into_func())
-    {
-        let _ = f.call(&mut *caller, &[Val::I64(val)], &mut []);
-    }
-}
+// Per-request reclamation (plan 115/116): release host-built guest graphs
+// via the shared helper (exported `__fai_release` → rt_release).
+use super::super::heap::host_release_value;
 
 /// Write the response bytes and shut the connection down gracefully.
 ///
@@ -516,8 +513,12 @@ fn dispatch_router_request(caller: &mut Caller<'_, ()>, router_id: u32, request_
                         "[router] handler error for {} {}: {}",
                         method, path, e
                     ));
+                    // `build_http_error` co-owns `request_val` for the
+                    // payload's lifetime so releasing it after dispatch
+                    // can't free the request the accept loop still owns.
                     let err_payload = build_http_error(caller, request_val, &e);
                     super::events::dispatch_event(caller, "http:error", err_payload);
+                    host_release_value(caller, err_payload);
                     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                     return build_response_dict(
                         caller,
@@ -658,12 +659,15 @@ fn build_server_started(caller: &mut Caller<'_, ()>, port: i32) -> i64 {
 }
 
 /// Build an `HttpError { request, message }` Dict on the guest heap
-/// — the `http:error` payload.
+/// — the `http:error` payload. CO-OWNS `request_val` (host_retain) so the
+/// caller can release the payload after dispatch without freeing the
+/// request the accept loop still owns.
 fn build_http_error(caller: &mut Caller<'_, ()>, request_val: i64, message: &str) -> i64 {
     let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
     let key_request = wasm_alloc_str(caller, &mem, "request");
     let key_message = wasm_alloc_str(caller, &mem, "message");
     let message_val = wasm_alloc_str(caller, &mem, message);
+    super::super::heap::host_retain(mem.data_mut(&mut *caller), request_val);
     alloc_dict(
         caller,
         &mem,

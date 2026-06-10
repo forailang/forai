@@ -6466,6 +6466,113 @@ mod tests {
     }
 
     #[test]
+    fn check_leaks_std_host_call_results_are_clean() {
+        // Regression (plan 116 host-leak pass): std host calls returning
+        // fresh object graphs (json.parse/stringify, file.read, env.get)
+        // were classified borrowed — over-retained on bind, one leaked
+        // graph per call — and file.read leaked its 64 KiB scratch buffer
+        // plus an owned literal path temp per call. All must come back to
+        // an empty live set.
+        std::fs::write("/tmp/fai_check_leaks_std.txt", "file-content-here").unwrap();
+        let stderr = run_with_check_leaks(
+            "check_leaks_std_host",
+            concat!(
+                "use std.env\n",
+                "\n",
+                "use std.file\n",
+                "\n",
+                "use std.json\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    var i = 0\n",
+                "    while i < 20\n",
+                "        let v = json.parse('{\"k\": [1, 2, 3], \"s\": \"hello\"}')\n",
+                "        let s = json.stringify(v)\n",
+                "        let f = file.read('/tmp/fai_check_leaks_std.txt')\n",
+                "        let e = env.get('HOME')\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print('done')\n",
+                "end\n",
+            ),
+        );
+        assert!(
+            stderr.contains("live heap: 0 objects, 0 bytes"),
+            "{stderr}",
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_event_dispatch_is_clean() {
+        // Regression (plan 116 host-leak pass): every event dispatch leaked
+        // its host-built Event{name,data} dict — `build_event` now retains
+        // the data and `dispatch_event` releases the event after the
+        // subscribers run. Only the one-time subscription survives.
+        let stderr = run_with_check_leaks(
+            "check_leaks_events",
+            concat!(
+                "use std.events\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    let _sub = events.on('tick') do with e Event\n",
+                "        let n = e.name\n",
+                "    end\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        events.emit('tick', 'payload-' + toString(i))\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print('done')\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+        // No per-dispatch group: 30 leaked events would show as a
+        // count-30 line.
+        assert!(!stderr.contains("\n     30 "), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_from_dict_binding_is_clean() {
+        // Regression (plan 116 host-leak pass): `let x T = from_dict(d)`
+        // bound its fresh record without note_droppable — one leaked
+        // record per call (brain's beforeRequest listener built one per
+        // request, pinning request sub-dicts with it).
+        let stderr = run_with_check_leaks(
+            "check_leaks_from_dict",
+            concat!(
+                "type Point\n",
+                "    x Int\n",
+                "    y Int\n",
+                "    label String\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    let src = { x: 1 y: 2 label: 'origin' }\n",
+                "    var total = 0\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        let p Point = from_dict(src)\n",
+                "        total = total + p.x\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print(total)\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+        assert!(!stderr.contains("\n     30 "), "{stderr}");
+        assert!(!stderr.contains("\n     29 "), "{stderr}");
+    }
+
+    #[test]
     fn check_leaks_accounts_for_host_side_allocations() {
         // Host-built objects (json.parse builds the value graph via the
         // host `reserve`, not `rt_alloc`) are recorded with host origin:
