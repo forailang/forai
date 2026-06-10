@@ -12441,6 +12441,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// the alias (result `==` the arg value) and retain it. A fresh result is
     /// already +1 and left untouched.
     fn emit_to_string_owned(&mut self, arg: &Expression) -> Result<(), BuildError> {
+        let transfers = self.expr_transfers_ownership(arg);
         self.compile_expr_as(arg, ValueShape::Boxed)?;
         let argl = self.alloc_local();
         self.emit(Instruction::LocalTee(argl));
@@ -12455,6 +12456,16 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
         self.emit(Instruction::Drop);
         self.emit(Instruction::End);
+        // Release an OWNED arg temp (plan 115 arg-temp mop-up): consuming
+        // the arg's +1 is balanced on both paths — the alias case just
+        // gave the result its own retained ref above, and a fresh result
+        // is independent of the arg. Without this `toString(<owned call>)`
+        // (e.g. `toString(signal.value())`, which returns a copy) leaked
+        // the arg once per call. Stack-neutral above the result.
+        if transfers {
+            self.emit(Instruction::LocalGet(argl));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
         Ok(())
     }
 
@@ -13656,6 +13667,17 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         if let Expression::CallExpression(ce) = expr {
             return self.call_returns_owned(ce);
+        }
+        // A function REFERENCE — an identifier that resolves to no binding
+        // but names a top-level function — compiles to a FRESH closure
+        // wrapper per use (`compile_function_reference`), an owned +1.
+        // Classified borrowed it gets retained on bind / at spawn and the
+        // wrapper leaks once per use (one per request in forui's
+        // `renderToString(App, path)`, plan 114 tail).
+        if let Expression::IdentifierExpression(id) = expr {
+            if self.resolve(&id.name).is_none() && self.resolves_to_user_fn(&id.name) {
+                return true;
+            }
         }
         false
     }

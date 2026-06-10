@@ -6647,6 +6647,59 @@ mod tests {
     }
 
     #[test]
+    fn check_leaks_fn_refs_and_tostring_owned_args_are_clean() {
+        // Regression (plan 114 tail — brain's last 2 objects/request):
+        // (a) a function REFERENCE used as a value compiles to a fresh
+        // closure wrapper per use and must transfer ownership (it was
+        // classified borrowed and the wrapper leaked once per use);
+        // (b) `toString(<owned call result>)` must release its arg temp
+        // (the alias-retain made the result +1 but never consumed the
+        // owned arg, leaking one copy per call — `toString(s.value())`).
+        let stderr = run_with_check_leaks(
+            "check_leaks_fnref_tostring",
+            concat!(
+                "type def Producer\n",
+                "    @return Int\n",
+                "end\n",
+                "\n",
+                "# Returns a constant.\n",
+                "def piece\n",
+                "    @return Int\n",
+                "do\n",
+                "    7\n",
+                "end\n",
+                "\n",
+                "# Async fn calling a closure-typed param.\n",
+                "def callIt\n",
+                "    @param f Producer\n",
+                "    @return Int\n",
+                "do\n",
+                "    sleep(0)\n",
+                "    f()\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    let base = 'value-string'\n",
+                "    var total = 0\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        total = total + callIt(piece)\n",
+                "        let s = toString(copy(base))\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print(total)\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+        assert!(!stderr.contains("\n     30 "), "{stderr}");
+        assert!(!stderr.contains("\n     29 "), "{stderr}");
+        assert!(!stderr.contains("Closure"), "{stderr}");
+    }
+
+    #[test]
     fn check_leaks_accounts_for_host_side_allocations() {
         // Host-built objects (json.parse builds the value graph via the
         // host `reserve`, not `rt_alloc`) are recorded with host origin:
