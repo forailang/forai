@@ -1,0 +1,59 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 116 follow-up (the brain SSR per-request leak): values produced INSIDE
+# a suspending loop are reclaimed per iteration, not just at task completion.
+# Three shapes, all in one async frame: a loop `let` rebinding its frame slot
+# each iteration (release-the-old on rebind), an awaited call result rebinding
+# its slot each iteration (release-the-old in `assign_pending`), and a
+# single-name accumulator (`html = html + part`) whose reassignment must
+# retain-new/release-old like a sync owned local. Two builds returning the
+# same live-object count means no per-iteration value accumulated.
+def main
+    @return Void
+do
+    let warm = buildAll()
+    let base = __liveObjects()
+    let again = buildAll()
+    print(__liveObjects() == base)
+end
+
+private:
+
+# Returns a fresh heap string after suspending (forces an async child task,
+# whose +1 result lands in the awaiter's frame slot).
+def apiece
+    @param i Int
+    @return String
+do
+    sleep(0)
+    'piece-' + toString(i)
+end
+
+# Awaits + accumulates in a suspending loop; returns a primitive so nothing
+# escapes to the caller.
+def buildAll
+    @return Int
+do
+    var html = ''
+    var i = 0
+    while i < 25
+        let part = apiece(i)
+        let decorated = '<' + part + '>'
+        html = html + decorated
+        i = i + 1
+    end
+    length(html)
+end
+
+test apiece
+    it 'returns the suffixed piece'
+        assert.equals(apiece(7), 'piece-7')
+    end
+end
+
+test buildAll
+    it 'accumulates every decorated piece'
+        assert.equals(buildAll(), 10 * 9 + 15 * 10)
+    end
+end

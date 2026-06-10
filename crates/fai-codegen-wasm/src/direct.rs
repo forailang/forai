@@ -4082,39 +4082,47 @@ fn collect_async_vars(stmts: &[Statement], vars: &mut Vec<String>) {
     }
 }
 
-/// Collect the names that are *rebound* (whole-variable `x = expr` /
-/// `x, y = expr`) anywhere in `stmts`, descending into nested bodies. A rebound
-/// frame var is EXCLUDED from the async completion release set: its slot's
-/// reference count is not guaranteed `+1` at completion (reassignment doesn't
-/// retain-new / release-old yet — that's plan 115 Part 2), so releasing it could
-/// over-release. Field/index mutations (`x.f = …`, `x[i] = …`) don't rebind `x`
-/// — they mutate its contents, so `x` keeps its single owned ref and is NOT
+/// Collect the names rebound by a MULTI-variable assignment (`x, y = expr`)
+/// anywhere in `stmts`, descending into nested bodies. Those names are
+/// EXCLUDED from the async completion release set: the tuple-destructure
+/// assignment path plain-overwrites without retain-new / release-old, so the
+/// slot's reference count is not guaranteed `+1` at completion.
+///
+/// SINGLE-variable reassignment (`x = expr`) is no longer an exclusion:
+/// `build_resume_fn` marks those frame locals owned (`owned_frame_locals`),
+/// so `compile_assignment` maintains the `+1` (retain-new / release-old) and
+/// completion can release them — this is what stops `html = html + piece`
+/// accumulators leaking every intermediate (the brain SSR leak, plan 116).
+/// Field/index mutations (`x.f = …`, `x[i] = …`) don't rebind `x` — they
+/// mutate its contents, so `x` keeps its single owned ref and is NOT
 /// collected here.
-fn collect_rebound_names(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+fn collect_multi_rebound_names(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
     for stmt in stmts {
         match stmt {
             Statement::AssignmentStatement(a) => {
                 if let fai_compiler::ast::AssignmentTarget::Variables { names } = &a.target {
-                    for n in names {
-                        out.insert(n.clone());
+                    if names.len() > 1 {
+                        for n in names {
+                            out.insert(n.clone());
+                        }
                     }
                 }
             }
             Statement::IfStatement(is) => {
                 for branch in &is.branches {
-                    collect_rebound_names(&branch.body, out);
+                    collect_multi_rebound_names(&branch.body, out);
                 }
                 if let Some(e) = &is.else_branch {
-                    collect_rebound_names(e, out);
+                    collect_multi_rebound_names(e, out);
                 }
             }
-            Statement::WhileStatement(ws) => collect_rebound_names(&ws.body, out),
-            Statement::ForStatement(fs) => collect_rebound_names(&fs.body, out),
+            Statement::WhileStatement(ws) => collect_multi_rebound_names(&ws.body, out),
+            Statement::ForStatement(fs) => collect_multi_rebound_names(&fs.body, out),
             Statement::TryStatement(ts) => {
-                collect_rebound_names(&ts.try_body, out);
-                collect_rebound_names(&ts.catch_body, out);
+                collect_multi_rebound_names(&ts.try_body, out);
+                collect_multi_rebound_names(&ts.catch_body, out);
                 if let Some(f) = &ts.finally_body {
-                    collect_rebound_names(f, out);
+                    collect_multi_rebound_names(f, out);
                 }
             }
             _ => {}
@@ -4913,15 +4921,29 @@ fn compile_async_segment_stmt(
             b.emit(Instruction::I64Store(mem0()));
         } else {
             b.compile_expr_as(value, ValueShape::Boxed)?;
-            // RC bind (plan 115, mirrors sync `compile_bindings`): a binding that
-            // the completion path will RELEASE must own exactly `+1`. A borrowed
-            // source (identifier / field / non-owning call) is co-owned, so
-            // retain it; a fresh value or owned call result already transfers its
-            // single ref. Vars NOT in the release set (rebound accumulators, etc.)
-            // keep today's no-retain behaviour — they leak, soundly.
-            if release_set.contains(name) && !b.expr_transfers_ownership(value) {
-                b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
+            if release_set.contains(name) {
+                // RC bind (plan 115, mirrors sync `compile_bindings`): a binding
+                // that the completion path will RELEASE must own exactly `+1`. A
+                // borrowed source (identifier / field / non-owning call) is
+                // co-owned, so retain it; a fresh value or owned call result
+                // already transfers its single ref.
+                if !b.expr_transfers_ownership(value) {
+                    b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
+                }
+                // Release the value the slot held from a PREVIOUS loop iteration
+                // (plan 116 follow-up — the async-frame loop leak): a binding
+                // statement in a suspending loop body re-executes per iteration,
+                // and completion releases only the final value, leaking N−1.
+                // Runs after the initializer is evaluated (so a read of a
+                // same-named outer binding still sees the old value); the new
+                // value rides the stack across the stack-neutral RT_RELEASE.
+                // First execution reads 0 — frames are zeroed at spawn — a safe
+                // no-op.
+                b.emit(Instruction::LocalGet(local));
+                b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
             }
+            // Vars NOT in the release set (multi-assign targets, catch vars)
+            // keep the no-retain/no-release behaviour — they leak, soundly.
             b.emit(Instruction::LocalSet(local));
         }
         return Ok(());
@@ -5171,8 +5193,12 @@ fn build_resume_fn(
     //
     // Excluded: the leading param / type-param slots (borrowed from the spawner
     // or host — never owned here), cell-captured vars (shared with closures that
-    // may outlive the task — plan 115 Part 3 / plan 114), catch vars and rebound
-    // vars (rc not guaranteed +1 — conservative).
+    // may outlive the task — plan 115 Part 3 / plan 114), catch vars and
+    // multi-assignment targets (`a, b = …` plain-overwrites — rc not
+    // guaranteed +1). Single-name reassigned vars ARE released: their locals
+    // are marked owned below, so binding release-the-old + `compile_assignment`
+    // retain-new/release-old keep them at exactly `+1` (plan 116 follow-up —
+    // the async-frame loop/accumulator leak).
     let param_names: std::collections::HashSet<String> = fd
         .type_params
         .iter()
@@ -5181,7 +5207,7 @@ fn build_resume_fn(
         .collect();
     let mut excluded: std::collections::HashSet<String> = cell_vars.clone();
     excluded.extend(param_names);
-    collect_rebound_names(&fd.body, &mut excluded);
+    collect_multi_rebound_names(&fd.body, &mut excluded);
     collect_catch_names(&fd.body, &mut excluded);
     let release_names: Vec<String> = frame
         .vars
@@ -5191,6 +5217,15 @@ fn build_resume_fn(
         .collect();
     let release_set: std::collections::HashSet<String> =
         release_names.iter().cloned().collect();
+    // Reassignment of a release-set var must keep the slot at one owned ref:
+    // mark the local so `compile_assignment` retains-new/releases-old exactly
+    // like a sync owned local (these are completion-released, never
+    // scope-dropped, so they don't go through `note_droppable`).
+    for name in &release_names {
+        if let Some(&l) = var_local.get(name) {
+            b.owned_frame_locals.insert(l);
+        }
+    }
 
     let store_vars = |b: &mut Builder| {
         for v in &frame.vars {
@@ -5320,6 +5355,16 @@ fn build_resume_fn(
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off + slot * 4)));
                 b.emit(Instruction::Call(layout.task_result));
+                // Release the previous iteration's value before overwriting
+                // (plan 116 follow-up): an awaited binding in a suspending loop
+                // re-receives a `+1` child result per iteration; without this
+                // only the final one is released at completion. First pass
+                // reads 0 (zeroed frame) — a safe no-op. The incoming result
+                // rides the stack across the stack-neutral RT_RELEASE.
+                if release_set.contains(name) {
+                    b.emit(Instruction::LocalGet(l));
+                    b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
+                }
                 b.emit(Instruction::LocalSet(l));
             }
             Ok(())
@@ -5412,6 +5457,12 @@ fn build_resume_fn(
                 } else {
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
+                    // Release the previous iteration's value (plan 116
+                    // follow-up) — same rationale as `assign_pending`.
+                    if release_set.contains(name) {
+                        b.emit(Instruction::LocalGet(l));
+                        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
+                    }
                     b.emit(Instruction::LocalSet(l));
                 }
             } else {
@@ -7538,6 +7589,14 @@ struct Builder<'a, 'c> {
     /// so the outer scope and the closure share one mutable slot.
     /// Populated once at `new()` via `collect_cell_captured_vars`.
     cell_captured_vars: HashSet<String>,
+    /// Async-frame locals that OWN their value (`+1`) for the task's
+    /// lifetime and are released at completion (`emit_async_drops`)
+    /// rather than at a sync scope exit. `compile_assignment` treats
+    /// them like `note_droppable`d locals (retain-new / release-old)
+    /// so reassignment — `html = html + piece` accumulators — keeps
+    /// the slot at exactly one owned ref instead of leaking the old
+    /// value. Populated by `build_resume_fn` from the release set.
+    owned_frame_locals: HashSet<u32>,
 }
 
 /// Per-`try` bookkeeping for `throw` dispatch. Popped *before* the
@@ -7629,6 +7688,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             upvalues: Vec::new(),
             upvalue_by_name: HashMap::new(),
             cell_captured_vars: collect_cell_captured_vars(&fd.body),
+            owned_frame_locals: HashSet::new(),
         }
     }
 
@@ -9011,6 +9071,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// by `compile_assignment` to decide whether to release-old / retain-new.
     fn is_owned_local(&self, local: u32) -> bool {
         self.scope_drops.iter().any(|s| s.contains(&local))
+            || self.owned_frame_locals.contains(&local)
     }
 
     /// Tail statement: the value of this statement (if it's an
@@ -13257,6 +13318,32 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// `function_by_name`, and the borrowed-returning bare-globals are excluded
     /// up front (mirroring `compile_call`'s bare-global-first dispatch), so a
     /// borrowed result can never be misclassified as transferable.
+    /// Does `name` resolve to a user function, the way `compile_call`
+    /// resolves a callee: bare name, module-peer fallback
+    /// (`{module_context}.{name}` — peer calls inside a user module
+    /// don't carry the module prefix), or a named import. Ownership
+    /// classification must use the SAME resolution: a peer call
+    /// classified "not a user fn" reads as borrowed, gets retained on
+    /// bind / skipped by operand mop-up, and leaks one ref per call —
+    /// this was the html-forui SSR per-node leak (plan 116).
+    fn resolves_to_user_fn(&self, name: &str) -> bool {
+        if self.function_by_name.contains_key(name) {
+            return true;
+        }
+        if let Some(ctx_mod) = &self.module_context {
+            if self
+                .function_by_name
+                .contains_key(&format!("{}.{}", ctx_mod, name))
+            {
+                return true;
+            }
+        }
+        matches!(
+            self.ctx.named_imports.get(name),
+            Some(q) if self.function_by_name.contains_key(q)
+        )
+    }
+
     fn call_returns_owned(&mut self, ce: &CallExpression) -> bool {
         let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
         let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
@@ -13296,8 +13383,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if self.resolve(name).is_some() {
                     return true;
                 }
-                // Direct user function, or a named import resolving to one.
-                if self.function_by_name.contains_key(name) {
+                // Direct user function — bare, module-peer, or named import.
+                if self.resolves_to_user_fn(name) {
                     return true;
                 }
                 // A type constructor (`Point(x: ..)`) lowers to a fresh dict
@@ -13307,13 +13394,12 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if self.ctx.type_fields.contains_key(name) {
                     return true;
                 }
-                if let Some(q) = self.ctx.named_imports.get(name) {
-                    return self.function_by_name.contains_key(q);
-                }
                 false
             }
             Expression::MemberExpression(me) if is_ufcs => {
-                // UFCS `recv.method(...)` resolves `method` as a bare identifier.
+                // UFCS `recv.method(...)` resolves `method` as a bare identifier
+                // (same resolution as `compile_call`: bare / module-peer /
+                // named import).
                 let m = me.property.as_str();
                 if Self::is_borrowed_bare_global(m) {
                     return false;
@@ -13321,11 +13407,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if Self::is_fresh_builtin_call(m) {
                     return true;
                 }
-                if self.function_by_name.contains_key(m) {
+                if self.resolves_to_user_fn(m) {
                     return true;
-                }
-                if let Some(q) = self.ctx.named_imports.get(m) {
-                    return self.function_by_name.contains_key(q);
                 }
                 false // builtin method (first / last / get / find / ...) → borrowed
             }

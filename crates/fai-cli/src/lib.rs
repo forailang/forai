@@ -6340,6 +6340,132 @@ mod tests {
     }
 
     #[test]
+    fn check_leaks_async_loop_bindings_are_clean() {
+        // Regression for the async-frame loop leak (the brain SSR
+        // ~15KB/request): a suspending loop's `let`, its awaited call
+        // result, and a `html = html + part` accumulator must all be
+        // reclaimed per iteration — the live set at exit contains no
+        // per-iteration strings. (The one allowed survivor is the
+        // scheduler's one-time startup allocation.)
+        let stderr = run_with_check_leaks(
+            "check_leaks_async_loop",
+            concat!(
+                "# Returns a fresh heap string after suspending.\n",
+                "def apiece\n",
+                "    @param i Int\n",
+                "    @return String\n",
+                "do\n",
+                "    sleep(0)\n",
+                "    'piece-' + toString(i)\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    var html = ''\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        let part = apiece(i)\n",
+                "        html = html + part\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print(length(html))\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("[check-leaks] live heap:"), "{stderr}");
+        assert!(stderr.contains("consistent"), "{stderr}");
+        // No per-iteration leak groups: neither the awaited results nor
+        // the accumulator intermediates survive to the exit report.
+        assert!(!stderr.contains("apiece"), "{stderr}");
+        assert!(!stderr.contains("\n     29 "), "{stderr}");
+        assert!(!stderr.contains("\n     30 "), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_module_peer_call_results_are_clean() {
+        // Regression: RC ownership classification must resolve module-peer
+        // calls (`piece(i)` inside module `rend` → `rend.piece`) exactly the
+        // way `compile_call` resolves them. Misclassified as borrowed, every
+        // peer-call result is over-retained on bind / skipped by operand
+        // mop-up and leaks once per call — the sync half of the brain SSR
+        // per-request leak (plan 116).
+        let dir = temp_dir("check_leaks_module_peer");
+        // Module discovery roots at fai.toml's source_root.
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"modpeer\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src/rend")).unwrap();
+        std::fs::write(
+            dir.join("src/rend/rend.fai"),
+            concat!(
+                "# Returns a fresh concat string.\n",
+                "def piece\n",
+                "    @param i Int\n",
+                "    @return String\n",
+                "do\n",
+                "    'piece-' + toString(i)\n",
+                "end\n",
+                "\n",
+                "# Wraps a peer-call result (one more sync call level).\n",
+                "def wrap\n",
+                "    @param i Int\n",
+                "    @return String\n",
+                "do\n",
+                "    let inner = piece(i)\n",
+                "    '<' + inner + '>'\n",
+                "end\n",
+                "\n",
+                "# Accumulates peer-call results in a loop.\n",
+                "def buildAll\n",
+                "    @return Int\n",
+                "do\n",
+                "    var html = ''\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        html = html + wrap(i)\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    length(html)\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        let main_src = concat!(
+            "use { buildAll } from rend\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "    print(buildAll())\n",
+            "end\n",
+        );
+        let path = dir.join("src/main.fai");
+        std::fs::write(&path, main_src).unwrap();
+        let _cg = fai_codegen_wasm::CheckLeaksGuard::new();
+        let wasm =
+            compile_fai_to_wasm(main_src, path.to_str().unwrap(), false, Vec::new(), None, None);
+        let guard = wasm_runner::output::CaptureGuard::new();
+        wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions {
+                check_leaks: Some(wasm_runner::CheckLeaksOptions::default()),
+                ..Default::default()
+            },
+        )
+        .expect("module program should run");
+        let stderr = guard.stderr();
+        drop(guard);
+        assert!(stderr.contains("consistent"), "{stderr}");
+        // No leak group may name the module's functions — every peer-call
+        // result (piece's string, wrap's string) is reclaimed.
+        assert!(!stderr.contains("rend."), "{stderr}");
+    }
+
+    #[test]
     fn check_leaks_accounts_for_host_side_allocations() {
         // Host-built objects (json.parse builds the value graph via the
         // host `reserve`, not `rt_alloc`) are recorded with host origin:
