@@ -1,0 +1,36 @@
+# expect: ok
+# stdout:
+#   10
+#   3
+# A generic accessor `@return $T` over a generic-struct param concretizes its
+# return from the receiver's instantiation, so the result can be indexed and
+# iterated (named-type analogue of `$T[]` inference). This is what lets a
+# signal-style `value()` accessor return a usable copy of a collection.
+
+type Box
+    items $T
+end
+
+# Copy of the box's items.
+def boxItems
+    @type T
+    @param b Box
+    @return $T
+do
+    copy(b.items)
+end
+
+test boxItems
+    it 'returns an indexable, concrete type'
+        let b = Box(items: [1 2 3])
+        assert.equals(boxItems(b)[0], 1)
+    end
+end
+
+def main
+    @return Void
+do
+    let b = Box(items: [10 20 30])
+    print(boxItems(b)[0])
+    print(length(boxItems(b)))
+end

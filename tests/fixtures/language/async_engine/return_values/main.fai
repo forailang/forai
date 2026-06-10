@@ -1,0 +1,27 @@
+# expect: ok
+# stdout:
+#   20
+def main
+    @return Int
+do
+    let x = compute(5)
+    let y = compute(x)
+    y
+end
+
+private:
+
+# Doubles its argument after a sleep.
+def compute
+    @param n Int
+    @return Int
+do
+    sleep(10)
+    n * 2
+end
+
+test compute
+    it 'doubles after a sleep'
+        assert.equals(compute(5), 10)
+    end
+end

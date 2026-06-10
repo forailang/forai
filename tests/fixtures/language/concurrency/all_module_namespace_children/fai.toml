@@ -1,0 +1,4 @@
+[project]
+name = "all_module_namespace_children"
+version = "0.1.0"
+source_root = "."

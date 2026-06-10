@@ -1,0 +1,21 @@
+# expect: ok
+# stdout:
+#   true
+# __release at rc=0 frees the block — including its 8-byte refcount prefix — back
+# to the allocator's free list, so the next same-size allocation reuses it
+# instead of bumping the heap. __heapPtr (the bump high-water) is therefore
+# unchanged across the release + re-alloc. Validates free-at-zero end to end.
+# 
+# The released value is an UNBOUND temporary, not a `var`: a tracked binding is
+# also auto-released at scope exit (RC, plan 113), so manually `__release`-ing it
+# would double-free. Releasing a fresh temp frees it exactly once, keeping this
+# fixture clean under the `FAI_RC_CHECK` checked-mode.
+def main
+    @return Void
+do
+    __release([9 8 7])
+    let h1 = __heapPtr()
+    let c = [6 5 4]
+    let h2 = __heapPtr()
+    print(h1 == h2)
+end

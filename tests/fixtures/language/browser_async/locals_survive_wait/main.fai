@@ -1,0 +1,10 @@
+# expect: ok
+# browser:
+#   rootResult: 42
+def main
+    @return Int
+do
+    let x = 41
+    sleep(1)
+    x + 1
+end

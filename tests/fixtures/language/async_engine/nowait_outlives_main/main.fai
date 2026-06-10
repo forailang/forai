@@ -1,0 +1,28 @@
+# expect: ok
+# stdout:
+#   main done
+#   nowait funcD
+def main
+    @return Void
+do
+    nowait funcD()
+    print('main done')
+end
+
+private:
+
+# Sleeps past main's completion, then prints. Because it was forked with
+# nowait, the scheduler must keep running until this finishes — proving
+# drain-until-idle rather than stopping the moment main (root) completes.
+def funcD
+    @return Void
+do
+    sleep(20)
+    print('nowait funcD')
+end
+
+test funcD
+    it 'runs'
+        funcD()
+    end
+end

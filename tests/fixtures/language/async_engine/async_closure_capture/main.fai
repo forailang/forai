@@ -1,0 +1,16 @@
+# expect: ok
+# stdout:
+#   30
+# An async closure capturing an upvalue (`factor`) across its suspension: the
+# captured env survives in the closure's heap object, and the resume fn re-seeds
+# `__env_ptr` from frame[0] on every (re)entry so the upvalue read resolves.
+def main
+    @return Void
+do
+    let factor = 3
+    let r = do
+        sleep(5)
+        factor * 10
+    end()
+    print(r)
+end

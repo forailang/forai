@@ -1,0 +1,61 @@
+# expect: ok
+# stdout:
+#   starting func B
+#   ending func B
+#   nowait funcD
+#   starting funcC
+#   ending funcC
+def main
+    @return Void
+do
+    nowait funcD()
+    funcB()
+    sleep(60)
+    funcC()
+end
+
+private:
+
+# Prints around a sleep.
+def funcB
+    @return Void
+do
+    print('starting func B')
+    sleep(20)
+    print('ending func B')
+end
+
+# Prints twice, no suspension.
+def funcC
+    @return Void
+do
+    print('starting funcC')
+    print('ending funcC')
+end
+
+# Sleeps, then prints. Forked via nowait so its timer fires while the
+# parent is mid-sleep — its line lands between funcB and funcC.
+def funcD
+    @return Void
+do
+    sleep(40)
+    print('nowait funcD')
+end
+
+test funcB
+    it 'runs'
+        funcB()
+    end
+end
+
+test funcC
+    it 'runs'
+        funcC()
+    end
+end
+
+test funcD
+    it 'runs'
+        funcD()
+    end
+end

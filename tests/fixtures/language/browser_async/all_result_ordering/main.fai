@@ -1,0 +1,39 @@
+# expect: ok
+# browser:
+#   rootResult: 12
+def main
+    @return Int
+do
+    let a, b = all(slow(), fast())
+    a * 10 + b
+end
+
+private:
+
+# Returns after a slower wait.
+def slow
+    @return Int
+do
+    sleep(2)
+    1
+end
+
+test slow
+    it 'is covered by the browser async fixture'
+        print('placeholder')
+    end
+end
+
+# Returns after a faster wait.
+def fast
+    @return Int
+do
+    sleep(1)
+    2
+end
+
+test fast
+    it 'is covered by the browser async fixture'
+        print('placeholder')
+    end
+end

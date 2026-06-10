@@ -1,0 +1,42 @@
+# expect: ok
+# stdout:
+#   9
+def main
+    @return Int
+do
+    let a = loadFirst()
+    let b = loadSecond(a)
+    let c = b + 4
+    c
+end
+
+private:
+
+# Returns after the first wait.
+def loadFirst
+    @return Int
+do
+    sleep(1)
+    2
+end
+
+test loadFirst
+    it 'returns after waiting'
+        assert.equals(loadFirst(), 2)
+    end
+end
+
+# Uses the first async result as an argument.
+def loadSecond
+    @param x Int
+    @return Int
+do
+    sleep(2)
+    x + 3
+end
+
+test loadSecond
+    it 'returns after waiting'
+        assert.equals(loadSecond(2), 5)
+    end
+end

@@ -312,7 +312,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         );
                         super::super::heap::build_value(&mut caller, &mem, &json_arr)
                     }
-                    Err(_) => super::super::nan_box::VAL_NULL,
+                    Err(_) => {
+                        let json_arr = serde_json::Value::Array(Vec::new());
+                        super::super::heap::build_value(&mut caller, &mem, &json_arr)
+                    }
                 }
             },
         )

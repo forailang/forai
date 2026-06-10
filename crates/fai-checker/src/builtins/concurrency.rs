@@ -8,6 +8,9 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // all() is variadic — for type checking we accept Unknown args and return Unknown.
     // The compiler wraps each arg in an implicit closure.
     ins(b, "all", &[p("tasks", Type::Unknown)], &[Type::Unknown]);
+    // `sleep(ms)` is the timed-suspend primitive. There is no `wait` —
+    // calls auto-await by default, so a `wait` spelling would read like an
+    // await keyword. See language.md "Concurrency".
     ins(b, "sleep", &[p("ms", Type::Int)], &[Type::Void]);
 }
 
@@ -27,6 +30,14 @@ mod tests {
         for name in &["all", "sleep"] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
+    }
+
+    #[test]
+    fn test_wait_is_not_a_builtin() {
+        // `wait` was removed in favour of `sleep`; calls auto-await by
+        // default so there is no await-like `wait` keyword.
+        let b = fresh();
+        assert!(!b.contains_key("wait"), "wait should no longer be a builtin");
     }
 
     #[test]

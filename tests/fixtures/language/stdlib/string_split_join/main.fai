@@ -4,10 +4,19 @@ use std.string
 # stdout:
 #   3
 #   a-b-c
+#   1
+#   1
+#   1
 def main
     @return Void
 do
     let parts = string.split('a b c', ' ')
     print(length(parts))
     print(string.join(parts, '-'))
+    let empty = string.split('', '/')
+    print(length(empty))
+    let short = string.split('a', '//')
+    print(length(short))
+    let one = string.split('x', '/')
+    print(length(one))
 end

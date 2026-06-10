@@ -1,0 +1,11 @@
+use helper
+
+# expect: ok
+# stdout:
+#   8
+def main
+    @return Int
+do
+    let x = helper.child()
+    x + 1
+end

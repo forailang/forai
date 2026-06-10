@@ -1,0 +1,42 @@
+# expect: ok
+# stdout:
+#   23
+def main
+    @return Int
+do
+    let base = 10
+    let a, b = all(slow(base), fast(base))
+    a + b
+end
+
+private:
+
+# Returns the argument after a slower wait.
+def slow
+    @param x Int
+    @return Int
+do
+    sleep(2)
+    x + 1
+end
+
+# Returns the argument after a faster wait.
+def fast
+    @param x Int
+    @return Int
+do
+    sleep(1)
+    x + 2
+end
+
+test slow
+    it 'returns after a slower wait'
+        assert.equals(slow(2), 3)
+    end
+end
+
+test fast
+    it 'returns after a faster wait'
+        assert.equals(fast(2), 4)
+    end
+end

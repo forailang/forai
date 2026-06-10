@@ -1,0 +1,34 @@
+# expect: ok
+# stdout:
+#   42
+#   hi
+# A generic async function. `@type T` is a hidden leading param in the ABI, so
+# its resume frame leads with a type-arg slot and the real `value` param lands
+# *after* it. Awaiting `loadValue` must pass the type-arg string into slot 0
+# and `value` into slot 1, then return `value` across the suspension.
+def main
+    @return Void
+do
+    let n = loadValue(42)
+    print(n)
+    let s = loadValue('hi')
+    print(s)
+end
+
+private:
+
+# Sleeps, then echoes its argument back — generic over the element type.
+def loadValue
+    @type T
+    @param value $T
+    @return $T
+do
+    sleep(10)
+    value
+end
+
+test loadValue
+    it 'echoes'
+        assert.equal(loadValue(7), 7)
+    end
+end

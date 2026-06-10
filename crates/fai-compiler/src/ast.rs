@@ -87,6 +87,10 @@ pub struct LetStatement {
     pub bindings: Vec<BindingDeclaration>,
     pub value: Expression,
     pub is_private: Option<bool>,
+    /// `shared let …`: value is deliberately aliased → excluded from
+    /// single-ownership auto-drop (Phase 4, plans/111).
+    #[serde(default)]
+    pub is_shared: Option<bool>,
     pub location: SourceLocation,
 }
 
@@ -96,6 +100,8 @@ pub struct VarStatement {
     pub bindings: Vec<BindingDeclaration>,
     pub value: Expression,
     pub is_private: Option<bool>,
+    #[serde(default)]
+    pub is_shared: Option<bool>,
     pub location: SourceLocation,
 }
 

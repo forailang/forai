@@ -1,0 +1,31 @@
+# Async loaders living in their own module. Both suspend on `sleep`, so the
+# async engine compiles them as resume tasks across the module boundary.
+
+# Sleeps a long time, then prints. Forked via `nowait` from `main`, so it
+# outlives `main` and its line lands last (drain-until-idle).
+def slowLoad
+    @return Void
+do
+    sleep(40)
+    print('slow loaded')
+end
+
+# Sleeps briefly, then prints. Awaited by `main`.
+def fastLoad
+    @return Void
+do
+    sleep(10)
+    print('fast loaded')
+end
+
+test slowLoad
+    it 'runs'
+        slowLoad()
+    end
+end
+
+test fastLoad
+    it 'runs'
+        fastLoad()
+    end
+end

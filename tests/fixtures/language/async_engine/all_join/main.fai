@@ -1,0 +1,45 @@
+# expect: ok
+# stdout:
+#   fast done
+#   slow done
+#   1
+#   2
+def main
+    @return Void
+do
+    let a, b = all(slow(), fast())
+    print(a)
+    print(b)
+end
+
+private:
+
+# Longer sleep; prints when it finishes; returns 1.
+def slow
+    @return Int
+do
+    sleep(40)
+    print('slow done')
+    1
+end
+
+# Shorter sleep; prints when it finishes; returns 2.
+def fast
+    @return Int
+do
+    sleep(10)
+    print('fast done')
+    2
+end
+
+test slow
+    it 'returns 1'
+        assert.equals(slow(), 1)
+    end
+end
+
+test fast
+    it 'returns 2'
+        assert.equals(fast(), 2)
+    end
+end

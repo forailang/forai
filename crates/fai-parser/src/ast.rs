@@ -55,6 +55,9 @@ pub struct LetStatement {
     pub bindings: Vec<BindingDeclaration>,
     pub value: Expression,
     pub is_private: bool,
+    /// `shared let …`: the value is deliberately aliased (e.g. a signal), so it
+    /// is excluded from single-ownership auto-drop and lives program-lifetime.
+    pub is_shared: bool,
     pub location: SourceLocation,
 }
 
@@ -63,6 +66,8 @@ pub struct VarStatement {
     pub bindings: Vec<BindingDeclaration>,
     pub value: Expression,
     pub is_private: bool,
+    /// `shared var …`: see [`LetStatement::is_shared`].
+    pub is_shared: bool,
     pub location: SourceLocation,
 }
 

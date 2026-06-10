@@ -1,0 +1,40 @@
+# expect: ok
+# stdout:
+#   30
+# A closure created *inside* an async fn (`main` suspends on `sleep`). The
+# closure captures `factor`, a frame-backed local that survives the suspension,
+# and is built + applied after the resume. Async-fn closures get table slots
+# after the async resume fns.
+
+type def Transform
+    @param n Int
+    @return Int
+end
+
+# Applies a transform callback.
+def apply
+    @param cb Transform
+    @param value Int
+    @return Int
+do
+    cb(value)
+end
+
+def main
+    @return Void
+do
+    let factor = 3
+    sleep(5)
+    let r = apply(do with n Int
+        n * factor
+    end, 10)
+    print(r)
+end
+
+test apply
+    it 'applies'
+        assert.equal(apply(do with n Int
+            n + 1
+        end, 4), 5)
+    end
+end

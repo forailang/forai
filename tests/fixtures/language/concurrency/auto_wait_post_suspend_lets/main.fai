@@ -1,0 +1,26 @@
+# expect: ok
+# stdout:
+#   9
+def main
+    @return Int
+do
+    let x = child()
+    let y = x + 1
+    y + 1
+end
+
+private:
+
+# Returns after waiting.
+def child
+    @return Int
+do
+    sleep(1)
+    7
+end
+
+test child
+    it 'returns after waiting'
+        assert.equals(child(), 7)
+    end
+end

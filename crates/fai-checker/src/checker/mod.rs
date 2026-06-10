@@ -90,6 +90,12 @@ pub struct Checker {
     pub(super) type_fields: HashMap<String, HashMap<String, Type>>,
     pub(super) extern_types: HashSet<String>,
     pub(super) loop_depth: u32,
+    /// Set while checking the *forked* call of a `nowait`/`all` (the outermost
+    /// call expression), consumed by the call-check to reject a forked target
+    /// with `mutable` params: a detached task holding a mutable reference would
+    /// outlive the caller's binding. Cleared once the outermost call is seen so
+    /// nested calls in the fork's args aren't affected.
+    pub(super) in_nowait_fork: bool,
     pub(super) current_file: Option<String>,
     /// Name of the module currently being checked, used to disambiguate
     /// source-location keys in `ufcs_calls` and `named_param_reorder`.
@@ -140,6 +146,7 @@ impl Checker {
             type_fields: HashMap::new(),
             extern_types: HashSet::new(),
             loop_depth: 0,
+            in_nowait_fork: false,
             current_file: None,
             current_module: None,
             ufcs_calls: HashSet::new(),

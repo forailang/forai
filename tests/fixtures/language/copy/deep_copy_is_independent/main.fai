@@ -1,0 +1,24 @@
+# expect: ok
+# stdout:
+#   1
+#   99
+# copy(x) is a DEEP, independently-owned duplicate: mutating a nested field of
+# the copy leaves the original untouched (reference-shared assignment would not).
+
+type Inner
+    v Int
+end
+
+type Outer
+    inner Inner
+end
+
+def main
+    @return Void
+do
+    var a = Outer(inner: Inner(v: 1))
+    var b = copy(a)
+    b.inner.v = 99
+    print(a.inner.v)
+    print(b.inner.v)
+end

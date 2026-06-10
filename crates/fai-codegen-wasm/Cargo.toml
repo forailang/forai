@@ -11,6 +11,9 @@ license.workspace = true
 fai-compiler = { path = "../fai-compiler" }
 fai-checker = { path = "../fai-checker" }
 wasm-encoder = "0.225"
+# Validate the async engine's output before returning it, so the engine never
+# hands back a module that fails to instantiate (soundness gate).
+wasmparser = "0.221"
 
 [dev-dependencies]
 serde_json = "1"

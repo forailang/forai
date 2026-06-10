@@ -4,12 +4,14 @@ use wasmtime::Linker;
 
 mod array;
 mod async_ops;
+mod crypto;
 mod env;
 mod events;
 mod http_server;
 mod io;
 mod json;
 mod net;
+mod process;
 mod socket_registry;
 mod sockets;
 mod spy;
@@ -17,6 +19,9 @@ mod storage;
 pub(super) mod util;
 
 pub(crate) use spy::reset_all as reset_spy_state;
+
+#[cfg(test)]
+pub(super) use async_ops::clear_timer_requests;
 
 /// Pull any pending trap message left by an assertion-failure import.
 /// Called by the CLI test runner right after catching a wasmtime trap.
@@ -30,12 +35,14 @@ pub(super) fn install_all(linker: &mut Linker<()>) -> Result<(), String> {
     async_ops::install(linker)?;
     json::install(linker)?;
     net::install(linker)?;
+    process::install(linker)?;
     util::install(linker)?;
     http_server::install(linker)?;
     storage::install(linker)?;
     env::install(linker)?;
     events::install(linker)?;
     array::install(linker)?;
+    crypto::install(linker)?;
     sockets::install(linker)?;
     spy::install(linker)?;
     Ok(())

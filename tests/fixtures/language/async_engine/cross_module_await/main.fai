@@ -1,0 +1,20 @@
+use loaders
+
+use { fastLoad } from loaders
+
+# expect: ok
+# stdout:
+#   fast loaded
+#   main done
+#   slow loaded
+# Cross-module async: `main` (entry) drives async fns defined in the `loaders`
+# module. `loaders.slowLoad` resolves via the namespace alias (member call);
+# `fastLoad` via the named import (bare call). The `nowait` fork outlives
+# `main`, so its line drains last.
+def main
+    @return Void
+do
+    nowait loaders.slowLoad()
+    fastLoad()
+    print('main done')
+end

@@ -1,0 +1,9 @@
+# expect: ok
+# browser:
+#   rootResult: 42
+def main
+    @return Int
+do
+    sleep(1)
+    42
+end

@@ -24,12 +24,14 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
             bindings: l.bindings.iter().map(convert_binding).collect(),
             value: convert_expr(&l.value),
             is_private: Some(l.is_private),
+            is_shared: Some(l.is_shared),
             location: loc(&l.location),
         }),
         n::Statement::Var(v) => s::Statement::VarStatement(s::VarStatement {
             bindings: v.bindings.iter().map(convert_binding).collect(),
             value: convert_expr(&v.value),
             is_private: Some(v.is_private),
+            is_shared: Some(v.is_shared),
             location: loc(&v.location),
         }),
         n::Statement::Assignment(a) => s::Statement::AssignmentStatement(s::AssignmentStatement {

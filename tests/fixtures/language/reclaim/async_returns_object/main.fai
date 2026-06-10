@@ -1,0 +1,35 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 115 Part 1, +1-return convention: an async task that RETURNS a heap
+# object transfers that object to the caller. The task releases its other owned
+# locals at completion but retains the result (it escapes), so the live count
+# settles at baseline + 1 — the one object now owned by the caller's `r`
+# binding (which is released later, at main's own completion).
+def main
+    @return Void
+do
+    let base = __liveObjects()
+    let r = makeArray()
+    let after = __liveObjects()
+    print(after == base + 1)
+end
+
+private:
+
+# Allocates two heap arrays, suspends, and returns one of them. The returned
+# array escapes (+1, kept); the scratch array is reclaimed at completion.
+def makeArray
+    @return Int[]
+do
+    let scratch = [9 9 9]
+    let out = [1 2 3]
+    sleep(1)
+    out
+end
+
+test makeArray
+    it 'returns the kept array after suspending'
+        assert.equals(length(makeArray()), 3)
+    end
+end

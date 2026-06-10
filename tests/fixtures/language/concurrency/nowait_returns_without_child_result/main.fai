@@ -1,0 +1,27 @@
+# expect: ok
+# stdout:
+#   11
+def main
+    @return Int
+do
+    let base = 10
+    nowait child(base)
+    base + 1
+end
+
+private:
+
+# Returns the argument after waiting.
+def child
+    @param x Int
+    @return Int
+do
+    sleep(1)
+    x + 1
+end
+
+test child
+    it 'returns after waiting'
+        assert.equals(child(2), 3)
+    end
+end

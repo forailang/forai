@@ -1,0 +1,13 @@
+# Returns after waiting.
+def child
+    @return Int
+do
+    sleep(1)
+    7
+end
+
+test child
+    it 'is covered by the namespace async fixture'
+        print('placeholder')
+    end
+end

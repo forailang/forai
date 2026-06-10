@@ -15,7 +15,7 @@ use wasmtime::*;
 
 use super::super::output;
 
-use super::super::heap::{decode_closure_header, wasm_alloc_str};
+use super::super::heap::{decode_closure_header, reserve, wasm_alloc_str};
 use super::super::nan_box::{
     encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_INT, VAL_NULL,
 };
@@ -174,6 +174,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, id: i32, pat_ptr: i32, pat_len: i32, handler_val: i64| {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let pattern = read_mem_str(mem.data(&caller), pat_ptr as usize, pat_len as usize);
+                // The router keeps the handler closure for the life of the server,
+                // so it must co-own it: retain on store, or the guest releasing
+                // its owned handler-arg temp after `server.get` frees the closure
+                // and the next request finds a recycled block (RC, plan 113/115).
+                super::super::heap::host_retain(mem.data_mut(&mut caller), handler_val);
                 WASM_ROUTER_STORE.with(|store| {
                     if let Some(r) = store.borrow_mut().get_mut(&(id as u32)) {
                         r.routes.push(WasmRoute {
@@ -196,6 +201,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, id: i32, pat_ptr: i32, pat_len: i32, handler_val: i64| {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let pattern = read_mem_str(mem.data(&caller), pat_ptr as usize, pat_len as usize);
+                // Retain — the router co-owns the handler for the server's life.
+                super::super::heap::host_retain(mem.data_mut(&mut caller), handler_val);
                 WASM_ROUTER_STORE.with(|store| {
                     if let Some(r) = store.borrow_mut().get_mut(&(id as u32)) {
                         r.routes.push(WasmRoute {
@@ -303,6 +310,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // plans/event-system.md.
                     super::events::drain_queue(&mut caller);
                     write_http_response(&mut caller, stream, response);
+                    // Reclaim the per-request graph (plan 115). `pair` is a
+                    // non-retaining dict holding the sole refs to `request_val`
+                    // and `response`, so one release of `pair` deep-frees the
+                    // pair, both dicts, and everything nested. A beforeRequest
+                    // listener that retained the request (e.g. session setup)
+                    // keeps it alive via its own ref. Must run AFTER
+                    // write_http_response has read the response bytes.
+                    host_release_value(&mut caller, pair);
                 }
             },
         )
@@ -396,6 +411,19 @@ fn try_serve_static_from_router(router_id: u32, path: &str) -> Option<Vec<u8>> {
 /// Write a raw byte response directly to the TCP stream.
 fn write_raw_response(stream: TcpStream, response: Vec<u8>) {
     finish_response(stream, &response);
+}
+
+/// Release a guest object the host owns, via the exported `__fai_release`
+/// (RT_RELEASE) — decrement its refcount and deep-free at zero. Used to reclaim
+/// per-request guest allocations the host built (plan 115). No-op if the export
+/// is missing (older modules) or the call traps.
+fn host_release_value(caller: &mut Caller<'_, ()>, val: i64) {
+    if let Some(f) = caller
+        .get_export("__fai_release")
+        .and_then(|e| e.into_func())
+    {
+        let _ = f.call(&mut *caller, &[Val::I64(val)], &mut []);
+    }
 }
 
 /// Write the response bytes and shut the connection down gracefully.
@@ -590,42 +618,21 @@ fn build_response_dict(
 
 /// Allocate a `Dict` on the guest heap and return a NaN-boxed pointer.
 fn alloc_dict(caller: &mut Caller<'_, ()>, mem: &Memory, entries: &[(i64, i64)]) -> i64 {
-    let addr = heap_ptr(caller);
     let cap = std::cmp::max(entries.len(), 16);
+    // Refcount-prefixed reserve (plan 113): writes the rc=1 prefix, grows memory
+    // through the full `cap*16` extent, and returns the logical dict pointer
+    // (tag@0). Replaces the old direct heap-bump (which also fixed the
+    // boundary-overrun crash by growing before writing).
+    let addr = reserve(caller, mem, 8 + cap * 16) as usize;
     let data = mem.data_mut(&mut *caller);
-    data[addr as usize..addr as usize + 4].copy_from_slice(&OBJ_TAG_DICT.to_le_bytes());
-    data[addr as usize + 4..addr as usize + 8]
-        .copy_from_slice(&(entries.len() as i32).to_le_bytes());
+    data[addr..addr + 4].copy_from_slice(&OBJ_TAG_DICT.to_le_bytes());
+    data[addr + 4..addr + 8].copy_from_slice(&(entries.len() as i32).to_le_bytes());
     for (i, (k, v)) in entries.iter().enumerate() {
-        let ea = addr as usize + 8 + i * 16;
+        let ea = addr + 8 + i * 16;
         data[ea..ea + 8].copy_from_slice(&k.to_le_bytes());
         data[ea + 8..ea + 16].copy_from_slice(&v.to_le_bytes());
     }
-    let new_heap = align8(addr + 8 + cap as u32 * 16);
-    set_heap_ptr(caller, new_heap);
-    encode_object(addr)
-}
-
-fn heap_ptr(caller: &mut Caller<'_, ()>) -> u32 {
-    let g = caller
-        .get_export("__heap_ptr")
-        .unwrap()
-        .into_global()
-        .unwrap();
-    g.get(&mut *caller).unwrap_i32() as u32
-}
-
-fn set_heap_ptr(caller: &mut Caller<'_, ()>, new_heap: u32) {
-    let g = caller
-        .get_export("__heap_ptr")
-        .unwrap()
-        .into_global()
-        .unwrap();
-    let _ = g.set(&mut *caller, Val::I32(new_heap as i32));
-}
-
-fn align8(n: u32) -> u32 {
-    (n + 7) & !7
+    encode_object(addr as u32)
 }
 
 /// Build a `RequestResponse { request, response }` Dict on the guest
@@ -1154,6 +1161,24 @@ fn invoke_handler_with_err(
             format!("not a closure at addr {:#x}, tag={}", addr, tag)
         })?
     };
+    // Async handler (a resume fn — `frame_size > 0`): can't be `call_indirect`'d
+    // like a sync `FaiFunc`. Hand it to the guest scheduler's host-driver, which
+    // spawns it as a task, drives `poll` to completion, and returns the result.
+    if header.frame_size > 0 {
+        let drive = caller
+            .get_export("__fai_drive_closure")
+            .ok_or_else(|| "async handler requires __fai_drive_closure".to_string())?
+            .into_func()
+            .ok_or_else(|| "__fai_drive_closure is not a func".to_string())?;
+        let mut results = vec![Val::I64(0)];
+        drive
+            .call(&mut *caller, &[Val::I64(handler_val), Val::I64(arg)], &mut results)
+            .map_err(|e| format!("wasm trap: {}", e))?;
+        return match results[0] {
+            Val::I64(v) => Ok(v),
+            _ => Err("unexpected result type".to_string()),
+        };
+    }
     if let Some(env_global) = caller.get_export("__env_ptr") {
         if let Some(g) = env_global.into_global() {
             let _ = g.set(&mut *caller, Val::I32(header.env_addr));

@@ -1,0 +1,31 @@
+# expect: ok
+# stdout:
+#   matched
+# Throws an Error; the catch body branches on e.message.
+def child
+    @return Int
+do
+    sleep(1)
+    throw Error('boom')
+end
+
+test child
+    it 'is covered by the branching catch fixture'
+        print('placeholder')
+    end
+end
+
+def main
+    @return String
+do
+    try
+        let x = child()
+        'unreached'
+    catch e
+        if e.message == 'boom'
+            'matched'
+        else
+            'other'
+        end
+    end
+end

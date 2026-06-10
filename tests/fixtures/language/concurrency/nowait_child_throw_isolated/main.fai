@@ -1,0 +1,27 @@
+# expect: ok
+# stdout:
+#   11
+def main
+    @return Int
+do
+    let base = 10
+    nowait background(base)
+    base + 1
+end
+
+private:
+
+# Throws after waiting in the background.
+def background
+    @param x Int
+    @return Int
+do
+    sleep(1)
+    throw 7
+end
+
+test background
+    it 'is covered by the async runtime fixture'
+        print('placeholder')
+    end
+end

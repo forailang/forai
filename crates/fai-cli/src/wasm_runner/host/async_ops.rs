@@ -1,9 +1,38 @@
-//! Async/concurrency host imports: `now_ms`, `random`, `sleep_ms`, `run_all`, `spawn`.
+//! Async/concurrency host imports.
+//!
+//! `host_set_timer` is the scheduler-owned sleep/all ABI: guest frames own
+//! task state and ask the host only to arrange a later wakeup. Production
+//! async (`fai run`, browser) lowers `sleep`/`all` through it.
+//!
+//! `sleep_ms` and `run_all` are the test-mode / legacy-direct compatibility
+//! path. They are emitted only when async analysis declines (e.g. `is_test`
+//! builds, where async functions called from `test` blocks fall through to the
+//! direct builder); production async never reaches them. There they give
+//! correct *values* for synchronous test assertions: `sleep_ms` blocks the
+//! thread, `run_all` runs children sequentially. `spawn` backs `nowait` the
+//! same way.
+
+use std::cell::RefCell;
 
 use wasmtime::*;
 
-use super::super::heap::decode_closure_header;
+use super::super::heap::{decode_closure_header, host_retain, reserve};
 use super::super::nan_box::{encode_object, OBJ_TAG_TUPLE, VAL_NULL, VAL_VOID};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimerRequest {
+    pub task_id: i32,
+    pub ms: i32,
+}
+
+thread_local! {
+    static TIMER_REQUESTS: RefCell<Vec<TimerRequest>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn clear_timer_requests() {
+    TIMER_REQUESTS.with(|requests| requests.borrow_mut().clear());
+}
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.now_ms() -> f64
@@ -36,15 +65,38 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.sleep_ms(ms: f64)
+    // Test-mode / legacy-direct path. Production `sleep` lowers to
+    // host_set_timer and never reaches this; here (async fns called from
+    // `test` blocks) a real blocking sleep makes the synchronous test
+    // assertion observe the post-suspend value.
     linker
         .func_wrap("env", "sleep_ms", |ms: f64| {
-            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            std::thread::sleep(std::time::Duration::from_millis(ms.max(0.0) as u64));
+        })
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.host_set_timer(task_id: i32, ms: i32)
+    // Records task wakeup requests for the host event loop. The current
+    // CLI runner still polls time directly, but keeping these requests
+    // makes the host side of the scheduler ABI real and testable.
+    linker
+        .func_wrap("env", "host_set_timer", |task_id: i32, ms: i32| {
+            TIMER_REQUESTS.with(|requests| {
+                requests.borrow_mut().push(TimerRequest {
+                    task_id,
+                    ms: ms.max(0),
+                });
+            });
         })
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.run_all(args_ptr: i32, count: i32) -> i64
-    // Reads N closure values from guest memory, calls each via the function table,
-    // allocates a tuple [tag=2][count][val0][val1]... in guest memory, returns NaN-boxed pointer.
+    // Test-mode / legacy-direct path. Production `all` lowers to guest-owned
+    // child task records via the scheduler; this is reached only when async
+    // analysis declines (e.g. `is_test`). Reads N closure values from guest
+    // memory, calls each via the function table (sequentially — tests assert
+    // values, not overlap), allocates a tuple
+    // [tag=2][count][val0][val1]... in guest memory, returns NaN-boxed pointer.
     linker
         .func_wrap(
             "env",
@@ -96,27 +148,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 }
 
                 // Allocate tuple in guest memory: [tag:i32=2][count:i32][val0:i64][val1:i64]...
-                let heap_ptr_val = match caller
-                    .get_export("__heap_ptr")
-                    .and_then(|e| e.into_global())
-                {
-                    Some(g) => match g.get(&mut caller) {
-                        Val::I32(v) => v,
-                        _ => return VAL_VOID,
-                    },
-                    None => return VAL_VOID,
-                };
-
-                let tuple_addr = heap_ptr_val as usize;
+                // Route through `reserve` so the tuple carries the rc=1 prefix
+                // the guest RC expects (plan 113). The tuple co-owns each result
+                // it collects (a closure may have returned a borrowed value), so
+                // each object element is retained — releasing whatever else holds
+                // it then can't free it out from under this tuple.
                 let tuple_size = 8 + results.len() * 8; // tag(4) + count(4) + N * i64
-                let new_heap_ptr = tuple_addr + tuple_size;
+                let tuple_addr = reserve(&mut caller, &mem, tuple_size) as usize;
 
-                // Write tuple to memory
                 {
                     let data = mem.data_mut(&mut caller);
-                    if tuple_addr + tuple_size > data.len() {
-                        return VAL_VOID; // out of memory
-                    }
                     data[tuple_addr..tuple_addr + 4].copy_from_slice(&OBJ_TAG_TUPLE.to_le_bytes());
                     data[tuple_addr + 4..tuple_addr + 8]
                         .copy_from_slice(&(results.len() as i32).to_le_bytes());
@@ -124,14 +165,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         let off = tuple_addr + 8 + i * 8;
                         data[off..off + 8].copy_from_slice(&val.to_le_bytes());
                     }
-                }
-
-                // Bump heap_ptr
-                if let Some(g) = caller
-                    .get_export("__heap_ptr")
-                    .and_then(|e| e.into_global())
-                {
-                    let _ = g.set(&mut caller, Val::I32(new_heap_ptr as i32));
+                    for &val in &results {
+                        host_retain(data, val);
+                    }
                 }
 
                 // Return NaN-boxed object pointer to tuple
@@ -141,7 +177,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.spawn(closure_val: i64) -> i64
-    // Calls the closure synchronously (Tier 1 — no real concurrency in WASM yet).
+    // Legacy nowait compatibility path. Calls the closure synchronously until
+    // nowait is moved onto guest-owned task records.
     linker
         .func_wrap(
             "env",

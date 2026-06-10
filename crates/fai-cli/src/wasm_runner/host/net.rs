@@ -4,9 +4,12 @@ use wasmtime::*;
 
 #[cfg(feature = "http-client")]
 use super::super::heap::{build_value, wasm_alloc_str};
-use super::super::nan_box::VAL_NULL;
+use super::super::nan_box::{ADDR_MASK, OBJ_TAG_DICT, OBJ_TAG_STRING, QNAN, SIGN_BIT, VAL_NULL};
 #[cfg(feature = "http-client")]
 use super::events::{alloc_dict, write_global_i32, write_global_i64};
+
+#[cfg(feature = "http-client")]
+const HTTP_CLIENT_TIMEOUT_SECS: u64 = 120;
 
 /// Build a forai-shaped Error Dict (`{ message, kind }`) in guest
 /// memory and stash it into `__error_value` with `__error_flag = 1`
@@ -118,6 +121,7 @@ fn do_verb(
     method: &str,
     url: &str,
     body: Option<&str>,
+    request_headers: &[(String, String)],
 ) -> i64 {
     // file:// parity with VM.
     if let Some(path) = file_url_to_path(url) {
@@ -173,7 +177,7 @@ fn do_verb(
 
     #[cfg(feature = "http-client")]
     {
-        match do_http_request(method, url, body) {
+        match do_http_request(method, url, body, request_headers) {
             Ok((status, body_text, headers)) => {
                 build_http_response_dict(caller, mem, status, &body_text, &headers)
             }
@@ -192,27 +196,51 @@ fn do_http_request(
     method: &str,
     url: &str,
     body: Option<&str>,
+    request_headers: &[(String, String)],
 ) -> Result<(i32, String, Vec<(String, String)>), String> {
     let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .timeout_global(Some(std::time::Duration::from_secs(
+            HTTP_CLIENT_TIMEOUT_SECS,
+        )))
         .build()
         .new_agent();
 
     let req_result = match (method, body) {
-        ("GET", _) => agent.get(url).call(),
-        ("DELETE", _) => agent.delete(url).call(),
-        ("POST", Some(b)) => agent
-            .post(url)
-            .header("Content-Type", "application/json")
-            .send(b.as_bytes()),
-        ("PUT", Some(b)) => agent
-            .put(url)
-            .header("Content-Type", "application/json")
-            .send(b.as_bytes()),
-        ("PATCH", Some(b)) => agent
-            .patch(url)
-            .header("Content-Type", "application/json")
-            .send(b.as_bytes()),
+        ("GET", _) => {
+            let mut req = agent.get(url);
+            for (name, value) in request_headers {
+                req = req.header(name, value);
+            }
+            req.call()
+        }
+        ("DELETE", _) => {
+            let mut req = agent.delete(url);
+            for (name, value) in request_headers {
+                req = req.header(name, value);
+            }
+            req.call()
+        }
+        ("POST", Some(b)) => {
+            let mut req = agent.post(url).header("Content-Type", "application/json");
+            for (name, value) in request_headers {
+                req = req.header(name, value);
+            }
+            req.send(b.as_bytes())
+        }
+        ("PUT", Some(b)) => {
+            let mut req = agent.put(url).header("Content-Type", "application/json");
+            for (name, value) in request_headers {
+                req = req.header(name, value);
+            }
+            req.send(b.as_bytes())
+        }
+        ("PATCH", Some(b)) => {
+            let mut req = agent.patch(url).header("Content-Type", "application/json");
+            for (name, value) in request_headers {
+                req = req.header(name, value);
+            }
+            req.send(b.as_bytes())
+        }
         _ => return Err(format!("invalid method/body combo: {}", method)),
     };
 
@@ -233,6 +261,66 @@ fn do_http_request(
         }
         Err(e) => Err(format!("{}", e)),
     }
+}
+
+fn read_headers_arg(
+    mem: &Memory,
+    caller: &mut Caller<'_, ()>,
+    headers_val: i64,
+) -> Vec<(String, String)> {
+    let v = headers_val as u64;
+    if v == VAL_NULL as u64 || (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return Vec::new();
+    }
+    let addr = (v & ADDR_MASK) as usize;
+    let data = mem.data(&*caller);
+    if addr + 8 > data.len() {
+        return Vec::new();
+    }
+    let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().unwrap_or([0; 4]));
+    if tag != OBJ_TAG_DICT {
+        return Vec::new();
+    }
+    let count = i32::from_le_bytes(data[addr + 4..addr + 8].try_into().unwrap_or([0; 4])) as usize;
+    let mut headers = Vec::new();
+    for i in 0..count {
+        let off = addr + 8 + i * 16;
+        if off + 16 > data.len() {
+            break;
+        }
+        let key = i64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0; 8]));
+        let value = i64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap_or([0; 8]));
+        let Some(name) = read_string_value(data, key) else {
+            continue;
+        };
+        let Some(header_value) = read_string_value(data, value) else {
+            continue;
+        };
+        headers.push((name.to_string(), header_value.to_string()));
+    }
+    headers
+}
+
+fn read_string_value(data: &[u8], val: i64) -> Option<&str> {
+    let v = val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return None;
+    }
+    let addr = (v & ADDR_MASK) as usize;
+    if addr + 8 > data.len() {
+        return None;
+    }
+    let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().ok()?);
+    if tag != OBJ_TAG_STRING {
+        return None;
+    }
+    let len = i32::from_le_bytes(data[addr + 4..addr + 8].try_into().ok()?) as usize;
+    let start = addr + 8;
+    let end = start.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    std::str::from_utf8(&data[start..end]).ok()
 }
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -263,7 +351,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 #[cfg(feature = "http-client")]
                 {
                     let agent = ureq::Agent::config_builder()
-                        .timeout_global(Some(std::time::Duration::from_secs(10)))
+                        .timeout_global(Some(std::time::Duration::from_secs(
+                            HTTP_CLIENT_TIMEOUT_SECS,
+                        )))
                         .build()
                         .new_agent();
                     match agent
@@ -297,20 +387,21 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.http_request_get(url_ptr, url_len) -> i64 (Dict or null)
+    // env.http_request_get(url_ptr, url_len, headers_val) -> i64 (Dict or null)
     linker
         .func_wrap(
             "env",
             "http_request_get",
-            |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32| -> i64 {
+            |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32, headers_val: i64| -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
-                do_verb(&mut caller, &mem, "GET", &url, None)
+                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                do_verb(&mut caller, &mem, "GET", &url, None, &headers)
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.http_request_post(url_ptr, url_len, body_ptr, body_len) -> i64
+    // env.http_request_post(url_ptr, url_len, body_ptr, body_len, headers_val) -> i64
     linker
         .func_wrap(
             "env",
@@ -319,17 +410,19 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
              url_ptr: i32,
              url_len: i32,
              body_ptr: i32,
-             body_len: i32|
+             body_len: i32,
+             headers_val: i64|
              -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                do_verb(&mut caller, &mem, "POST", &url, Some(&body))
+                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                do_verb(&mut caller, &mem, "POST", &url, Some(&body), &headers)
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.http_request_put(url_ptr, url_len, body_ptr, body_len) -> i64
+    // env.http_request_put(url_ptr, url_len, body_ptr, body_len, headers_val) -> i64
     linker
         .func_wrap(
             "env",
@@ -338,17 +431,19 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
              url_ptr: i32,
              url_len: i32,
              body_ptr: i32,
-             body_len: i32|
+             body_len: i32,
+             headers_val: i64|
              -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                do_verb(&mut caller, &mem, "PUT", &url, Some(&body))
+                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                do_verb(&mut caller, &mem, "PUT", &url, Some(&body), &headers)
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.http_request_patch(url_ptr, url_len, body_ptr, body_len) -> i64
+    // env.http_request_patch(url_ptr, url_len, body_ptr, body_len, headers_val) -> i64
     linker
         .func_wrap(
             "env",
@@ -357,25 +452,28 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
              url_ptr: i32,
              url_len: i32,
              body_ptr: i32,
-             body_len: i32|
+             body_len: i32,
+             headers_val: i64|
              -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                do_verb(&mut caller, &mem, "PATCH", &url, Some(&body))
+                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                do_verb(&mut caller, &mem, "PATCH", &url, Some(&body), &headers)
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.http_request_delete(url_ptr, url_len) -> i64
+    // env.http_request_delete(url_ptr, url_len, headers_val) -> i64
     linker
         .func_wrap(
             "env",
             "http_request_delete",
-            |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32| -> i64 {
+            |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32, headers_val: i64| -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
-                do_verb(&mut caller, &mem, "DELETE", &url, None)
+                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                do_verb(&mut caller, &mem, "DELETE", &url, None, &headers)
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -455,7 +553,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         fn_name, args_json, hash
                     );
                     let agent = ureq::Agent::config_builder()
-                        .timeout_global(Some(std::time::Duration::from_secs(10)))
+                        .timeout_global(Some(std::time::Duration::from_secs(
+                            HTTP_CLIENT_TIMEOUT_SECS,
+                        )))
                         .build()
                         .new_agent();
                     // Send the request and surface every failure mode as a
@@ -518,5 +618,123 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.remote_begin(task_id, url*,len, fn*,len, args*,len, hash*,len) -> ()
+    // The async (suspending) RPC path. Native does the request synchronously,
+    // stores the result keyed by task id, and resumes the parked task; the guest
+    // then reads it with `remote_result`. (On the browser the same import is
+    // implemented with async `fetch`, keeping the UI thread free.)
+    linker
+        .func_wrap(
+            "env",
+            "remote_begin",
+            |#[allow(unused_mut)] mut caller: Caller<'_, ()>,
+             task_id: i32,
+             url_ptr: i32,
+             url_len: i32,
+             fn_ptr: i32,
+             fn_len: i32,
+             args_ptr: i32,
+             args_len: i32,
+             hash_ptr: i32,
+             hash_len: i32| {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                #[allow(unused_variables)]
+                let (url, fn_name, args_json, hash) = {
+                    let data = mem.data(&caller);
+                    (
+                        String::from_utf8_lossy(&data[url_ptr as usize..(url_ptr + url_len) as usize])
+                            .into_owned(),
+                        String::from_utf8_lossy(&data[fn_ptr as usize..(fn_ptr + fn_len) as usize])
+                            .into_owned(),
+                        String::from_utf8_lossy(&data[args_ptr as usize..(args_ptr + args_len) as usize])
+                            .into_owned(),
+                        String::from_utf8_lossy(&data[hash_ptr as usize..(hash_ptr + hash_len) as usize])
+                            .into_owned(),
+                    )
+                };
+                #[cfg(feature = "http-client")]
+                let outcome: Result<i64, String> = {
+                    let rpc_url = format!("{}/fai/rpc", url.trim_end_matches('/'));
+                    let body = format!(
+                        "{{\"fn\":\"{}\",\"args\":{},\"hash\":\"{}\"}}",
+                        fn_name, args_json, hash
+                    );
+                    let agent = ureq::Agent::config_builder()
+                        .timeout_global(Some(std::time::Duration::from_secs(
+                            HTTP_CLIENT_TIMEOUT_SECS,
+                        )))
+                        .build()
+                        .new_agent();
+                    match agent
+                        .post(&rpc_url)
+                        .header("Content-Type", "application/json")
+                        .send(body.as_bytes())
+                    {
+                        Err(e) => Err(format!("network error: {}", e)),
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let resp_body = resp.into_body().read_to_string().unwrap_or_default();
+                            if !(200..300).contains(&status) {
+                                Err(format!("HTTP {}", status))
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                                    Ok(parsed) => {
+                                        if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            let value =
+                                                parsed.get("value").unwrap_or(&serde_json::Value::Null);
+                                            Ok(build_value(&mut caller, &mem, value))
+                                        } else {
+                                            Err(parsed
+                                                .get("error")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("remote call failed")
+                                                .to_string())
+                                        }
+                                    }
+                                    Err(_) => Err("invalid JSON in response".to_string()),
+                                }
+                            }
+                        }
+                    }
+                };
+                #[cfg(not(feature = "http-client"))]
+                let outcome: Result<i64, String> = Ok(VAL_NULL);
+                PENDING_RPC.with(|p| p.borrow_mut().insert(task_id, outcome));
+                // Wake the parked task so the next poll runs its continuation.
+                if let Some(f) = caller
+                    .get_export("__fai_resume_task")
+                    .and_then(|e| e.into_func())
+                {
+                    let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.remote_result(task_id) -> i64 — the value stored by `remote_begin`,
+    // or null with `__error_flag` set on failure (for the caller's try/catch).
+    linker
+        .func_wrap(
+            "env",
+            "remote_result",
+            |mut caller: Caller<'_, ()>, task_id: i32| -> i64 {
+                let outcome = PENDING_RPC.with(|p| p.borrow_mut().remove(&task_id));
+                match outcome {
+                    Some(Ok(v)) => v,
+                    Some(Err(msg)) => signal_remote_call_error(&mut caller, &msg),
+                    None => signal_remote_call_error(&mut caller, "missing RPC result"),
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
+}
+
+thread_local! {
+    /// Per-task RPC results bridging `remote_begin` → `remote_result` across the
+    /// task's suspension. The value is a NaN-boxed guest heap address (stable —
+    /// the bump heap never reclaims) or an error message re-signaled on read.
+    static PENDING_RPC: std::cell::RefCell<std::collections::HashMap<i32, Result<i64, String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }

@@ -57,6 +57,9 @@ pub struct BrowserAssertion {
     pub selector: Option<String>,
     pub text: Option<String>,
     pub html: Option<String>,
+    pub root_result: Option<String>,
+    pub duration_less_than_ms: Option<u64>,
+    pub duration_at_least_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -259,7 +262,12 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     }
 
     let stdout = stdout_lines.map(|v| v.join("\n"));
-    let browser = if browser.selector.is_some() || browser.text.is_some() || browser.html.is_some()
+    let browser = if browser.selector.is_some()
+        || browser.text.is_some()
+        || browser.html.is_some()
+        || browser.root_result.is_some()
+        || browser.duration_less_than_ms.is_some()
+        || browser.duration_at_least_ms.is_some()
     {
         Some(browser)
     } else {
@@ -280,7 +288,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
 fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), String> {
     let Some((key, value)) = line.split_once(':') else {
         return Err(format!(
-            "browser directive lines must be `selector:`, `text:`, or `html:`, got `{}`",
+            "browser directive lines must be `selector:`, `text:`, `html:`, `rootResult:`, `durationLessThanMs:`, or `durationAtLeastMs:`, got `{}`",
             line
         ));
     };
@@ -289,9 +297,26 @@ fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), 
         "selector" => browser.selector = Some(value),
         "text" => browser.text = Some(value),
         "html" => browser.html = Some(value),
+        "rootResult" => browser.root_result = Some(value),
+        "durationLessThanMs" => {
+            browser.duration_less_than_ms = Some(value.parse::<u64>().map_err(|e| {
+                format!(
+                    "durationLessThanMs must be an integer millisecond value: {}",
+                    e
+                )
+            })?)
+        }
+        "durationAtLeastMs" => {
+            browser.duration_at_least_ms = Some(value.parse::<u64>().map_err(|e| {
+                format!(
+                    "durationAtLeastMs must be an integer millisecond value: {}",
+                    e
+                )
+            })?)
+        }
         other => {
             return Err(format!(
-                "unknown browser assertion `{}` (want selector|text|html)",
+                "unknown browser assertion `{}` (want selector|text|html|rootResult|durationLessThanMs|durationAtLeastMs)",
                 other
             ));
         }
@@ -428,6 +453,15 @@ fn browser_assertion_json(assertion: &BrowserAssertion) -> String {
     }
     if let Some(html) = &assertion.html {
         parts.push(format!("\"html\":\"{}\"", escape_json(html)));
+    }
+    if let Some(root_result) = &assertion.root_result {
+        parts.push(format!("\"rootResult\":\"{}\"", escape_json(root_result)));
+    }
+    if let Some(ms) = assertion.duration_less_than_ms {
+        parts.push(format!("\"durationLessThanMs\":{}", ms));
+    }
+    if let Some(ms) = assertion.duration_at_least_ms {
+        parts.push(format!("\"durationAtLeastMs\":{}", ms));
     }
     format!("{{{}}}", parts.join(","))
 }

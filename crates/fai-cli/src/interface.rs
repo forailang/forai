@@ -673,6 +673,7 @@ mod tests {
             bindings: vec![],
             value: Expression::NullExpression(NullExpression { location: loc() }),
             is_private: None,
+            is_shared: None,
             location: loc(),
         };
         let spec = extract_interface("app", "1.0.0", &[Statement::LetStatement(ls)]);

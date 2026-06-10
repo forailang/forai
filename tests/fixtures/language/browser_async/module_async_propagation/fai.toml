@@ -1,0 +1,4 @@
+[project]
+name = "browser_async_module_async_propagation"
+version = "0.1.0"
+source_root = "."

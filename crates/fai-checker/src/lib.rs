@@ -542,6 +542,21 @@ mod tests {
         check_ok("type P\n  x Int\nend\n\n# Mutate.\ndef mutate\n    @param p P, mutable\n    @return Void\ndo\n  p.x = 2\nend\n\ndef main\n    @return Void\ndo\n  var p = P(x: 1)\n  mutate(p)\nend");
     }
 
+    #[test]
+    fn test_nowait_of_mutable_param_fn_errors() {
+        // A `nowait` fork must not target a fn with a `mutable` param — the
+        // detached task would hold a reference escaping the caller's scope.
+        check_err(
+            "type P\n  x Int\nend\n\n# Mutate.\ndef mutate\n    @param p P, mutable\n    @return Void\ndo\n  p.x = 2\nend\n\ndef main\n    @return Void\ndo\n  var p = P(x: 1)\n  nowait mutate(p)\nend",
+            "mutable parameter",
+        );
+    }
+
+    #[test]
+    fn test_nowait_of_immutable_param_fn_ok() {
+        check_ok("type P\n  x Int\nend\n\n# Read.\ndef show\n    @param p P\n    @return Void\ndo\n  print(p.x)\nend\n\ndef main\n    @return Void\ndo\n  let p = P(x: 1)\n  nowait show(p)\nend");
+    }
+
     // ── closure captures var bindings — mutable propagation ─────────
 
     #[test]

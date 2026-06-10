@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   A
+#   B
+def main
+    @return Void
+do
+    print('A')
+    sleep(50)
+    print('B')
+end

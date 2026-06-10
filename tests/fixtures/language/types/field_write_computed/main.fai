@@ -1,0 +1,24 @@
+# expect: ok
+# stdout:
+#   6
+#   20
+# Regression: assigning a *computed* value (not a literal) to a record field
+# must NaN-box the result. The field-store path once used the boxing-agnostic
+# `compile_expr`, so an arithmetic fast-path (`p.x = p.x + 1`) left a raw i64 in
+# the slot and read back as a garbage float — the same trap the Index path
+# already guarded against.
+
+type Point
+    x Int
+    y Int
+end
+
+def main
+    @return Void
+do
+    var p = Point(x: 5, y: 10)
+    p.x = p.x + 1
+    print(p.x)
+    p.y = p.y * 2
+    print(p.y)
+end

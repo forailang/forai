@@ -94,11 +94,28 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
+        // `shared let …` / `shared var …` — `shared` is a CONTEXTUAL keyword
+        // (still usable as an identifier elsewhere): only special immediately
+        // before `let`/`var`. Marks the binding as deliberately aliased.
+        if self.check(TokenType::Identifier)
+            && self.peek().lexeme == "shared"
+            && matches!(
+                self.peek_next().token_type,
+                TokenType::Let | TokenType::Var
+            )
+        {
+            self.advance(); // consume `shared`
+            let mutable = self.match_t(TokenType::Var);
+            if !mutable {
+                self.advance(); // consume `let`
+            }
+            return self.parse_variable_statement(mutable, true);
+        }
         if self.match_t(TokenType::Let) {
-            return self.parse_variable_statement(false);
+            return self.parse_variable_statement(false, false);
         }
         if self.match_t(TokenType::Var) {
-            return self.parse_variable_statement(true);
+            return self.parse_variable_statement(true, false);
         }
         if self.match_t(TokenType::Use) {
             return self.parse_use_statement();
@@ -265,7 +282,11 @@ impl Parser {
         ))
     }
 
-    fn parse_variable_statement(&mut self, mutable: bool) -> Result<Statement, String> {
+    fn parse_variable_statement(
+        &mut self,
+        mutable: bool,
+        is_shared: bool,
+    ) -> Result<Statement, String> {
         let loc = self.location_of_prev();
         let mut bindings = vec![self.parse_binding_declaration()?];
         while self.match_t(TokenType::Comma) {
@@ -278,6 +299,7 @@ impl Parser {
                 bindings,
                 value,
                 is_private: false,
+                is_shared,
                 location: loc,
             }))
         } else {
@@ -285,6 +307,7 @@ impl Parser {
                 bindings,
                 value,
                 is_private: false,
+                is_shared,
                 location: loc,
             }))
         }

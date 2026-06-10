@@ -446,16 +446,34 @@ Fixtures:
 The same `.fai` sources should be used where possible for CLI/server and
 browser assertions.
 
-### Phase 8: Replace Old Concurrency Imports
+### Phase 8: Replace Old Concurrency Imports — DONE
 
-Once scheduler-owned `wait` and `all` pass parity tests:
+Status (2026-06-03):
 
-- deprecate or remove synchronous `sleep_ms`, `run_all`, and `spawn` behavior
-  where they conflict with the new model
-- update `language.md`
-- update `fai-cli/docs/lang/concurrency.fai`
-- update generated browser loaders
-- keep compatibility aliases only if they map into the scheduler
+- **Naming decided (Open Question 1):** `wait` is removed entirely; `sleep(ms)`
+  is the sole timed-suspend primitive. Calls auto-await by default, so a `wait`
+  spelling read like an await keyword. `wait` removed from the checker builtin,
+  codegen dispatch, async-effect analysis, the scheduler's `wait_call_delay_ms`,
+  `language.md`, `concurrency.fai`, and all fixtures. `sleep`/`all`/`nowait` are
+  the only concurrency surface.
+- **Synchronous imports scoped to the test/legacy path.** Production async
+  (`fai run`, browser; `is_test=false`) routes through `try_codegen_async` →
+  scheduler / `host_set_timer` and never emits or calls `sleep_ms`/`run_all`.
+  Those imports are reachable only when async analysis declines — i.e.
+  `is_test=true`, where async functions called from `test` blocks fall through
+  to the direct builder. There the host `sleep_ms` (blocking) and `run_all`
+  (sequential tuple) give correct *values* for synchronous test assertions
+  (tests assert values, not timing/overlap). They are documented as the
+  test-mode / legacy-direct path in `host/async_ops.rs` and `direct.rs`.
+- Browser loader shims for `sleep_ms`/`run_all` throw (browser is always
+  `is_test=false` and strips those imports); messages updated to drop `wait()`.
+- `language.md` + `fai-cli/docs/lang/concurrency.fai` updated.
+- Full workspace green; all concurrency + browser_async fixtures pass.
+
+Remaining (future, not blocking): retiring `sleep_ms`/`run_all` *entirely* would
+require routing the test runner (`_fai_run_test`) through the scheduler so async
+test bodies suspend/resume like production. Deferred — see "uniform async in
+tests" under Future Extensions.
 
 ## Future Extensions
 
@@ -541,7 +559,9 @@ Performance checks:
 
 ## Open Questions
 
-1. Should the user-facing primitive be `wait(ms)`, `sleep(ms)`, or both?
+1. ~~Should the user-facing primitive be `wait(ms)`, `sleep(ms)`, or both?~~
+   **Resolved (2026-06-03): `sleep(ms)` only.** `wait` removed — calls
+   auto-await by default, and `nowait` is the only concurrency keyword.
 2. Should async-effectful named functions be visible in docs as async, even
    without source syntax?
 3. Should `all()` with zero arguments be allowed? If yes, what tuple shape?

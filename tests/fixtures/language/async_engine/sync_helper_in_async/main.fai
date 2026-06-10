@@ -1,0 +1,32 @@
+# expect: ok
+# stdout:
+#   42
+#   84
+# Hybrid model: `main` is async (it sleeps), but `double` never suspends so
+# it stays on the fast sync path. The call `double(n)` inside the async body
+# is a plain direct call — not an await — and threads args + a return value
+# across the boundary.
+def main
+    @return Void
+do
+    let n = double(21)
+    sleep(10)
+    print(n)
+    print(double(n))
+end
+
+private:
+
+# Doubles a number. Pure/synchronous — no suspension.
+def double
+    @param x Int
+    @return Int
+do
+    x * 2
+end
+
+test double
+    it 'doubles'
+        double(21)
+    end
+end

@@ -1,0 +1,13 @@
+# expect: ok
+# browser:
+#   rootResult: 8
+def main
+    @return Int
+do
+    try
+        sleep(1)
+        throw 7
+    catch e
+        8
+    end
+end

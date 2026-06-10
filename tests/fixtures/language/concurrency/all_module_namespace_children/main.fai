@@ -1,0 +1,11 @@
+use helper
+
+# expect: ok
+# stdout:
+#   11
+def main
+    @return Int
+do
+    let a, b = all(helper.slow(), helper.fast())
+    a + b
+end

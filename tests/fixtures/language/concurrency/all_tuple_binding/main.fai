@@ -1,0 +1,39 @@
+# expect: ok
+# stdout:
+#   3
+def main
+    @return Int
+do
+    let results = all(slow(), fast())
+    results[0] + results[1]
+end
+
+private:
+
+# Returns after a slower wait.
+def slow
+    @return Int
+do
+    sleep(2)
+    1
+end
+
+# Returns after a faster wait.
+def fast
+    @return Int
+do
+    sleep(1)
+    2
+end
+
+test slow
+    it 'returns after a slower wait'
+        assert.equals(slow(), 1)
+    end
+end
+
+test fast
+    it 'returns after a faster wait'
+        assert.equals(fast(), 2)
+    end
+end

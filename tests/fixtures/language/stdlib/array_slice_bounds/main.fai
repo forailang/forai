@@ -1,0 +1,35 @@
+use std.array
+
+# Out-of-range and empty slices: start/end are clamped to [0, len] and an
+# end<start range collapses to empty (shared emit_clamp_range_to_len, signed
+# compares so negative/over-range indices never drive an OOB read).
+# expect: ok
+# stdout:
+#   full 3
+#   10
+#   20
+#   30
+#   endlt 0
+#   past 0
+#   emptyarr 0
+def main
+    @return Void
+do
+    let a = [
+        10
+        20
+        30
+    ]
+    let full = array.slice(a, -5, 100)
+    print('full ' + toString(length(full)))
+    for x in full
+        print(x)
+    end
+    let endlt = array.slice(a, 2, 1)
+    print('endlt ' + toString(length(endlt)))
+    let past = array.slice(a, 5, 9)
+    print('past ' + toString(length(past)))
+    let e Int[] = []
+    let emptyarr = array.slice(e, 0, 5)
+    print('emptyarr ' + toString(length(emptyarr)))
+end

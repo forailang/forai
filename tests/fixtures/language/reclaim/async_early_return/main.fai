@@ -1,0 +1,40 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 115 Part 1: an early `return` reaches a completion BEFORE a later binding
+# is assigned. Because task frames are zeroed at spawn, that unwritten slot reads
+# 0 — a safe RT_RELEASE no-op — instead of a stale pointer from a recycled frame
+# block. So releasing the whole owned-slot set at the early completion reclaims
+# the assigned locals and harmlessly skips the unset one. Live count returns to
+# baseline.
+def main
+    @return Void
+do
+    let base = __liveObjects()
+    let n = doWork(true)
+    let after = __liveObjects()
+    print(after == base)
+end
+
+private:
+
+# `b` is declared after the early return, so on the `flag` path its frame slot
+# is never written (stays zero). `a` is reclaimed; the zero `b` slot is skipped.
+def doWork
+    @param flag Bool
+    @return Int
+do
+    let a = [1 2 3]
+    sleep(1)
+    if flag
+        return length(a)
+    end
+    let b = [4 5 6]
+    length(a) + length(b)
+end
+
+test doWork
+    it 'returns early on the flag path'
+        assert.equals(doWork(true), 3)
+    end
+end

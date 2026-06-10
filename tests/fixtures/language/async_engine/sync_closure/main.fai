@@ -1,0 +1,52 @@
+# expect: ok
+# stdout:
+#   42
+# `main` is async (it sleeps), but `doubleIt` is a sync helper that builds and
+# applies a closure. Sync-fn closures must be emitted in the async module's
+# function table (after the async resume fns), and the async→sync direct call
+# reaches them.
+
+type def Transform
+    @param n Int
+    @return Int
+end
+
+# Applies a transform callback.
+def apply
+    @param cb Transform
+    @param value Int
+    @return Int
+do
+    cb(value)
+end
+
+# Sync: builds a doubling closure and applies it.
+def doubleIt
+    @param x Int
+    @return Int
+do
+    apply(do with n Int
+        n * 2
+    end, x)
+end
+
+def main
+    @return Void
+do
+    sleep(5)
+    print(doubleIt(21))
+end
+
+test apply
+    it 'applies'
+        assert.equal(apply(do with n Int
+            n + 1
+        end, 4), 5)
+    end
+end
+
+test doubleIt
+    it 'doubles'
+        assert.equal(doubleIt(10), 20)
+    end
+end

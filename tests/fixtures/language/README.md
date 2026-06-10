@@ -99,7 +99,7 @@ end
 | `stdout:` | Expected stdout. Each following `#` line (indented under the directive) is one output line. Trailing newline tolerated. |
 | `error:` | Pattern the diagnostic must contain. Plain substring, or `/regex/` for a regex. |
 | `skip: <reason>` | Temporarily skip. Must reference a tracking issue. |
-| `browser:` | Browser DOM assertion. Requires `selector:` plus `text:` or `html:` continuation lines. |
+| `browser:` | Browser assertion. Use `selector:` plus `text:`/`html:` for DOM assertions, `rootResult:` for the root return value, and optional duration bounds for async parity. |
 
 ## Gates
 
@@ -136,6 +136,25 @@ The harness runs fmt-check and check, builds the fixture with
 `fai build --html`, serves the generated bundle with the contained
 Playwright runner in `tests/browser-harness`, and asserts either the
 selected element's `innerText` (`text:`) or `innerHTML` (`html:`).
+
+Async/browser parity fixtures can assert a returned root value directly:
+
+```fai
+# expect: ok
+# browser:
+#   rootResult: 42
+```
+
+Async browser fixtures can also assert root execution duration after the
+WASM instance starts:
+
+```fai
+# expect: ok
+# browser:
+#   rootResult: 3
+#   durationAtLeastMs: 80
+#   durationLessThanMs: 170
+```
 
 ## Conventions
 

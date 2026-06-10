@@ -11,10 +11,10 @@
 
 use wasmtime::*;
 
-use super::super::heap::wasm_alloc_str;
+use super::super::heap::{host_retain, reserve, wasm_alloc_str};
 use super::super::nan_box::{
-    ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_CLOSURE, QNAN, SIGN_BIT, TAG_BOOL, TAG_NULL, TAG_VOID,
-    VAL_NULL,
+    encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_CLOSURE, QNAN, SIGN_BIT, TAG_BOOL, TAG_NULL,
+    TAG_VOID, VAL_NULL,
 };
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -207,35 +207,33 @@ fn invoke_closure(caller: &mut Caller<'_, ()>, closure_val: i64, arg: i64) -> Op
 }
 
 /// Allocate an Array on the guest heap with the given NaN-boxed items.
-/// Returns VAL_NULL if the heap can't fit.
+///
+/// Routes through `reserve` so the array carries the 8-byte rc=1 prefix the
+/// guest RC expects (without it, binding/releasing the result reads a garbage
+/// count 8 bytes early). The result array co-owns each element it stores —
+/// `filter` keeps references shared with the source array, and a projecting
+/// `map` closure can return a borrowed element — so each object element is
+/// retained; releasing the source later then can't free them out from under
+/// this array. Over-retaining a freshly-built `map` result only leaks, never a
+/// UAF.
 fn alloc_array_of(caller: &mut Caller<'_, ()>, items: &[i64]) -> i64 {
     let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
         Some(m) => m,
         None => return VAL_NULL,
     };
-    let heap_global = match caller
-        .get_export("__heap_ptr")
-        .and_then(|e| e.into_global())
-    {
-        Some(g) => g,
-        None => return VAL_NULL,
-    };
-    let addr = heap_global.get(&mut *caller).unwrap_i32() as u32;
-    let need = 8 + items.len() as u32 * 8;
-    let new_heap = (addr + need + 7) & !7;
+    let need = 8 + items.len() * 8;
+    let addr = reserve(caller, &mem, need) as usize;
     let data = mem.data_mut(&mut *caller);
-    let a = addr as usize;
-    if a + need as usize > data.len() {
-        return VAL_NULL;
-    }
-    data[a..a + 4].copy_from_slice(&OBJ_TAG_ARRAY.to_le_bytes());
-    data[a + 4..a + 8].copy_from_slice(&(items.len() as i32).to_le_bytes());
+    data[addr..addr + 4].copy_from_slice(&OBJ_TAG_ARRAY.to_le_bytes());
+    data[addr + 4..addr + 8].copy_from_slice(&(items.len() as i32).to_le_bytes());
     for (i, v) in items.iter().enumerate() {
-        let off = a + 8 + i * 8;
+        let off = addr + 8 + i * 8;
         data[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
-    let _ = heap_global.set(&mut *caller, Val::I32(new_heap as i32));
-    ((QNAN | SIGN_BIT) | (addr as u64)) as i64
+    for v in items {
+        host_retain(data, *v);
+    }
+    encode_object(addr as u32)
 }
 
 /// VM-parity truthiness: `false`, `null`, and `void` are falsy; everything

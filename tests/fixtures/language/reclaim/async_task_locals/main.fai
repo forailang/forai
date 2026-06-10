@@ -1,0 +1,34 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 115 Part 1: an async task's owned locals (here a heap array) are
+# RT_RELEASE'd at task completion — the async analogue of sync scope-exit. After
+# the awaited `doWork` finishes, the live-object counter returns to the
+# pre-call baseline: its frame array was reclaimed, not leaked. `doWork` returns
+# a primitive, so nothing escapes to keep the count elevated.
+def main
+    @return Void
+do
+    let base = __liveObjects()
+    let n = doWork()
+    let after = __liveObjects()
+    print(after == base)
+end
+
+private:
+
+# Allocates a heap array local, suspends (forcing an async frame), then returns
+# a primitive derived from it. The array must be reclaimed at completion.
+def doWork
+    @return Int
+do
+    let xs = [1 2 3]
+    sleep(1)
+    length(xs)
+end
+
+test doWork
+    it 'returns the length after suspending'
+        assert.equals(doWork(), 3)
+    end
+end

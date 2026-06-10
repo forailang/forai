@@ -8,6 +8,42 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // I/O
     ins(b, "print", &[p("value", Type::Unknown)], &[Type::Void]);
 
+    // (R0 clean slate, plan 113: `reclaim`/`markShared` removed — manual memory
+    // management is gone; reference counting is rebuilt in R1.)
+    // Deep-copy a value: returns a fresh, independently-owned duplicate of the
+    // whole reachable graph. Use it to break aliasing — an independent copy that
+    // follows normal value semantics.
+    ins(
+        b,
+        "copy",
+        &[p("value", type_parameter("T"))],
+        &[type_parameter("T")],
+    );
+    // Debug/diagnostics: current heap bump pointer (`__heap_ptr`, the allocation
+    // high-water mark in bytes). Freed blocks are reused from the free-list
+    // without advancing this, so under correct reclamation it plateaus across
+    // render/signal cycles; a monotonic climb signals a leak. Instrumentation
+    // only — not part of the stable language surface.
+    ins(b, "__heapPtr", &[], &[Type::Int]);
+    // Debug/diagnostics: the live heap-object counter (`__live_objects`, ++ in
+    // rt_alloc, -- in rt_free). Under correct reclamation an async task that
+    // allocates locals returns this to its pre-spawn baseline at completion;
+    // a per-task climb signals an async-reclamation leak (plan 115).
+    // Instrumentation only — not part of the stable language surface.
+    ins(b, "__liveObjects", &[], &[Type::Int]);
+    // Reference-counting diagnostics (plan 113). `__refcount(x)` is the object's
+    // current count (or -1 for a primitive). `__retain`/`__release` drive the
+    // RC primitives directly — test scaffolding for validating the count
+    // transitions before the codegen emits them at every reference site (P3).
+    ins(b, "__refcount", &[p("value", type_parameter("T"))], &[Type::Int]);
+    ins(
+        b,
+        "__retain",
+        &[p("value", type_parameter("T"))],
+        &[type_parameter("T")],
+    );
+    ins(b, "__release", &[p("value", type_parameter("T"))], &[Type::Void]);
+
     // Collection
     ins(b, "length", &[p("value", Type::Unknown)], &[Type::Int]);
     ins(b, "isEmpty", &[p("value", Type::Unknown)], &[Type::Bool]);

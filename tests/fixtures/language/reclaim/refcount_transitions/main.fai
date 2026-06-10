@@ -1,0 +1,23 @@
+# expect: ok
+# stdout:
+#   1
+#   2
+#   1
+#   -1
+# Reference counting (plan 113): a fresh allocation starts at rc=1; __retain
+# increments and __release decrements the count stored in the object's 8-byte
+# prefix (at obj_addr-8). __refcount reports it — and returns -1 for a primitive,
+# which is inlined in the NaN box and carries no heap count. (__retain/__release
+# are debug intrinsics for validating the primitives before the codegen emits
+# them at every reference site in P3.)
+def main
+    @return Void
+do
+    var a = [1 2 3]
+    print(__refcount(a))
+    __retain(a)
+    print(__refcount(a))
+    __release(a)
+    print(__refcount(a))
+    print(__refcount(7))
+end

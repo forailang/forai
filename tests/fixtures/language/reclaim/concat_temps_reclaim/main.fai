@@ -1,0 +1,39 @@
+# expect: ok
+# stdout:
+#   true
+# Binary-operator OWNED operand temps are reclaimed after the op (plan 115 /
+# arg-temp mop-up): `compile_binary` stashes a fresh/owned operand and
+# RT_RELEASEs it once the helper has produced its result. `toString` is the
+# common operand source — it can alias a String arg, so its codegen retains on
+# the alias path to be uniformly +1, letting it be released like any temp.
+# Building strings in a loop therefore returns the live-object count to baseline
+# instead of leaking the operand strings.
+def main
+    @return Void
+do
+    let base = countAfterBuilding()
+    let again = countAfterBuilding()
+    print(base == again)
+end
+
+private:
+
+# Builds many throwaway strings (literal + toString operands), then reports the
+# live-object count. Two runs returning the same count means no per-iteration
+# leak accumulated across the loop.
+def countAfterBuilding
+    @return Int
+do
+    var i = 0
+    while i < 500
+        let label = 'item-' + toString(i)
+        i = i + 1
+    end
+    __liveObjects()
+end
+
+test countAfterBuilding
+    it 'is covered by the reclamation fixture run'
+        print('placeholder')
+    end
+end

@@ -126,17 +126,21 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             }
         }
         Statement::Let(l) => {
+            let shared = if l.is_shared { "shared " } else { "" };
             format!(
-                "{}let {} = {}",
+                "{}{}let {} = {}",
                 indent,
+                shared,
                 format_bindings(&l.bindings),
                 format_expression(&l.value, indent)
             )
         }
         Statement::Var(v) => {
+            let shared = if v.is_shared { "shared " } else { "" };
             format!(
-                "{}var {} = {}",
+                "{}{}var {} = {}",
                 indent,
+                shared,
                 format_bindings(&v.bindings),
                 format_expression(&v.value, indent)
             )
@@ -2551,5 +2555,23 @@ end
         }))]);
         let result = format_program(&prog);
         assert!(result.contains("1, 2, 3"));
+    }
+
+    #[test]
+    fn test_format_preserves_shared_let_and_var() {
+        // Regression: `fai fmt` must round-trip the `shared` qualifier — Phase 4
+        // memory reclamation relies on it to mark deliberate aliasing, and a
+        // formatter that drops it silently breaks `shared` in any formatted
+        // project.
+        let prog = fai_parser::parse(
+            "shared let a = [1, 2, 3]\nshared var b = 'x'\nlet c = 1\nvar d = 2\n",
+        )
+        .expect("parse");
+        let result = format_program(&prog);
+        assert!(result.contains("shared let a ="), "{result}");
+        assert!(result.contains("shared var b ="), "{result}");
+        // Plain bindings stay plain (no spurious `shared`).
+        assert!(result.contains("\nlet c ="), "{result}");
+        assert!(result.contains("\nvar d ="), "{result}");
     }
 }

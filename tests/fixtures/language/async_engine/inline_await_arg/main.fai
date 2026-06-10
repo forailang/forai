@@ -1,0 +1,47 @@
+# expect: ok
+# stdout:
+#   21
+#   42
+#   42
+#   43
+# An async call nested as a *subexpression* (call argument, operand) rather than
+# the whole value of a let/return/expr-stmt. The engine A-normalizes these:
+# each nested async call is hoisted into a preceding `let __anf_await_N = <call>`
+# so the CFG's await lowering applies. Regression for
+# `UnsupportedExpression("async-shape")` on `print(fetch())` & friends.
+def fetch
+    @return Int
+do
+    sleep(1)
+    21
+end
+
+# Doubles a value (sync).
+def double
+    @param n Int
+    @return Int
+do
+    n * 2
+end
+
+def main
+    @return Void
+do
+    print(fetch())
+    print(double(fetch()))
+    print(fetch() + fetch())
+    let n = double(fetch()) + 1
+    print(n)
+end
+
+test fetch
+    it 'returns'
+        fetch()
+    end
+end
+
+test double
+    it 'doubles'
+        double(2)
+    end
+end

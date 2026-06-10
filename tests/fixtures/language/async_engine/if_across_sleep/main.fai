@@ -1,0 +1,14 @@
+# expect: ok
+# stdout:
+#   positive
+def main
+    @return String
+do
+    var x = 1
+    if x > 0
+        sleep(10)
+        'positive'
+    else
+        'nonpositive'
+    end
+end

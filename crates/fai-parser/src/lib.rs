@@ -38,6 +38,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_shared_let_and_var() {
+        let p = parse_ok("shared let s = 1\nshared var v = 2\nlet plain = 3");
+        match &p.statements[0] {
+            Statement::Let(l) => assert!(l.is_shared, "shared let → is_shared"),
+            other => panic!("expected Let, got {other:?}"),
+        }
+        match &p.statements[1] {
+            Statement::Var(v) => assert!(v.is_shared, "shared var → is_shared"),
+            other => panic!("expected Var, got {other:?}"),
+        }
+        match &p.statements[2] {
+            Statement::Let(l) => assert!(!l.is_shared, "plain let → not shared"),
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shared_still_usable_as_identifier() {
+        // `shared` is a CONTEXTUAL keyword — only special before `let`/`var`.
+        let p = parse_ok("let shared = 5");
+        match &p.statements[0] {
+            Statement::Let(l) => {
+                assert_eq!(l.bindings[0].name, "shared");
+                assert!(!l.is_shared);
+            }
+            other => panic!("expected Let binding named `shared`, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_function() {
         let p = parse_ok("# Add numbers.\ndef add\n    @param a Int\n    @param b Int\n    @return Int\ndo\n  a + b\nend");
         assert_eq!(p.statements.len(), 1);
@@ -162,9 +192,8 @@ mod tests {
             "  0\n",
             "end\n",
         );
-        let _ = parse(src).unwrap_or_else(|e| {
-            panic!("`end.method()` same-line chain should parse, got: {}", e)
-        });
+        let _ = parse(src)
+            .unwrap_or_else(|e| panic!("`end.method()` same-line chain should parse, got: {}", e));
     }
 
     #[test]
@@ -185,7 +214,10 @@ mod tests {
             "end\n",
         );
         let _ = parse(src).unwrap_or_else(|e| {
-            panic!("`end\\n  .method()` new-line chain should parse, got: {}", e)
+            panic!(
+                "`end\\n  .method()` new-line chain should parse, got: {}",
+                e
+            )
         });
     }
 
@@ -197,10 +229,8 @@ mod tests {
         // The error must explain *what* forai expects, not just that
         // a newline was missing — agents stall when the diagnostic
         // doesn't show the fix pattern.
-        let err = parse(
-            "if x > 5 then 1 else 0 end",
-        )
-        .expect_err("inline if-then-else should fail to parse");
+        let err = parse("if x > 5 then 1 else 0 end")
+            .expect_err("inline if-then-else should fail to parse");
         assert!(
             err.contains("statement-form"),
             "error should explain that `if` is statement-form, got: {}",
@@ -212,9 +242,7 @@ mod tests {
             err
         );
         assert!(
-            err.contains("var result")
-                || err.contains("multi-line")
-                || err.contains("multi line"),
+            err.contains("var result") || err.contains("multi-line") || err.contains("multi line"),
             "error should show the lift-to-var fix pattern, got: {}",
             err
         );
@@ -378,7 +406,9 @@ mod tests {
 
     #[test]
     fn test_lexer_rejects_scientific_exponent_sign_without_digits() {
-        let err = Lexer::new("1e+").scan_tokens().expect_err("lex should fail");
+        let err = Lexer::new("1e+")
+            .scan_tokens()
+            .expect_err("lex should fail");
         assert!(err.contains("Malformed scientific notation"));
     }
 

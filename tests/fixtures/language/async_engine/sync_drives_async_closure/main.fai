@@ -1,0 +1,66 @@
+# expect: ok
+# stdout:
+#   12
+# A *sync* function calling a closure-typed parameter must dispatch on the
+# closure's frame_size at runtime: a sync closure is a direct call_indirect; an
+# async one (a resume fn) is spawned and driven to completion. This is the
+# sync->async boundary that lets sync render machinery (`renderSSR(app)` doing
+# `app()`) invoke an async component. Regression for the SSR trap where a sync
+# `call_indirect` of an async resume fn mismatched signatures.
+def syncVal
+    @return Int
+do
+    5
+end
+
+# Async work (suspends, then returns).
+def asyncVal
+    @return Int
+do
+    sleep(1)
+    7
+end
+
+type def Producer
+    @return Int
+end
+
+# Sync: calls the closure param — sync inline, async driven.
+def runIt
+    @param p Producer
+    @return Int
+do
+    p()
+end
+
+def main
+    @return Void
+do
+    let a = runIt do
+        syncVal()
+    end
+    let b = runIt do
+        asyncVal()
+    end
+    print(a + b)
+end
+
+test syncVal
+    it 'x'
+        syncVal()
+    end
+end
+
+test asyncVal
+    it 'y'
+        asyncVal()
+    end
+end
+
+test runIt
+    it 'z'
+        runIt do
+            1
+        end
+    end
+end

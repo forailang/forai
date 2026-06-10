@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   3
+# `shared` marks a binding as deliberately aliased, opting it out of
+# single-ownership move checking — so reading `a` after `let b = a` is fine.
+def main
+    @return Void
+do
+    shared let a = [1 2 3]
+    let b = a
+    print(length(a))
+end

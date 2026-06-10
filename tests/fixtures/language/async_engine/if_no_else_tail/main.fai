@@ -1,0 +1,43 @@
+# expect: ok
+# stdout:
+#   main done
+#   7
+# An async fn whose body is a tail-position `if` with NO `else`, guarding a
+# `nowait` fork. Both paths complete Void; the forked task drains after main.
+# (This is the Forui `reload` shape, minus the mutable param.)
+def doLoad
+    @param x Int
+    @return Void
+do
+    sleep(5)
+    print(x)
+end
+
+# Tail `if` (no else) containing a nowait fork.
+def maybeLoad
+    @param x Int
+    @return Void
+do
+    if x > 0
+        nowait doLoad(x)
+    end
+end
+
+def main
+    @return Void
+do
+    maybeLoad(7)
+    print('main done')
+end
+
+test doLoad
+    it 'x'
+        doLoad(1)
+    end
+end
+
+test maybeLoad
+    it 'y'
+        maybeLoad(1)
+    end
+end

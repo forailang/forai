@@ -1,0 +1,8 @@
+# expect: runtime_error
+# error: WASM async task failed: 7
+def main
+    @return Int
+do
+    sleep(1)
+    throw 7
+end

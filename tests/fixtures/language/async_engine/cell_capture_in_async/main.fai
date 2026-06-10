@@ -1,0 +1,50 @@
+# expect: ok
+# stdout:
+#   6
+# A `var` initialised by an await and then captured-and-mutated by a closure
+# must live as a *cell* whose storage survives suspension. In a resume fn the
+# frame slot itself IS the cell (`cell_addr = frame_ptr + offset`, a stable heap
+# address), so the closure captures a valid i32 address rather than a snapshot.
+# Regression for the ChatComposer "expected i32, found i64" invalid-wasm bug.
+def useInt
+    @return Int
+do
+    sleep(1)
+    5
+end
+
+type def Thunk
+    @return Void
+end
+
+# Calls the thunk.
+def run
+    @param t Thunk
+    @return Void
+do
+    t()
+end
+
+def main
+    @return Void
+do
+    var x = useInt()
+    run do
+        x = x + 1
+    end
+    print(x)
+end
+
+test useInt
+    it 'returns'
+        useInt()
+    end
+end
+
+test run
+    it 'calls'
+        run do
+
+        end
+    end
+end

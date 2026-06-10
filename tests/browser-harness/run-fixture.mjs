@@ -96,6 +96,37 @@ try {
     }
   }
 
+  if (assertion.rootResult !== undefined) {
+    await page.waitForFunction(() => window.__FAI_ROOT_DONE === true, null, {
+      timeout: assertion.timeoutMs ?? 5000,
+    });
+    const actual = await page.evaluate(() => window.__FAI_ROOT_RESULT_TEXT ?? '');
+    if (String(actual).trim() !== assertion.rootResult.trim()) {
+      throw new Error(`root result mismatch\nexpected:\n${assertion.rootResult}\nactual:\n${actual}`);
+    }
+  }
+
+  if (assertion.durationLessThanMs !== undefined || assertion.durationAtLeastMs !== undefined) {
+    await page.waitForFunction(() => window.__FAI_ROOT_DONE === true, null, {
+      timeout: assertion.timeoutMs ?? 5000,
+    });
+    const duration = await page.evaluate(() => {
+      if (typeof window.__FAI_ROOT_STARTED_AT !== 'number' || typeof window.__FAI_ROOT_FINISHED_AT !== 'number') {
+        return null;
+      }
+      return window.__FAI_ROOT_FINISHED_AT - window.__FAI_ROOT_STARTED_AT;
+    });
+    if (duration === null) {
+      throw new Error('root duration unavailable');
+    }
+    if (assertion.durationAtLeastMs !== undefined && duration < assertion.durationAtLeastMs) {
+      throw new Error(`root duration too short\nminimum: ${assertion.durationAtLeastMs}ms\nactual: ${duration}ms`);
+    }
+    if (assertion.durationLessThanMs !== undefined && duration >= assertion.durationLessThanMs) {
+      throw new Error(`root duration too long\nmaximum: < ${assertion.durationLessThanMs}ms\nactual: ${duration}ms`);
+    }
+  }
+
   if (consoleErrors.length > 0) {
     throw new Error(`browser console errors:\n${consoleErrors.join('\n')}`);
   }

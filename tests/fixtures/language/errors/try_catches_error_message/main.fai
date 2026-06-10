@@ -1,0 +1,27 @@
+# expect: ok
+# stdout:
+#   boom
+# Throws an Error after a wait; the catch body reads e.message.
+def child
+    @return Int
+do
+    sleep(1)
+    throw Error('boom')
+end
+
+test child
+    it 'is covered by the async error-message fixture'
+        print('placeholder')
+    end
+end
+
+def main
+    @return String
+do
+    try
+        let x = child()
+        'bad'
+    catch err
+        err.message
+    end
+end

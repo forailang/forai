@@ -1,0 +1,63 @@
+# expect: ok
+# stdout:
+#   5
+#   10
+#   7
+# An omitted optional param with `default: null` must be filled on the *spawn*
+# (await/nowait) path, not left as a zero-initialized frame slot. Regression for
+# the chat-click crash: `useSignal('')` (no loader) forked `doLoad` because the
+# unset `loader` slot read as 0, and `0 != null` wrongly passed → `doLoad`
+# invoked a null loader → `call_indirect` on garbage. `emit_spawn_child` now
+# fills defaults like the sync call path does.
+
+type def Loader
+    @return Int
+end
+
+# Forked worker: invokes its loader.
+def doWork
+    @param id Int
+    @param loader Loader
+    @return Void
+do
+    sleep(1)
+    print(loader())
+end
+
+# Async fn with an optional loader (mirrors useSignal): forks only when given one.
+def makeThing
+    @param initial Int
+    @param loader Loader?, default: null
+    @return Int
+do
+    if loader != null
+        nowait doWork(initial, loader!)
+    end
+    initial
+end
+
+def main
+    @return Void
+do
+    let a = makeThing(5)
+    print(a)
+    let b = makeThing(10) do
+        7
+    end
+    print(b)
+    sleep(20)
+end
+
+test doWork
+    it 'invokes the loader'
+        doWork(1) do
+            9
+        end
+    end
+end
+
+test makeThing
+    it 'no loader does not fork'
+        makeThing(0)
+    end
+end

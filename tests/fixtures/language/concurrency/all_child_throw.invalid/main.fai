@@ -1,0 +1,38 @@
+# expect: runtime_error
+# error: WASM async task failed: 9
+def main
+    @return Int
+do
+    let a, b = all(slow(), fast())
+    a + b
+end
+
+private:
+
+# Returns after a slower wait.
+def slow
+    @return Int
+do
+    sleep(50)
+    1
+end
+
+test slow
+    it 'is covered by the async runtime fixture'
+        print('placeholder')
+    end
+end
+
+# Throws after a faster wait.
+def fast
+    @return Int
+do
+    sleep(1)
+    throw 9
+end
+
+test fast
+    it 'is covered by the async runtime fixture'
+        print('placeholder')
+    end
+end

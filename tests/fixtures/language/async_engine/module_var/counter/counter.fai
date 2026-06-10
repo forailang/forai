@@ -1,0 +1,30 @@
+# A module-level mutable counter. Its initializer runs once (via the
+# synthesized module-init) before `main` is spawned.
+var count = 0
+
+# Async: sleeps, then bumps the shared module var.
+def bump
+    @return Void
+do
+    sleep(5)
+    count = count + 1
+end
+
+# Sync: reads the shared module var.
+def current
+    @return Int
+do
+    count
+end
+
+test bump
+    it 'bumps'
+        bump()
+    end
+end
+
+test current
+    it 'reads'
+        current()
+    end
+end

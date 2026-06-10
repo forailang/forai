@@ -1,0 +1,71 @@
+# expect: ok
+# stdout:
+#   fast
+def main
+    @return String
+do
+    try
+        let a, b = all(slow(), fast())
+        'bad'
+    catch e
+        e.message
+    end
+end
+
+private:
+
+# Auto-waits a slower leaf function.
+def slow
+    @return Int
+do
+    let x = slowLeaf()
+    x + 10
+end
+
+test slow
+    it 'is covered by the nested all error fixture'
+        print('placeholder')
+    end
+end
+
+# Throws later and should not be the observed all error.
+def slowLeaf
+    @return Int
+do
+    sleep(20)
+    throw Error('slow')
+end
+
+test slowLeaf
+    it 'is covered by the nested all error fixture'
+        print('placeholder')
+    end
+end
+
+# Auto-waits a faster leaf function.
+def fast
+    @return Int
+do
+    let x = fastLeaf()
+    x + 20
+end
+
+test fast
+    it 'is covered by the nested all error fixture'
+        print('placeholder')
+    end
+end
+
+# Throws first and should be the observed all error.
+def fastLeaf
+    @return Int
+do
+    sleep(1)
+    throw Error('fast')
+end
+
+test fastLeaf
+    it 'is covered by the nested all error fixture'
+        print('placeholder')
+    end
+end

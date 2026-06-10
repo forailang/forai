@@ -1,0 +1,32 @@
+# expect: ok
+# stdout:
+#   100
+def main
+    @return Int
+do
+    try
+        let x = child()
+        x + 1
+    catch e
+        100
+    finally
+        5
+    end
+end
+
+private:
+
+# Throws after waiting so the parent auto-wait must wake the
+# suspended parent and route the throw into the parent try/catch.
+def child
+    @return Int
+do
+    sleep(1)
+    throw 7
+end
+
+test child
+    it 'is covered by the async finally fixture'
+        print('placeholder')
+    end
+end

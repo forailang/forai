@@ -49,32 +49,57 @@ var items = [1 2 3]
 items[0] = 99       # OK — var allows index mutation
 ```
 
-### Value semantics
+### Values and references
 
-All assignments are deep copies. Every variable owns its value independently:
-
-```
-var a = User(name: 'Alice', age: 30)
-var b = a           # deep copy — b is independent
-b.age = 99
-print(a.age)        # 30 — a is unchanged
-print(b.age)        # 99
-
-let frozen = a      # deep copy — frozen is an immutable snapshot
-```
-
-Nested objects are also deep copied:
+Primitive values (`Int`, `Float`, `Bool`) are **copied** — every binding gets its
+own, independent of the others:
 
 ```
-var outer = Outer(inner: Inner(value: 1))
-var copy = outer
-copy.inner.value = 99
-print(outer.inner.value)  # 1 — fully independent
+var x = 5
+let y = x
+x = 9
+print(y)             # 5 — y is an independent copy
 ```
+
+Heap values (arrays, dictionaries, strings, and objects) are held **by
+reference**. Assigning a heap value, passing it to a function, or storing it in a
+field or container makes another reference to the *same* value — not a copy — and
+every reference can be used freely:
+
+```
+let a = [1 2 3]
+let b = a            # `a` and `b` refer to the same array
+print(length(a))     # 3
+print(length(b))     # 3
+```
+
+Because both names point at one underlying value, mutating it through a `var`
+binding is visible through every reference to it.
+
+Memory is reclaimed **automatically**: forai tracks how many references point at
+each heap value and frees it as soon as the last reference goes away. There is
+nothing to free by hand, and there are no memory-management keywords —
+allocation and reclamation are invisible.
+
+### Independent copies
+
+When you need a value that is *independent* of the original — so that changing
+one does not affect the other — use `copy`, which returns a deep duplicate of the
+whole value, including nested fields and elements:
+
+```
+var a = [1 2 3]
+var b = copy(a)      # b is a separate array
+b[0] = 99
+print(a[0])          # 1 — a is untouched
+```
+
+`copy` is about *value independence*, not manual memory management — reclamation
+still happens automatically for both the original and the copy.
 
 ### Function parameters
 
-Function parameters are immutable by default (like `let`). The function receives its own copy unless the parameter is marked `mutable`:
+Function parameters are immutable bindings by default (like `let`) — the body cannot reassign or mutate them. A parameter marked `mutable` operates on the caller's value in place, so the caller must pass a `var` binding and sees the changes:
 
 ```
 # Cannot mutate params — return a new value instead.
@@ -603,7 +628,7 @@ nowait logEvent('page_viewed')
 
 ### `all` — parallel tasks
 
-`all` runs multiple closures concurrently and returns their results as a tuple. The caller blocks until all tasks complete:
+`all` runs async-effectful tasks concurrently and resumes the caller when every task has completed. Results are returned as a tuple in source order:
 
 ```
 let a, b = all(fetchUser(), fetchPosts())
@@ -618,8 +643,10 @@ let x, y, z = all(taskA(), taskB(), taskC())
 ### `sleep` — delay
 
 ```
-sleep(500)   # pause for 500 milliseconds
+sleep(500)   # pause for at least 500 milliseconds
 ```
+
+`sleep` suspends the current task and auto-resumes after at least the given number of milliseconds, without blocking the host thread. There is no `await`/`wait` keyword — calls auto-await by default, so `result = someAsyncFunc()` already waits for the final value.
 
 ## Modules and Imports
 

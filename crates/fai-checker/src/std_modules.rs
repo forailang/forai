@@ -171,6 +171,20 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
     );
 
     m.insert(
+        "std.process".into(),
+        vec![
+            ("run", "processRun"),
+            ("start", "processStart"),
+            ("write", "processWrite"),
+            ("read", "processRead"),
+            ("stop", "processStop"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect(),
+    );
+
+    m.insert(
         "std.path".into(),
         vec![
             ("join", "pathJoin"),
@@ -313,6 +327,22 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             .into_iter()
             .map(|(a, b)| (a.into(), b.into()))
             .collect(),
+    );
+
+    m.insert(
+        "std.crypto".into(),
+        vec![
+            ("available", "cryptoAvailable"),
+            ("hmacSha256Hex", "cryptoHmacSha256Hex"),
+            ("sha256Hex", "cryptoSha256Hex"),
+            ("hexEncode", "cryptoHexEncode"),
+            ("constantTimeEquals", "cryptoConstantTimeEquals"),
+            ("base64Encode", "cryptoBase64Encode"),
+            ("base64Decode", "cryptoBase64Decode"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect(),
     );
 
     m.insert(

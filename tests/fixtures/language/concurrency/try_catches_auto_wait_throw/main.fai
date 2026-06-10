@@ -1,0 +1,29 @@
+# expect: ok
+# stdout:
+#   8
+def main
+    @return Int
+do
+    try
+        let x = child()
+        x + 1
+    catch e
+        8
+    end
+end
+
+private:
+
+# Throws after waiting.
+def child
+    @return Int
+do
+    sleep(1)
+    throw 7
+end
+
+test child
+    it 'is covered by the async catch fixture'
+        print('placeholder')
+    end
+end

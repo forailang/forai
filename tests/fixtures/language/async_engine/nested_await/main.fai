@@ -1,0 +1,41 @@
+# expect: ok
+# stdout:
+#   42
+# Two-level nested await: `mid` sleeps then awaits `leaf`, and `main` awaits
+# `mid`. Regression for the scheduler bug where `await` left a stale `O_WAKE`
+# from an earlier `sleep`, so `poll` spuriously timer-promoted a task before its
+# awaited child completed.
+def leaf
+    @return Int
+do
+    sleep(5)
+    42
+end
+
+# Sleeps, then awaits leaf (the 2-level case).
+def mid
+    @return Int
+do
+    sleep(1)
+    let r = leaf()
+    r
+end
+
+def main
+    @return Void
+do
+    let r = mid()
+    print(r)
+end
+
+test leaf
+    it 'x'
+        leaf()
+    end
+end
+
+test mid
+    it 'y'
+        mid()
+    end
+end

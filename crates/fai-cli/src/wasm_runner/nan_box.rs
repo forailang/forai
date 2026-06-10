@@ -28,6 +28,8 @@ pub(crate) const VAL_VOID: i64 = (QNAN | TAG_VOID) as i64;
 // Object-header tags (written as the first i32 of a heap-allocated object).
 pub(crate) const OBJ_TAG_STRING: i32 = 0;
 pub(crate) const OBJ_TAG_ARRAY: i32 = 1;
+// Tuple heap tag. Used by the test-mode / legacy `run_all` host import to
+// build a result tuple; production async builds tuples in the guest.
 pub(crate) const OBJ_TAG_TUPLE: i32 = 2;
 pub(crate) const OBJ_TAG_DICT: i32 = 3;
 pub(crate) const OBJ_TAG_CLOSURE: i32 = 4;

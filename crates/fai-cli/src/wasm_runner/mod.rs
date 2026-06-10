@@ -8,6 +8,7 @@
 //! one across runs cuts per-run cost to roughly module compilation time.
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use wasmtime::*;
 
@@ -66,6 +67,43 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
         .instantiate(&mut store, &module)
         .map_err(|e| fmt_err("WASM instantiation error", e))?;
 
+    if let Some(start_async) = instance
+        .get_typed_func::<(), i32>(&mut store, "_start_async")
+        .ok()
+    {
+        let poll = instance
+            .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+            .map_err(|e| fmt_err("missing __fai_poll export", e))?;
+        let task_result = instance
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .map_err(|e| fmt_err("missing __fai_task_result export", e))?;
+
+        let mut status = start_async
+            .call(&mut store, ())
+            .map_err(|e| fmt_err("WASM async start error", e))?;
+        while status != 2 && status != 3 {
+            std::thread::sleep(Duration::from_millis(1));
+            status = poll
+                .call(&mut store, ())
+                .map_err(|e| fmt_err("WASM async poll error", e))?;
+        }
+        if status == 3 {
+            let result = task_result
+                .call(&mut store, 1)
+                .map_err(|e| fmt_err("WASM async result error", e))?;
+            return Err(format!(
+                "WASM async task failed: {}",
+                print::format_return_value(result, &instance, &mut store)
+                    .unwrap_or_else(|| "<unprintable>".to_string())
+            ));
+        }
+        let result = task_result
+            .call(&mut store, 1)
+            .map_err(|e| fmt_err("WASM async result error", e))?;
+        print::print_return_value(result, &instance, &mut store);
+        return Ok(());
+    }
+
     let start = instance
         .get_typed_func::<(), i64>(&mut store, "_start")
         .map_err(|e| fmt_err("missing _start export", e))?;
@@ -76,7 +114,29 @@ pub fn run_wasm_with_externs(wasm_bytes: &[u8], externs: Vec<ExternInfo>) -> Res
 
     print::print_return_value(result, &instance, &mut store);
 
+    report_leak_check(&instance, &mut store);
+
     Ok(())
+}
+
+/// Leak oracle (plan 113). When `FAI_LEAK_CHECK` is set, read the
+/// `__live_objects` counter the runtime maintains (++ in rt_alloc, -- in
+/// rt_free) after the program finishes and report how many heap objects are
+/// still live. Once reference counting is emitted at every reference site (P3),
+/// a no-leak program returns to its root set (0 for a no-global program), so
+/// this becomes a hard pass/fail oracle; for now it is observational, since
+/// nothing releases yet.
+fn report_leak_check(instance: &wasmtime::Instance, store: &mut wasmtime::Store<()>) {
+    if std::env::var_os("FAI_LEAK_CHECK").is_none() {
+        return;
+    }
+    match instance.get_global(&mut *store, "__live_objects") {
+        Some(g) => {
+            let live = g.get(&mut *store).i32().unwrap_or(-1);
+            eprintln!("[leak-check] live heap objects at exit: {live}");
+        }
+        None => eprintln!("[leak-check] module has no __live_objects export"),
+    }
 }
 
 /// Output captured from a single [`run_wasm_capturing`] invocation.
@@ -297,6 +357,53 @@ mod tests {
         .expect("direct codegen refused")
     }
 
+
+    /// Regression (plans/111): a function whose TAIL is a user-call await
+    /// lowers to `Term::CompletePending`, which recycles the awaited child slot
+    /// (`free_pending`) by reading this task's frame. Phase 4 frame reclaim made
+    /// `complete` free the frame, so `free_pending` MUST run before `complete`
+    /// — otherwise it reads a freed frame → corrupts the slot freelist → wasm
+    /// OOB (this is what broke brain's conversation loader). Driving the shape N
+    /// times must stay correct (and not trap).
+    #[test]
+    fn complete_pending_tail_await_is_not_use_after_free() {
+        let src = "# Suspend then return a constant.\n\
+                   def leaf\n    @return Int\ndo\n  sleep(0)\n  42\nend\n\n\
+                   # Tail await a user fn → CompletePending.\n\
+                   def step\n    @return Int\ndo\n  leaf()\nend\n\n\
+                   def main\n    @return Int\ndo\n  var total Int = 0\n  var i Int = 0\n  while i < 200\n    total = total + step()\n    i = i + 1\n  end\n  total\nend\n";
+        let wasm = compile_to_wasm(src);
+        let (mut store, instance) = instantiate_for_async_test(&wasm);
+        let start = instance.get_typed_func::<(), i32>(&mut store, "_start_async").expect("_start_async");
+        let poll = instance.get_typed_func::<(), i32>(&mut store, "__fai_poll").expect("__fai_poll");
+        let result = instance.get_typed_func::<i32, i64>(&mut store, "__fai_task_result").expect("task_result");
+        let mut status = start.call(&mut store, ()).expect("start");
+        let mut guard = 0u64;
+        while status != 2 && status != 3 {
+            status = poll.call(&mut store, ()).expect("poll");
+            guard += 1;
+            assert!(guard < 50_000_000, "did not converge");
+        }
+        assert_eq!(status, 2, "root completed ok (no trap/corruption)");
+        // total = 200 * 42. Decode the NaN-boxed Int result.
+        let boxed = result.call(&mut store, 1).expect("result") as u64;
+        let int_val = (boxed & 0xFFFF_FFFF) as u32 as i32;
+        assert_eq!(int_val, 200 * 42, "correct result → no slot-freelist corruption");
+    }
+
+    fn instantiate_for_async_test(wasm: &[u8]) -> (Store<()>, Instance) {
+        host::clear_timer_requests();
+        let engine = shared_engine();
+        let module = Module::new(engine, wasm).expect("WASM should load");
+        let mut store = Store::new(engine, ());
+        let mut linker = Linker::new(engine);
+        host::install_all(&mut linker).expect("host imports should install");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("WASM should instantiate");
+        (store, instance)
+    }
+
     #[test]
     fn test_run_wasm_hello_world() {
         let src = "def main\n    @return Void\ndo\n  print('hello')\nend\n";
@@ -357,10 +464,9 @@ mod tests {
 
     #[test]
     fn test_run_wasm_with_all_concurrency() {
-        // Exercises env.run_all via the direct path's synthesized
-        // `<all-task>` closures. Each call arg is wrapped in a
-        // zero-arg closure, their pointers land in a scratch buffer,
-        // and `run_all(buf, count)` returns a NaN-boxed tuple.
+        // all(...) lowers through the real engine: each child is spawned as
+        // a task and joined. The children here don't suspend, so they
+        // complete immediately; `main` resumes once both are done.
         let src = concat!(
             "# Returns x doubled.\n",
             "def double\n",
@@ -378,7 +484,51 @@ mod tests {
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        assert!(run_wasm(&wasm).is_ok());
+        let output = run_wasm_capturing(&wasm).expect("all() should run");
+        assert_eq!(output.stdout.trim(), "done");
+    }
+
+    #[test]
+    fn test_closure_param_call_preserves_frame_vars() {
+        // Regression: calling a closure PARAMETER (`build()`) lowers to
+        // `Term::AwaitClosure`, which writes a child/synth task id to
+        // `frame[pending_off]`. The frame must reserve that pending slot — if
+        // `stmt_pending_count` doesn't count the closure call, the write
+        // overflows the frame into the adjacent heap object and silently
+        // corrupts a still-live param (here `label` would print empty).
+        // This is exactly what broke forui `Link` (`children()` wiped `to`).
+        // Must run through the REAL async engine (not the is_test bypass).
+        let src = concat!(
+            "# A builder closure.\n",
+            "type def Builder\n",
+            "    @return Void\n",
+            "end\n",
+            "\n",
+            "# Calls the closure param, then uses a param declared before it.\n",
+            "def make\n",
+            "    @param label String\n",
+            "    @param build Builder\n",
+            "    @return Void\n",
+            "do\n",
+            "  build()\n",
+            "  print(label)\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  make('alpha') do\n",
+            "\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("closure-param call should run");
+        assert_eq!(
+            output.stdout.trim(),
+            "alpha",
+            "param `label` must survive a closure-parameter call (Term::AwaitClosure)"
+        );
     }
 
     #[test]
@@ -465,7 +615,145 @@ mod tests {
 
     #[test]
     fn test_run_wasm_nowait() {
-        // Exercises env.spawn via `nowait`
+        let src = concat!(
+            "# A background task.\n",
+            "def background\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(25)\n",
+            "  x + 1\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 10\n",
+            "  nowait background(base)\n",
+            "  base + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("minimal nowait should run");
+        assert_eq!(output.stdout.trim(), "11");
+    }
+
+    #[test]
+    fn test_nowait_child_task_can_finish_after_root() {
+        let src = concat!(
+            "# A background task.\n",
+            "def background\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(20)\n",
+            "  x + 5\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 10\n",
+            "  nowait background(base)\n",
+            "  base + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let (mut store, instance) = instantiate_for_async_test(&wasm);
+        let start_async = instance
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .expect("missing _start_async");
+        let poll = instance
+            .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+            .expect("missing __fai_poll");
+        let task_result = instance
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .expect("missing __fai_task_result");
+
+        // Drain-until-idle: `main` (task 1) completes immediately with
+        // base+1 = 11, but the forked `background` (task 2) is still
+        // sleeping, so the scheduler is not yet idle — `_start_async`
+        // reports "working" (1), not complete.
+        assert_eq!(start_async.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 1).unwrap() as u64),
+            nan_box::ReturnKind::Int(11)
+        );
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
+            nan_box::ReturnKind::Void
+        );
+
+        // After the background timer elapses, polling resumes it; once it
+        // finishes the scheduler is idle and reports complete (2).
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(poll.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
+            nan_box::ReturnKind::Int(15)
+        );
+    }
+
+    #[test]
+    fn test_nowait_child_throw_does_not_fail_root() {
+        let src = concat!(
+            "# Throws after waiting in the background.\n",
+            "def background\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(20)\n",
+            "  throw 7\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 10\n",
+            "  nowait background(base)\n",
+            "  base + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let (mut store, instance) = instantiate_for_async_test(&wasm);
+        let start_async = instance
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .expect("missing _start_async");
+        let poll = instance
+            .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+            .expect("missing __fai_poll");
+        let task_result = instance
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .expect("missing __fai_task_result");
+
+        // main completes with 11 immediately, but the nowait'd `background`
+        // is still sleeping — the scheduler keeps draining (status 1).
+        assert_eq!(start_async.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 1).unwrap() as u64),
+            nan_box::ReturnKind::Int(11)
+        );
+        // After the background timer, it throws and fails — but it was
+        // forked with `nowait`, so nobody awaits it: the root is unaffected
+        // and the scheduler reports idle (2), not failed (3).
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(poll.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 1).unwrap() as u64),
+            nan_box::ReturnKind::Int(11)
+        );
+        // The failed background task's error (7) is in its result slot.
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
+            nan_box::ReturnKind::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_run_wasm_nowait_sync_body_runs() {
+        // A `nowait` of a non-suspending function: the body is compiled as
+        // a task that completes immediately. `main` runs to completion
+        // first (it doesn't suspend), then the forked task runs.
         let src = concat!(
             "# A background task.\n",
             "def background\n",
@@ -482,12 +770,15 @@ mod tests {
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        assert!(run_wasm(&wasm).is_ok());
+        let output = run_wasm_capturing(&wasm).expect("nowait sync body should run");
+        assert_eq!(output.stdout.trim(), "done\nbg");
     }
 
     #[test]
     fn test_run_wasm_sleep_builtin() {
-        // sleep(ms) is a global builtin that emits Call(IMPORT_SLEEP_MS) in WASM mode
+        // `sleep(ms)` lowers through the real async engine: the body
+        // runs as a resume function that suspends on `sleep` and resumes
+        // to run the rest. The `print` after the suspension must execute.
         let src = concat!(
             "def main\n",
             "    @return Void\n",
@@ -497,7 +788,559 @@ mod tests {
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        assert!(run_wasm(&wasm).is_ok());
+        let output = run_wasm_capturing(&wasm).expect("async sleep body should run");
+        assert_eq!(output.stdout.trim(), "done");
+    }
+
+    #[test]
+    fn test_run_wasm_minimal_wait_async() {
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  42\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("minimal async wait should run");
+        assert_eq!(output.stdout.trim(), "42");
+    }
+
+    #[test]
+    fn test_run_wasm_wait_preserves_int_local() {
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let x = 41\n",
+            "  sleep(1)\n",
+            "  x + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("async wait should preserve local");
+        assert_eq!(output.stdout.trim(), "42");
+    }
+
+    #[test]
+    fn test_run_wasm_minimal_auto_await_call() {
+        let src = concat!(
+            "# Returns after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  7\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let x = child()\n",
+            "  x + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("minimal auto-await should run");
+        assert_eq!(output.stdout.trim(), "8");
+    }
+
+    #[test]
+    fn test_run_wasm_auto_await_call_with_int_arg() {
+        let src = concat!(
+            "# Returns x after waiting.\n",
+            "def child\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  x + 1\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 7\n",
+            "  let y = child(base)\n",
+            "  y + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("auto-await arg should run");
+        assert_eq!(output.stdout.trim(), "9");
+    }
+
+    #[test]
+    fn test_run_wasm_async_throw_after_wait_fails() {
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 7\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let err = run_wasm_capturing(&wasm).expect_err("async throw should fail");
+        assert!(
+            err.contains("WASM async task failed: 7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_wasm_try_catches_async_throw_after_wait() {
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    sleep(1)\n",
+            "    throw 7\n",
+            "  catch e\n",
+            "    8\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("async catch should run");
+        assert_eq!(output.stdout.trim(), "8");
+    }
+
+    #[test]
+    fn test_run_wasm_auto_await_child_throw_fails_parent() {
+        let src = concat!(
+            "# Throws after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 7\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let x = child()\n",
+            "  x + 1\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let err = run_wasm_capturing(&wasm).expect_err("auto-await throw should fail");
+        assert!(
+            err.contains("WASM async task failed: 7"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_wasm_try_catches_auto_await_child_throw() {
+        let src = concat!(
+            "# Throws after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 7\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    let x = child()\n",
+            "    x + 1\n",
+            "  catch e\n",
+            "    8\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("auto-await catch should run");
+        assert_eq!(output.stdout.trim(), "8");
+    }
+
+    #[test]
+    fn test_run_wasm_minimal_all_waits() {
+        let src = concat!(
+            "# Returns after a slower wait.\n",
+            "def slow\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(50)\n",
+            "  1\n",
+            "end\n",
+            "\n",
+            "# Returns after a faster wait.\n",
+            "def fast\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(10)\n",
+            "  2\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let a, b = all(slow(), fast())\n",
+            "  a + b\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("minimal all should run");
+        assert_eq!(output.stdout.trim(), "3");
+    }
+
+    #[test]
+    fn test_run_wasm_all_child_throw_fails_parent() {
+        let src = concat!(
+            "# Returns after a slower wait.\n",
+            "def slow\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(50)\n",
+            "  1\n",
+            "end\n",
+            "\n",
+            "# Throws after a faster wait.\n",
+            "def fast\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 9\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let a, b = all(slow(), fast())\n",
+            "  a + b\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let err = run_wasm_capturing(&wasm).expect_err("all child throw should fail");
+        assert!(
+            err.contains("WASM async task failed: 9"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_wasm_try_catches_all_child_throw() {
+        let src = concat!(
+            "# Returns after a slower wait.\n",
+            "def slow\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(50)\n",
+            "  1\n",
+            "end\n",
+            "\n",
+            "# Throws after a faster wait.\n",
+            "def fast\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 9\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    let a, b = all(slow(), fast())\n",
+            "    99\n",
+            "  catch e\n",
+            "    10\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("all catch should run");
+        assert_eq!(output.stdout.trim(), "10");
+    }
+
+    #[test]
+    fn test_run_wasm_finally_runs_after_catch_after_wait_throw() {
+        // try/catch/finally: sleep → throw in try, caught (value 100);
+        // finally runs for effect (it does not add to the value). The
+        // throw happens after the suspension point.
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    sleep(1)\n",
+            "    throw 7\n",
+            "  catch e\n",
+            "    100\n",
+            "  finally\n",
+            "    5\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("finally-after-catch should run");
+        assert_eq!(output.stdout.trim(), "100");
+    }
+
+    #[test]
+    fn test_run_wasm_finally_runs_after_success_after_wait() {
+        // No throw — the try value is 42; finally runs for effect and
+        // does not change the value.
+        let src = concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    sleep(1)\n",
+            "    42\n",
+            "  catch e\n",
+            "    100\n",
+            "  finally\n",
+            "    5\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("finally-after-success should run");
+        assert_eq!(output.stdout.trim(), "42");
+    }
+
+    #[test]
+    fn test_run_wasm_finally_runs_after_catch_after_auto_wait_throw() {
+        // The child frame suspends; the parent auto-wait wakes the
+        // parent and routes the throw into the parent try/catch (caught,
+        // value 100); finally runs for effect.
+        let src = concat!(
+            "# Throws after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 7\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    let x = child()\n",
+            "    x + 1\n",
+            "  catch e\n",
+            "    100\n",
+            "  finally\n",
+            "    5\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("finally-after-auto-await catch should run");
+        assert_eq!(output.stdout.trim(), "100");
+    }
+
+    #[test]
+    fn test_run_wasm_finally_runs_after_catch_after_all_throw() {
+        // A failing `all` child wakes the waiting parent. The
+        // finally runs for effect after the caught error from
+        // parent join.
+        let src = concat!(
+            "# Returns after a slower wait.\n",
+            "def slow\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(50)\n",
+            "  1\n",
+            "end\n",
+            "\n",
+            "# Throws after a faster wait.\n",
+            "def fast\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw 9\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  try\n",
+            "    let a, b = all(slow(), fast())\n",
+            "    a + b\n",
+            "  catch e\n",
+            "    100\n",
+            "  finally\n",
+            "    5\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("finally-after-all catch should run");
+        assert_eq!(output.stdout.trim(), "100");
+    }
+
+    #[test]
+    fn test_run_wasm_catches_error_message() {
+        // Phase 6 acceptance: `throw Error('msg')` propagates
+        // through the auto-wait, the catch body reads `e.message`,
+        // and the result is a String. The narrow path bakes the
+        // Error dict and message string into the data section.
+        let src = concat!(
+            "# Throws an Error after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw Error('boom')\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  try\n",
+            "    let x = child()\n",
+            "    'bad'\n",
+            "  catch err\n",
+            "    err.message\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("error message catch should run");
+        assert_eq!(output.stdout.trim(), "boom");
+    }
+
+    #[test]
+    fn test_run_wasm_catch_branches_on_error_message() {
+        // Catch body branches on e.message == 'boom' and returns
+        // 'matched' for the matching throw. Exercises the runtime
+        // `e.message` field read, the inline string-equality
+        // helper, and the if/else ResultExpr shape.
+        let src = concat!(
+            "# Throws an Error after waiting.\n",
+            "def child\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  throw Error('boom')\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  try\n",
+            "    let x = child()\n",
+            "    'unreached'\n",
+            "  catch err\n",
+            "    if err.message == 'boom'\n",
+            "      'matched'\n",
+            "    else\n",
+            "      'other'\n",
+            "    end\n",
+            "  end\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("branching catch should run");
+        assert_eq!(output.stdout.trim(), "matched");
+    }
+
+    #[test]
+    fn test_run_wasm_minimal_all_waits_with_args() {
+        let src = concat!(
+            "# Returns x after a slower wait.\n",
+            "def slow\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(50)\n",
+            "  x + 1\n",
+            "end\n",
+            "\n",
+            "# Returns x after a faster wait.\n",
+            "def fast\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(10)\n",
+            "  x + 2\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 10\n",
+            "  let a, b = all(slow(base), fast(base))\n",
+            "  a + b\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let output = run_wasm_capturing(&wasm).expect("minimal all args should run");
+        assert_eq!(output.stdout.trim(), "23");
+    }
+
+    #[test]
+    fn test_all_child_task_results_are_ordered_by_task_id() {
+        let src = concat!(
+            "# Returns x after a slower wait.\n",
+            "def slow\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(20)\n",
+            "  x + 1\n",
+            "end\n",
+            "\n",
+            "# Returns x after a faster wait.\n",
+            "def fast\n",
+            "    @param x Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  x + 2\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let base = 10\n",
+            "  let a, b = all(slow(base), fast(base))\n",
+            "  a + b\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let (mut store, instance) = instantiate_for_async_test(&wasm);
+        let start_async = instance
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .expect("missing _start_async");
+        let poll = instance
+            .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+            .expect("missing __fai_poll");
+        let task_result = instance
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .expect("missing __fai_task_result");
+
+        // Children still running → scheduler not idle yet (status 1).
+        assert_eq!(start_async.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
+            nan_box::ReturnKind::Void
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(poll.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 1).unwrap() as u64),
+            nan_box::ReturnKind::Int(23)
+        );
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
+            nan_box::ReturnKind::Int(11)
+        );
+        assert_eq!(
+            nan_box::classify_return_value(task_result.call(&mut store, 3).unwrap() as u64),
+            nan_box::ReturnKind::Int(12)
+        );
     }
 
     #[test]
@@ -1454,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_wasm_file_list_missing_dir_returns_null() {
+    fn test_run_wasm_file_list_missing_dir_returns_empty_array() {
         let src = concat!(
             "use std.file\n",
             "\n",
@@ -1462,13 +2305,11 @@ mod tests {
             "    @return Int\n",
             "do\n",
             "  let entries = file.list('/tmp/fai_definitely_missing_dir_xyz')\n",
-            "  0\n",
+            "  length(entries)\n",
             "end\n",
         );
         let wasm = compile_to_wasm(src);
         let out = run_wasm_capturing(&wasm).expect("run failed");
-        // Just checking we don't trap — file.list returns null and the
-        // unused binding is dropped.
         assert_eq!(out.stdout, "0\n");
     }
 
@@ -1814,6 +2655,34 @@ mod tests {
         assert_eq!(out.stdout, "200\n");
         let written = std::fs::read_to_string(tmp).expect("file written");
         assert_eq!(written, "written by http.post");
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn test_run_wasm_http_post_accepts_headers() {
+        // Regression: the checker allowed optional request headers, but
+        // direct wasm codegen only handled (url, body), causing an
+        // arg-count compile error before the host request layer.
+        let tmp = "/tmp/fai_wasm_http_post_headers.txt";
+        let _ = std::fs::remove_file(tmp);
+
+        let src = concat!(
+            "use std.dictionary\n",
+            "use std.http.request\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  var h = {}\n",
+            "  h = dictionary.set(h, 'authorization', 'Bearer test')\n",
+            "  let resp = request.post('file:///tmp/fai_wasm_http_post_headers.txt', 'with headers', h)\n",
+            "  resp.status\n",
+            "end\n",
+        );
+        let wasm = compile_to_wasm(src);
+        let out = run_wasm_capturing(&wasm).expect("run failed");
+        assert_eq!(out.stdout, "200\n");
+        assert_eq!(std::fs::read_to_string(tmp).unwrap(), "with headers");
         let _ = std::fs::remove_file(tmp);
     }
 

@@ -300,6 +300,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "event_on",
             |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, closure_val: i64| -> i64 {
                 let name = read_name(&mut caller, name_ptr, name_len);
+                // The subscription keeps the listener closure, so co-own it:
+                // retain on register, or the guest releasing its owned handler-arg
+                // temp after `events.on` frees the closure (RC, plan 113/115).
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                super::super::heap::host_retain(mem.data_mut(&mut caller), closure_val);
                 let id = register(&name, closure_val, false);
                 build_subscription(&mut caller, id, &name)
             },
@@ -313,6 +318,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "event_once",
             |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, closure_val: i64| -> i64 {
                 let name = read_name(&mut caller, name_ptr, name_len);
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                super::super::heap::host_retain(mem.data_mut(&mut caller), closure_val);
                 let id = register(&name, closure_val, true);
                 build_subscription(&mut caller, id, &name)
             },
@@ -465,24 +472,24 @@ fn read_subscription(
 /// dict in place (we don't, but parity with the response builders is
 /// worth maintaining).
 pub(super) fn alloc_dict(caller: &mut Caller<'_, ()>, mem: &Memory, entries: &[(i64, i64)]) -> i64 {
-    let addr = read_global_i32(caller, "__heap_ptr") as u32;
     let cap = std::cmp::max(entries.len(), 16);
+    // Refcount-prefixed reserve (plan 113): writes the rc=1 prefix, grows memory
+    // through the full `cap*16` extent, and returns the logical dict pointer
+    // (tag@0). MUST match the guest `rt_alloc` layout — a Subscription/Event
+    // Dict built here is later retained/released by guest RC code (e.g. `let sub
+    // = events.on(...)`), which reads the count 8 bytes before `addr`; the old
+    // direct heap-bump left that prefix as garbage, so a release could free the
+    // dict out from under `event_off`.
+    let addr = crate::wasm_runner::heap::reserve(caller, mem, 8 + cap * 16) as usize;
     let data = mem.data_mut(&mut *caller);
-    data[addr as usize..addr as usize + 4].copy_from_slice(&OBJ_TAG_DICT.to_le_bytes());
-    data[addr as usize + 4..addr as usize + 8]
-        .copy_from_slice(&(entries.len() as i32).to_le_bytes());
+    data[addr..addr + 4].copy_from_slice(&OBJ_TAG_DICT.to_le_bytes());
+    data[addr + 4..addr + 8].copy_from_slice(&(entries.len() as i32).to_le_bytes());
     for (i, (k, v)) in entries.iter().enumerate() {
-        let ea = addr as usize + 8 + i * 16;
+        let ea = addr + 8 + i * 16;
         data[ea..ea + 8].copy_from_slice(&k.to_le_bytes());
         data[ea + 8..ea + 16].copy_from_slice(&v.to_le_bytes());
     }
-    let new_heap = align8(addr + 8 + cap as u32 * 16);
-    write_global_i32(caller, "__heap_ptr", new_heap as i32);
-    encode_object(addr)
-}
-
-fn align8(n: u32) -> u32 {
-    (n + 7) & !7
+    encode_object(addr as u32)
 }
 
 fn read_global_i32(caller: &mut Caller<'_, ()>, name: &str) -> i32 {

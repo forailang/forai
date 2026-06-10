@@ -398,6 +398,10 @@ impl Checker {
         env: &mut Environment,
         return_hint: Option<Type>,
     ) -> Result<Type, CheckError> {
+        // Capture "is this the forked call of a `nowait`?" before any nested
+        // arg-checking clears the flag. Nested calls in the args see `false`.
+        let is_fork = self.in_nowait_fork;
+        self.in_nowait_fork = false;
         // UFCS: if callee is x.foo(args) and foo is not a field on x's type,
         // try rewriting to foo(x, args) — a free function call.
         if let Expression::MemberExpression(me) = &*ce.callee {
@@ -432,6 +436,8 @@ impl Checker {
                             location: ce.location.clone(),
                         };
 
+                        // Preserve the fork context through the UFCS rewrite.
+                        self.in_nowait_fork = is_fork;
                         return self.check_call_expression_inner(&ufcs_call, env, return_hint);
                     }
                 }
@@ -498,7 +504,9 @@ impl Checker {
 
         match &callee_type {
             Type::TypeConstructor(name) => self.check_type_construction(name, ce, env),
-            Type::Function(sig) => self.check_function_call(sig.clone(), ce, env, return_hint),
+            Type::Function(sig) => {
+                self.check_function_call(sig.clone(), ce, env, return_hint, is_fork)
+            }
             _ => Err(CheckError::new(format!(
                 "Cannot call value of type {}",
                 describe_type(&callee_type)
@@ -579,6 +587,7 @@ impl Checker {
         ce: &CallExpression,
         env: &mut Environment,
         return_hint: Option<Type>,
+        is_fork: bool,
     ) -> Result<Type, CheckError> {
         // Special arg count checks for mock/assert builtins
         let name = &sig.name;
@@ -697,6 +706,22 @@ impl Checker {
                 (module_key, ce.location.line, ce.location.column),
                 arg_to_param.clone(),
             );
+        }
+
+        // A `nowait`/`all` fork may not target a function with `mutable`
+        // params: the detached task would hold a mutable reference to the
+        // caller's binding after the caller has moved on.
+        if is_fork {
+            if let Some(p) = sig.params.iter().find(|p| p.is_mutable) {
+                return Err(CheckError::new(format!(
+                    "Cannot `nowait` '{}': it has a mutable parameter '{}'. A \
+                     forked task outlives the caller, so a `mutable` reference \
+                     would escape its owner. Rework '{}' to take the value \
+                     (not `mutable`) — e.g. mutate shared state through a \
+                     registry/id instead of the parameter.",
+                    sig.name, p.name, sig.name
+                )));
+            }
         }
 
         for (i, param) in sig.params.iter().enumerate() {
@@ -1133,6 +1158,41 @@ impl Checker {
             return params_ok && returns_ok;
         }
 
+        // Generic struct argument: when both sides are the same named type, the
+        // argument carries its instantiation (e.g. `Signal{T:Int[]}` from
+        // `createSignal([…])`) while a bare `@param s Signal` param does not.
+        // First match any type args the param explicitly constrains, then SEED
+        // the call's bindings from the argument's instantiation — so a generic
+        // accessor like `value(s Signal) -> $T` concretizes its return from the
+        // receiver (this is the named-type analogue of `$T[]` array inference).
+        if let (
+            Type::Named {
+                name: a_name,
+                generic_bindings: a_binds,
+                ..
+            },
+            Type::Named {
+                name: e_name,
+                generic_bindings: e_binds,
+                ..
+            },
+        ) = (actual, expected)
+        {
+            if a_name == e_name {
+                for (k, e_val) in e_binds {
+                    if let Some(a_val) = a_binds.get(k) {
+                        if !self.bind_and_check_assignable(a_val, e_val, bindings) {
+                            return false;
+                        }
+                    }
+                }
+                for (k, v) in a_binds {
+                    bindings.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                return true;
+            }
+        }
+
         is_assignable(actual, expected)
     }
 }
@@ -1157,6 +1217,38 @@ mod tests {
         bindings.insert("T".to_string(), Type::Int);
         assert!(c.bind_and_check_assignable(&Type::Int, &type_parameter("T"), &mut bindings));
         assert!(!c.bind_and_check_assignable(&Type::String, &type_parameter("T"), &mut bindings));
+    }
+
+    #[test]
+    fn test_bind_named_seeds_bindings_from_arg_instantiation() {
+        // A `Signal{T: Int[]}` argument matched against a bare `Signal` param
+        // seeds T into the call bindings, so a generic `@return $T` resolves.
+        let c = Checker::new();
+        let mut bindings = HashMap::new();
+        let mut inst = HashMap::new();
+        inst.insert("T".to_string(), array_of(Type::Int));
+        let actual = named_type_with_bindings("Signal", NamedCategory::Type, inst);
+        let expected = named_type("Signal", NamedCategory::Type);
+        assert!(c.bind_and_check_assignable(&actual, &expected, &mut bindings));
+        assert!(matches!(bindings.get("T"), Some(Type::Array(inner)) if matches!(**inner, Type::Int)));
+        // The return type param then concretizes through apply_generic_bindings.
+        let resolved = apply_generic_bindings(&type_parameter("T"), &bindings);
+        assert!(matches!(resolved, Type::Array(inner) if matches!(*inner, Type::Int)));
+    }
+
+    #[test]
+    fn test_bind_named_mismatched_type_args_rejected() {
+        // An explicitly-constrained param (`Signal{T: String}`) rejects an arg
+        // instantiated differently (`Signal{T: Int}`).
+        let c = Checker::new();
+        let mut bindings = HashMap::new();
+        let mut a_inst = HashMap::new();
+        a_inst.insert("T".to_string(), Type::Int);
+        let mut e_inst = HashMap::new();
+        e_inst.insert("T".to_string(), Type::String);
+        let actual = named_type_with_bindings("Signal", NamedCategory::Type, a_inst);
+        let expected = named_type_with_bindings("Signal", NamedCategory::Type, e_inst);
+        assert!(!c.bind_and_check_assignable(&actual, &expected, &mut bindings));
     }
 
     #[test]

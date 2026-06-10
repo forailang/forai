@@ -9,6 +9,12 @@
 //! `codegen_all` entry points. `try_codegen_direct_full` is the
 //! only production path.
 
+pub mod async_analysis;
+mod async_codegen;
+pub mod async_engine;
+mod async_emit_spec;
+pub mod async_runtime;
+mod async_wait_codegen;
 pub mod direct;
 mod program;
 mod runtime;
@@ -151,6 +157,26 @@ pub fn codegen_direct_full_reasoned(
     target: Option<&str>,
     is_test: bool,
 ) -> Result<Vec<u8>, LocatedBuildError> {
+    let async_analysis = async_analysis::analyze(ast, modules);
+    // Real async engine (R2+): handles the shapes it supports through the
+    // guest scheduler + resumable lowering. Only runs for non-test builds
+    // for now; unsupported shapes return None and fall through to the
+    // facade below.
+    if !is_test {
+        if let Some(wasm) =
+            direct::try_codegen_async_engine(ast, modules, checker, target, &async_analysis)
+        {
+            return Ok(wasm);
+        }
+    }
+    if let Some(outcome) = async_codegen::try_codegen_async(ast, modules, &async_analysis, is_test)
+    {
+        match outcome {
+            async_codegen::AsyncBuildOutcome::Compiled(wasm) => return Ok(wasm),
+            async_codegen::AsyncBuildOutcome::Unsupported(err) => return Err(err),
+        }
+    }
+
     let rt = direct::RtOffsets {
         base: direct::direct_rt_base_for_target_with_test_flag(target, is_test),
     };
@@ -215,13 +241,8 @@ mod located_error_tests {
         )
         .expect("prepare entry");
         let info = direct::CheckerInfo::default();
-        let result = codegen_direct_full_reasoned(
-            &entry.serde_ast,
-            &[mod_helpers],
-            &info,
-            None,
-            false,
-        );
+        let result =
+            codegen_direct_full_reasoned(&entry.serde_ast, &[mod_helpers], &info, None, false);
         assert!(
             result.is_ok(),
             "codegen should succeed for cross-file calls at the same (line, col); got: {:?}",
@@ -241,7 +262,8 @@ mod located_error_tests {
         // what matters is that the returned error has a non-empty
         // line. Falls back to `UnknownIdentifier` since that path is
         // covered by `find_name_in_statements`.
-        let src = "# Trigger.\ndef trigger\n    @return Int\ndo\n  somethingThatDoesNotExist()\nend\n";
+        let src =
+            "# Trigger.\ndef trigger\n    @return Int\ndo\n  somethingThatDoesNotExist()\nend\n";
         let prep = fai_compiler::prepare_source(src, None).expect("prepare");
         let info = direct::CheckerInfo::default();
         let result = codegen_direct_full_reasoned(&prep.serde_ast, &[], &info, None, false);
@@ -253,5 +275,38 @@ mod located_error_tests {
         );
         let line = err.line.unwrap();
         assert!(line > 0, "line should be > 0, got: {}", line);
+    }
+
+    #[test]
+    fn async_effect_program_compiles_post_wait_lets() {
+        let src = "def main\n    @return Int\ndo\n  sleep(1)\n  let x = 42\n  x\nend\n";
+        let prep = fai_compiler::prepare_source(src, None).expect("prepare");
+        let info = direct::CheckerInfo::default();
+        let result = codegen_direct_full_reasoned(&prep.serde_ast, &[], &info, None, false);
+        assert!(
+            result.is_ok(),
+            "async lowering should support post-wait let bindings: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn async_effect_program_compiles_in_test_mode() {
+        let src = "def child\n    @return Int\ndo\n  sleep(1)\n  42\nend\n\n\
+test child\n  it 'returns after wait'\n    assert.equals(child(), 42)\n  end\nend\n";
+        let prep = fai_compiler::prepare_source_with_synthetic_and_entry_for_tests(
+            src,
+            None,
+            Vec::new(),
+            None,
+        )
+        .expect("prepare");
+        let info = direct::CheckerInfo::default();
+        let result = codegen_direct_full_reasoned(&prep.serde_ast, &[], &info, None, true);
+        assert!(
+            result.is_ok(),
+            "test-mode codegen should allow wait-backed functions: {:?}",
+            result.err()
+        );
     }
 }

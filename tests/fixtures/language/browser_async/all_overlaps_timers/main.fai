@@ -1,0 +1,41 @@
+# expect: ok
+# browser:
+#   rootResult: 3
+#   durationAtLeastMs: 80
+#   durationLessThanMs: 170
+def main
+    @return Int
+do
+    let a, b = all(slow(), fast())
+    a + b
+end
+
+private:
+
+# Returns after the same delay as fast.
+def slow
+    @return Int
+do
+    sleep(100)
+    1
+end
+
+test slow
+    it 'is covered by the browser async overlap fixture'
+        print('placeholder')
+    end
+end
+
+# Returns after the same delay as slow.
+def fast
+    @return Int
+do
+    sleep(100)
+    2
+end
+
+test fast
+    it 'is covered by the browser async overlap fixture'
+        print('placeholder')
+    end
+end

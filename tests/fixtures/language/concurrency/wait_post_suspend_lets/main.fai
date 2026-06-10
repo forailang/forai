@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   42
+def main
+    @return Int
+do
+    let x = 40
+    sleep(1)
+    let y = x + 1
+    y + 1
+end

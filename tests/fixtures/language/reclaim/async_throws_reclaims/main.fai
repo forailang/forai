@@ -1,0 +1,51 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 115 Part 1: the throw/fail path is a completion too. A task that allocates
+# locals and then throws must still release those owned locals (the `fail`
+# terminator releases the frame bindings, retaining the error). After the thrown
+# error is caught, the live count returns to the pre-call baseline — `boom`'s
+# frame and its scratch array were reclaimed on the failing path, not leaked.
+def main
+    @return Void
+do
+    print(reclaimsOnThrow())
+end
+
+private:
+
+# Records a baseline, calls a task that allocates then throws, and (in the
+# catch) checks the live count came back to that baseline.
+def reclaimsOnThrow
+    @return Bool
+do
+    let base = __liveObjects()
+    try
+        let n = boom()
+        n > 0
+    catch e
+        __liveObjects() == base
+    end
+end
+
+test reclaimsOnThrow
+    it 'is covered by the async reclamation fixture run'
+        print('placeholder')
+    end
+end
+
+# Allocates a heap local, suspends, then throws a value derived from it. The
+# scratch array must be reclaimed on the fail completion path.
+def boom
+    @return Int
+do
+    let scratch = [1 2 3]
+    sleep(1)
+    throw length(scratch)
+end
+
+test boom
+    it 'is covered by the async reclamation fixture'
+        print('placeholder')
+    end
+end

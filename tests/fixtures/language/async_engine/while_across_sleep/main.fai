@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   3
+def main
+    @return Int
+do
+    var i = 0
+    var total = 0
+    while i < 3
+        sleep(10)
+        total = total + i
+        i = i + 1
+    end
+    total
+end

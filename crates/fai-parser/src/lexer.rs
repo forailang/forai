@@ -266,7 +266,8 @@ impl Lexer {
             }
         }
 
-        if (has_fraction || has_exponent) && self.peek() == '.' && self.peek_next().is_ascii_digit() {
+        if (has_fraction || has_exponent) && self.peek() == '.' && self.peek_next().is_ascii_digit()
+        {
             self.errors
                 .push(format!("Malformed number literal at {}:{}", line, column));
             while matches!(self.peek(), '0'..='9' | '.' | 'e' | 'E' | '+' | '-') {

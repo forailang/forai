@@ -1,0 +1,29 @@
+use std.array
+
+# Regression: sorting an EMPTY array must not trap. The bubble sort's
+# `i >= count - 1` guard underflowed to 0xFFFFFFFF under an unsigned
+# compare when count was 0, so the loop ran and read past the
+# zero-length array (OOB at the heap boundary). A signed compare breaks
+# immediately for count 0/1.
+# expect: ok
+# stdout:
+#   empty len 0
+#   one len 1
+#   sorted 1 2 3
+def main
+    @return Void
+do
+    let empty Int[] = []
+    let se = array.sort(empty)
+    print('empty len ' + toString(length(se)))
+    let one = array.sort([
+        7
+    ])
+    print('one len ' + toString(length(one)))
+    let many = array.sort([
+        3
+        1
+        2
+    ])
+    print('sorted ' + toString(many[0]) + ' ' + toString(many[1]) + ' ' + toString(many[2]))
+end

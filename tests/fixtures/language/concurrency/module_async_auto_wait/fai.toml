@@ -1,0 +1,4 @@
+[project]
+name = "module_async_auto_wait"
+version = "0.1.0"
+source_root = "."

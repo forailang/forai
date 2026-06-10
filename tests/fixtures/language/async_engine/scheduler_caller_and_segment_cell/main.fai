@@ -1,0 +1,87 @@
+# expect: ok
+# stdout:
+#   18
+# Two regressions exercised together (both surfaced dogfooding `brain`):
+# 
+# 1. A *direct* call to a scheduler function (`makeStore`, which forks via
+#    `nowait`) forces the caller (`component`) to be async. Scheduler fns are
+#    compiled as resume fns (`()->()`), so they can only be invoked through the
+#    spawn/await convention — a sync caller would emit a direct `call` to a
+#    resume fn and produce invalid wasm.
+# 
+# 2. A top-level `var base Int = …` in an async segment, captured by a closure,
+#    is a cell. The segment-statement lowering must store the initial value
+#    *through* the cell address, not `LocalSet` it over the address.
+# Async work — suspends, then returns a value (discarded by the fork).
+def fetch
+    @return Int
+do
+    sleep(1)
+    10
+end
+
+# Scheduler fn: forks `fetch` but does not itself suspend.
+def makeStore
+    @return Int
+do
+    nowait fetch()
+    7
+end
+
+type def Thunk
+    @return Int
+end
+
+# Calls the thunk.
+def run
+    @param t Thunk
+    @return Int
+do
+    t()
+end
+
+# Calls a scheduler fn directly (=> must be async) and has a top-level cell var.
+def component
+    @return Int
+do
+    let storeValue = makeStore()
+    var base Int = 5
+    let r = run do
+        base + storeValue
+    end
+    base = base + 1
+    r + base
+end
+
+def main
+    @return Void
+do
+    let result = component()
+    print(result)
+end
+
+test fetch
+    it 'returns'
+        fetch()
+    end
+end
+
+test makeStore
+    it 'forks'
+        makeStore()
+    end
+end
+
+test run
+    it 'calls'
+        run do
+            0
+        end
+    end
+end
+
+test component
+    it 'composes'
+        component()
+    end
+end

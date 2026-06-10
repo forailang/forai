@@ -1,0 +1,67 @@
+# expect: ok
+# stdout:
+#   33
+def main
+    @return Int
+do
+    let a, b = all(slow(), fast())
+    a + b
+end
+
+private:
+
+# Auto-waits a slower leaf function.
+def slow
+    @return Int
+do
+    let x = slowLeaf()
+    x + 10
+end
+
+test slow
+    it 'is covered by the nested all fixture'
+        print('placeholder')
+    end
+end
+
+# Returns after a slower wait.
+def slowLeaf
+    @return Int
+do
+    sleep(2)
+    1
+end
+
+test slowLeaf
+    it 'is covered by the nested all fixture'
+        print('placeholder')
+    end
+end
+
+# Auto-waits a faster leaf function.
+def fast
+    @return Int
+do
+    let x = fastLeaf()
+    x + 20
+end
+
+test fast
+    it 'is covered by the nested all fixture'
+        print('placeholder')
+    end
+end
+
+# Returns after a faster wait.
+def fastLeaf
+    @return Int
+do
+    sleep(1)
+    2
+end
+
+test fastLeaf
+    it 'is covered by the nested all fixture'
+        print('placeholder')
+    end
+end

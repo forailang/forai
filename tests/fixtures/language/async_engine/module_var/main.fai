@@ -1,0 +1,17 @@
+use counter
+
+# expect: ok
+# stdout:
+#   0
+#   2
+# Module-level `var count = 0` lives in another module. `main` reads it before
+# (0) and after two awaited async bumps (2), exercising module-var init + cross
+# -module mutation of a global across suspensions.
+def main
+    @return Void
+do
+    print(counter.current())
+    counter.bump()
+    counter.bump()
+    print(counter.current())
+end

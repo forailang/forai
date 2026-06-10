@@ -1,0 +1,30 @@
+# expect: ok
+# stdout:
+#   true
+# Dicts over-allocate spare capacity (`cap = max(16, count+8)`) for in-place
+# growth, so freeing one by a count-derived size would strand the spare tail and
+# defeat free-list reuse. `rt_alloc` stamps the LOGICAL alloc size into the
+# prefix word at obj_addr-4 and `rt_release` frees by it, so a released dict's
+# block is reused exactly by the next same-shape dict — `__heapPtr` (the bump
+# high-water) is unchanged across release + re-alloc (plan 115).
+# 
+# Released value is an UNBOUND temp, not a binding: a tracked binding auto-frees
+# at scope exit, so manual `__release` would double-free. Keeps it clean under
+# `FAI_RC_CHECK`.
+def main
+    @return Void
+do
+    __release({
+        path: '/home'
+        method: 'GET'
+        id: 1
+    })
+    let h1 = __heapPtr()
+    let c = {
+        a: 1
+        b: 2
+        c: 3
+    }
+    let h2 = __heapPtr()
+    print(h1 == h2)
+end

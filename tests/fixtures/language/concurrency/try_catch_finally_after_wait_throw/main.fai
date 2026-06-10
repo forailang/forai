@@ -1,0 +1,15 @@
+# expect: ok
+# stdout:
+#   100
+def main
+    @return Int
+do
+    try
+        sleep(1)
+        throw 7
+    catch e
+        100
+    finally
+        5
+    end
+end

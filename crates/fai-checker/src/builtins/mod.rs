@@ -11,6 +11,7 @@ mod array;
 mod browser;
 mod concurrency;
 mod core;
+mod crypto;
 mod dict;
 mod env;
 mod events;
@@ -20,6 +21,7 @@ mod http;
 mod json;
 mod math;
 mod net;
+mod process;
 mod storage;
 mod string;
 mod test;
@@ -41,6 +43,8 @@ pub fn install_builtins() -> HashMap<String, Type> {
     browser::install(&mut b);
     http::install(&mut b);
     net::install(&mut b);
+    crypto::install(&mut b);
+    process::install(&mut b);
     storage::install(&mut b);
     test::install(&mut b);
     ffi::install(&mut b);
@@ -189,6 +193,13 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.file", name: "exists", builtin_name: "fileExists", doc: "Return true if the file exists." },
         BuiltinDoc { module: "std.file", name: "list",   builtin_name: "fileList",   doc: "List all file names in a directory." },
 
+        // std.process
+        BuiltinDoc { module: "std.process", name: "run",   builtin_name: "processRun",   doc: "Run a bash command and return a JSON result string." },
+        BuiltinDoc { module: "std.process", name: "start", builtin_name: "processStart", doc: "Start a bash command session and return a JSON result string." },
+        BuiltinDoc { module: "std.process", name: "write", builtin_name: "processWrite", doc: "Write input to a process session and return a JSON result string." },
+        BuiltinDoc { module: "std.process", name: "read",  builtin_name: "processRead",  doc: "Read buffered output from a process session and return a JSON result string." },
+        BuiltinDoc { module: "std.process", name: "stop",  builtin_name: "processStop",  doc: "Stop a process session and return a JSON result string." },
+
         // std.path
         BuiltinDoc { module: "std.path", name: "join",     builtin_name: "pathJoin",     doc: "Join two path segments." },
         BuiltinDoc { module: "std.path", name: "dirname",  builtin_name: "pathDirname",  doc: "Return the directory portion of a path." },
@@ -269,6 +280,15 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.net.udp", name: "receive",   builtin_name: "netUdpReceive",   doc: "Receive a UDP datagram." },
         BuiltinDoc { module: "std.net.udp", name: "close",     builtin_name: "netUdpClose",     doc: "Close a UDP socket." },
         BuiltinDoc { module: "std.net.udp", name: "broadcast", builtin_name: "netUdpBroadcast", doc: "Enable or disable UDP broadcast mode." },
+
+        // std.crypto
+        BuiltinDoc { module: "std.crypto", name: "available",          builtin_name: "cryptoAvailable",          doc: "Return true if crypto primitives are available on this host (native only)." },
+        BuiltinDoc { module: "std.crypto", name: "hmacSha256Hex",      builtin_name: "cryptoHmacSha256Hex",      doc: "Return the lowercase hex HMAC-SHA256 of message under key (both UTF-8)." },
+        BuiltinDoc { module: "std.crypto", name: "sha256Hex",          builtin_name: "cryptoSha256Hex",          doc: "Return the lowercase hex SHA-256 digest of the UTF-8 input." },
+        BuiltinDoc { module: "std.crypto", name: "hexEncode",          builtin_name: "cryptoHexEncode",          doc: "Return the lowercase hex encoding of the UTF-8 input bytes." },
+        BuiltinDoc { module: "std.crypto", name: "constantTimeEquals", builtin_name: "cryptoConstantTimeEquals", doc: "Compare two strings in constant time. False on length mismatch." },
+        BuiltinDoc { module: "std.crypto", name: "base64Encode",       builtin_name: "cryptoBase64Encode",       doc: "Return the standard padded base64 encoding of the UTF-8 input." },
+        BuiltinDoc { module: "std.crypto", name: "base64Decode",       builtin_name: "cryptoBase64Decode",       doc: "Decode standard base64 and return the bytes as a UTF-8 (lossy) string. Empty on invalid input." },
 
         // std.storage
         BuiltinDoc { module: "std.storage", name: "storageGet",    builtin_name: "storageGet",    doc: "Read a value for a key from the platform's persistent store. Returns null if absent." },

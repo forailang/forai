@@ -1,0 +1,27 @@
+# Returns after a slower wait.
+def slow
+    @return Int
+do
+    sleep(2)
+    5
+end
+
+# Returns after a faster wait.
+def fast
+    @return Int
+do
+    sleep(1)
+    6
+end
+
+test slow
+    it 'is covered by the namespace all fixture'
+        print('placeholder')
+    end
+end
+
+test fast
+    it 'is covered by the namespace all fixture'
+        print('placeholder')
+    end
+end

@@ -12,6 +12,9 @@ use crate::std_modules;
 use crate::types::*;
 
 impl Checker {
+    // (R0 clean slate, plan 113: `ownership_errors` removed with the move +
+    // borrow-escape checkers — memory safety comes from reference counting.)
+
     /// Check a single-module program (the entry point).
     pub fn check_program(&mut self, statements: &[Statement]) -> Result<(), CheckError> {
         // Phase 1: collect type and enum declarations

@@ -1,0 +1,45 @@
+# expect: ok
+# stdout:
+#   100
+def main
+    @return Int
+do
+    try
+        let a, b = all(slow(), fast())
+        a + b
+    catch e
+        100
+    finally
+        5
+    end
+end
+
+private:
+
+# Returns after a slower wait.
+def slow
+    @return Int
+do
+    sleep(50)
+    1
+end
+
+test slow
+    it 'is covered by the async finally fixture'
+        print('placeholder')
+    end
+end
+
+# Throws after a faster wait so `all` fails before the parent join.
+def fast
+    @return Int
+do
+    sleep(1)
+    throw 9
+end
+
+test fast
+    it 'is covered by the async finally fixture'
+        print('placeholder')
+    end
+end

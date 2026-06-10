@@ -1,0 +1,43 @@
+# expect: ok
+# browser:
+#   rootResult: fast
+def main
+    @return String
+do
+    try
+        let a, b = all(slow(), fast())
+        'bad'
+    catch e
+        e.message
+    end
+end
+
+private:
+
+# Throws later and should not be the observed all error.
+def slow
+    @return Int
+do
+    sleep(20)
+    throw Error('slow')
+end
+
+test slow
+    it 'is covered by the browser async fixture'
+        print('placeholder')
+    end
+end
+
+# Throws first and should be the observed all error.
+def fast
+    @return Int
+do
+    sleep(1)
+    throw Error('fast')
+end
+
+test fast
+    it 'is covered by the browser async fixture'
+        print('placeholder')
+    end
+end

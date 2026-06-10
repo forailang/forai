@@ -1,0 +1,14 @@
+# expect: ok
+# stdout:
+#   boom
+def main
+    @return String
+do
+    try
+        sleep(1)
+        throw Error('boom')
+    catch e
+        let touched = 1
+        e.message
+    end
+end

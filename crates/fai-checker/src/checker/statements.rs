@@ -26,7 +26,13 @@ impl Checker {
                 Ok(Type::Never)
             }
             Statement::NowaitStatement(nw) => {
-                self.check_expression(&nw.expression, env)?;
+                // The forked call's target may not take `mutable` params (a
+                // detached task would outlive the caller's binding). The flag
+                // is consumed by the call-check on the outermost call.
+                self.in_nowait_fork = true;
+                let r = self.check_expression(&nw.expression, env);
+                self.in_nowait_fork = false;
+                r?;
                 Ok(Type::Void)
             }
             Statement::ForStatement(fs) => self.check_for_statement(fs, env),

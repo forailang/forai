@@ -1,4 +1,6 @@
-# nowait — spawn a background task and return immediately (fire and forget).
+# nowait — start background work and return immediately (fire and forget).
+# Today this is a compatibility surface while scheduler-owned task
+# records continue to expand.
 def doc_nowait
     @return Void
 do
@@ -6,8 +8,8 @@ do
   # nowait sendWelcomeEmail(user.email)
 end
 
-# all() — run multiple tasks concurrently, block until all complete.
-# Returns results as a tuple matching the order of the calls.
+# all() — run async-effectful tasks concurrently and resume when all complete.
+# Results are returned as a tuple matching the source order of the calls.
 def doc_all
     @return Void
 do
@@ -15,9 +17,11 @@ do
   # let x, y, z = all(taskA(), taskB(), taskC())
 end
 
-# sleep() — pause execution for a given number of milliseconds.
+# sleep() — pause the current task without blocking the host thread.
+# Calls auto-await by default, so there is no `await`/`wait` keyword:
+# `let x = someAsyncFunc()` already waits for the final value.
 def doc_sleep
     @return Void
 do
-  # sleep(500)   # pause for 500 ms
+  # sleep(500)   # resume after at least 500 ms
 end
