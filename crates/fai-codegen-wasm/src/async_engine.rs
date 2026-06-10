@@ -78,6 +78,10 @@ pub struct SchedLayout {
     /// `rt_free` `(ptr:i32, size:i32) -> ()`: returns a heap block to the free
     /// list. `complete`/`fail` use it to reclaim the finished task's frame.
     pub free: u32,
+    /// `rt_retain` `(v:i64) -> i64`: refcount increment, returns the value.
+    /// `drive_closure` retains the host-passed arg into the param slot
+    /// (param slots own +1; the task releases them at completion, plan 114).
+    pub retain: u32,
     pub ready_push: u32,
     pub ready_pop: u32,
     pub spawn: u32,
@@ -737,9 +741,14 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(16));
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::I32Store(ma(0)));
-    // frame[8] = arg (first param sits past the env slot)
+    // frame[8] = retain(arg) (first param sits past the env slot). Param
+    // slots own +1 (plan 114 follow-up) and the task releases them at
+    // completion; the host caller's own ref (e.g. the request graph the
+    // accept loop frees via the pair) stays balanced. RT_RETAIN returns
+    // its argument, so the retained value is what lands in the slot.
     f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::Call(l.retain));
     f.instruction(&Instruction::I64Store(ma(8)));
     // id = spawn(table_idx @ addr+4, frame)
     f.instruction(&Instruction::LocalGet(2));
@@ -888,6 +897,9 @@ mod tests {
             // 15 = no-op free (test frames record size 0, so it's never called
             // at runtime — present only so `complete`'s `Call(free)` validates).
             free: 15,
+            // 16 = identity retain (test harness has no RC; present only so
+            // `drive_closure`'s `Call(retain)` validates).
+            retain: 16,
             resume_type: 1, // () -> ()
             g_count: 0,
             g_head: 1,
@@ -928,6 +940,7 @@ mod tests {
         types
             .ty()
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]); // 10 drive_closure
+        types.ty().function(vec![ValType::I64], vec![ValType::I64]); // 11 retain
         module.section(&types);
 
         let mut imports = ImportSection::new();
@@ -950,6 +963,7 @@ mod tests {
         funcs.function(10); // drive_closure (i64,i64)->i64
         funcs.function(7); // alloc (i32)->i32
         funcs.function(9); // free (i32,i32)->() — no-op stub (type 9)
+        funcs.function(11); // retain (i64)->i64 — identity stub (type 11)
         for _ in &resume_bodies {
             funcs.function(1); // resume body ()->()
         }
@@ -1001,7 +1015,7 @@ mod tests {
 
         if n > 0 {
             let mut elements = ElementSection::new();
-            let idxs: Vec<u32> = (0..n).map(|i| 16 + i).collect();
+            let idxs: Vec<u32> = (0..n).map(|i| 17 + i).collect();
             elements.active(
                 Some(0),
                 &ConstExpr::i32_const(0),
@@ -1024,6 +1038,12 @@ mod tests {
         let mut free = Function::new([]);
         free.instruction(&Instruction::End);
         code.function(&free);
+        // retain: identity stub (i64)->i64 — the test harness has no RC;
+        // exists so `drive_closure`'s `Call(retain)` validates.
+        let mut retain = Function::new([]);
+        retain.instruction(&Instruction::LocalGet(0));
+        retain.instruction(&Instruction::End);
+        code.function(&retain);
         for body in &resume_bodies {
             code.function(body);
         }

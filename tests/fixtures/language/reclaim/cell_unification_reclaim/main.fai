@@ -1,0 +1,60 @@
+# expect: ok
+# stdout:
+#   true
+# Plan 114 (cell unification): captured-mutated `var`s live in tagged
+# OBJ_TAG_CELL heap blocks that are RC'd like any object — the enclosing
+# scope/frame and each capturing closure co-own them. Three behaviors in
+# one async frame: per-call cell reclamation (frames with cells are
+# reclaimed again), value-RC on cell writes (intermediates freed), and
+# owned-argument transfer into async param slots. Two runs returning the
+# same live count means nothing per-call accumulated.
+def main
+    @return Void
+do
+    let warm = runOnce()
+    let base = __liveObjects()
+    let again = runOnce()
+    print(__liveObjects() == base)
+end
+
+private:
+
+# Async fn taking a heap arg (the param slot owns +1, released at
+# completion — without that, every fresh arg passed to an async call
+# leaked one ref).
+def measure
+    @param s String
+    @return Int
+do
+    sleep(0)
+    length(s)
+end
+
+# Mutates captured cells across suspensions and passes fresh args.
+def runOnce
+    @return Int
+do
+    var acc = ''
+    var count = 0
+    let bump = do
+        count = count + 1
+        acc = acc + 'x'
+    end
+    bump()
+    sleep(0)
+    bump()
+    let n = measure('fresh-' + toString(count))
+    count + n
+end
+
+test measure
+    it 'measures the arg'
+        assert.equals(measure('abc'), 3)
+    end
+end
+
+test runOnce
+    it 'accumulates cell mutations across suspensions'
+        assert.equals(runOnce(), 2 + 7)
+    end
+end

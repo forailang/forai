@@ -44,7 +44,8 @@ use crate::runtime::{
     METHOD_SERVER_LISTEN, METHOD_SERVER_OK, METHOD_SERVER_POST, METHOD_SERVER_REDIRECT,
     METHOD_SERVER_ROUTER, METHOD_SERVER_SERVE_FILES, METHOD_SERVER_TEXT, METHOD_SLICE, METHOD_SORT,
     METHOD_SPLIT, METHOD_STARTS_WITH, METHOD_SUBSTRING, METHOD_TO_LOWER, METHOD_TO_UPPER,
-    METHOD_TRIM, METHOD_TRIM_END, METHOD_TRIM_START, OBJ_TAG_ARRAY, OBJ_TAG_CLOSURE, OBJ_TAG_DICT,
+    METHOD_TRIM, METHOD_TRIM_END, METHOD_TRIM_START, OBJ_TAG_ARRAY, OBJ_TAG_CELL, OBJ_TAG_CLOSURE,
+    OBJ_TAG_DICT,
     OBJ_TAG_NATIVE_FN, OBJ_TAG_STRING, OBJ_TAG_TUPLE, QNAN, RT_ADD, RT_ALLOC, RT_ALLOC_STRING,
     RT_AS_NUMBER, RT_CALL_NATIVE, RT_CONCAT, RT_COUNT, RT_DIV, RT_EQ, RT_GE, RT_GET_FIELD,
     RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE, RT_LT, RT_MAKE_BOOL,
@@ -4920,15 +4921,16 @@ fn compile_async_segment_stmt(
         let local = *var_local
             .get(name)
             .ok_or(BuildError::UnsupportedExpression("async-unknown-binding"))?;
-        // A cell-captured var's frame slot IS its cell: `local` holds the cell
-        // address (i32), not the value. Store the initial value *through* the
-        // address — a plain `LocalSet` would clobber the address with the value
-        // and hand the capturing closure an i64 where it expects an i32.
+        // A cell-captured var's binding local holds the heap cell's address
+        // (plan 114): store the initial value *through* the cell's value
+        // slot with value-RC — a plain `LocalSet` would clobber the address
+        // with the value and hand the capturing closure an i64 where it
+        // expects an i32.
         let is_cell = b.lookup(name).map(|bnd| bnd.is_cell).unwrap_or(false);
         if is_cell {
-            b.emit(Instruction::LocalGet(local));
+            let transfers = b.expr_transfers_ownership(value);
             b.compile_expr_as(value, ValueShape::Boxed)?;
-            b.emit(Instruction::I64Store(mem0()));
+            b.emit_cell_store(local, transfers);
         } else {
             b.compile_expr_as(value, ValueShape::Boxed)?;
             if release_set.contains(name) {
@@ -5036,10 +5038,24 @@ fn emit_spawn_child(
     };
     for i in 0..real_param_count {
         b.emit(Instruction::LocalGet(childframe_l));
+        // RC: every param slot OWNS exactly +1 (plan 114 follow-up) —
+        // retain a borrowed arg, transfer a fresh/owned one — and the
+        // child releases its param slots at completion. Without this the
+        // spawner's owned arg temps (a fresh closure / dict / concat
+        // passed to an async fn) had no release point and leaked one ref
+        // per call: forui's per-render view-builder closures, exactly.
         if let Some(arg) = args.get(i) {
+            let transfers = b.expr_transfers_ownership(arg);
             b.compile_expr_as(arg, ValueShape::Boxed)?;
+            if !transfers {
+                b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
+            }
         } else if let Some(Some(default_expr)) = defaults.get(i + tpc) {
+            let transfers = b.expr_transfers_ownership(default_expr);
             b.compile_expr_as(default_expr, ValueShape::Boxed)?;
+            if !transfers {
+                b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
+            }
         } else {
             return Err(BuildError::UnsupportedExpression("async-spawn-arg-count-mismatch"));
         }
@@ -5072,8 +5088,10 @@ fn emit_async_drops(
     b: &mut Builder,
     names: &[String],
     var_local: &std::collections::HashMap<String, u32>,
+    cell_offsets: &[u64],
+    frame_ptr_l: u32,
 ) {
-    if names.is_empty() {
+    if names.is_empty() && cell_offsets.is_empty() {
         return;
     }
     let release_fn = b.rt().base + RT_RELEASE;
@@ -5082,6 +5100,17 @@ fn emit_async_drops(
             b.emit(Instruction::LocalGet(local));
             b.emit(Instruction::Call(release_fn));
         }
+    }
+    // Plan 114: release the frame's co-ownership of each heap CELL (the
+    // boxed pointer stored in its slot — read from the frame, which is
+    // still live here; `complete` frees it after). RT_RELEASE's CELL
+    // branch frees the held value and the block at rc 0; a closure that
+    // captured the cell holds its own retained ref, so an escaped
+    // closure keeps the cell alive past the task.
+    for &off in cell_offsets {
+        b.emit(Instruction::LocalGet(frame_ptr_l));
+        b.emit(Instruction::I64Load(mem_off(off)));
+        b.emit(Instruction::Call(release_fn));
     }
 }
 
@@ -5201,22 +5230,19 @@ fn build_resume_fn(
     // terminator so it survives (the +1-return convention), exactly like sync
     // `compile_return`.
     //
-    // Excluded: the leading param / type-param slots (borrowed from the spawner
-    // or host — never owned here), cell-captured vars (shared with closures that
-    // may outlive the task — plan 115 Part 3 / plan 114), catch vars and
-    // multi-assignment targets (`a, b = …` plain-overwrites — rc not
-    // guaranteed +1). Single-name reassigned vars ARE released: their locals
-    // are marked owned below, so binding release-the-old + `compile_assignment`
-    // retain-new/release-old keep them at exactly `+1` (plan 116 follow-up —
-    // the async-frame loop/accumulator leak).
-    let param_names: std::collections::HashSet<String> = fd
-        .type_params
-        .iter()
-        .map(|t| t.name.clone())
-        .chain(fd.params.iter().map(|p| p.name.clone()))
-        .collect();
+    // Excluded: cell-captured vars (released through their frame SLOT below,
+    // not their addr local — plan 114), catch vars and multi-assignment
+    // targets (`a, b = …` plain-overwrites — rc not guaranteed +1).
+    // Single-name reassigned vars ARE released: their locals are marked
+    // owned below, so binding release-the-old + `compile_assignment`
+    // retain-new/release-old keep them at exactly `+1` (plan 116 follow-up).
+    // Params and type-params are released too (plan 114 follow-up): every
+    // spawn site now stores an OWNED `+1` into each param slot
+    // (retain-if-borrowed in `emit_spawn_child` / `Term::AwaitClosure` /
+    // `emit_drive_closure`; type-arg strings are interned fresh), so the
+    // task releasing them at completion is what closes the
+    // owned-argument-to-async-call leak.
     let mut excluded: std::collections::HashSet<String> = cell_vars.clone();
-    excluded.extend(param_names);
     collect_multi_rebound_names(&fd.body, &mut excluded);
     collect_catch_names(&fd.body, &mut excluded);
     let release_names: Vec<String> = frame
@@ -5236,11 +5262,21 @@ fn build_resume_fn(
             b.owned_frame_locals.insert(l);
         }
     }
+    // Cell vars are released at completion through their frame SLOT (the
+    // boxed heap-cell pointer, plan 114), not their addr local — collect
+    // the slot offsets for `emit_async_drops`.
+    let cell_offsets: Vec<u64> = frame
+        .vars
+        .iter()
+        .filter(|v| cell_vars.contains(*v))
+        .map(|v| frame.var_off[v])
+        .collect();
 
     let store_vars = |b: &mut Builder| {
         for v in &frame.vars {
-            // Cell vars live in the frame slot already (writes deref the cell
-            // address = the slot); nothing to flush.
+            // Cell slots hold the boxed heap-cell pointer, written once at
+            // first entry; the mutable value lives in the cell — nothing to
+            // flush.
             if cell_vars.contains(v) {
                 continue;
             }
@@ -5263,31 +5299,44 @@ fn build_resume_fn(
     }
     for v in &frame.vars {
         if cell_vars.contains(v) {
-            // cell address = frame_ptr + slot offset (stable across suspension).
+            // Plan 114: the frame slot holds the NaN-boxed pointer of a
+            // HEAP cell, not the cell itself. First entry (slot reads 0 —
+            // frames are zeroed at spawn): allocate + tag the cell and
+            // store its boxed pointer into the slot. Every entry: unbox
+            // the pointer into the addr local. A heap cell survives the
+            // frame, so an escaped closure that captured it stays valid
+            // after the task completes — which is what lets frames with
+            // cells be reclaimed again (the old design leaked the whole
+            // frame to keep escaped closures safe).
             b.emit(Instruction::LocalGet(frame_ptr_l));
-            b.emit(Instruction::I32Const(frame.var_off[v] as i32));
-            b.emit(Instruction::I32Add);
+            b.emit(Instruction::I64Load(mem_off(frame.var_off[v])));
+            b.emit(Instruction::I64Eqz);
+            b.emit(Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                let addr = var_local[v];
+                b.emit(Instruction::I32Const(16));
+                b.emit(Instruction::Call(b.rt().base + RT_ALLOC));
+                b.emit(Instruction::LocalTee(addr));
+                b.emit(Instruction::I64Const(crate::runtime::OBJ_TAG_CELL as i64));
+                b.emit(Instruction::I64Store(mem0()));
+                b.emit(Instruction::LocalGet(addr));
+                b.emit(Instruction::I64Const(0));
+                b.emit(Instruction::I64Store(mem_off(8)));
+                b.emit(Instruction::LocalGet(frame_ptr_l));
+                b.emit(Instruction::LocalGet(addr));
+                b.emit(Instruction::Call(b.rt().base + RT_MAKE_OBJ));
+                b.emit(Instruction::I64Store(mem_off(frame.var_off[v])));
+            }
+            b.emit(Instruction::End);
+            b.emit(Instruction::LocalGet(frame_ptr_l));
+            b.emit(Instruction::I64Load(mem_off(frame.var_off[v])));
+            b.emit(Instruction::Call(b.rt().base + RT_OBJ_ADDR));
             b.emit(Instruction::LocalSet(var_local[v]));
         } else {
             b.emit(Instruction::LocalGet(frame_ptr_l));
             b.emit(Instruction::I64Load(mem_off(frame.var_off[v])));
             b.emit(Instruction::LocalSet(var_local[v]));
         }
-    }
-
-    // Soundness: if this function shares frame slots as cells with nested
-    // closures, such a closure may escape and outlive the task — its env points
-    // INTO this frame. So the frame must NOT be reclaimed at completion. Zero
-    // the recorded frame size on every (re)entry to suppress the free in
-    // `complete`/`fail` (idempotent; sound — leak rather than dangle).
-    if !cell_vars.is_empty() {
-        b.emit(Instruction::GlobalGet(layout.g_table_base));
-        b.emit(Instruction::GlobalGet(layout.g_current));
-        b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
-        b.emit(Instruction::I32Mul);
-        b.emit(Instruction::I32Add);
-        b.emit(Instruction::I32Const(0));
-        b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_FRAME_SIZE)));
     }
 
     // loop { block^B { br_table(resume_state) } <block bodies> }
@@ -5355,12 +5404,12 @@ fn build_resume_fn(
                 .get(name)
                 .ok_or(BuildError::UnsupportedExpression("async-unknown-bind"))?;
             if cell_vars.contains(name) {
-                // Store the awaited result into the cell (the frame slot).
-                b.emit(Instruction::LocalGet(l));
+                // Store the awaited result through the heap cell with
+                // value-RC (plan 114). The child's +1 result transfers.
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off + slot * 4)));
                 b.emit(Instruction::Call(layout.task_result));
-                b.emit(Instruction::I64Store(mem0()));
+                b.emit_cell_store(l, true);
             } else {
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off + slot * 4)));
@@ -5460,10 +5509,11 @@ fn build_resume_fn(
                     .get(name)
                     .ok_or(BuildError::UnsupportedExpression("async-unknown-remote-bind"))?;
                 if cell_vars.contains(name) {
-                    b.emit(Instruction::LocalGet(l));
+                    // Value-RC store through the heap cell (plan 114); the
+                    // host-built RPC result transfers.
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
-                    b.emit(Instruction::I64Store(mem0()));
+                    b.emit_cell_store(l, true);
                 } else {
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
@@ -5572,7 +5622,7 @@ fn build_resume_fn(
                 // is this (stub) task's return value. The result is host-provided
                 // (not a frame slot), so releasing the body bindings first can't
                 // touch it.
-                emit_async_drops(&mut b, &release_names, &var_local);
+                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
@@ -5718,7 +5768,14 @@ fn build_resume_fn(
                 b.emit(Instruction::I32Store(mem_off(0)));
                 for (j, arg) in args.iter().enumerate() {
                     b.emit(Instruction::LocalGet(childframe_l));
+                    // Param slots own +1 (see `emit_spawn_child`) — retain
+                    // a borrowed arg; the closure task releases its param
+                    // slots at completion.
+                    let transfers = b.expr_transfers_ownership(arg);
                     b.compile_expr_as(arg, ValueShape::Boxed)?;
+                    if !transfers {
+                        b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
+                    }
                     b.emit(Instruction::I64Store(mem_off(8 + (j as u64) * 8)));
                 }
                 b.emit(Instruction::LocalGet(closure_addr_l));
@@ -5788,7 +5845,7 @@ fn build_resume_fn(
                 }
                 let saved = b.alloc_local();
                 b.emit(Instruction::LocalSet(saved));
-                emit_async_drops(&mut b, &release_names, &var_local);
+                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(saved));
                 b.emit(Instruction::Call(layout.complete));
@@ -5796,7 +5853,7 @@ fn build_resume_fn(
             }
             Term::CompleteVoid => {
                 // Void is a primitive — no result to retain.
-                emit_async_drops(&mut b, &release_names, &var_local);
+                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::I64Const(VAL_VOID));
                 b.emit(Instruction::Call(layout.complete));
@@ -5808,7 +5865,7 @@ fn build_resume_fn(
                 // child's (read below from its task record, not a frame slot),
                 // so releasing the body bindings first can't touch it.
                 check_child_error(&mut b, None)?;
-                emit_async_drops(&mut b, &release_names, &var_local);
+                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off)));
@@ -5854,7 +5911,7 @@ fn build_resume_fn(
                     }
                     let saved = b.alloc_local();
                     b.emit(Instruction::LocalSet(saved));
-                    emit_async_drops(&mut b, &release_names, &var_local);
+                    emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit(Instruction::LocalGet(saved));
                     b.emit(Instruction::Call(layout.fail));
@@ -5879,7 +5936,7 @@ fn build_resume_fn(
             Term::CompleteResult => {
                 // try_result_l already holds a `+1` ref (retained at
                 // StoreResultGoto when there are bindings to release).
-                emit_async_drops(&mut b, &release_names, &var_local);
+                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(try_result_l));
                 b.emit(Instruction::Call(layout.complete));
@@ -6702,6 +6759,7 @@ pub fn try_codegen_async_engine(
         now_ms: now_ms_idx,
         alloc: actual_import_count + RT_ALLOC,
         free: actual_import_count + RT_FREE,
+        retain: actual_import_count + RT_RETAIN,
         ready_push: sb,
         ready_pop: sb + 1,
         spawn: sb + 2,
@@ -7798,10 +7856,10 @@ impl<'a, 'c> Builder<'a, 'c> {
                 if let Some(Resolve::Local(local)) = self.resolve(&id.name) {
                     if local.is_cell {
                         // Cell-bound: local holds an i32 cell address;
-                        // dereference to get the Boxed value, then
-                        // convert to the requested shape.
+                        // dereference the value slot (@8, plan 114) to get
+                        // the Boxed value, then convert.
                         self.emit(Instruction::LocalGet(local.local));
-                        self.emit(Instruction::I64Load(mem0()));
+                        self.emit(Instruction::I64Load(mem_off(8)));
                         return self.emit_convert(ValueShape::Boxed, want);
                     }
                     self.emit(Instruction::LocalGet(local.local));
@@ -7944,14 +8002,14 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Emit the instructions that read upvalue `i` onto the stack:
     /// `env_ptr + i*8 -> I64Load`. Valid only inside a closure body.
     /// Cell-bound upvalues require one extra dereference: the env slot
-    /// holds the cell's address (widened to i64), so narrow to i32 and
-    /// `i64.load` the stored Boxed value.
+    /// holds the NaN-boxed cell (plan 114), so unbox the address and
+    /// `i64.load` the value slot at offset 8.
     fn emit_upvalue_read(&mut self, uv_idx: u32) {
         self.emit(Instruction::GlobalGet(GLOBAL_ENV_PTR));
         self.emit(Instruction::I64Load(mem_off(uv_idx as u64 * 8)));
         if self.upvalues[uv_idx as usize].is_cell {
-            self.emit(Instruction::I32WrapI64);
-            self.emit(Instruction::I64Load(mem0()));
+            self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
+            self.emit(Instruction::I64Load(mem_off(8)));
         }
     }
 
@@ -7971,8 +8029,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     /// Bind `name` to a cell-backed slot. `addr_local` is an i32 local
-    /// holding the cell's heap address; reads/writes on the name
-    /// dereference the cell. The stored value is always `Boxed`.
+    /// holding the cell's heap address (the logical pointer of a tagged
+    /// `OBJ_TAG_CELL` block since plan 114); reads/writes on the name
+    /// dereference the cell's value slot at offset 8. The stored value
+    /// is always `Boxed`.
     fn bind_cell(&mut self, name: &str, addr_local: u32) {
         self.scopes.last_mut().unwrap().insert(
             name.to_string(),
@@ -7982,6 +8042,45 @@ impl<'a, 'c> Builder<'a, 'c> {
                 is_cell: true,
             },
         );
+    }
+
+    /// Store the Boxed value currently on the stack into the cell whose
+    /// address is in `addr_local`, with value-RC (plan 114): the cell OWNS
+    /// its value, so retain a borrowed source, release the previous value,
+    /// then write the slot at offset 8. The previous value is released
+    /// AFTER the new one is computed, so a self-referencing write
+    /// (`s = s + x`) reads the old value safely.
+    fn emit_cell_store(&mut self, addr_local: u32, transfers: bool) {
+        if !transfers {
+            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+        }
+        let tmp = self.alloc_local();
+        self.emit(Instruction::LocalSet(tmp));
+        self.emit(Instruction::LocalGet(addr_local));
+        self.emit(Instruction::I64Load(mem_off(8)));
+        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        self.emit(Instruction::LocalGet(addr_local));
+        self.emit(Instruction::LocalGet(tmp));
+        self.emit(Instruction::I64Store(mem_off(8)));
+    }
+
+    /// Allocate a fresh tagged cell (`OBJ_TAG_CELL`, 16 bytes, rc=1 from
+    /// the allocator) with a zeroed value slot, leaving its logical
+    /// address in a new i32 local. The zero value makes the first
+    /// `emit_cell_store`'s release-the-old a safe no-op (RT_ALLOC reuses
+    /// free-list blocks without clearing them).
+    fn emit_cell_alloc(&mut self) -> u32 {
+        let addr_local = self.alloc_i32_local();
+        self.emit(Instruction::I32Const(16));
+        self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
+        self.emit(Instruction::LocalTee(addr_local));
+        // tag@0 + zeroed pad@4 in one i64 store.
+        self.emit(Instruction::I64Const(OBJ_TAG_CELL as i64));
+        self.emit(Instruction::I64Store(mem0()));
+        self.emit(Instruction::LocalGet(addr_local));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem_off(8)));
+        addr_local
     }
 
     fn emit_typed_param_prelude(&mut self) -> Result<(), BuildError> {
@@ -8823,13 +8922,14 @@ impl<'a, 'c> Builder<'a, 'c> {
                 match self.resolve(&names[0]) {
                     Some(Resolve::Local(binding)) => {
                         if binding.is_cell {
-                            // Cell-bound `var` shared with closures. RC for the
-                            // cell's contents is deferred to R2 (shared-mutable
-                            // ownership) — overwrite without release/retain, so
-                            // nothing a sibling closure still reads gets freed.
-                            self.emit(Instruction::LocalGet(binding.local));
+                            // Cell-bound `var` shared with closures: the cell
+                            // OWNS its value (plan 114) — retain-new-if-
+                            // borrowed, release-old, store at offset 8. A
+                            // sibling closure that kept the old value has its
+                            // own retain, so the release can't free under it.
+                            let transfers = self.expr_transfers_ownership(&a.value);
                             self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                            self.emit(Instruction::I64Store(mem0()));
+                            self.emit_cell_store(binding.local, transfers);
                         } else if binding.shape == ValueShape::Boxed
                             && self.is_owned_local(binding.local)
                         {
@@ -8860,13 +8960,16 @@ impl<'a, 'c> Builder<'a, 'c> {
                                 "AssignmentStatement/write-to-snapshot-upvalue",
                             ));
                         }
-                        // env[uv] stores the cell's address (widened to i64).
-                        // Narrow it to i32, push the value, then i64.store.
+                        // env[uv] stores the NaN-boxed cell (plan 114).
+                        // Unbox the address, then value-RC store at @8.
+                        let cell_addr = self.alloc_i32_local();
                         self.emit(Instruction::GlobalGet(GLOBAL_ENV_PTR));
                         self.emit(Instruction::I64Load(mem_off(uv_idx as u64 * 8)));
-                        self.emit(Instruction::I32WrapI64);
+                        self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
+                        self.emit(Instruction::LocalSet(cell_addr));
+                        let transfers = self.expr_transfers_ownership(&a.value);
                         self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                        self.emit(Instruction::I64Store(mem0()));
+                        self.emit_cell_store(cell_addr, transfers);
                         Ok(())
                     }
                     Some(Resolve::ModuleVar(global_idx)) => {
@@ -9266,33 +9369,42 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // immutable binding.
                 if self.cell_captured_vars.contains(name) {
                     // Already bound as a cell? In a resume fn the frame slot
-                    // itself is the cell, seeded at function entry — store the
-                    // initial value *through* that existing address rather than
-                    // allocating a fresh heap cell and rebinding. Rebinding
-                    // would orphan the frame slot (losing the value across
-                    // suspension) and hand the capturing closure a plain i64
-                    // local where it expects an i32 cell address.
+                    // holds the boxed pointer of the heap cell, seeded at
+                    // function entry — store the initial value *through* that
+                    // existing cell rather than allocating a fresh one and
+                    // rebinding. Rebinding would orphan the frame's cell
+                    // (losing the value across suspension) and hand the
+                    // capturing closure a plain i64 local where it expects an
+                    // i32 cell address.
                     if let Some(existing) = self.lookup(name) {
                         if existing.is_cell {
                             let addr_local = existing.local;
-                            self.emit(Instruction::LocalGet(addr_local));
+                            let transfers = self.expr_transfers_ownership(value);
                             self.compile_expr_as(value, ValueShape::Boxed)?;
-                            self.emit(Instruction::I64Store(mem0()));
+                            self.emit_cell_store(addr_local, transfers);
                             return Ok(());
                         }
                     }
-                    // Allocate 8 bytes, store the (Boxed) initial
-                    // value, stash the address in an i32 local, bind
-                    // the name to a cell binding. Reads and writes on
-                    // either side deref through the address.
-                    self.emit(Instruction::I32Const(8));
-                    self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
-                    let addr_local = self.alloc_i32_local();
-                    self.emit(Instruction::LocalSet(addr_local));
-                    self.emit(Instruction::LocalGet(addr_local));
+                    // Allocate a tagged 16-byte cell (plan 114), store the
+                    // (Boxed) initial value with value-RC, bind the name to
+                    // a cell binding. Reads and writes on either side deref
+                    // the value slot at offset 8.
+                    let addr_local = self.emit_cell_alloc();
+                    let transfers = self.expr_transfers_ownership(value);
                     self.compile_expr_as(value, ValueShape::Boxed)?;
-                    self.emit(Instruction::I64Store(mem0()));
+                    self.emit_cell_store(addr_local, transfers);
                     self.bind_cell(name, addr_local);
+                    // The scope owns the cell's +1 from the allocator:
+                    // release it at scope exit like any owned binding (the
+                    // shadow local carries the boxed form scope_drops
+                    // expects). A capturing closure that escapes keeps the
+                    // cell alive through its own retained upvalue ref —
+                    // before plan 114 this block simply leaked.
+                    let boxed_local = self.alloc_local();
+                    self.emit(Instruction::LocalGet(addr_local));
+                    self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
+                    self.emit(Instruction::LocalSet(boxed_local));
+                    self.note_droppable(boxed_local);
                     return Ok(());
                 }
 
@@ -9418,9 +9530,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                 Some(Resolve::Local(local)) => {
                     if local.is_cell {
                         // Cell-bound: local holds the cell address;
-                        // deref to get the Boxed value.
+                        // deref the value slot (@8, plan 114).
                         self.emit(Instruction::LocalGet(local.local));
-                        self.emit(Instruction::I64Load(mem0()));
+                        self.emit(Instruction::I64Load(mem_off(8)));
                     } else {
                         self.emit(Instruction::LocalGet(local.local));
                         self.emit_convert(local.shape, ValueShape::Boxed)?;
@@ -12710,12 +12822,10 @@ impl<'a, 'c> Builder<'a, 'c> {
                         memory_index: 0,
                     }));
                     if binding.is_cell {
-                        // Write through the heap cell.
-                        let value_local = self.alloc_local();
-                        self.emit(Instruction::LocalSet(value_local));
-                        self.emit(Instruction::LocalGet(binding.local));
-                        self.emit(Instruction::LocalGet(value_local));
-                        self.emit(Instruction::I64Store(mem0()));
+                        // Write through the heap cell (value-RC store @8;
+                        // the host-written out value is a fresh handle —
+                        // transfer).
+                        self.emit_cell_store(binding.local, true);
                     } else {
                         self.emit_convert(ValueShape::Boxed, binding.shape)?;
                         self.emit(Instruction::LocalSet(binding.local));
@@ -13205,15 +13315,15 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(frame_size));
         self.emit(Instruction::I32Store(mem_off(12)));
         // upvalues — non-cell locals snapshot their current Boxed value;
-        // cell-bound locals store the cell's address (widened to i64),
-        // so outer and closure share one mutable slot.
+        // cell-bound locals store the cell as a NaN-boxed object (plan
+        // 114), so outer and closure share one mutable slot.
         for (i, upvalue) in upvalues.iter().enumerate() {
             self.emit(Instruction::LocalGet(tmp));
             match upvalue.source {
                 CaptureSource::Local(outer_local) => {
                     if upvalue.is_cell {
                         self.emit(Instruction::LocalGet(outer_local.local));
-                        self.emit(Instruction::I64ExtendI32U);
+                        self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
                     } else {
                         self.emit(Instruction::LocalGet(outer_local.local));
                         self.emit_convert(outer_local.shape, ValueShape::Boxed)?;
@@ -13225,15 +13335,12 @@ impl<'a, 'c> Builder<'a, 'c> {
                 }
             }
             // The closure co-owns each captured object (RC, plan 113 R1): a
-            // captured object must outlive the binding it snapshots, so retain
-            // it. Cell captures store the cell's raw address (a shared mutable
-            // slot, not an owned object value) — skip those. NOTE: closures are
-            // not yet torn down by RT_RELEASE, so these retains are currently
-            // unbalanced and the captured objects leak; closure teardown + cell
-            // ownership are deferred to R2.
-            if !upvalue.is_cell {
-                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-            }
+            // captured object must outlive the binding it snapshots, so
+            // retain it. Cells included (plan 114) — the closure's retained
+            // ref is what keeps a shared cell alive after the enclosing
+            // scope (or async frame) lets go. RT_RELEASE's closure-teardown
+            // branch releases every upvalue, balancing these.
+            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
             self.emit(Instruction::I64Store(mem_off(16 + i as u64 * 8)));
         }
 

@@ -6573,6 +6573,80 @@ mod tests {
     }
 
     #[test]
+    fn check_leaks_cells_and_async_args_are_clean() {
+        // Regression (plan 114 cell unification): captured-mutated vars
+        // (cells), their value chains, the closures that capture them,
+        // and owned arguments passed to async calls must all reclaim —
+        // including a closure that ESCAPES its task and is called after
+        // the task completed (the cell outlives the reclaimed frame).
+        let stderr = run_with_check_leaks(
+            "check_leaks_cells",
+            concat!(
+                "type def Thunk\n",
+                "    @return Void\n",
+                "end\n",
+                "\n",
+                "# Async fn taking a heap arg (param slot owns +1).\n",
+                "def measure\n",
+                "    @param s String\n",
+                "    @return Int\n",
+                "do\n",
+                "    sleep(0)\n",
+                "    length(s)\n",
+                "end\n",
+                "\n",
+                "# Mutates captured cells across suspensions.\n",
+                "def runOnce\n",
+                "    @param i Int\n",
+                "    @return Int\n",
+                "do\n",
+                "    var acc = ''\n",
+                "    let bump = do\n",
+                "        acc = acc + 'x'\n",
+                "    end\n",
+                "    bump()\n",
+                "    sleep(0)\n",
+                "    bump()\n",
+                "    length(acc) + measure('fresh-' + toString(i))\n",
+                "end\n",
+                "\n",
+                "# Returns a closure over a cell; called after the task completes.\n",
+                "def makeEscaped\n",
+                "    @return Thunk\n",
+                "do\n",
+                "    var stash = 'payload'\n",
+                "    sleep(0)\n",
+                "    let esc = do\n",
+                "        stash = stash + '!'\n",
+                "    end\n",
+                "    esc\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    var total = 0\n",
+                "    var i = 0\n",
+                "    while i < 30\n",
+                "        total = total + runOnce(i)\n",
+                "        let escaped = makeEscaped()\n",
+                "        escaped()\n",
+                "        escaped()\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print(total)\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+        // No per-iteration groups: cells, closures, args all reclaimed.
+        assert!(!stderr.contains("\n     30 "), "{stderr}");
+        assert!(!stderr.contains("\n     29 "), "{stderr}");
+        assert!(!stderr.contains("\n     60 "), "{stderr}");
+        assert!(!stderr.contains("Cell"), "{stderr}");
+    }
+
+    #[test]
     fn check_leaks_accounts_for_host_side_allocations() {
         // Host-built objects (json.parse builds the value graph via the
         // host `reserve`, not `rt_alloc`) are recorded with host origin:

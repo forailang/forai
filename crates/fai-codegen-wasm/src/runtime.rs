@@ -90,8 +90,13 @@ pub const OBJ_TAG_CLOSURE: i32 = 4;
 pub const OBJ_TAG_MODULE: i32 = 5;
 pub const OBJ_TAG_NATIVE_FN: i32 = 6;
 pub const OBJ_TAG_INSTANCE: i32 = 7;
+/// Shared mutable slot for a captured-and-mutated `var` (plan 114):
+/// `[tag@0][pad@4][value@8]`, fixed 16 bytes, rc-prefixed like every
+/// object. The enclosing scope and each capturing closure co-own it;
+/// `RT_RELEASE` frees the held value and the block at rc 0.
+pub const OBJ_TAG_CELL: i32 = 8;
 /// Debug poison written into a freed object's tag slot under the RC checked-mode
-/// (`FAI_RC_CHECK`, plan 113 R2). Not a valid tag (real tags are 0..=7), so any
+/// (`FAI_RC_CHECK`, plan 113 R2). Not a valid tag (real tags are 0..=8), so any
 /// RC op that observes it in a freed block traps loudly. Overwritten when the
 /// block is reused by a later alloc.
 pub const OBJ_TAG_POISON: i32 = 0x7E_DEAD;
@@ -2853,10 +2858,10 @@ fn emit_release(base: u32, import_remap: &[Option<u32>]) -> Function {
     // CLOSURE → upvalues @ +16, stride 8; size = 16 + uv_count*8 (plan 113 R2).
     // `uv_count` lives at addr+8 (addr+4 is the table index), so reload local 3
     // before reusing the entry loop. Releasing each upvalue balances the
-    // capture-time retain: a captured-object upvalue drops its ref, while a cell
-    // upvalue holds a raw cell address (a small int) that RT_RELEASE's is_obj
-    // guard skips — the shared cell itself is not freed here (cell ownership is
-    // a separate, still-deferred concern).
+    // capture-time retain: a captured-object upvalue drops its ref, and a
+    // captured CELL (a NaN-boxed OBJ_TAG_CELL since plan 114) drops the
+    // closure's co-ownership of the shared slot — the cell frees when its
+    // last owner (enclosing frame or sibling closure) lets go.
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(OBJ_TAG_CLOSURE));
     f.instruction(&Instruction::I32Eq);
@@ -2870,6 +2875,19 @@ fn emit_release(base: u32, import_remap: &[Option<u32>]) -> Function {
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Mul);
     f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(5));
+    f.instruction(&Instruction::End);
+    // CELL → shared mutable slot for a captured-mutated `var` (plan 114):
+    // [tag@0][pad@4][value@8], fixed 16 bytes. Release the owned value,
+    // then free the block.
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_CELL));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(empty));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+    f.instruction(&Instruction::Call(base + RT_RELEASE));
+    f.instruction(&Instruction::I32Const(16));
     f.instruction(&Instruction::LocalSet(5));
     f.instruction(&Instruction::End);
 

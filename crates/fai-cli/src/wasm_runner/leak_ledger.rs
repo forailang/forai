@@ -365,6 +365,7 @@ fn tag_name(tag: i32) -> &'static str {
         t if t == OBJ_TAG_TUPLE => "Tuple",
         t if t == OBJ_TAG_DICT => "Dict",
         t if t == OBJ_TAG_CLOSURE => "Closure",
+        8 => "Cell",
         _ => "Object",
     }
 }
