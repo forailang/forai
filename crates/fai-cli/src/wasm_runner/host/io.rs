@@ -439,6 +439,47 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // __fai_alloc_event / __fai_free_event (plan 116 phase 5) — heap
+    // allocation ledger feed. Only `--check-leaks` builds import these
+    // (rt_alloc return paths / rt_free entry). The backtrace capture is
+    // what buys allocation-site attribution (Tier 2a); it's expensive
+    // per alloc, which is fine for a leak-hunt mode.
+    linker
+        .func_wrap(
+            "env",
+            "__fai_alloc_event",
+            |mut caller: Caller<'_, ()>, addr: i32, size: i32| {
+                use super::super::leak_ledger;
+                if !leak_ledger::is_enabled() {
+                    return;
+                }
+                let frames = leak_ledger::capture_frames(&caller);
+                if leak_ledger::record_alloc(addr as u32, size as u32, false, frames) {
+                    // Interval due — render with guest memory for tags.
+                    let line = match caller.get_export("memory").and_then(|m| m.into_memory()) {
+                        Some(mem) => leak_ledger::interval_report(mem.data(&caller)),
+                        None => leak_ledger::interval_report(&[]),
+                    };
+                    if let Some(line) = line {
+                        super::super::output::stderr_line(&line);
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+    linker
+        .func_wrap(
+            "env",
+            "__fai_free_event",
+            |_caller: Caller<'_, ()>, addr: i32, size: i32| {
+                use super::super::leak_ledger;
+                if leak_ledger::is_enabled() {
+                    leak_ledger::record_free(addr as u32, size as u32);
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // cli.move_to(row, col) — ANSI cursor position.
     linker
         .func_wrap(

@@ -1014,6 +1014,7 @@ pub fn collect_lang_docs() -> Vec<DocEntry> {
         ("env", include_str!("../docs/lang/env.fai")),
         ("events", include_str!("../docs/lang/events.fai")),
         ("limits", include_str!("../docs/lang/limits.fai")),
+        ("debugging", include_str!("../docs/lang/debugging.fai")),
     ];
 
     let overview = include_str!("../docs/lang/overview.md");

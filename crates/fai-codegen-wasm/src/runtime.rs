@@ -485,7 +485,19 @@ pub const IMPORT_REMOTE_RESULT: u32 = 103;
 /// surfaces it when the trap unwinds. Browser hosts log the same message
 /// via `console.error` before the trap kills the task. Plan 116 phase 1.
 pub const IMPORT_TRAP_REPORT: u32 = 104;
-pub const IMPORT_COUNT: u32 = 105;
+/// `env.__fai_alloc_event(addr, size) -> void` — heap allocation ledger
+/// (plan 116 phase 5, `--check-leaks`). Called at every `rt_alloc` return
+/// with the logical object pointer and logical size, ONLY in builds where
+/// [`check_leaks_enabled`] was set at codegen time. The host keeps an
+/// addr→record map; whatever is never freed is the itemized live set, so
+/// a leak names itself instead of being a scalar count.
+pub const IMPORT_ALLOC_EVENT: u32 = 105;
+/// `env.__fai_free_event(addr, size) -> void` — ledger twin of
+/// [`IMPORT_ALLOC_EVENT`], called at `rt_free` entry (same gating). A free
+/// with no matching live allocation surfaces double-free / heap corruption
+/// that `--check-rc` (which only sees rc-prefixed objects) can miss.
+pub const IMPORT_FREE_EVENT: u32 = 106;
+pub const IMPORT_COUNT: u32 = 107;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -514,6 +526,48 @@ pub const TRAP_UNCAUGHT_ERROR: i32 = 7;
 /// converts a silent 100%-CPU hang into a reportable trap.
 pub const TRAP_SCHED_STALL: i32 = 8;
 
+// ── Check-leaks codegen gate (plan 116 phase 5) ───────────────────
+// When enabled, `rt_alloc`/`rt_free` call the `__fai_alloc_event` /
+// `__fai_free_event` host imports (and those imports are declared in
+// the module). Release builds are unchanged: no imports, no calls.
+//
+// The flag is THREAD-LOCAL plus an env fallback (`FAI_CHECK_LEAKS`,
+// mirroring `FAI_RC_CHECK`): codegen for one module runs on a single
+// thread, and a thread-local toggle lets parallel test builds flip it
+// without racing each other's import layout mid-build.
+thread_local! {
+    static CHECK_LEAKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable `--check-leaks` instrumentation for codegen on this
+/// thread. The CLI sets this before compiling; tests use
+/// [`CheckLeaksGuard`] for scoped enabling.
+pub fn set_check_leaks(on: bool) {
+    CHECK_LEAKS.with(|c| c.set(on));
+}
+
+/// Whether the current build should emit alloc/free ledger events.
+pub fn check_leaks_enabled() -> bool {
+    CHECK_LEAKS.with(|c| c.get()) || std::env::var_os("FAI_CHECK_LEAKS").is_some()
+}
+
+/// RAII guard enabling check-leaks codegen for the current thread.
+pub struct CheckLeaksGuard;
+
+impl CheckLeaksGuard {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        set_check_leaks(true);
+        CheckLeaksGuard
+    }
+}
+
+impl Drop for CheckLeaksGuard {
+    fn drop(&mut self) {
+        set_check_leaks(false);
+    }
+}
+
 /// Return which imports are available for a given build target.
 /// `None` means all imports available (native/test). The returned
 /// vec has one bool per import index (0..IMPORT_COUNT).
@@ -523,6 +577,13 @@ pub const TRAP_SCHED_STALL: i32 = 8;
 /// instantiate against a host that doesn't provide the test framework.
 pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> Vec<bool> {
     let mut avail = vec![true; IMPORT_COUNT as usize];
+    // Ledger imports exist only in `--check-leaks` builds, so release
+    // modules carry no extra import entries (and instantiate against
+    // hosts that predate them).
+    if !check_leaks_enabled() {
+        avail[IMPORT_ALLOC_EVENT as usize] = false;
+        avail[IMPORT_FREE_EVENT as usize] = false;
+    }
     match target {
         Some("wasm-html") | Some("wasm") => {
             // Browser async lowering owns wait/all through host_set_timer.
@@ -746,7 +807,7 @@ pub fn emit_all(
         emit_call_native(base, import_remap),      // rt_call_native
         emit_parse_int(base),                      // rt_parse_int
         emit_parse_float(base),                    // rt_parse_float
-        emit_free(freelist_global, live_count_global, bucket_base), // rt_free
+        emit_free(freelist_global, live_count_global, bucket_base, import_remap), // rt_free
         emit_copy_deep(base),                      // rt_copy_deep
         emit_retain(base, import_remap),           // rt_retain
         emit_release(base, import_remap),          // rt_release
@@ -1691,8 +1752,18 @@ fn emit_alloc(
 ) -> Function {
     // locals: 1=addr, 2=new_ptr, 3=mem_bytes, 4=prev/bucket_addr, 5=cur/head,
     // 6=orig_size, 7=bucket_idx (all i32)
+    let check_leaks = check_leaks_enabled();
     let mut f = Function::new([(7, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
+    // `--check-leaks` ledger event: __fai_alloc_event(base+8, logical_size)
+    // right before each return path hands out the logical pointer.
+    let alloc_event = |f: &mut Function, base_local: u32| {
+        f.instruction(&Instruction::LocalGet(base_local));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(6));
+        emit_import_call(f, IMPORT_ALLOC_EVENT, import_remap);
+    };
     // Stash the LOGICAL size requested (before the rc-prefix inflation below) so
     // each return path can stamp it into the prefix's spare word at obj_addr-4.
     // RT_RELEASE reads it back to free the block at its true allocated size —
@@ -1770,6 +1841,9 @@ fn emit_alloc(
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::LocalGet(6));
     f.instruction(&Instruction::I32Store(off4));
+    if check_leaks {
+        alloc_event(&mut f, 5);
+    }
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Add);
@@ -1810,6 +1884,9 @@ fn emit_alloc(
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::LocalGet(6));
     f.instruction(&Instruction::I32Store(off4));
+    if check_leaks {
+        alloc_event(&mut f, 5);
+    }
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Add);
@@ -1899,6 +1976,9 @@ fn emit_alloc(
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::LocalGet(6));
     f.instruction(&Instruction::I32Store(off4));
+    if check_leaks {
+        alloc_event(&mut f, 1);
+    }
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Add);
@@ -1911,11 +1991,23 @@ fn emit_alloc(
 // block and make it the new list head. `size` is the block's original
 // alloc size so a later same-size `alloc` reuses it. Blocks are always
 // >= 8 bytes (every heap object is), so the [size,next] header fits.
-fn emit_free(freelist_global: u32, live_count_global: u32, bucket_base: u32) -> Function {
+fn emit_free(
+    freelist_global: u32,
+    live_count_global: u32,
+    bucket_base: u32,
+    import_remap: &[Option<u32>],
+) -> Function {
     // params: 0 = ptr (i32, logical obj ptr), 1 = size (i32, logical obj size)
     // locals: 2 = bucket_idx, 3 = bucket_addr (i32)
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let mut f = Function::new([(2, ValType::I32)]);
+    // `--check-leaks` ledger event, with the logical ptr/size before the
+    // rc-prefix conversion below rewrites them to block base/size.
+    if check_leaks_enabled() {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        emit_import_call(&mut f, IMPORT_FREE_EVENT, import_remap);
+    }
     // Live-object counter (plan 113 oracle): one object reclaimed per free.
     f.instruction(&Instruction::GlobalGet(live_count_global));
     f.instruction(&Instruction::I32Const(1));
@@ -8109,6 +8201,11 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I32, ValType::I64, ValType::I64],
             vec![],
         ),
+        // IMPORT_ALLOC_EVENT / IMPORT_FREE_EVENT: (addr, size) -> void —
+        // heap allocation ledger (`--check-leaks`); only declared when
+        // check-leaks codegen is enabled.
+        ("__fai_alloc_event", vec![ValType::I32, ValType::I32], vec![]),
+        ("__fai_free_event", vec![ValType::I32, ValType::I32], vec![]),
     ]
 }
 
@@ -8213,7 +8310,7 @@ mod alloc_free_tests {
         // No imports in this fixture module — an empty remap makes the
         // OOM trap-report degrade to a bare `unreachable`, which is fine.
         code.function(&emit_alloc(fl, live, bucket_base, &[]));
-        code.function(&emit_free(fl, live, bucket_base));
+        code.function(&emit_free(fl, live, bucket_base, &[]));
         let mut m = Module::new();
         m.section(&types);
         m.section(&funcs);

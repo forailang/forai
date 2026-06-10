@@ -1,0 +1,78 @@
+# Debugging tools (`fai run` debug flags)
+#
+# When a program compiles, the tests pass, and it still doesn't work,
+# reach for the debug flags. Every mode is run-to-completion: run once
+# with the flag, get a deterministic text report on stderr, grep it.
+# No REPL, no breakpoints, no sessions.
+#
+#   fai run main.fai --debug                       # umbrella (watchdog)
+#   fai run main.fai --watchdog[=secs]             # hang killer + dump
+#   fai run main.fai --check-leaks                 # heap allocation ledger
+#   fai run main.fai --check-leaks=interval:1000   # + periodic summary
+#
+# Always on (no flag needed): trap backtraces are named and
+# source-mapped (`migrate (src/migrate.fai:16)`), trap reasons are
+# decoded (`over-release (rc -1) of String "id"`), and every trap or
+# watchdog kill appends a post-mortem dump (async task table + heap
+# stats).
+def doc_debugging_overview
+    @return Void
+do
+  # Environment fallbacks (same behavior, no flag):
+  #   FAI_WATCHDOG=10
+  #   FAI_CHECK_LEAKS=1            (or interval:<ms>)
+  #   FAI_RC_CHECK=1               (checked refcount ops; CI oracle)
+  #   FAI_LEAK_CHECK=1             (scalar live-object count at exit)
+end
+
+# --watchdog[=secs] / --debug — kill a hung run (default 10s) and dump
+# state: each live async task's id, named resume function, status,
+# rstate, waiter, join count, and wake deadline, plus heap stats. A
+# task forever WAITING on a child that never finishes — or a livelock
+# re-readying itself — is visible at a glance. In-guest infinite loops
+# are interrupted via epoch interruption; a stall guard in the
+# scheduler converts the silent 100%-CPU livelock class into a trap.
+def doc_debugging_watchdog
+    @return Void
+do
+  # fai run server.fai --watchdog=30
+  #
+  # WASM watchdog: no completion after 30s — killing the run
+  # post-mortem:
+  #   heap: heap_ptr=0x11e8, live objects=42, free blocks=3 (168 bytes)
+  #   async tasks (count 3, live 2, current -, root t1):
+  #     id    status    rstate  waiter  joins  wake      resume
+  #     t1    WAITING        2       -      1  -         main#resume
+  #     t2    WAITING        1      t1      0  in 59.8s  fetchAll#resume
+end
+
+# --check-leaks — the heap allocation ledger. Instead of a scalar
+# live-object count, an itemized record of every live heap block,
+# grouped by size and allocation site, printed at exit and after a
+# trap. A leak names itself: the report says WHAT leaked (object tag +
+# size), HOW MANY, and WHERE (the forai function that allocated it,
+# resolved from a captured backtrace). Frees with no matching live
+# allocation (double-free / heap corruption) are reported too.
+#
+# The flag instruments codegen, so it needs to compile from source —
+# a prebuilt `.wasm` run with `--check-leaks` reports that it lacks
+# instrumentation. The report self-checks against `__live_objects`.
+#
+# For servers (which never exit), `--check-leaks=interval:<ms>` prints
+# a compact summary line every <ms> ms — a non-plateauing live count
+# is the leak curve, no exit required. In the browser, build with
+# `FAI_CHECK_LEAKS=1 fai build --html` and call
+# `window.__fai_dump_leaks()` from DevTools or Playwright.
+def doc_debugging_check_leaks
+    @return Void
+do
+  # fai run app.fai --check-leaks
+  #
+  # [check-leaks] live heap: 12 objects, 388 bytes (__live_objects=12 consistent; 0 host-side)
+  #   count    bytes  what
+  #      10      290      29B  String allocated in makeLeak ← main ← <__start__>
+  #       1       88      88B  Array allocated in makeLeak ← main ← <__start__>
+  #
+  # fai run server.fai --check-leaks=interval:1000
+  # [check-leaks] live=1234 (+56) bytes=78901 (+1234) top: 264B×120, 29B×80
+end

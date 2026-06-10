@@ -26,6 +26,9 @@ pub use runtime::{
     TRAP_FORCE_UNWRAP_NULL, TRAP_OOM, TRAP_RC_OVER_RELEASE, TRAP_RC_RELEASE_POISON,
     TRAP_RC_RETAIN_POISON, TRAP_SCHED_STALL, TRAP_TASK_OVERFLOW, TRAP_UNCAUGHT_ERROR,
 };
+// Check-leaks codegen gate (plan 116 phase 5): the CLI flips this
+// before compiling a `--check-leaks` run; tests use the guard.
+pub use runtime::{check_leaks_enabled, set_check_leaks, CheckLeaksGuard};
 
 /// Try compiling `ast` through the direct AST→wasm builder in one
 /// shot. Returns `Some(wasm)` on success; `None` is an internal

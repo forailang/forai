@@ -109,6 +109,13 @@ impl DbgTable {
         self.functions.get(&index)
     }
 
+    /// Resolved name of a wasm function index, when the `fai-dbg`
+    /// table knows it. Used by the leak ledger to attribute an
+    /// allocation backtrace to the forai function that made it.
+    pub(crate) fn func_name(&self, index: u32) -> Option<&str> {
+        self.lookup(index).map(|f| f.name.as_str())
+    }
+
     /// Name of the function installed in indirect-table slot `slot`
     /// (e.g. a task record's resume fn). Falls back to the raw slot.
     pub(crate) fn table_slot_name(&self, slot: u32) -> String {

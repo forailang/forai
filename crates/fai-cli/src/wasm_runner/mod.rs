@@ -16,6 +16,7 @@ mod debug_table;
 pub(crate) mod externs_section;
 mod heap;
 mod host;
+mod leak_ledger;
 mod nan_box;
 pub mod output;
 mod post_mortem;
@@ -52,17 +53,37 @@ pub struct RunOptions {
     /// `None` = no watchdog (the default; servers legitimately run
     /// forever). Armed by `fai run --watchdog [secs]` / `--debug`.
     pub watchdog_secs: Option<u64>,
+    /// Heap allocation ledger (plan 116 phase 5, `--check-leaks`).
+    /// `Some(..)` arms it: every alloc/free event from a `--check-leaks`
+    /// build is recorded, and an itemized live-set report (grouped by
+    /// size + allocation site) prints at exit and after a trap.
+    pub check_leaks: Option<CheckLeaksOptions>,
+}
+
+/// Options for the `--check-leaks` heap ledger.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CheckLeaksOptions {
+    /// Print a compact live-set summary every this-many milliseconds
+    /// (`--check-leaks=interval:1000`) — the server mode, where "exit"
+    /// never comes and the leak shows as a non-plateauing curve.
+    pub interval_ms: Option<u64>,
 }
 
 impl RunOptions {
-    /// Read options from the environment (`FAI_WATCHDOG=<secs>`), the
-    /// channel the CLI flags use so options survive the call chain
-    /// without threading parameters through every compile step.
+    /// Read options from the environment (`FAI_WATCHDOG=<secs>`,
+    /// `FAI_CHECK_LEAKS=1|interval:<ms>`), the channel the CLI flags
+    /// use so options survive the call chain without threading
+    /// parameters through every compile step.
     pub fn from_env() -> Self {
         Self {
             watchdog_secs: std::env::var("FAI_WATCHDOG")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            check_leaks: std::env::var("FAI_CHECK_LEAKS")
+                .ok()
+                .map(|v| CheckLeaksOptions {
+                    interval_ms: v.strip_prefix("interval:").and_then(|n| n.parse().ok()),
+                }),
         }
     }
 }
@@ -155,7 +176,16 @@ pub fn run_wasm_with_externs_opts(
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
     // Debug side-table (plan 116): function index → name/file/line,
     // used to decorate trap backtraces. Empty for pre-116 binaries.
-    let dbg = debug_table::DbgTable::from_wasm(wasm_bytes);
+    let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
+    // Arm (or clear) the heap allocation ledger for this run. Always
+    // reset: a previous `--check-leaks` run on this thread must not
+    // bleed records into this one. The ledger gets its own handle on
+    // the debug table so interval reports can attribute allocations.
+    leak_ledger::reset(
+        opts.check_leaks.is_some(),
+        opts.check_leaks.and_then(|c| c.interval_ms),
+        opts.check_leaks.is_some().then(|| dbg.clone()),
+    );
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
@@ -191,6 +221,10 @@ pub fn run_wasm_with_externs_opts(
             msg.push('\n');
             msg.push_str(&pm);
         }
+        if let Some(leaks) = leak_ledger::render_report(&instance, store, &dbg) {
+            msg.push('\n');
+            msg.push_str(&leaks);
+        }
         msg
     };
 
@@ -224,6 +258,10 @@ pub fn run_wasm_with_externs_opts(
                         msg.push('\n');
                         msg.push_str(&pm);
                     }
+                    if let Some(leaks) = leak_ledger::render_report(&instance, &mut store, &dbg) {
+                        msg.push('\n');
+                        msg.push_str(&leaks);
+                    }
                     return Err(msg);
                 }
             }
@@ -237,6 +275,7 @@ pub fn run_wasm_with_externs_opts(
             let result = task_result
                 .call(&mut store, 1)
                 .map_err(|e| fmt_err("WASM async result error", e))?;
+            report_check_leaks(&instance, &mut store, &dbg);
             return Err(format!(
                 "WASM async task failed: {}",
                 print::format_return_value(result, &instance, &mut store)
@@ -247,6 +286,7 @@ pub fn run_wasm_with_externs_opts(
             .call(&mut store, 1)
             .map_err(|e| fmt_err("WASM async result error", e))?;
         print::print_return_value(result, &instance, &mut store);
+        report_check_leaks(&instance, &mut store, &dbg);
         return Ok(());
     }
 
@@ -262,8 +302,21 @@ pub fn run_wasm_with_externs_opts(
     print::print_return_value(result, &instance, &mut store);
 
     report_leak_check(&instance, &mut store);
+    report_check_leaks(&instance, &mut store, &dbg);
 
     Ok(())
+}
+
+/// Print the `--check-leaks` live-set report (when the ledger is
+/// armed) to the host stderr sink at the end of a run.
+fn report_check_leaks(
+    instance: &wasmtime::Instance,
+    store: &mut wasmtime::Store<()>,
+    dbg: &debug_table::DbgTable,
+) {
+    if let Some(report) = leak_ledger::render_report(instance, store, dbg) {
+        output::stderr_line(&report);
+    }
 }
 
 /// Leak oracle (plan 113). When `FAI_LEAK_CHECK` is set, read the

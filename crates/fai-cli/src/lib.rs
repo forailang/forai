@@ -113,6 +113,10 @@ fn print_usage() {
     eprintln!("  build -o <path>         Write build output to a specific path");
     eprintln!("  run --watchdog[=secs]   Kill a hung run after secs (default 10) with a");
     eprintln!("                          post-mortem dump (task table + heap stats)");
+    eprintln!("  run --check-leaks       Heap allocation ledger: itemized live set at");
+    eprintln!("                          exit/trap, grouped by size + allocation site");
+    eprintln!("  run --check-leaks=interval:<ms>  Also print a live-set summary every");
+    eprintln!("                          <ms> ms (for servers that never exit)");
     eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
     eprintln!();
     eprintln!("Shorthand:");
@@ -206,6 +210,16 @@ fn cmd_run(args: &[String]) {
             if let Some(name) = project.as_deref() {
                 build_args.retain(|a| a != name);
             }
+            // `--check-leaks` instruments codegen, and in project mode
+            // the codegen happens HERE (step_build), not in step_run —
+            // arm the gate before building or the artifact carries no
+            // ledger events.
+            if args
+                .iter()
+                .any(|a| a == "--check-leaks" || a.starts_with("--check-leaks="))
+            {
+                fai_codegen_wasm::set_check_leaks(true);
+            }
             step_build(&build_args, project.as_deref(), &reporter);
             if let Some(wasm) = resolve_target_wasm_artifact(project.as_deref()) {
                 // Keep `fai run --project <target>` rooted at the
@@ -214,7 +228,10 @@ fn cmd_run(args: &[String]) {
                 // project-root relative in the fullstack templates.
                 // Users who want a self-contained build-dir runtime can
                 // still `cd build/<target>` and run the wasm directly.
-                let run_args: Vec<String> = vec![wasm];
+                // Forward the debug flags (--watchdog/--debug/
+                // --check-leaks) so the runner half still sees them.
+                let mut run_args: Vec<String> = vec![wasm];
+                run_args.extend(args.iter().filter(|a| a.starts_with("--")).cloned());
                 step_run(&run_args, None, &reporter);
                 return;
             }
@@ -1159,7 +1176,33 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
             }
         })
         .or(wasm_runner::RunOptions::from_env().watchdog_secs);
-    let run_opts = wasm_runner::RunOptions { watchdog_secs };
+    // Plan 116 phase 5: `--check-leaks[=interval:<ms>]` arms the heap
+    // allocation ledger. The flag has a codegen half (rt_alloc/rt_free
+    // emit `__fai_alloc_event`/`__fai_free_event`) and a runner half
+    // (record events, print the itemized live set at exit/trap, or on
+    // an interval for servers). `FAI_CHECK_LEAKS=1|interval:<ms>` is
+    // the env fallback.
+    let check_leaks = args
+        .iter()
+        .find_map(|a| {
+            if a == "--check-leaks" {
+                Some(wasm_runner::CheckLeaksOptions::default())
+            } else {
+                a.strip_prefix("--check-leaks=")
+                    .map(|v| wasm_runner::CheckLeaksOptions {
+                        interval_ms: v.strip_prefix("interval:").and_then(|n| n.parse().ok()),
+                    })
+            }
+        })
+        .or(wasm_runner::RunOptions::from_env().check_leaks);
+    if check_leaks.is_some() {
+        // Codegen gate — must be set before compile_fai_to_wasm below.
+        fai_codegen_wasm::set_check_leaks(true);
+    }
+    let run_opts = wasm_runner::RunOptions {
+        watchdog_secs,
+        check_leaks,
+    };
 
     // Check if the first positional arg is a target name or a file path.
     // If no positional arg, try project-based resolution from cwd.
@@ -3445,7 +3488,9 @@ const env = {{
   event_drain(){{}},
   event_queue_len(){{return 0}},
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
-  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}}
+  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
+  __fai_alloc_event(){{}},
+  __fai_free_event(){{}}
 }};
 let instance;
 let asyncRootDone = false;
@@ -3594,7 +3639,9 @@ const env={{
   event_drain(){{}},
   event_queue_len(){{return 0}},
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
-  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}}
+  __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
+  __fai_alloc_event(){{}},
+  __fai_free_event(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
@@ -3780,8 +3827,8 @@ function jsToWasm(v){{
   if(typeof v==='boolean')return QNAN|TAG_BOOL|BigInt(v?1:0);
   if(typeof v==='number'){{if(Number.isInteger(v))return QNAN|TAG_INT|BigInt.asUintN(32,BigInt(v));var buf=new ArrayBuffer(8);new Float64Array(buf)[0]=v;return new BigInt64Array(buf)[0]}}
   if(typeof v==='string')return writeStrToWasm(v);
-  if(Array.isArray(v)){{var base=instance.exports.__heap_ptr.value,logsz=8+v.length*8,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,1,true);dv.setInt32(addr+4,v.length,true);var items=v.map(function(i){{return jsToWasm(i)}});m=instance.exports.memory.buffer;for(var i=0;i<items.length;i++){{new BigInt64Array(m,addr+8+i*8,1)[0]=items[i]}}return OBJ_MASK|BigInt(addr)}}
-  if(typeof v==='object'){{var keys=Object.keys(v),base=instance.exports.__heap_ptr.value,cap=Math.max(keys.length,16),logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,keys.length,true);for(var i=0;i<keys.length;i++){{var kv=writeStrToWasm(keys[i]),vv=jsToWasm(v[keys[i]]),ea=addr+8+i*16;m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,ea,2);bi[0]=kv;bi[1]=vv}}return OBJ_MASK|BigInt(addr)}}
+  if(Array.isArray(v)){{var base=instance.exports.__heap_ptr.value,logsz=8+v.length*8,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,1,true);dv.setInt32(addr+4,v.length,true);faiLeakAlloc(addr,logsz,true);var items=v.map(function(i){{return jsToWasm(i)}});m=instance.exports.memory.buffer;for(var i=0;i<items.length;i++){{new BigInt64Array(m,addr+8+i*8,1)[0]=items[i]}}return OBJ_MASK|BigInt(addr)}}
+  if(typeof v==='object'){{var keys=Object.keys(v),base=instance.exports.__heap_ptr.value,cap=Math.max(keys.length,16),logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,keys.length,true);faiLeakAlloc(addr,logsz,true);for(var i=0;i<keys.length;i++){{var kv=writeStrToWasm(keys[i]),vv=jsToWasm(v[keys[i]]),ea=addr+8+i*16;m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,ea,2);bi[0]=kv;bi[1]=vv}}return OBJ_MASK|BigInt(addr)}}
   return QNAN|TAG_NULL;
 }}
 function wasmToJs(v){{
@@ -3802,7 +3849,7 @@ function wasmToJs(v){{
 function readStr(p,l){{return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,p,l))}}
 function writeStr(p,s){{var b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p).set(b);return b.length}}
 function wasmGrow(needed){{var mem=instance.exports.memory;var cur=mem.buffer.byteLength;if(needed>cur){{var pages=Math.ceil((needed-cur)/65536);mem.grow(pages)}}}}
-function writeStrToWasm(s){{var b=new TextEncoder().encode(s),base=instance.exports.__heap_ptr.value,logsz=8+b.length,h=base+8;wasmGrow(base+8+logsz+8);var m=new Uint8Array(instance.exports.memory.buffer),d=new DataView(instance.exports.memory.buffer);d.setInt32(base,1,true);d.setInt32(base+4,logsz,true);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;return OBJ_MASK|BigInt(h)}}
+function writeStrToWasm(s){{var b=new TextEncoder().encode(s),base=instance.exports.__heap_ptr.value,logsz=8+b.length,h=base+8;wasmGrow(base+8+logsz+8);var m=new Uint8Array(instance.exports.memory.buffer),d=new DataView(instance.exports.memory.buffer);d.setInt32(base,1,true);d.setInt32(base+4,logsz,true);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;faiLeakAlloc(h,logsz,true);return OBJ_MASK|BigInt(h)}}
 function readNanBoxedStr(v){{var n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{var a=Number(n&0x0000FFFFFFFFFFFFn),d=new DataView(instance.exports.memory.buffer);if(d.getInt32(a,true)===0){{var l=d.getInt32(a+4,true);return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,a+8,l))}}}}return''}}
 function invokeExport(name){{var fn=instance.exports[name];if(!fn)return;var args=Array.prototype.slice.call(arguments,1);try{{return fn.apply(null,args)}}catch(e){{console.error('FAI',name,'failed',e);throw e}}}}
 function rootResultText(result){{var v=wasmToJs(result);if(Array.isArray(v))return JSON.stringify(v);if(v===null||v===undefined)return'';return String(v)}}
@@ -3814,6 +3861,14 @@ function responseHeaders(xhr){{var headers={{}};String(xhr.getAllResponseHeaders
 function httpRequest(method,url,body){{try{{var x=new XMLHttpRequest();x.open(method,url,false);if(body!==undefined)x.setRequestHeader('Content-Type','text/plain; charset=utf-8');x.send(body===undefined?null:body);return jsToWasm({{status:x.status,body:x.responseText||'',headers:responseHeaders(x)}})}}catch(e){{console.error('FAI http request failed',e);return NULL_VAL}}}}
 var faiEventRegistry={{byName:Object.create(null),nextId:0,queue:[],draining:false}};
 var __faiRpcResults={{}};
+// Heap allocation ledger (plan 116 phase 5, `--check-leaks`). Armed by the
+// first __fai_alloc_event from a check-leaks build (or ?fai_check_leaks=1).
+// Tier 1 only in the browser: live set grouped by size, dumped on demand
+// from DevTools/Playwright via window.__fai_dump_leaks().
+var faiLeak={{on:new URLSearchParams(location.search).get('fai_check_leaks')==='1',map:new Map(),hostAllocs:0,guestEvents:0,unknownFrees:0,bytes:0}};
+function faiLeakAlloc(addr,size,host){{if(!host&&!faiLeak.on)faiLeak.on=true;if(!faiLeak.on)return;if(host)faiLeak.hostAllocs++;else faiLeak.guestEvents++;var old=faiLeak.map.get(addr);if(old!==undefined)faiLeak.bytes-=old;faiLeak.map.set(addr,size);faiLeak.bytes+=size}}
+function faiLeakFree(addr,size){{if(!faiLeak.on)return;faiLeak.guestEvents++;var s=faiLeak.map.get(addr);if(s===undefined){{faiLeak.unknownFrees++}}else{{faiLeak.map.delete(addr);faiLeak.bytes-=s}}}}
+window.__fai_dump_leaks=function(){{var by={{}};faiLeak.map.forEach(function(size){{by[size]=(by[size]||0)+1}});var rows=Object.keys(by).map(function(s){{return{{size:+s,count:by[s]}}}}).sort(function(a,b){{return b.size*b.count-a.size*a.count}});var live=instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null;var out='[check-leaks] live heap: '+faiLeak.map.size+' objects, '+faiLeak.bytes+' bytes ('+faiLeak.hostAllocs+' host-side, '+faiLeak.unknownFrees+' unknown frees'+(live===null?'':', __live_objects='+live)+')';if(faiLeak.guestEvents===0)out+='\n  no guest events — module not built with --check-leaks';rows.slice(0,40).forEach(function(r){{out+='\n  '+r.count+' × '+r.size+'B = '+(r.count*r.size)+'B'}});console.log(out);return out}};
 function faiBuildEvent(name,dataVal){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var kn=writeStrToWasm('name'),vn=writeStrToWasm(name),kd=writeStrToWasm('data');m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=kn;bi[1]=vn;bi[2]=kd;bi[3]=BigInt.asIntN(64,BigInt(dataVal));return OBJ_MASK|BigInt(addr)}}
 function faiBuildSubscription(id,name){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var ki=writeStrToWasm('id'),kn=writeStrToWasm('name'),vn=writeStrToWasm(name),iv=INT_MASK|BigInt.asUintN(32,BigInt(id));m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=ki;bi[1]=iv;bi[2]=kn;bi[3]=vn;return OBJ_MASK|BigInt(addr)}}
 function faiReadSubscription(subVal){{var n=BigInt.asIntN(64,BigInt(subVal));var u=BigInt.asUintN(64,n);if((u&OBJ_MASK)!==OBJ_MASK)return null;var a=Number(u&0x0000FFFFFFFFFFFFn),dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==3)return null;var cnt=dv.getInt32(a+4,true),id=null,name=null;for(var i=0;i<cnt;i++){{var ea=a+8+i*16,bi=new BigInt64Array(instance.exports.memory.buffer,ea,2),k=readNanBoxedStr(bi[0]),v=BigInt.asUintN(64,bi[1]);if(k==='id')id=Number(BigInt.asIntN(32,v&0xFFFFFFFFn));else if(k==='name')name=readNanBoxedStr(bi[1])}}if(id===null||name===null)return null;return{{id:id,name:name}}}}
@@ -3909,6 +3964,8 @@ var env={{
   cli_write_line:function(p,l){{output.style.display='block';output.textContent+=readStr(p,l)+'\n'}},
   cli_clear:function(){{output.textContent=''}},
   cli_move_to:function(){{}},
+  __fai_alloc_event:function(addr,size){{faiLeakAlloc(addr>>>0,size>>>0,false)}},
+  __fai_free_event:function(addr,size){{faiLeakFree(addr>>>0,size>>>0)}},
   __fai_set_trap_msg:function(p,l){{var m=readStr(p,l);window.__FAI_TRAP_MSG=m;console.error('FAI trap:',m)}},
   __fai_trap_report:function(code,a,b){{
     // Plan 116: structured trap reason, mirrored from the native host
@@ -6101,6 +6158,7 @@ mod tests {
             Vec::new(),
             wasm_runner::RunOptions {
                 watchdog_secs: Some(1),
+                ..Default::default()
             },
         )
         .expect_err("watchdog should kill the parked program");
@@ -6140,6 +6198,7 @@ mod tests {
             Vec::new(),
             wasm_runner::RunOptions {
                 watchdog_secs: Some(1),
+                ..Default::default()
             },
         )
         .expect_err("watchdog should interrupt the spinning program");
@@ -6186,6 +6245,149 @@ mod tests {
         assert!(err.contains("main.fai:"), "{err}");
         assert!(err.contains("post-mortem:"), "{err}");
         assert!(err.contains("main#resume"), "{err}");
+    }
+
+    // ── Plan 116 phase 5: `--check-leaks` heap allocation ledger ──
+
+    /// Run a `--check-leaks` build and return the captured stderr
+    /// (where the ledger report lands). Codegen instrumentation comes
+    /// from the thread-local guard; compile and run share this thread.
+    fn run_with_check_leaks(tag: &str, src: &str) -> String {
+        let _cg = fai_codegen_wasm::CheckLeaksGuard::new();
+        let wasm = compile_snippet(tag, src);
+        let guard = wasm_runner::output::CaptureGuard::new();
+        let result = wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions {
+                check_leaks: Some(wasm_runner::CheckLeaksOptions::default()),
+                ..Default::default()
+            },
+        );
+        let stderr = guard.stderr();
+        drop(guard);
+        result.expect("check-leaks program should run to completion");
+        stderr
+    }
+
+    #[test]
+    fn check_leaks_report_names_the_leaking_function() {
+        // Ten same-size strings escape into a program-lifetime global —
+        // the live set at exit. Tier 1: the report shows the group with
+        // its count; Tier 2a: the allocation site names `makeLeak` (via
+        // the backtrace captured at each rt_alloc). The self-check
+        // against `__live_objects` must agree.
+        let stderr = run_with_check_leaks(
+            "check_leaks_named",
+            concat!(
+                "use std.array\n",
+                "\n",
+                "var cache String[] = []\n",
+                "\n",
+                "# Allocates strings that stay referenced by the global cache.\n",
+                "def makeLeak\n",
+                "    @return Void\n",
+                "do\n",
+                "    var i = 0\n",
+                "    while i < 10\n",
+                "        cache = array.append(cache, 'leak-string-payload-' + toString(i))\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    makeLeak()\n",
+                "    print(length(cache))\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("[check-leaks] live heap:"), "{stderr}");
+        // Tier 1: ten leaked strings of one size, grouped.
+        assert!(stderr.contains("\n     10 "), "{stderr}");
+        assert!(stderr.contains("String"), "{stderr}");
+        // Tier 2a: the allocation site names the leaking function.
+        assert!(stderr.contains("makeLeak"), "{stderr}");
+        // Self-check: ledger and __live_objects agree.
+        assert!(stderr.contains("consistent"), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_clean_program_reports_empty_live_set() {
+        // A loop that builds and drops temporaries must come back to an
+        // empty live set — the ledger version of the reclaim fixtures.
+        let stderr = run_with_check_leaks(
+            "check_leaks_clean",
+            concat!(
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    var i = 0\n",
+                "    while i < 200\n",
+                "        let label = 'item-' + toString(i)\n",
+                "        i = i + 1\n",
+                "    end\n",
+                "    print('done')\n",
+                "end\n",
+            ),
+        );
+        assert!(
+            stderr.contains("live heap: 0 objects, 0 bytes"),
+            "{stderr}",
+        );
+        assert!(stderr.contains("consistent"), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_accounts_for_host_side_allocations() {
+        // Host-built objects (json.parse builds the value graph via the
+        // host `reserve`, not `rt_alloc`) are recorded with host origin:
+        // the self-check offsets them, and the report attributes them.
+        let stderr = run_with_check_leaks(
+            "check_leaks_host",
+            concat!(
+                "use std.json\n",
+                "\n",
+                "var keep = json.parse('{\"name\": \"hello\", \"xs\": [1, 2]}')\n",
+                "\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "    print('ok')\n",
+                "end\n",
+            ),
+        );
+        assert!(stderr.contains("[check-leaks] live heap:"), "{stderr}");
+        assert!(stderr.contains("host-side"), "{stderr}");
+        assert!(stderr.contains("consistent"), "{stderr}");
+        assert!(stderr.contains("host import"), "{stderr}");
+    }
+
+    #[test]
+    fn check_leaks_on_uninstrumented_module_reports_hint() {
+        // A module compiled WITHOUT the flag emits no events; running it
+        // with --check-leaks must say so instead of claiming "no leaks".
+        let wasm = compile_snippet(
+            "check_leaks_uninstrumented",
+            "def main\n    @return Void\ndo\n    print('hi')\nend\n",
+        );
+        let guard = wasm_runner::output::CaptureGuard::new();
+        wasm_runner::run_wasm_with_externs_opts(
+            &wasm,
+            Vec::new(),
+            wasm_runner::RunOptions {
+                check_leaks: Some(wasm_runner::CheckLeaksOptions::default()),
+                ..Default::default()
+            },
+        )
+        .expect("program should run");
+        let stderr = guard.stderr();
+        drop(guard);
+        assert!(
+            stderr.contains("not built with --check-leaks"),
+            "{stderr}",
+        );
     }
 
     /// Shared mutex for tests that call `set_current_dir` — CWD is

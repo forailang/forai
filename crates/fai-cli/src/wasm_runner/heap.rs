@@ -67,6 +67,21 @@ pub(crate) fn reserve(caller: &mut Caller<'_, ()>, mem: &Memory, logical_size: u
         .copy_from_slice(&(logical_size as i32).to_le_bytes());
     let logical = base + 8;
     set_heap_ptr(caller, align8(logical + logical_size as u32));
+    // `--check-leaks` ledger (plan 116 phase 5): host-side allocations
+    // bypass `rt_alloc` (no `__fai_alloc_event`), but the objects ARE
+    // released through guest `rt_free` — record them here so those
+    // frees match instead of reading as heap corruption, and so
+    // host-built objects (RPC/JSON payloads, request dicts) get named
+    // in the live-set report.
+    if super::leak_ledger::is_enabled() {
+        let frames = super::leak_ledger::capture_frames(&*caller);
+        if super::leak_ledger::record_alloc(logical, logical_size as u32, true, frames) {
+            // Interval due — render with guest memory for tags.
+            if let Some(line) = super::leak_ledger::interval_report(mem.data(&*caller)) {
+                super::output::stderr_line(&line);
+            }
+        }
+    }
     logical
 }
 
