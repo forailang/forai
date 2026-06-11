@@ -1,0 +1,19 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+#
+# String-returning boxed host import (path.join → fresh via
+# wasm_alloc_str): bind releases at scope exit, discard releases
+# immediately — both must stay flat under the table's Owned entry.
+
+use std.path
+
+def main
+    @return Void
+do
+    let joined = path.join('a', 'b')
+    path.join('x', 'y')
+    if joined == 'a/b'
+        print('ok')
+    end
+end

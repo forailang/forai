@@ -1,0 +1,22 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+#
+# BORROWED boxed host import (json.requireString returns the dict
+# entry's own string pointer — host/json.rs, verified alias). Binding a
+# borrowed return retains/releases symmetrically; the dict releases at
+# scope exit. Flat proves the Borrowed table entry is correct — an
+# Owned entry here would be a use-after-free under FAI_RC_CHECK.
+
+use std.json
+
+def main
+    @return Void
+do
+    let parsed = json.parse('{"name": "fai"}')
+    let name = unwrap(json.requireString(parsed, 'name'), '')
+    json.requireString(parsed, 'name')
+    if name == 'fai'
+        print('ok')
+    end
+end

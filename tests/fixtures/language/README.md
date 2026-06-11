@@ -125,7 +125,7 @@ project's test lane, not here.
 | 3 | destructuring | `rc/destructure_tuple` | tuple leaks → expected phase4 |
 | 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort` | append flat; map/filter boxed arg temps → phase4; fresh receiver → phase6 |
 | 5 | dict/field stores | `rc/dict_field_store` | flat |
-| 6 | std host imports | `rc/std_json_roundtrip` | flat |
+| 6 | std host imports | `rc/std_json_roundtrip`, `rc/std_path_join`, `rc/json_parse_array`, `rc/json_require_string` | flat — incl. the Owned string/graph classes and the verified-Borrowed alias class (plan 119; requireString returns the dict entry's own pointer) |
 | 7 | FFI externs | `rc/ffi_libc_abs` | flat (primitive returns) |
 | 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | handler closures retained, never released → expected phase6 |
 | 9 | async frames | `rc/async_frame_complete` | frames released; scheduler buffer → expected async-runtime-root |

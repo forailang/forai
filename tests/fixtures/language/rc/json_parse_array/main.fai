@@ -1,0 +1,19 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+#
+# Array-graph-returning boxed host import (json.parse of an array —
+# fresh graph via heap::build_value): bind then scope exit, and a
+# discarded re-parse, both flat.
+
+use std.json
+
+def main
+    @return Void
+do
+    let xs = json.parse('[1, 2, 3]')
+    json.parse('[4]')
+    if length(xs) == 3
+        print('ok')
+    end
+end
