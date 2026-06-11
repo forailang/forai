@@ -551,6 +551,66 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // __fai_mem_watch() — memory watchpoint. Called at every
+    // alloc/retain/release when FAI_MEM_WATCH codegen is on. The host
+    // reads the word at FAI_MEM_WATCH=<hex addr> and logs a backtrace
+    // whenever it changes — the general "what touched this address" view
+    // for a stray write to any field (a clobbered count, a header word),
+    // not just an object's refcount. Poll granularity: the change is
+    // reported at the first RC op / allocation after the write, so the
+    // backtrace lands within a statement or two of the writer.
+    linker
+        .func_wrap("env", "__fai_mem_watch", |mut caller: Caller<'_, ()>| {
+            let want = match std::env::var("FAI_MEM_WATCH").ok().and_then(|s| {
+                let t = s.trim().trim_start_matches("0x");
+                u32::from_str_radix(t, 16).ok()
+            }) {
+                Some(w) => w,
+                None => return,
+            };
+            let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return,
+            };
+            let cur = {
+                let d = mem.data(&caller);
+                let a = want as usize;
+                if a + 4 > d.len() {
+                    return;
+                }
+                i32::from_le_bytes([d[a], d[a + 1], d[a + 2], d[a + 3]])
+            };
+            // wasm memory is zero-initialised, so treat an unseen address
+            // as 0 — then the first non-zero write is visible too.
+            let prev = MEM_WATCH_LAST.with(|c| c.replace(Some(cur))).unwrap_or(0);
+            if prev == cur {
+                return;
+            }
+            let sites: Vec<String> = wasmtime::WasmBacktrace::capture(&caller)
+                .frames()
+                .iter()
+                .filter_map(|fr| fr.func_name())
+                .filter(|n| !n.starts_with("rt_") && !n.starts_with("__"))
+                .take(6)
+                .map(|s| s.to_string())
+                .collect();
+            let region = super::super::leak_ledger::describe_block(want)
+                .map(|d| format!(" [{}]", d))
+                .unwrap_or_default();
+            eprintln!(
+                "[mem-watch 0x{:x}] {} -> {} (0x{:x}){} at {}",
+                want,
+                prev,
+                cur,
+                cur as u32,
+                region,
+                sites.join(" ← ")
+            );
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+        })
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // __fai_alloc_event / __fai_free_event (plan 116 phase 5) — heap
     // allocation ledger feed. Only `--check-leaks` builds import these
     // (rt_alloc return paths / rt_free entry). The backtrace capture is
@@ -632,6 +692,10 @@ thread_local! {
     /// after catching a trap.
     static TRAP_MSG: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)
+    };
+    /// Last value seen at the FAI_MEM_WATCH address, for change detection.
+    static MEM_WATCH_LAST: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
     };
 }
 

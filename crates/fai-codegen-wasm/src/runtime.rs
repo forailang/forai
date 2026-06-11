@@ -520,7 +520,13 @@ pub const IMPORT_STORAGE_GET_STR: u32 = 109;
 /// rc only for the watched address. The debugger-style "who touches this
 /// refcount" primitive for tracking an over-release to its unmatched op.
 pub const IMPORT_RC_WATCH: u32 = 110;
-pub const IMPORT_COUNT: u32 = 111;
+/// `env.__fai_mem_watch() -> void` — memory watchpoint (FAI_MEM_WATCH).
+/// Called at every alloc/retain/release (and around FFI calls); the host
+/// reads the word at FAI_MEM_WATCH=<addr> and logs a backtrace whenever it
+/// changes. Generalizes the RC watchpoint to any address — for tracking a
+/// stray write (e.g. a clobbered count field) to the op that produced it.
+pub const IMPORT_MEM_WATCH: u32 = 111;
+pub const IMPORT_COUNT: u32 = 112;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -644,6 +650,10 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     // builds neither declare nor require it.
     if std::env::var_os("FAI_RC_WATCH").is_none() {
         avail[IMPORT_RC_WATCH as usize] = false;
+    }
+    // Same for the memory watchpoint import / FAI_MEM_WATCH.
+    if std::env::var_os("FAI_MEM_WATCH").is_none() {
+        avail[IMPORT_MEM_WATCH as usize] = false;
     }
     match target {
         Some("wasm-html") | Some("wasm") => {
@@ -1916,6 +1926,7 @@ fn emit_alloc(
     let check_leaks = check_leaks_enabled();
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mem_watch = std::env::var_os("FAI_MEM_WATCH").is_some();
     let mut f = Function::new([(9, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
     let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
@@ -1997,6 +2008,9 @@ fn emit_alloc(
     // alloc; a mid-chain dirty node surfaces once it becomes head.
     if heap_verify {
         emit_heads_scan(&mut f, bucket_base, import_remap, 8, 9);
+    }
+    if mem_watch {
+        emit_import_call(&mut f, IMPORT_MEM_WATCH, import_remap);
     }
     // Stash the LOGICAL size requested (before the rc-prefix inflation below) so
     // each return path can stamp it into the prefix's spare word at obj_addr-4.
@@ -2947,11 +2961,15 @@ fn emit_retain(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fun
     // param 0: v (i64). local 1 = rc slot address; 2/3 = scan scratch (i32).
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mem_watch = std::env::var_os("FAI_MEM_WATCH").is_some();
     let rc_watch = std::env::var_os("FAI_RC_WATCH").is_some();
     let mut f = Function::new([(3, ValType::I32)]);
     let empty = wasm_encoder::BlockType::Empty;
     if heap_verify {
         emit_heads_scan(&mut f, bucket_base, import_remap, 2, 3);
+    }
+    if mem_watch {
+        emit_import_call(&mut f, IMPORT_MEM_WATCH, import_remap);
     }
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_IS_OBJ));
@@ -3016,12 +3034,16 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     // 8/9 = FAI_HEAP_VERIFY scan scratch.
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mem_watch = std::env::var_os("FAI_MEM_WATCH").is_some();
     let rc_watch = std::env::var_os("FAI_RC_WATCH").is_some();
     let mut f = Function::new([(9, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
     let empty = wasm_encoder::BlockType::Empty;
     if heap_verify {
         emit_heads_scan(&mut f, bucket_base, import_remap, 8, 9);
+    }
+    if mem_watch {
+        emit_import_call(&mut f, IMPORT_MEM_WATCH, import_remap);
     }
 
     // if !is_obj(v) { return }
@@ -8791,6 +8813,8 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_RC_WATCH: (obj_addr, rc_slot_addr, delta) -> void.
         ("__fai_rc_watch", vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+        // IMPORT_MEM_WATCH: () -> void. Host reads the watched address.
+        ("__fai_mem_watch", vec![], vec![]),
     ]
 }
 
