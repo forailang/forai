@@ -131,45 +131,33 @@ impl Signature {
 /// functions, closures, type constructors, externs) — those are owned by the
 /// `+1` return convention and resolved per-program by codegen, not by this
 /// static table.
-/// Debug-only seeded-misclassification hook (plan 118 U6). With
-/// `FAI_ABI_SEED=<name>` set, the named bare-call entry's return
-/// convention is forced to `Borrowed` so CI can prove the FAI_ABI_CHECK
-/// divergence detector actually fires — if a deliberately wrong entry
-/// can hide, a real one can too. Compiled only under
-/// `debug_assertions`: once plan-117 phase 3 makes this table
-/// load-bearing, a seed in a release binary would change emitted code.
-/// Seeding an already-`Borrowed` name (or `set`, whose `PassThrough`
-/// is structurally exempt from parity) produces no divergence — seed
-/// an `Owned`-returning name like `unwrap` or `map`.
+/// Debug-only seeded-absence hook (plan 119 U2, repurposed from the
+/// plan-118 divergence seed). With `FAI_ABI_SEED=<import-name>` set, the
+/// named host-import row is treated as ABSENT by [`lookup_host_import`]
+/// — and only there — so CI can prove the missing-signature sentinel and
+/// the checked-build error actually fire. It deliberately never affects
+/// the classification lookups: post-swap those drive emitted code, and a
+/// seed that changed codegen would invalidate the very build it tests.
+/// Compiled only under `debug_assertions`; an unknown import name warns
+/// and stays inactive.
 #[cfg(debug_assertions)]
-fn seeded(name: &str) -> bool {
+fn seeded_absent(import: &str) -> bool {
     use std::sync::OnceLock;
     static SEED: OnceLock<Option<String>> = OnceLock::new();
     let seed = SEED.get_or_init(|| {
         let v = std::env::var("FAI_ABI_SEED").ok()?;
-        let known = v == "set"
-            || v == "unwrap"
-            || is_borrowed_bare_global(&v)
-            || is_fresh_builtin_call(&v);
-        if !known {
+        if !HOST_IMPORTS.iter().any(|r| r.import == v) {
             eprintln!(
-                "[abi-check] FAI_ABI_SEED='{}' names no bare-call table entry — seed inactive",
+                "[abi-check] FAI_ABI_SEED='{}' names no host-import row — seed inactive",
                 v
             );
         }
         Some(v)
     });
-    seed.as_deref() == Some(name)
+    seed.as_deref() == Some(import)
 }
 
 pub fn lookup_bare_call(name: &str) -> Option<Signature> {
-    #[cfg(debug_assertions)]
-    if seeded(name) {
-        return Some(Signature::ret_only(
-            ReturnConvention::Borrowed,
-            "SEEDED-BUG: return convention flipped by FAI_ABI_SEED (plan 118 U6)",
-        ));
-    }
     // 1. `set` returns its first arg, mutated in place.
     if name == "set" {
         return Some(Signature {
@@ -339,6 +327,10 @@ pub fn lookup_std_module_call(canon: &str, method: &str) -> Option<Signature> {
 /// Look up ownership by wasm `env` import name — the form the emission
 /// coverage check and the import round-trip test use.
 pub fn lookup_host_import(import: &str) -> Option<Signature> {
+    #[cfg(debug_assertions)]
+    if seeded_absent(import) {
+        return None;
+    }
     HOST_IMPORTS
         .iter()
         .find(|r| r.import == import)

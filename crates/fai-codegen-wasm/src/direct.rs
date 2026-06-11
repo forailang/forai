@@ -233,7 +233,42 @@ thread_local! {
     static ABI_CHECK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether the plan-117 table-vs-heuristic parity logging is enabled.
+/// Import index -> "env" import name, cached once per thread (the
+/// signatures vec is rebuilt per call otherwise).
+fn import_name(idx: u32) -> &'static str {
+    thread_local! {
+        static NAMES: std::cell::OnceCell<Vec<&'static str>> =
+            const { std::cell::OnceCell::new() };
+    }
+    NAMES.with(|n| {
+        n.get_or_init(|| {
+            crate::runtime::import_signatures()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect()
+        })[idx as usize]
+    })
+}
+
+/// `[abi-check] MISSING-SIGNATURE` sentinel, once per import name per
+/// thread (plan 119 U2) — the unchecked-build form of the coverage error.
+fn report_missing_signature_once(name: &'static str) {
+    thread_local! {
+        static SEEN: std::cell::RefCell<std::collections::HashSet<&'static str>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+    SEEN.with(|s| {
+        if s.borrow_mut().insert(name) {
+            eprintln!(
+                "[abi-check] MISSING-SIGNATURE: boxed host import '{}' has no ownership                  table entry (fai-compiler ownership_abi) — classified borrowed, leaks on bind",
+                name
+            );
+        }
+    });
+}
+
+/// Whether the strict ownership-coverage error is enabled (plan 119; the
+/// env var doubles as the missing-signature gate post-swap).
 fn abi_check_enabled() -> bool {
     ABI_CHECK.with(|c| match c.get() {
         Some(v) => v,
@@ -935,6 +970,10 @@ pub enum BuildError {
     UnsupportedStatement(&'static str),
     /// An Expression variant the builder hasn't migrated yet.
     UnsupportedExpression(&'static str),
+    /// A boxed-returning host import has no ownership signature in the
+    /// plan-117 table (checked builds only; unchecked builds log the
+    /// `[abi-check] MISSING-SIGNATURE` sentinel instead).
+    MissingOwnershipSignature(String),
     /// A binary operator string we don't recognise.
     UnknownBinaryOp(String),
     /// A unary operator string we don't recognise.
@@ -10680,6 +10719,20 @@ impl<'a, 'c> Builder<'a, 'c> {
                 "ModuleCall/arg-count-mismatch",
             ));
         }
+        // Plan 119 U2: a boxed host return without an ownership signature
+        // is a bug — error under checked builds (or FAI_ABI_CHECK), a
+        // once-per-import stderr sentinel otherwise. Classification reads
+        // the same table, so an unsigned import would otherwise silently
+        // fall through as borrowed and over-retain forever.
+        if matches!(result, ResultShape::Boxed) {
+            let name = import_name(import_idx);
+            if fai_compiler::ownership_abi::lookup_host_import(name).is_none() {
+                if crate::runtime::checked_enabled() || abi_check_enabled() {
+                    return Err(BuildError::MissingOwnershipSignature(name.to_string()));
+                }
+                report_missing_signature_once(name);
+            }
+        }
         // Owned STRING arg temps are released after the call (plan 115 arg-temp
         // mop-up). This is safe for every import: a string arg is passed as
         // (ptr,len) and the host copies the bytes, so it never keeps the guest
@@ -13516,15 +13569,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// `resolve` — an early upvalue capture from the logging path would
     /// reorder env-slot indices and make FAI_ABI_CHECK builds emit different
     /// wasm than unchecked builds, breaking the "logging only" contract.
-    fn resolve_would_hit(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
-            || self.upvalue_by_name.contains_key(name)
-            || self
-                .outer_scope
-                .map_or(false, |outer| outer.lookup(name).is_some())
-            || self.ctx.module_vars.contains_key(name)
-    }
-
+    
     /// Log a divergence between the signature table and the heuristic for the
     /// statically-classified callables the table covers. Mirrors the
     /// heuristic's three dispatch arms exactly (bare identifier, UFCS member,

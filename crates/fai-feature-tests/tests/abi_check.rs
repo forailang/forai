@@ -1,92 +1,98 @@
-//! CI tests for the FAI_ABI_CHECK parity instrument (plan 118 U6).
+//! CI tests for the plan-117 ownership-coverage enforcement (plan 119 U2,
+//! repurposed from the plan-118 parity tests after the heuristic swap).
 //!
-//! Two directions, both via subprocess so the env vars can't leak into
-//! parallel tests: an unseeded compile must produce ZERO divergence
-//! lines (the ownership table matches the legacy heuristic), and a
-//! deliberately seeded misclassification (FAI_ABI_SEED, debug-only)
-//! MUST be detected — if an injected wrong entry can hide from the
-//! detector, a real one can too.
+//! The table now DRIVES classification, so there is no heuristic to
+//! diverge from. What must stay provable instead: a boxed host import
+//! with no ownership signature is a compile error under checked flags and
+//! a `MISSING-SIGNATURE` sentinel otherwise. `FAI_ABI_SEED=<import>`
+//! (debug-only) makes one row invisible to the coverage check — without
+//! touching classification — so both paths fire on demand. Subprocess
+//! invocation keeps the env vars away from parallel tests.
 
 use fai_feature_tests::fai_binary;
 use std::fs;
 use std::process::Command;
 
-const DIVERGENCE: &str = "[abi-check] DIVERGENCE";
+const SENTINEL: &str = "[abi-check] MISSING-SIGNATURE";
 
-/// A program whose `unwrap` call is classified Owned by the heuristic —
-/// the seed flips the table side to Borrowed, which must surface.
-const PROBE: &str = "def main
+/// A probe whose `json.parse` call emits the boxed host import the seed
+/// targets.
+const PROBE: &str = "use std.json
+
+def main
     @return Void
 do
-    let d = set({}, 'k', 'v')
-    let s = unwrap(getString(d, 'k'), 'x')
+    let parsed = json.parse('{\"a\": 1}')
+    let s = unwrap(getString(parsed, 'a'), 'x')
     print(s)
 end
 ";
 
-fn write_probe(name: &str) -> std::path::PathBuf {
+fn run_probe(name: &str, seed: Option<&str>, abi_check: bool) -> (String, bool) {
     let dir = std::env::temp_dir().join("fai-abi-check-tests").join(name);
     fs::create_dir_all(&dir).expect("create probe dir");
     let path = dir.join("main.fai");
     fs::write(&path, PROBE).expect("write probe");
-    path
-}
-
-fn run_probe(name: &str, seed: Option<&str>) -> String {
-    let path = write_probe(name);
     let mut cmd = Command::new(fai_binary());
-    cmd.arg("run").arg(&path).env("FAI_ABI_CHECK", "1");
-    if let Some(seed) = seed {
-        cmd.env("FAI_ABI_SEED", seed);
+    cmd.arg("run").arg(&path);
+    if abi_check {
+        cmd.env("FAI_ABI_CHECK", "1");
     } else {
-        cmd.env_remove("FAI_ABI_SEED");
+        cmd.env_remove("FAI_ABI_CHECK");
     }
+    match seed {
+        Some(s) => cmd.env("FAI_ABI_SEED", s),
+        None => cmd.env_remove("FAI_ABI_SEED"),
+    };
     let out = cmd.output().expect("spawn fai");
-    String::from_utf8_lossy(&out.stderr).into_owned()
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned()
+            + &String::from_utf8_lossy(&out.stdout),
+        out.status.success(),
+    )
 }
 
 #[test]
-fn unseeded_compile_has_zero_divergences() {
-    let stderr = run_probe("unseeded", None);
+fn full_surface_has_no_missing_signatures() {
+    let (output, ok) = run_probe("clean", None, true);
+    assert!(ok, "probe should build and run clean:\n{}", output);
     assert!(
-        !stderr.contains(DIVERGENCE),
-        "table diverged from the heuristic on an unseeded build:\n{}",
-        stderr
-    );
-}
-
-#[test]
-fn seeded_misclassification_is_detected_and_attributed() {
-    let stderr = run_probe("seeded", Some("unwrap"));
-    assert!(
-        stderr.contains(DIVERGENCE),
-        "seeded wrong entry was NOT detected — the parity instrument is blind:\n{}",
-        stderr
-    );
-    // Attribution: module label + line:col + the seeded doc string.
-    assert!(
-        stderr.contains("SEEDED-BUG"),
-        "divergence line lacks the seeded signature doc:\n{}",
-        stderr
-    );
-    assert!(
-        stderr.contains("<entry>:"),
-        "divergence line lacks site attribution:\n{}",
-        stderr
+        !output.contains(SENTINEL),
+        "unsigned boxed import on an unseeded build:\n{}",
+        output
     );
 }
 
 #[test]
-fn seed_naming_unknown_entry_warns_and_stays_inactive() {
-    let stderr = run_probe("unknown_seed", Some("noSuchBuiltin"));
+fn seeded_absent_entry_is_a_checked_build_error() {
+    let (output, ok) = run_probe("seeded_checked", Some("json_parse"), true);
+    assert!(!ok, "checked build must FAIL on a missing signature:\n{}", output);
     assert!(
-        stderr.contains("names no bare-call table entry"),
-        "unknown seed name should warn:\n{}",
-        stderr
+        output.contains("MissingOwnershipSignature") && output.contains("json_parse"),
+        "error must name the unsigned import:\n{}",
+        output
     );
+}
+
+#[test]
+fn seeded_absent_entry_logs_sentinel_on_unchecked_build() {
+    let (output, ok) = run_probe("seeded_unchecked", Some("json_parse"), false);
+    assert!(ok, "unchecked build must still succeed:\n{}", output);
     assert!(
-        !stderr.contains(DIVERGENCE),
-        "unknown seed must be a no-op:\n{}",
-        stderr
+        output.contains(SENTINEL) && output.contains("json_parse"),
+        "sentinel must fire and name the import:\n{}",
+        output
     );
+}
+
+#[test]
+fn seed_naming_unknown_import_warns_and_stays_inactive() {
+    let (output, ok) = run_probe("unknown_seed", Some("noSuchImport"), true);
+    assert!(ok, "unknown seed must not break the build:\n{}", output);
+    assert!(
+        output.contains("names no host-import row"),
+        "unknown seed should warn:\n{}",
+        output
+    );
+    assert!(!output.contains(SENTINEL), "unknown seed must be a no-op:\n{}", output);
 }
