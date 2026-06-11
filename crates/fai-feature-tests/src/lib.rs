@@ -41,6 +41,22 @@ impl ErrorPattern {
     }
 }
 
+/// `# leak:` directive (plan 118 U3) — the expected-leak ratchet.
+/// Two-sided: a `Flat` fixture that leaks fails; an `Expected` fixture
+/// that runs flat fails ("flip the marker"). Fixtures WITHOUT the
+/// directive are ungated — `Flat` is the opt-in for new baseline
+/// fixtures, so the legacy corpus pays no extra leak-check run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeakExpectation {
+    /// `# leak: flat` — must end with zero live heap objects. Locals
+    /// release at scope exit; module-level `var`s persist, so flat
+    /// fixtures avoid them (use `expected` or restructure).
+    Flat,
+    /// `# leak: expected <phase-tag>` — leaks today; the named plan-117
+    /// phase is the one that must flip this marker to `flat`.
+    Expected(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub path: PathBuf,
@@ -50,6 +66,7 @@ pub struct Fixture {
     pub browser: Option<BrowserAssertion>,
     pub error: Option<ErrorPattern>,
     pub skip: Option<String>,
+    pub leak: Option<LeakExpectation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,6 +178,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     let mut browser = BrowserAssertion::default();
     let mut error: Option<ErrorPattern> = None;
     let mut skip: Option<String> = None;
+    let mut leak: Option<LeakExpectation> = None;
 
     let mut active: Option<&'static str> = None;
     for raw in content.lines() {
@@ -237,6 +255,10 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
                     }
                     active = Some("browser");
                 }
+                "leak" => {
+                    leak = Some(parse_leak_value(value)?);
+                    active = Some("leak");
+                }
                 _ => {
                     // Unknown directive: treat as a plain human comment.
                     active = None;
@@ -274,6 +296,11 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
         None
     };
 
+    // A leak gate only makes sense on a fixture that runs successfully.
+    if leak.is_some() && expect != Expect::Ok {
+        return Err("`# leak:` requires `# expect: ok`".to_string());
+    }
+
     Ok(Fixture {
         path: main_path.to_path_buf(),
         display_name,
@@ -282,6 +309,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
         browser,
         error,
         skip,
+        leak,
     })
 }
 
@@ -339,6 +367,13 @@ pub fn run_fixture(fx: &Fixture) -> Result<(), FixtureFailure> {
                 assert_browser_run(fx)?;
             } else {
                 assert_run_ok(fx)?;
+                // Native leak gate (plan 118 U3). Browser fixtures get
+                // their leak gate inside the browser run instead (U4) —
+                // their programs use browser natives the native host
+                // lacks, so a native re-run can't be the oracle.
+                if let Some(leak) = &fx.leak {
+                    assert_leak_gate(fx, leak)?;
+                }
             }
         }
         Expect::CheckError => {
@@ -365,6 +400,83 @@ fn fai_command(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to spawn fai binary")
+}
+
+/// Parse a `# leak:` directive value. Pure so the grammar is unit-testable.
+fn parse_leak_value(value: &str) -> Result<LeakExpectation, String> {
+    if value == "flat" {
+        return Ok(LeakExpectation::Flat);
+    }
+    if let Some(tag) = value.strip_prefix("expected") {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(
+                "`# leak: expected` needs a phase tag (e.g. `expected phase5`)".to_string(),
+            );
+        }
+        return Ok(LeakExpectation::Expected(tag.to_string()));
+    }
+    Err(format!(
+        "unknown leak value '{}' (want `flat` or `expected <phase-tag>`)",
+        value
+    ))
+}
+
+/// Extract the live-object count from `fai run --check-leaks` stderr.
+/// Parses the STABLE sentinel pinned by `leak_ledger::sentinel_line`:
+/// `[check-leaks] live heap: N objects, M bytes` (suffixes tolerated).
+/// `None` when no sentinel line is present (run died before the report,
+/// or the module carried no ledger events).
+pub fn parse_live_objects(stderr: &str) -> Option<u64> {
+    const PREFIX: &str = "[check-leaks] live heap: ";
+    for line in stderr.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(PREFIX) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                if rest[digits.len()..].starts_with(" object") {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `# leak:` gate (plan 118 U3): re-run the fixture under
+/// `--check-leaks` and enforce the two-sided contract against the
+/// sentinel. Exit code stays 0 either way (the flag is observational by
+/// design) — the sentinel on stderr is the oracle.
+fn assert_leak_gate(fx: &Fixture, leak: &LeakExpectation) -> Result<(), FixtureFailure> {
+    let path = fx.path.to_string_lossy().to_string();
+    let out = fai_command(&["run", &path, "--check-leaks"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let live = parse_live_objects(&stderr).ok_or_else(|| FixtureFailure {
+        gate: "leak",
+        detail: format!(
+            "no `[check-leaks] live heap:` sentinel on stderr — leak-instrumented run \
+             produced no report. stderr:\n{}",
+            stderr
+        ),
+    })?;
+    match leak {
+        LeakExpectation::Flat if live > 0 => Err(FixtureFailure {
+            gate: "leak",
+            detail: format!(
+                "marked `leak: flat` but {} object(s) live at exit — an unexpected leak \
+                 (regression). stderr:\n{}",
+                live, stderr
+            ),
+        }),
+        LeakExpectation::Expected(tag) if live == 0 => Err(FixtureFailure {
+            gate: "leak",
+            detail: format!(
+                "marked `leak: expected {}` but ran FLAT — the leak is fixed; flip the \
+                 marker to `leak: flat` in the same change",
+                tag
+            ),
+        }),
+        _ => Ok(()),
+    }
 }
 
 fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
@@ -630,4 +742,57 @@ fn indent(s: &str) -> String {
         .map(|l| format!("    {}", l))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod leak_directive_tests {
+    use super::*;
+
+    #[test]
+    fn parses_flat_and_expected() {
+        assert_eq!(parse_leak_value("flat"), Ok(LeakExpectation::Flat));
+        assert_eq!(
+            parse_leak_value("expected phase5"),
+            Ok(LeakExpectation::Expected("phase5".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_tag_and_unknown_values() {
+        assert!(parse_leak_value("expected").is_err());
+        assert!(parse_leak_value("expected   ").is_err());
+        assert!(parse_leak_value("maybe").is_err());
+        assert!(parse_leak_value("").is_err());
+    }
+
+    #[test]
+    fn parses_sentinel_objects_count() {
+        // The pinned sentinel shape, with and without suffixes.
+        assert_eq!(
+            parse_live_objects("[check-leaks] live heap: 3 objects, 99 bytes"),
+            Some(3)
+        );
+        assert_eq!(
+            parse_live_objects(
+                "noise\n[check-leaks] live heap: 0 objects, 0 bytes (__live_objects=0 consistent; 2 host-side)\nmore"
+            ),
+            Some(0)
+        );
+        // Singular form would still parse (starts_with " object").
+        assert_eq!(
+            parse_live_objects("[check-leaks] live heap: 1 objects, 8 bytes"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn sentinel_absent_or_malformed_is_none() {
+        assert_eq!(parse_live_objects(""), None);
+        assert_eq!(parse_live_objects("[leak-check] live heap objects at exit: 3"), None);
+        assert_eq!(parse_live_objects("[check-leaks] live heap: many objects"), None);
+        assert_eq!(
+            parse_live_objects("[check-leaks] no allocation events — not built with the flag"),
+            None
+        );
+    }
 }

@@ -100,6 +100,8 @@ end
 | `error:` | Pattern the diagnostic must contain. Plain substring, or `/regex/` for a regex. |
 | `skip: <reason>` | Temporarily skip. Must reference a tracking issue. |
 | `browser:` | Browser assertion. Use `selector:` plus `text:`/`html:` for DOM assertions, `rootResult:` for the root return value, and optional duration bounds for async parity. |
+| `leak: flat` | Leak gate (plan 118): re-run under `--check-leaks`; the program must end with zero live heap objects. Locals release at scope exit, so a flat fixture avoids module-level `var`s (they stay live by design). |
+| `leak: expected <phase-tag>` | The fixture leaks today; `<phase-tag>` names the plan-117 phase that fixes it. Two-sided: when the leak is fixed, the gate FAILS with "flip the marker" — the fixing change must flip this to `leak: flat`. Fixtures without a `leak:` directive are ungated. |
 
 ## Gates
 
