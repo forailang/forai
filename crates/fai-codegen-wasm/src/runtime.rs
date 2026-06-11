@@ -514,7 +514,13 @@ pub const IMPORT_FILE_READ_STR: u32 = 108;
 /// host-allocated NaN-boxed String, or VAL_NULL when absent. Replaces
 /// the guest-scratch-buffer `storage_get` ABI for the same reason.
 pub const IMPORT_STORAGE_GET_STR: u32 = 109;
-pub const IMPORT_COUNT: u32 = 110;
+/// `env.__fai_rc_watch(obj_addr, rc_slot_addr, delta) -> void` — RC
+/// watchpoint (FAI_RC_WATCH). rt_retain/rt_release call this on every RC
+/// op when the watch codegen is on; the host logs a backtrace + the new
+/// rc only for the watched address. The debugger-style "who touches this
+/// refcount" primitive for tracking an over-release to its unmatched op.
+pub const IMPORT_RC_WATCH: u32 = 110;
+pub const IMPORT_COUNT: u32 = 111;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -632,6 +638,12 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     if !check_leaks_enabled() {
         avail[IMPORT_ALLOC_EVENT as usize] = false;
         avail[IMPORT_FREE_EVENT as usize] = false;
+    }
+    // RC watchpoint import exists only when FAI_RC_WATCH is set (the same
+    // gate under which rt_retain/rt_release emit the call), so normal
+    // builds neither declare nor require it.
+    if std::env::var_os("FAI_RC_WATCH").is_none() {
+        avail[IMPORT_RC_WATCH as usize] = false;
     }
     match target {
         Some("wasm-html") | Some("wasm") => {
@@ -2935,6 +2947,7 @@ fn emit_retain(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fun
     // param 0: v (i64). local 1 = rc slot address; 2/3 = scan scratch (i32).
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let rc_watch = std::env::var_os("FAI_RC_WATCH").is_some();
     let mut f = Function::new([(3, ValType::I32)]);
     let empty = wasm_encoder::BlockType::Empty;
     if heap_verify {
@@ -2949,6 +2962,15 @@ fn emit_retain(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fun
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Sub);
     f.instruction(&Instruction::LocalSet(1));
+    // RC watchpoint: __fai_rc_watch(obj_addr=rc_slot+8, rc_slot, +1).
+    if rc_watch {
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(1));
+        emit_import_call(&mut f, IMPORT_RC_WATCH, import_remap);
+    }
     // Checked-mode: trap on retaining a freed object (tag at rc_slot+8 poisoned).
     if rc_check {
         f.instruction(&Instruction::LocalGet(1));
@@ -2994,6 +3016,7 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     // 8/9 = FAI_HEAP_VERIFY scan scratch.
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let rc_watch = std::env::var_os("FAI_RC_WATCH").is_some();
     let mut f = Function::new([(9, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
     let empty = wasm_encoder::BlockType::Empty;
@@ -3012,6 +3035,15 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
     f.instruction(&Instruction::LocalSet(1));
+    // RC watchpoint: __fai_rc_watch(obj_addr, rc_slot=addr-8, -1).
+    if rc_watch {
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(-1));
+        emit_import_call(&mut f, IMPORT_RC_WATCH, import_remap);
+    }
     // Checked-mode: trap on releasing a freed object (tag poisoned). Catches a
     // stale reference being released a second time. (plan 113 R2)
     if rc_check {
@@ -8757,6 +8789,8 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I32, ValType::I32],
             vec![ValType::I64],
         ),
+        // IMPORT_RC_WATCH: (obj_addr, rc_slot_addr, delta) -> void.
+        ("__fai_rc_watch", vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
     ]
 }
 

@@ -493,6 +493,64 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // __fai_rc_watch(obj_addr, rc_slot_addr, delta) — RC watchpoint.
+    // rt_retain/rt_release call this on every RC op when FAI_RC_WATCH
+    // codegen is on. The host filters to the single watched address
+    // (FAI_RC_WATCH=<hex obj addr or rc-slot addr>) and logs the op, the
+    // resulting rc, and a guest backtrace — the "who touches this
+    // refcount" view that walks an over-release back to its unmatched op.
+    linker
+        .func_wrap(
+            "env",
+            "__fai_rc_watch",
+            |mut caller: Caller<'_, ()>, obj_addr: i32, rc_slot: i32, delta: i32| {
+                let want = match std::env::var("FAI_RC_WATCH")
+                    .ok()
+                    .and_then(|s| {
+                        let t = s.trim().trim_start_matches("0x");
+                        u32::from_str_radix(t, 16).ok()
+                    }) {
+                    Some(w) => w,
+                    None => return,
+                };
+                // Match either the logical object address or its rc-slot.
+                if obj_addr as u32 != want && rc_slot as u32 != want {
+                    return;
+                }
+                let mem = caller.get_export("memory").and_then(|e| e.into_memory());
+                let rc_after = mem
+                    .map(|m| {
+                        let d = m.data(&caller);
+                        let a = rc_slot as usize;
+                        if a + 4 <= d.len() {
+                            i32::from_le_bytes([d[a], d[a + 1], d[a + 2], d[a + 3]])
+                        } else {
+                            -999
+                        }
+                    })
+                    .unwrap_or(-999);
+                let sites: Vec<String> = wasmtime::WasmBacktrace::capture(&caller)
+                    .frames()
+                    .iter()
+                    .filter_map(|fr| fr.func_name())
+                    .filter(|n| !n.starts_with("rt_") && !n.starts_with("__"))
+                    .take(6)
+                    .map(|s| s.to_string())
+                    .collect();
+                let op = if delta > 0 { "retain" } else { "release" };
+                eprintln!(
+                    "[rc-watch 0x{:x}] {} -> rc={} at {}",
+                    obj_addr,
+                    op,
+                    rc_after,
+                    sites.join(" ← ")
+                );
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // __fai_alloc_event / __fai_free_event (plan 116 phase 5) — heap
     // allocation ledger feed. Only `--check-leaks` builds import these
     // (rt_alloc return paths / rt_free entry). The backtrace capture is
