@@ -9086,8 +9086,10 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // Checked-mode (plan 116): an out-of-range index store is
                 // silent heap corruption — i = -1 lands on the array's own
                 // tag/count header; past-end clobbers the next block. Trap
-                // with a named reason at the write site instead.
-                if std::env::var_os("FAI_RC_CHECK").is_some() {
+                // with a named reason at the write site instead. Cheap
+                // (one compare on a write that already happens) so it
+                // rides along with `--checked`, not just FAI_RC_CHECK.
+                if crate::runtime::checked_enabled() {
                     self.emit(Instruction::LocalGet(idx));
                     self.emit(Instruction::LocalGet(arr_addr));
                     self.emit(Instruction::I32Load(MemArg {

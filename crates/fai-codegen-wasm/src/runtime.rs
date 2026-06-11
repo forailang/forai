@@ -629,6 +629,37 @@ impl Drop for CheckLeaksGuard {
     }
 }
 
+// --- Checked mode (plan 116) -------------------------------------------
+//
+// `--checked` bundles the cheap, always-safe corruption guards that have
+// no measurable runtime cost: the alloc-guard (trap any single allocation
+// past the 256 MB ceiling) and the index-store bounds check (trap an
+// out-of-range `xs[i] = v` at the write site). It deliberately does NOT
+// enable the heavy poison/free-list verification of `FAI_RC_CHECK` — those
+// scan the free list on every alloc/release and are for deep debugging.
+//
+// Like check-leaks, the flag is thread-local plus an env fallback
+// (`FAI_CHECKED`) so parallel test builds can flip it without racing each
+// other's import layout mid-build.
+thread_local! {
+    static CHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable `--checked` guard codegen for this thread. The CLI sets
+/// this before compiling when `fai test --checked` is used.
+pub fn set_checked(on: bool) {
+    CHECKED.with(|c| c.set(on));
+}
+
+/// Whether the current build should emit the cheap checked-mode guards
+/// (alloc-guard, index-store bounds check). `FAI_RC_CHECK` implies it,
+/// since the heavy mode is a strict superset.
+pub fn checked_enabled() -> bool {
+    CHECKED.with(|c| c.get())
+        || std::env::var_os("FAI_CHECKED").is_some()
+        || std::env::var_os("FAI_RC_CHECK").is_some()
+}
+
 /// Return which imports are available for a given build target.
 /// `None` means all imports available (native/test). The returned
 /// vec has one bool per import index (0..IMPORT_COUNT).
@@ -2052,8 +2083,9 @@ fn emit_alloc(
     // string, an array/dict blowup) — trapping here names the size and
     // the backtrace instead of letting the bump path grow memory toward
     // the 4 GB ceiling and thrash. Diagnostic-only (off unless the env
-    // is set at codegen) so production allocs pay nothing.
-    if std::env::var_os("FAI_ALLOC_GUARD").is_some() {
+    // is set at codegen or `--checked` is on) so production allocs pay
+    // nothing.
+    if std::env::var_os("FAI_ALLOC_GUARD").is_some() || checked_enabled() {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Const(0x1000_0000)); // 256 MiB
         f.instruction(&Instruction::I32GeU);

@@ -26,7 +26,10 @@ mod templates;
 mod test_meta;
 mod wasm_runner;
 
-use report::{count_fai_files_recursive, extract_verbose_flag, is_verbose, Reporter, StepStatus};
+use report::{
+    count_fai_files_recursive, extract_checked_flag, extract_verbose_flag, is_verbose, Reporter,
+    StepStatus,
+};
 
 /// Magic marker appended at the end of self-extracting native
 /// binaries produced by `forai build --target native` / `target =
@@ -97,7 +100,7 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  fmt [path] [--check]    fmt");
     eprintln!("  check [file]            fmt → check");
-    eprintln!("  test [file]             fmt → check → test");
+    eprintln!("  test [file] [--checked] fmt → check → test");
     eprintln!("  run [file]              fmt → check → test → run");
     eprintln!("  build [target]          fmt → check → test → build");
     eprintln!("  new <name>              Create a new project");
@@ -118,6 +121,36 @@ fn print_usage() {
     eprintln!("  run --check-leaks=interval:<ms>  Also print a live-set summary every");
     eprintln!("                          <ms> ms (for servers that never exit)");
     eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
+    eprintln!("  test --checked          Build tests with cheap always-on memory");
+    eprintln!("                          guards: trap an out-of-bounds index store");
+    eprintln!("                          (xs[i]=v) and any single alloc past 256 MB");
+    eprintln!("                          at the source, with a named reason. Use this");
+    eprintln!("                          first when a test suite corrupts the heap.");
+    eprintln!();
+    eprintln!("Debugging (set as environment variables, e.g. FAI_RC_CHECK=1 fai test):");
+    eprintln!("  These instrument the generated wasm for memory-corruption hunts.");
+    eprintln!("  Most cost runtime, so they are off unless explicitly set. Reach for");
+    eprintln!("  --checked / FAI_CHECKED first; escalate to the heavier ones below.");
+    eprintln!();
+    eprintln!("  FAI_CHECKED         Same guards as 'test --checked' (alloc-guard +");
+    eprintln!("                      index-store bounds check). Cheap; safe to leave on.");
+    eprintln!("  FAI_ALLOC_GUARD     Trap any single allocation past 256 MB — names the");
+    eprintln!("                      size + backtrace of a runaway (concat/array blowup).");
+    eprintln!("  FAI_RC_CHECK        Heavy: poison freed blocks and verify the free list");
+    eprintln!("                      on each alloc/release; traps double-free, use-after-");
+    eprintln!("                      free, free-list corruption. Implies --checked.");
+    eprintln!("  FAI_HEAP_VERIFY     Scan the free-list head on every heap op (paranoid;");
+    eprintln!("                      pairs with FAI_RC_CHECK to localize corruption).");
+    eprintln!("  FAI_NO_REUSE        Never recycle freed blocks, so a stale read/write");
+    eprintln!("                      traps at the offending op instead of after reuse.");
+    eprintln!("  FAI_RC_WATCH=0xADDR Watchpoint: log every refcount change at object ADDR");
+    eprintln!("                      with a backtrace (find who over-retains/releases).");
+    eprintln!("  FAI_MEM_WATCH=0xADDR Watchpoint: log every write to memory word ADDR with");
+    eprintln!("                      a backtrace (find who clobbers a specific address).");
+    eprintln!("  FAI_CHECK_LEAKS     Allocation ledger (same as 'run --check-leaks'):");
+    eprintln!("                      itemized live set at exit/trap, grouped by alloc site.");
+    eprintln!("  FAI_TRACE_TESTS     Print each test case's name on stderr before it runs,");
+    eprintln!("                      so a trap/hang is attributable to the exact case.");
     eprintln!();
     eprintln!("Shorthand:");
     eprintln!("  forai <file.fai>        Same as 'forai run <file.fai>'");
@@ -160,6 +193,7 @@ fn cmd_check(args: &[String]) {
 
 fn cmd_test(args: &[String]) {
     let (args, verbose) = extract_verbose_flag(args);
+    let (args, checked) = extract_checked_flag(&args);
     let (args, project) = extract_project_flag(&args);
     let (args, project) = lift_target_name_positional(args, project);
     let reporter = Reporter::new(verbose);
@@ -182,6 +216,15 @@ fn cmd_test(args: &[String]) {
     // runaway allocator needs naming.
     if std::env::var_os("FAI_CHECK_LEAKS").is_some() {
         fai_codegen_wasm::set_check_leaks(true);
+    }
+    // `--checked` (plan 116): build the test wasm with the cheap,
+    // always-safe corruption guards (alloc-guard past 256 MB + index-store
+    // bounds check). These trap at the corruption site with a named reason
+    // instead of letting it surface later as a runaway alloc or silent
+    // clobber, and carry no measurable cost — unlike the heavy poison /
+    // free-list scanning of FAI_RC_CHECK.
+    if checked {
+        fai_codegen_wasm::set_checked(true);
     }
     step_fmt(&args, &reporter);
     step_check(&args, &reporter);
@@ -4061,7 +4104,7 @@ var env={{
       case 9: msg='rc-check: corrupt free-list node 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' (heap_ptr 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
       case 10: msg='rc-check: freed block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' was written through a stale pointer while on the free list (tag word now 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
       case 11: msg='rc-check: double free of block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' (block size '+b+')'; break;
-      case 12: msg='rc-check: index store out of bounds — xs['+a+'] = ... on an array of '+b+' elements'; break;
+      case 12: msg='checked: index store out of bounds — xs['+a+'] = ... on an array of '+b+' elements'; break;
       case 13: msg='dict grow: implausible capacity '+a+' (size word 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+') — dictionary.set on a non-dict/stale/mis-typed pointer'; break;
       case 14: msg='alloc-guard: single allocation of '+a+' bytes ('+b+' block) exceeds 256 MB — runaway allocation'; break;
       default: msg='trap report (code '+code+', a=0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+', b=0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')';

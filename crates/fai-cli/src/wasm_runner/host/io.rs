@@ -802,7 +802,7 @@ fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
             msg
         }
         c if c == cg::TRAP_INDEX_OOB => format!(
-            "rc-check: index store out of bounds — xs[{}] = ... on an array of {} elements",
+            "checked: index store out of bounds — xs[{}] = ... on an array of {} elements",
             a, b,
         ),
         c if c == cg::TRAP_DICT_CAP_INSANE => format!(

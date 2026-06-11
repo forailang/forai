@@ -142,6 +142,24 @@ pub fn extract_verbose_flag(args: &[String]) -> (Vec<String>, bool) {
     (remaining, verbose)
 }
 
+/// Extract the `--checked` flag (plan 116). When present, `fai test`
+/// builds the test wasm with the cheap always-safe corruption guards
+/// (alloc-guard + index-store bounds check) enabled, so heap corruption
+/// traps with a named reason at its source instead of surfacing later as
+/// a runaway allocation or silent clobber.
+pub fn extract_checked_flag(args: &[String]) -> (Vec<String>, bool) {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut checked = false;
+    for a in args {
+        if a == "--checked" {
+            checked = true;
+        } else {
+            remaining.push(a.clone());
+        }
+    }
+    (remaining, checked)
+}
+
 /// Recursively count `.fai` files under `root`. Used to populate
 /// the top-level `checking N .fai files in ...` banner. Skips common
 /// build / vendor directories so the number matches user intuition —

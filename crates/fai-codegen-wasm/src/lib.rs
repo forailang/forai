@@ -32,6 +32,9 @@ pub use runtime::{
 // Check-leaks codegen gate (plan 116 phase 5): the CLI flips this
 // before compiling a `--check-leaks` run; tests use the guard.
 pub use runtime::{check_leaks_enabled, set_check_leaks, CheckLeaksGuard};
+// Checked-mode codegen gate (plan 116): `fai test --checked` flips this
+// before compiling to enable the cheap alloc-guard + index-store guards.
+pub use runtime::{checked_enabled, set_checked};
 
 /// Try compiling `ast` through the direct AST→wasm builder in one
 /// shot. Returns `Some(wasm)` on success; `None` is an internal
