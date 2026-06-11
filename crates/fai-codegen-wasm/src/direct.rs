@@ -18026,12 +18026,12 @@ mod tests {
 
     #[test]
     fn direct_module_convert_parse_int_succeeds() {
-        // RT_PARSE_INT("123") returns Int(123).
+        // RT_PARSE_INT("123") returns Int(123). parseInt is Int? now.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "use std.convert\n",
             "\n",
             "def main\n",
-            "    @return Int\n",
+            "    @return Int?\n",
             "do\n",
             "  convert.parseInt('123')\n",
             "end\n",
@@ -18049,7 +18049,7 @@ mod tests {
             "use std.convert\n",
             "\n",
             "def main\n",
-            "    @return Int\n",
+            "    @return Int?\n",
             "do\n",
             "  convert.parseInt('xyz')\n",
             "end\n",
@@ -18065,7 +18065,7 @@ mod tests {
             "use std.convert\n",
             "\n",
             "def main\n",
-            "    @return Float\n",
+            "    @return Float?\n",
             "do\n",
             "  convert.parseFloat('3.5')\n",
             "end\n",

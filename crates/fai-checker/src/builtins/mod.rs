@@ -150,8 +150,8 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.convert", name: "toInt",      builtin_name: "toInt",      doc: "Convert a value to an integer." },
         BuiltinDoc { module: "std.convert", name: "toFloat",    builtin_name: "toFloat",    doc: "Convert a value to a float." },
         BuiltinDoc { module: "std.convert", name: "toBool",     builtin_name: "toBool",     doc: "Convert a value to a boolean." },
-        BuiltinDoc { module: "std.convert", name: "parseInt",   builtin_name: "parseInt",   doc: "Parse an integer from a string." },
-        BuiltinDoc { module: "std.convert", name: "parseFloat", builtin_name: "parseFloat", doc: "Parse a float from a string." },
+        BuiltinDoc { module: "std.convert", name: "parseInt",   builtin_name: "parseInt",   doc: "Parse an integer from a string, or null if unparseable. Returns Int?." },
+        BuiltinDoc { module: "std.convert", name: "parseFloat", builtin_name: "parseFloat", doc: "Parse a float from a string, or null if unparseable. Returns Float?." },
 
         // std.dictionary
         BuiltinDoc { module: "std.dictionary", name: "get",       builtin_name: "get",       doc: "Look up a value by key, returns null if missing." },

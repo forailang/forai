@@ -62,8 +62,15 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     ins(b, "toInt", &[p("value", Type::Unknown)], &[Type::Int]);
     ins(b, "toFloat", &[p("value", Type::Unknown)], &[Type::Float]);
     ins(b, "toBool", &[p("value", Type::Unknown)], &[Type::Bool]);
-    ins(b, "parseInt", &[p("text", Type::String)], &[Type::Int]);
-    ins(b, "parseFloat", &[p("text", Type::String)], &[Type::Float]);
+    // parseInt/parseFloat return null at runtime for unparseable input,
+    // so their type is optional — callers must `unwrap`/`?`-check.
+    ins(b, "parseInt", &[p("text", Type::String)], &[optional_of(Type::Int)]);
+    ins(
+        b,
+        "parseFloat",
+        &[p("text", Type::String)],
+        &[optional_of(Type::Float)],
+    );
 
     // Error
     ins(b, "Error", &[p("message", Type::String)], &[Type::Error]);
@@ -224,12 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_int_returns_int() {
+    fn test_parse_int_returns_optional_int() {
         let b = fresh();
         match b.get("parseInt").unwrap() {
             Type::Function(sig) => {
                 assert!(matches!(sig.params[0].ty, Type::String));
-                assert!(matches!(sig.returns[0], Type::Int));
+                // parseInt returns null on unparseable input → Int?.
+                match &sig.returns[0] {
+                    Type::Optional(inner) => assert!(matches!(**inner, Type::Int)),
+                    other => panic!("expected Optional(Int), got {:?}", other),
+                }
             }
             _ => panic!("expected Function"),
         }
