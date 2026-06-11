@@ -6,6 +6,21 @@ fixing commit.
 
 ## Open
 
+### rc: double-free in brain's data.hooks.memorySearchOutput under FAI_RC_CHECK
+
+- **Date:** 2026-06-11
+- **Area:** RC release path (double-free), surfaced by plan-118 leak lane
+- **Found by:** `FAI_RC_CHECK=1 fai test` over brain's inline suite.
+
+`data.hooks.memorySearchOutput — returns only documents matching the
+extracted keywords` traps with `rc-check: release of freed object at
+0x527b8` (a double-free) while passing without the guards. 457/458
+brain cases are RC_CHECK-clean; this is the one corruption-class
+failure, in the same hooks subtree as brain's open multi-GB
+hooks-runaway issue — plausibly the same root cause. Needs a minimal
+repro; candidate classes: an over-release in a path the plan-117
+phase-3/4 helper migration will reroute.
+
 ### test-mode codegen: UFCS call in an entry file fails the test step with a misattributed UnknownIdentifier
 
 - **Date:** 2026-06-11
