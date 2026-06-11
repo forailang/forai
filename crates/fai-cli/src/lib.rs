@@ -3803,7 +3803,7 @@ const env={{
   __fai_free_event(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
-  instance=r.instance;debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
+  instance=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
 }}).catch(e=>{{app.innerHTML='<p style="color:red;padding:20px">Error: '+e.message+'</p>'}});
 </script>
 </body>
@@ -4157,7 +4157,7 @@ var env={{
   }}
 }};
 fetch('/{}').then(function(r){{return r.arrayBuffer()}}).then(function(b){{return WebAssembly.instantiate(b,{{env:env}})}}).then(function(r){{
-  instance=r.instance;window.__fai_dbg=r.instance;startFai();
+  instance=r.instance;window.__fai_dbg=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};startFai();
   window.addEventListener('popstate',function(){{if(instance&&instance.exports.setPathFromPlatform)instance.exports.setPathFromPlatform(writeStrToWasm(window.location.pathname))}});
 }}).catch(function(e){{app.innerHTML='<p style="color:red;padding:20px">Error: '+e.message+'</p>'}});
 "#,

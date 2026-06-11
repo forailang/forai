@@ -508,7 +508,7 @@ fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
 
     let harness = workspace_root().join("tests").join("browser-harness");
     let script = harness.join("run-fixture.mjs");
-    let assertion = browser_assertion_json(fx.browser.as_ref().unwrap());
+    let assertion = browser_assertion_json(fx.browser.as_ref().unwrap(), fx.leak.as_ref());
     let out = Command::new("node")
         .arg(&script)
         .arg(&build_dir)
@@ -555,7 +555,7 @@ fn browser_build_dir(fx: &Fixture) -> PathBuf {
         .join(safe)
 }
 
-fn browser_assertion_json(assertion: &BrowserAssertion) -> String {
+fn browser_assertion_json(assertion: &BrowserAssertion, leak: Option<&LeakExpectation>) -> String {
     let mut parts = Vec::new();
     if let Some(selector) = &assertion.selector {
         parts.push(format!("\"selector\":\"{}\"", escape_json(selector)));
@@ -574,6 +574,18 @@ fn browser_assertion_json(assertion: &BrowserAssertion) -> String {
     }
     if let Some(ms) = assertion.duration_at_least_ms {
         parts.push(format!("\"durationAtLeastMs\":{}", ms));
+    }
+    // Browser leak gate (plan 118 U4): a fixture carrying both `browser:`
+    // and `leak:` runs the gate inside the browser — same two-sided
+    // semantics as the native gate. The always-exported __live_objects
+    // counter is the oracle (no special build needed); the harness reads
+    // it through window.__fai_live_objects() after the root completes.
+    match leak {
+        Some(LeakExpectation::Flat) => parts.push("\"leak\":\"flat\"".to_string()),
+        Some(LeakExpectation::Expected(tag)) => {
+            parts.push(format!("\"leak\":\"expected\",\"leakTag\":\"{}\"", escape_json(tag)))
+        }
+        None => {}
     }
     format!("{{{}}}", parts.join(","))
 }

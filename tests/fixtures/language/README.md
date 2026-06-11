@@ -103,6 +103,12 @@ end
 | `leak: flat` | Leak gate (plan 118): re-run under `--check-leaks`; the program must end with zero live heap objects. Locals release at scope exit, so a flat fixture avoids module-level `var`s (they stay live by design). |
 | `leak: expected <phase-tag>` | The fixture leaks today; `<phase-tag>` names the plan-117 phase that fixes it. Two-sided: when the leak is fixed, the gate FAILS with "flip the marker" — the fixing change must flip this to `leak: flat`. Fixtures without a `leak:` directive are ungated. |
 
+A fixture carrying both `browser:` and `leak:` runs the leak gate inside the
+browser instead of natively: after the root completes, the harness reads the
+always-exported `__live_objects` counter via `window.__fai_live_objects()`
+with the same two-sided semantics. Categories that cannot run in the browser
+simply never carry `browser:`.
+
 ## Gates
 
 For `expect: ok` fixtures:
