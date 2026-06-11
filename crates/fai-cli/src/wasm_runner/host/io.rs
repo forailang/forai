@@ -515,7 +515,15 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         None => leak_ledger::interval_report(&[]),
                     };
                     if let Some(line) = line {
-                        super::super::output::stderr_line(&line);
+                        // Bypass the per-test output capture (CaptureGuard
+                        // buffers host stdout/stderr so tests can assert on
+                        // it) and write straight to the process stderr — a
+                        // leak-hunt diagnostic must reach the terminal even
+                        // mid-test, especially when chasing a runaway that
+                        // never lets the test finish.
+                        eprintln!("{}", line);
+                        use std::io::Write as _;
+                        let _ = std::io::stderr().flush();
                     }
                 }
             },
@@ -662,6 +670,16 @@ fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
         }
         c if c == cg::TRAP_INDEX_OOB => format!(
             "rc-check: index store out of bounds — xs[{}] = ... on an array of {} elements",
+            a, b,
+        ),
+        c if c == cg::TRAP_DICT_CAP_INSANE => format!(
+            "dict grow: implausible capacity {} (size word 0x{:x}) — dictionary.set \
+             was handed a non-dict, stale, or mis-typed pointer",
+            a, b,
+        ),
+        c if c == cg::TRAP_ALLOC_TOO_BIG => format!(
+            "alloc-guard: single allocation of {} bytes ({} block) exceeds 256 MB — \
+             runaway allocation (e.g. a string/array growing in a loop)",
             a, b,
         ),
         _ => format!("trap report (code {}, a=0x{:x}, b=0x{:x})", code, a, b),

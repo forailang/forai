@@ -175,6 +175,14 @@ fn cmd_test(args: &[String]) {
     // layouts where there's no src/main.fai), missing the target's
     // actual source tree.
     let args = scoped_pipeline_args(&args, project.as_deref());
+    // Enable allocation-ledger codegen for the test build when
+    // FAI_CHECK_LEAKS is set, mirroring cmd_run. Without this the test
+    // wasm carries no `__fai_alloc_event` hooks, so the ledger (and its
+    // interval report) stays silent during `fai test` — exactly when a
+    // runaway allocator needs naming.
+    if std::env::var_os("FAI_CHECK_LEAKS").is_some() {
+        fai_codegen_wasm::set_check_leaks(true);
+    }
     step_fmt(&args, &reporter);
     step_check(&args, &reporter);
     step_test(&args, &reporter);
@@ -4054,6 +4062,8 @@ var env={{
       case 10: msg='rc-check: freed block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' was written through a stale pointer while on the free list (tag word now 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
       case 11: msg='rc-check: double free of block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' (block size '+b+')'; break;
       case 12: msg='rc-check: index store out of bounds — xs['+a+'] = ... on an array of '+b+' elements'; break;
+      case 13: msg='dict grow: implausible capacity '+a+' (size word 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+') — dictionary.set on a non-dict/stale/mis-typed pointer'; break;
+      case 14: msg='alloc-guard: single allocation of '+a+' bytes ('+b+' block) exceeds 256 MB — runaway allocation'; break;
       default: msg='trap report (code '+code+', a=0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+', b=0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')';
     }}
     window.__FAI_TRAP_MSG=msg;console.error('FAI trap:',msg);

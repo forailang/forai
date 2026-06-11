@@ -563,6 +563,17 @@ pub const TRAP_DOUBLE_FREE: i32 = 11;
 /// the write-after-free signature TRAP_FREED_DIRTY catches downstream).
 /// `a` = the index (signed), `b` = the array count.
 pub const TRAP_INDEX_OOB: i32 = 12;
+/// Dict grow saw an implausible capacity (always on): `RT_SET_FIELD`
+/// derived `cap = (size_word - 8) / 16` from the rc-prefix size word and
+/// got an absurd value, meaning `set()` was handed a non-dict, stale, or
+/// mis-typed pointer. Trapping here prevents a multi-GB allocation.
+/// `a` = computed capacity, `b` = the raw size word at addr-4.
+pub const TRAP_DICT_CAP_INSANE: i32 = 13;
+/// Single allocation exceeded the FAI_ALLOC_GUARD ceiling (256 MB) —
+/// a runaway (concat loop, array/dict blowup) caught at the allocator
+/// before it grows memory toward the 4 GB ceiling. `a` = requested
+/// logical size, `b` = rounded block size.
+pub const TRAP_ALLOC_TOO_BIG: i32 = 14;
 
 // ── Check-leaks codegen gate (plan 116 phase 5) ───────────────────
 // When enabled, `rt_alloc`/`rt_free` call the `__fai_alloc_event` /
@@ -838,7 +849,7 @@ pub fn emit_all(
         emit_concat_fn(base),                      // rt_concat
         emit_get_index(base),                      // rt_get_index
         emit_get_field(base, ks),                  // rt_get_field
-        emit_set_field(base),                      // rt_set_field
+        emit_set_field(base, import_remap),        // rt_set_field
         emit_print_val_new(base, import_remap),    // rt_print_val_new
         emit_value_to_str(base, ks, import_remap), // rt_value_to_str
         emit_import_module(base),                  // rt_import_module
@@ -2009,6 +2020,33 @@ fn emit_alloc(
     f.instruction(&Instruction::I32Const(!7));
     f.instruction(&Instruction::I32And);
     f.instruction(&Instruction::LocalSet(0));
+    // FAI_ALLOC_GUARD: trap on any single allocation past 256 MB. No
+    // forai value legitimately needs that in one block, so a request
+    // this large is a runaway (a concat loop building an ever-bigger
+    // string, an array/dict blowup) — trapping here names the size and
+    // the backtrace instead of letting the bump path grow memory toward
+    // the 4 GB ceiling and thrash. Diagnostic-only (off unless the env
+    // is set at codegen) so production allocs pay nothing.
+    if std::env::var_os("FAI_ALLOC_GUARD").is_some() {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(0x1000_0000)); // 256 MiB
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_ALLOC_TOO_BIG,
+            |f| {
+                f.instruction(&Instruction::LocalGet(6)); // requested logical size
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(0)); // rounded block size
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
+        f.instruction(&Instruction::End);
+    }
     // ── reuse from the free list first ──
     // Free lists are SIZE-BUCKETED: one head per block size (`block_size/8`) in
     // the reserved region at `bucket_base`, so reuse is O(1) — no linear scan
@@ -3711,7 +3749,7 @@ fn emit_method_check(
 }
 
 // ── $rt_set_field(obj: i64, name_ptr: i32, name_len: i32, val: i64) -> void ──
-fn emit_set_field(base: u32) -> Function {
+fn emit_set_field(base: u32, import_remap: &[Option<u32>]) -> Function {
     // locals: 4=addr(i32), 5=count(i32), 6=i(i32), 7=entry_addr(i32),
     //         8=key_addr(i32), 9=key_len(i32), 10=entry_base(i32),
     //         11=is_instance(i32), 12=cap(i32), 13=new_addr(i32),
@@ -3862,6 +3900,34 @@ fn emit_set_field(base: u32) -> Function {
     f.instruction(&Instruction::I32Const(16));
     f.instruction(&Instruction::I32DivU);
     f.instruction(&Instruction::LocalSet(12));
+    // Sanity guard: a plausible dict capacity is small. A huge `cap`
+    // means the size word at addr-4 was garbage (set() called on a
+    // non-dict / stale / mis-typed pointer), and growing would request
+    // gigabytes and exhaust memory. Trap with the bad capacity + size
+    // word and a backtrace instead — names the caller passing the bad
+    // value. (1<<24 = 16M entries — orders beyond any real dict.)
+    f.instruction(&Instruction::LocalGet(12));
+    f.instruction(&Instruction::I32Const(1 << 24));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    emit_trap_report_unreachable(
+        &mut f,
+        import_remap,
+        TRAP_DICT_CAP_INSANE,
+        |f| {
+            f.instruction(&Instruction::LocalGet(12)); // computed capacity
+            f.instruction(&Instruction::I64ExtendI32U);
+        },
+        |f| {
+            // raw size word at addr-4
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::I32Load(mem0()));
+            f.instruction(&Instruction::I64ExtendI32U);
+        },
+    );
+    f.instruction(&Instruction::End);
     // if count >= cap: grow
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::LocalGet(12));

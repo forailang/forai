@@ -443,7 +443,14 @@ pub fn run_wasm_tests_with_externs(
         let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
         host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
         let leaks = std::env::var_os("FAI_CHECK_LEAKS").is_some();
-        leak_ledger::reset(leaks, None, leaks.then(|| dbg.clone()));
+        // FAI_CHECK_LEAKS_INTERVAL_MS streams a periodic live-set report
+        // (top groups WITH allocation sites) during a test run — the way
+        // to pinpoint a runaway allocator that never reaches the exit
+        // report because the suite is still climbing.
+        let interval_ms = std::env::var("FAI_CHECK_LEAKS_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        leak_ledger::reset(leaks, interval_ms, leaks.then(|| dbg.clone()));
     }
     let engine = shared_engine();
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
@@ -492,6 +499,14 @@ pub fn run_wasm_tests_with_externs(
             // Clear spy/mock state between cases so call counts and
             // mocked values don't bleed across `it(...)` blocks.
             host::reset_spy_state();
+            // FAI_TRACE_TESTS: name each case on the real stderr before it
+            // runs (bypassing the per-test output capture), so a hang or
+            // runaway is pinned to the test that never returns.
+            if std::env::var_os("FAI_TRACE_TESTS").is_some() {
+                eprintln!("[trace] {} — {}", test.suite_name, desc);
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+            }
             let res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
             let outcome = match res {
                 Ok(()) => {
