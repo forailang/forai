@@ -381,6 +381,29 @@ pub struct CaseOutcome {
     pub suite_line: u32,
 }
 
+/// Per-run options for the test runner (plan 118 U2). Threaded as a
+/// parameter rather than ambient env vars so in-process callers can't
+/// race each other's settings.
+#[derive(Default, Clone)]
+pub struct TestRunOptions {
+    /// Arm per-case leak deltas (`fai test --check-leaks`). The wasm
+    /// must also be BUILT with the check-leaks codegen flag or the
+    /// ledger sees no events (the caller arms that before codegen).
+    pub check_leaks: bool,
+    /// Leak allowances: exact `suite` or `suite::case` names (equality,
+    /// not substring). An allowed case with a delta reports as leaked-
+    /// allowed and still passes.
+    pub allow_leaks: Vec<String>,
+}
+
+impl TestRunOptions {
+    fn allows(&self, suite: &str, case: &str) -> bool {
+        self.allow_leaks
+            .iter()
+            .any(|a| a == suite || a == &format!("{}::{}", suite, case))
+    }
+}
+
 /// Structured summary returned by [`run_wasm_tests`].
 #[derive(Debug, Default, Clone)]
 pub struct TestSummary {
@@ -424,7 +447,7 @@ pub fn run_wasm_tests(
     tests: &[crate::test_meta::TestSuiteMeta],
     on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
-    run_wasm_tests_with_externs(wasm_bytes, tests, Vec::new(), on_case)
+    run_wasm_tests_with_externs(wasm_bytes, tests, Vec::new(), &TestRunOptions::default(), on_case)
 }
 
 /// Same as [`run_wasm_tests`] but populates the extern-function table
@@ -434,19 +457,18 @@ pub fn run_wasm_tests_with_externs(
     wasm_bytes: &[u8],
     tests: &[crate::test_meta::TestSuiteMeta],
     externs: Vec<ExternInfo>,
+    opts: &TestRunOptions,
     mut on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
     let _extern_guard = ExternGuard::set(externs);
-    // Debug instrumentation for test runs is env-driven (the test
-    // pipeline has no per-run RunOptions): FAI_HEAP_VERIFY feeds the
-    // host-side free-list scan its bucket base; FAI_CHECK_LEAKS arms
-    // the allocation ledger so corruption traps can name victim blocks.
-    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some()
-        || std::env::var_os("FAI_CHECK_LEAKS").is_some();
+    // Debug instrumentation: FAI_HEAP_VERIFY feeds the host-side
+    // free-list scan its bucket base; the ledger arms for FAI_CHECK_LEAKS
+    // (observability) or opts.check_leaks (per-case assertion, plan 118).
+    let leaks = opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some();
+    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks;
     if debug_env {
         let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
         host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
-        let leaks = std::env::var_os("FAI_CHECK_LEAKS").is_some();
         // FAI_CHECK_LEAKS_INTERVAL_MS streams a periodic live-set report
         // (top groups WITH allocation sites) during a test run — the way
         // to pinpoint a runaway allocator that never reaches the exit
@@ -487,11 +509,32 @@ pub fn run_wasm_tests_with_externs(
         .get_typed_func::<(i32, i32), ()>(&mut store, "_fai_run_test")
         .map_err(|e| fmt_err("missing _fai_run_test export", e))?;
 
+    // Per-case leak deltas (plan 118 U2): when armed, snapshot the
+    // ledger around each `_fai_run_test` call. The case wrapper bakes
+    // setup+beforeEach+body+afterEach into that one call, so cleanup is
+    // inside the window by construction — a case passes only if its
+    // cleanup really releases. The memory handle feeds object tags to
+    // the delta report.
+    let leak_memory = if opts.check_leaks {
+        instance.get_memory(&mut store, "memory")
+    } else {
+        None
+    };
+
     summary.total = tests.iter().map(|t| t.case_descriptions.len()).sum();
     for (suite_i, test) in tests.iter().enumerate() {
         let mut suite_report = SuiteReport {
             suite_name: test.suite_name.clone(),
             cases: Vec::with_capacity(test.case_descriptions.len()),
+        };
+        // Pre-suite snapshot: feeds the suite-level report so
+        // beforeAll/afterAll growth is visible (informational — shared
+        // state built in beforeAll is legitimate and per-case baselines
+        // start AFTER it).
+        let pre_suite = if opts.check_leaks {
+            leak_ledger::snapshot()
+        } else {
+            None
         };
         if test.has_before_all {
             host::reset_spy_state();
@@ -511,7 +554,45 @@ pub fn run_wasm_tests_with_externs(
                 use std::io::Write as _;
                 let _ = std::io::stderr().flush();
             }
+            let pre_case = if opts.check_leaks {
+                leak_ledger::snapshot()
+            } else {
+                None
+            };
             let res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            // Leak verdict for the case window. Only evaluated on a
+            // clean return — a trapped case left guest state
+            // indeterminate, and the trap is the failure that matters.
+            let leak_failure: Option<String> = match (&res, &pre_case) {
+                (Ok(()), Some(snap)) => {
+                    let data = leak_memory.as_ref().map(|m| m.data(&store)).unwrap_or(&[]);
+                    match leak_ledger::delta_since(snap, data) {
+                        Some(d) if d.new_count > 0 => {
+                            if opts.allows(&test.suite_name, desc) {
+                                eprintln!(
+                                    "[check-leaks] {} — {}: leaked {} object(s), {} bytes (allowed)",
+                                    test.suite_name, desc, d.new_count, d.new_bytes
+                                );
+                                None
+                            } else {
+                                Some(format!(
+                                    "leaked {} object(s), {} bytes{}",
+                                    d.new_count, d.new_bytes, d.report
+                                ))
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            // A leak verdict converts a passing case into a failure;
+            // take_trap_msg() is empty on a clean return, so the error
+            // formatting below falls through to this message.
+            let res = match (res, leak_failure) {
+                (Ok(()), Some(msg)) => Err(wasmtime::Error::msg(msg)),
+                (r, _) => r,
+            };
             let outcome = match res {
                 Ok(()) => {
                     summary.passed += 1;
@@ -555,6 +636,23 @@ pub fn run_wasm_tests_with_externs(
             run_test
                 .call(&mut store, (suite_i as i32, TEST_HOOK_AFTER_ALL_CASE_IDX))
                 .map_err(|e| fmt_err(&format!("afterAll failed in '{}'", test.suite_name), e))?;
+        }
+        // Suite-level report (informational, never a failure): growth
+        // since the pre-suite snapshot that per-case windows can't see —
+        // beforeAll/afterAll allocations plus allowed-case residue.
+        // Shared state built in beforeAll is legitimate, so this line
+        // exists for attribution, not assertion.
+        if let Some(snap) = &pre_suite {
+            let data = leak_memory.as_ref().map(|m| m.data(&store)).unwrap_or(&[]);
+            if let Some(d) = leak_ledger::delta_since(snap, data) {
+                let net = d.new_count as i64 - d.freed_count as i64;
+                if net != 0 {
+                    eprintln!(
+                        "[check-leaks] suite '{}': net {:+} object(s) ({} new, {} freed; {} new bytes) across the suite",
+                        test.suite_name, net, d.new_count, d.freed_count, d.new_bytes
+                    );
+                }
+            }
         }
         summary.suites.push(suite_report);
     }

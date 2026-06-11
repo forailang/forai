@@ -185,7 +185,6 @@ pub(crate) fn record_free(addr: u32, size: u32) {
 #[derive(Clone, Default)]
 pub(crate) struct LedgerSnapshot {
     addrs: HashSet<u32>,
-    live_bytes: u64,
 }
 
 /// What changed since a [`LedgerSnapshot`]. `new_count`/`new_bytes`
@@ -216,7 +215,6 @@ pub(crate) fn snapshot() -> Option<LedgerSnapshot> {
         }
         Some(LedgerSnapshot {
             addrs: led.map.keys().copied().collect(),
-            live_bytes: led.live_bytes,
         })
     })
 }

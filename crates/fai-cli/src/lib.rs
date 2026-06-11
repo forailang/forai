@@ -100,7 +100,7 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  fmt [path] [--check]    fmt");
     eprintln!("  check [file]            fmt → check");
-    eprintln!("  test [file] [--checked] fmt → check → test");
+    eprintln!("  test [file] [--checked] [--check-leaks] fmt → check → test");
     eprintln!("  run [file]              fmt → check → test → run");
     eprintln!("  build [target]          fmt → check → test → build");
     eprintln!("  new <name>              Create a new project");
@@ -122,6 +122,10 @@ fn print_usage() {
     eprintln!("                          <ms> ms (for servers that never exit)");
     eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
     eprintln!("  test --checked          Build tests with cheap always-on memory");
+    eprintln!("  test --check-leaks      Per-test leak assertion: a case that does not");
+    eprintln!("                          return the heap to its baseline fails with a");
+    eprintln!("                          delta report. --allow-leak=<suite[::case]>");
+    eprintln!("                          (repeatable, exact match) exempts known leaks.");
     eprintln!("                          guards: trap an out-of-bounds index store");
     eprintln!("                          (xs[i]=v) and any single alloc past 256 MB");
     eprintln!("                          at the source, with a named reason. Use this");
@@ -197,6 +201,38 @@ fn cmd_check(args: &[String]) {
 fn cmd_test(args: &[String]) {
     let (args, verbose) = extract_verbose_flag(args);
     let (args, checked) = extract_checked_flag(&args);
+    // `fai test --check-leaks` (plan 118 U2): per-case leak assertion.
+    // `--allow-leak=<name>` (repeatable) exempts an exact `suite` or
+    // `suite::case` name — for the known host leaks (events.off/clear,
+    // spy reset, ...) until plan-117 phases 4-6 fix them.
+    let (args, check_leaks) = {
+        let mut rest = Vec::new();
+        let mut found = false;
+        for a in args {
+            if a == "--check-leaks" {
+                found = true;
+            } else {
+                rest.push(a);
+            }
+        }
+        (rest, found)
+    };
+    let (args, allow_leaks) = {
+        let mut rest = Vec::new();
+        let mut allows = Vec::new();
+        for a in args {
+            if let Some(name) = a.strip_prefix("--allow-leak=") {
+                allows.push(name.to_string());
+            } else {
+                rest.push(a);
+            }
+        }
+        (rest, allows)
+    };
+    let test_opts = wasm_runner::TestRunOptions {
+        check_leaks,
+        allow_leaks,
+    };
     let (args, project) = extract_project_flag(&args);
     let (args, project) = lift_target_name_positional(args, project);
     let reporter = Reporter::new(verbose);
@@ -217,7 +253,7 @@ fn cmd_test(args: &[String]) {
     // wasm carries no `__fai_alloc_event` hooks, so the ledger (and its
     // interval report) stays silent during `fai test` — exactly when a
     // runaway allocator needs naming.
-    if std::env::var_os("FAI_CHECK_LEAKS").is_some() {
+    if test_opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some() {
         fai_codegen_wasm::set_check_leaks(true);
     }
     // `--checked` (plan 116): build the test wasm with the cheap,
@@ -231,7 +267,7 @@ fn cmd_test(args: &[String]) {
     }
     step_fmt(&args, &reporter);
     step_check(&args, &reporter);
-    step_test(&args, &reporter);
+    step_test_with_opts(&args, &reporter, &test_opts);
 }
 
 fn cmd_run(args: &[String]) {
@@ -787,11 +823,15 @@ fn try_check_single_file(path: &str) -> Result<(), (String, usize)> {
 }
 
 fn step_test(args: &[String], reporter: &Reporter) {
+    step_test_with_opts(args, reporter, &wasm_runner::TestRunOptions::default());
+}
+
+fn step_test_with_opts(args: &[String], reporter: &Reporter, opts: &wasm_runner::TestRunOptions) {
     let file_arg = args.iter().find(|a| !a.starts_with("--"));
 
     if let Some(path) = file_arg {
         // Test a single file
-        run_tests_file(path, reporter);
+        run_tests_file(path, reporter, opts);
         return;
     }
 
@@ -822,7 +862,7 @@ fn step_test(args: &[String], reporter: &Reporter) {
                 continue;
             }
             println!("▶ testing target {}", name);
-            run_tests_file(&main_path.to_string_lossy(), reporter);
+            run_tests_file(&main_path.to_string_lossy(), reporter, opts);
         }
         return;
     }
@@ -833,7 +873,7 @@ fn step_test(args: &[String], reporter: &Reporter) {
     // extern blocks in `_ffi.fai`, private helpers, and public APIs
     // all resolve regardless of which file declares which.
     let src_path = project_root.join(&src_dir);
-    run_tests_module(&src_path, reporter);
+    run_tests_module(&src_path, reporter, opts);
 }
 
 /// Run every test in a flat library/app source directory as one
@@ -841,7 +881,7 @@ fn step_test(args: &[String], reporter: &Reporter) {
 /// `prepare_module_directory_for_tests` so there's no notion of an
 /// "entry file" — every `.fai` file in `src_path` contributes its
 /// declarations and tests to the same module.
-fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
+fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter, opts: &wasm_runner::TestRunOptions) {
     let src_path_str = src_path.to_string_lossy().to_string();
     let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path_str) {
         Ok(p) => p,
@@ -891,7 +931,7 @@ fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter) {
         .collect();
 
     let externs = extract_externs_from_prepared(&prepared, Some(&src_path_str));
-    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs) {
+    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs, opts) {
         Ok(p) => p,
         Err(e) => {
             reporter.error_line(&format!("runtime error during test setup: {}", e));
@@ -945,6 +985,7 @@ fn run_tests_with_compact_output(
     wasm_bytes: &[u8],
     tests: &[crate::test_meta::TestSuiteMeta],
     externs: Vec<wasm_runner::ExternInfo>,
+    opts: &wasm_runner::TestRunOptions,
 ) -> Result<(usize, usize), String> {
     let mut current_suite: Option<String> = None;
     let mut suite_pass: u32 = 0;
@@ -952,7 +993,7 @@ fn run_tests_with_compact_output(
     let mut failures: Vec<(String, String, u32, String)> = Vec::new();
 
     let summary =
-        wasm_runner::run_wasm_tests_with_externs(wasm_bytes, tests, externs, |outcome| {
+        wasm_runner::run_wasm_tests_with_externs(wasm_bytes, tests, externs, opts, |outcome| {
             if current_suite.as_deref() != Some(&outcome.suite_name) {
                 if let Some(name) = current_suite.take() {
                     println!("{}", format_suite_line(&name, suite_pass, suite_fail));
@@ -1090,7 +1131,7 @@ fn collect_fai_files_recursive(root: &std::path::Path) -> Vec<String> {
     out
 }
 
-fn run_tests_file(path: &str, reporter: &Reporter) {
+fn run_tests_file(path: &str, reporter: &Reporter, opts: &wasm_runner::TestRunOptions) {
     let raw_content = read_file(path);
     // If the file has no test blocks, skip the full compile-and-run —
     // complex entry-point files can overflow the VM register file in
@@ -1192,7 +1233,7 @@ fn run_tests_file(path: &str, reporter: &Reporter) {
         .collect();
 
     let externs = extract_externs_from_prepared(&prepared, source_root.as_deref());
-    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs) {
+    let (passed, failed) = match run_tests_with_compact_output(&wasm_bytes, &tests, externs, opts) {
         Ok(p) => p,
         Err(e) => {
             reporter.error_line(&format!("runtime error during test setup: {}", e));
