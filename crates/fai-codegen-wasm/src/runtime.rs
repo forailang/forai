@@ -9044,3 +9044,56 @@ mod alloc_free_tests {
         assert!(small > b, "smaller request bumps rather than grabbing a larger freed block");
     }
 }
+
+#[cfg(test)]
+mod ownership_roundtrip_tests {
+    use super::*;
+
+    /// Plan 119 U4: the ownership table and the declared import surface
+    /// cannot drift. Direction 1: every i64-returning env import either
+    /// has an ownership row or is on the explicit allow-list below (with
+    /// the reason it is not a user-visible boxed RESULT). Direction 2:
+    /// every table row names a real import. `import_signatures()` is the
+    /// full declared surface — a compiled module's import section is
+    /// always a subset — so iterating it is the exhaustive check.
+    #[test]
+    fn import_surface_round_trips_against_ownership_table() {
+        // i64-returning imports that are NOT user-visible boxed results.
+        // Every entry carries its justification; an import in neither the
+        // table nor this list fails the test.
+        const ALLOWED_UNSIGNED: &[(&str, &str)] = &[(
+            "spawn",
+            "returns VAL_VOID, immediately dropped at the nowait call site \
+             (compile_nowait) — never a user-visible value",
+        )];
+
+        let sigs = import_signatures();
+        let names: std::collections::HashSet<&str> =
+            sigs.iter().map(|(n, _, _)| *n).collect();
+
+        // Direction 2: no dead table rows.
+        for row in fai_compiler::ownership_abi::HOST_IMPORTS {
+            assert!(
+                names.contains(row.import),
+                "table row '{}' names no declared import",
+                row.import
+            );
+        }
+
+        // Direction 1: no unsigned i64-returning imports.
+        let mut unsigned: Vec<&str> = Vec::new();
+        for (name, _params, results) in &sigs {
+            if results.as_slice() == [wasm_encoder::ValType::I64]
+                && fai_compiler::ownership_abi::lookup_host_import(name).is_none()
+                && !ALLOWED_UNSIGNED.iter().any(|(n, _)| n == name)
+            {
+                unsigned.push(name);
+            }
+        }
+        assert!(
+            unsigned.is_empty(),
+            "i64-returning imports with no ownership row and no allow-list entry:\n  {}",
+            unsigned.join("\n  ")
+        );
+    }
+}
