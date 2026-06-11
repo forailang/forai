@@ -6,6 +6,29 @@ fixing commit.
 
 ## Open
 
+### test-mode codegen: UFCS call in an entry file fails the test step with a misattributed UnknownIdentifier
+
+- **Date:** 2026-06-11
+- **Area:** UFCS metadata / test-mode compilation
+- **Found by:** Plan 118 phase-2 work — a probe with `'a,b,c'.split(',')` in `main`.
+
+A UFCS method call in an ENTRY file (e.g. `'a,b,c'.split(',')` inside
+`def main`) passes `fai check` but fails the test-step compile of the
+`fai run`/`fai test` pipeline with `UnknownIdentifier("split")` at the
+call site — the run-step compile of the same file succeeds. Fixture
+programs under `tests/fixtures/language` use UFCS and pass, so the
+break is specific to how the entry file is prepared for the test step.
+
+Suspected cause: the checker's `ufcs_calls` set is keyed by
+`(module_key, line, col)`; test-mode source handling (synthetic test
+wrapping / module attribution for the entry file) shifts or re-keys
+those positions, so codegen misses the UFCS rewrite and falls through
+to bare-identifier resolution.
+
+Repro fixture (skipped): `tests/fixtures/language/ufcs/entry_file_test_step/`.
+Until fixed, plan-118 fixtures avoid UFCS-in-entry shapes where the
+test step matters.
+
 ### codegen: tail-position `from_dict` passes check but breaks build, with a misattributed error
 
 - **Date:** 2026-06-01
