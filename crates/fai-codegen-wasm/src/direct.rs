@@ -12676,14 +12676,25 @@ impl<'a, 'c> Builder<'a, 'c> {
         ext_fn_idx: u16,
         args: &[&Expression],
     ) -> Result<(), BuildError> {
-        // 64 KiB offset — above the string data pool and well above
-        // any reasonable globals area. The bytecode path uses the
-        // exact same constant; keeping it in lockstep means a
-        // migrated-then-fallback function hits the same host state.
-        const FFI_ARGS_BASE: i32 = 65536;
+        // Heap-allocate the args scratch buffer per call. A fixed
+        // address here (the old `FFI_ARGS_BASE = 65536`) is unsound: the
+        // heap base is `string_pool + bucket_region`, which in a large
+        // program (big interned-string pool) climbs to and past 0x10000,
+        // so the fixed buffer collides with live heap objects and every
+        // FFI call scribbles them (a layout-dependent heap corruption —
+        // it bit brain once its string pool crossed 64 KiB). A heap block
+        // can't alias the heap. RT_ALLOC rounds up, so a 0-arg call still
+        // gets a valid block; size it to hold every arg slot.
+        let buf_bytes = ((args.len() as i32) * 8).max(8);
+        let args_buf = self.alloc_i32_local();
+        self.emit(Instruction::I32Const(buf_bytes));
+        self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
+        self.emit(Instruction::LocalSet(args_buf));
 
         for (i, a) in args.iter().enumerate() {
-            self.emit(Instruction::I32Const(FFI_ARGS_BASE + (i as i32) * 8));
+            self.emit(Instruction::LocalGet(args_buf));
+            self.emit(Instruction::I32Const((i as i32) * 8));
+            self.emit(Instruction::I32Add);
             // Must be Boxed — the scratch slot holds a NaN-boxed i64.
             // A RawFloat/RawInt from an arithmetic fast-path (e.g.
             // `fabs(-5.5)`) stored unconverted would trip wasm
@@ -12697,19 +12708,17 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         self.emit(Instruction::I32Const(ext_fn_idx as i32));
         self.emit(Instruction::I32Const(args.len() as i32));
-        self.emit(Instruction::I32Const(FFI_ARGS_BASE));
+        self.emit(Instruction::LocalGet(args_buf));
         self.emit_import_call(IMPORT_CALL_FFI);
-        // ^ leaves the C return value on the stack as i64. For
-        // OUT params the host also wrote the tracked-handle Value
-        // back into `mem[FFI_ARGS_BASE + i*8]`; emit a LocalSet for
-        // each out arg whose source expression is a simple local
-        // identifier. That lets `let db Ptr? = null;
-        // sqlite3_open(path, db)` see `db` populated after the call.
+        // ^ leaves the C return value on the stack as i64. Stash it so we
+        // can read OUT params back and free the args buffer, then restore
+        // it on top.
+        let ret_local = self.alloc_local();
+        self.emit(Instruction::LocalSet(ret_local));
+        // For OUT params the host wrote the tracked-handle Value back into
+        // `mem[args_buf + i*8]`; copy it into the source local so
+        // `let db Ptr? = null; sqlite3_open(path, db)` sees `db` populated.
         if let Some(out_flags) = self.ctx.extern_out_params.get(extern_name).cloned() {
-            // Stash the return value so we can reshuffle the out
-            // readbacks and still end with the return on top.
-            let ret_local = self.alloc_local();
-            self.emit(Instruction::LocalSet(ret_local));
             for (i, &is_out) in out_flags.iter().enumerate() {
                 if !is_out {
                     continue;
@@ -12721,9 +12730,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                     let Some(binding) = self.lookup(&id.name) else {
                         continue;
                     };
-                    // `mem[FFI_ARGS_BASE + i*8]` holds the boxed
-                    // handle Value the host wrote.
-                    self.emit(Instruction::I32Const(FFI_ARGS_BASE + (i as i32) * 8));
+                    self.emit(Instruction::LocalGet(args_buf));
+                    self.emit(Instruction::I32Const((i as i32) * 8));
+                    self.emit(Instruction::I32Add);
                     self.emit(Instruction::I64Load(MemArg {
                         offset: 0,
                         align: 3,
@@ -12740,8 +12749,13 @@ impl<'a, 'c> Builder<'a, 'c> {
                     }
                 }
             }
-            self.emit(Instruction::LocalGet(ret_local));
         }
+        // Free the scratch buffer (raw i64 slots, not an object graph — a
+        // flat RT_FREE, no child release). Then restore the return value.
+        self.emit(Instruction::LocalGet(args_buf));
+        self.emit(Instruction::I32Const(buf_bytes));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(ret_local));
         Ok(())
     }
 
