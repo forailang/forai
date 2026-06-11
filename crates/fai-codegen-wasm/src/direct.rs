@@ -13357,14 +13357,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// (`unwrap`, the `get*` dict accessors, `set`, the `message`/`kind` error
     /// field reads). Fresh-returning bare-globals are intentionally absent —
     /// transferring their (genuinely fresh) result is correct.
-    fn is_borrowed_bare_global(name: &str) -> bool {
-        // Delegated to the plan-117 signature table so the name list has one
-        // physical home and cannot drift from the parity instrument's copy.
-        // The dispatch ORDER (set/unwrap overridden before this check) still
-        // lives in call_returns_owned_heuristic, unchanged.
-        fai_compiler::ownership_abi::is_borrowed_bare_global(name)
-    }
-
+    
     /// Builtins that ALWAYS return a freshly `RT_ALLOC`-d (rc-prefixed) object
     /// distinct from their arguments (plan 113 R2). A call to one of these is
     /// ownership-transferring just like a user function: the result is a
@@ -13381,12 +13374,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// host-allocated results (json/env/file/path — unverified rc prefix), where
     /// transferring an aliasing result would be a use-after-free; the bar is
     /// "provably +1".
-    fn is_fresh_builtin_call(name: &str) -> bool {
-        // Delegated to the plan-117 signature table (single physical home for
-        // the name list; per-name verification notes live there too).
-        fai_compiler::ownership_abi::is_fresh_builtin_call(name)
-    }
-
+    
     /// Ownership inference (plan 113 R2). True if `ce` resolves to a call that
     /// yields an OWNED (+1) value the caller must take ownership of — a
     /// user-defined function or a closure value, both of which return +1 via
@@ -13426,21 +13414,100 @@ impl<'a, 'c> Builder<'a, 'c> {
         )
     }
 
-    /// Ownership classifier (plan 113 R2). Returns whether `ce` yields an
-    /// OWNED (+1) value the caller must take. This is the heuristic that still
-    /// drives behavior; `call_returns_owned` wraps it with the plan-117
-    /// signature-table parity check (logging only, behavior unchanged).
+    /// Ownership classifier (plan 117 phase 3): does `ce` yield an OWNED
+    /// (+1) value the caller must take? Table-driven for everything the
+    /// signature table classifies statically (the heuristic this replaced
+    /// was proven equivalent by a zero-divergence FAI_ABI_CHECK run over
+    /// the full 320-fixture corpus immediately before the swap); dynamic
+    /// callables — externs, bound closures, user fns, type constructors —
+    /// are per-program facts resolved in code, all returning +1.
     fn call_returns_owned(&mut self, ce: &CallExpression) -> bool {
-        let heuristic = self.call_returns_owned_heuristic(ce);
-        // Plan 117 phase 1: with FAI_ABI_CHECK set, consult the central
-        // ownership signature table alongside the heuristic and log any
-        // divergence. This proves the table is equivalent to the heuristic
-        // over the whole test corpus before phase 3 swaps the lookups in.
-        // Off by default; never affects the returned value.
-        if abi_check_enabled() {
-            self.abi_parity_log(ce, heuristic);
+        use fai_compiler::ownership_abi::{
+            lookup_bare_call, lookup_member_call, lookup_std_module_call, ReturnConvention,
+        };
+        let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
+        let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
+        let sig = match &*ce.callee {
+            Expression::IdentifierExpression(id) => lookup_bare_call(id.name.as_str()),
+            // UFCS `recv.method(...)`: member dispatch checks the borrowed
+            // list first (the bare/member set/unwrap asymmetry, preserved
+            // by decision — see plans/119 KTD).
+            Expression::MemberExpression(me) if is_ufcs => {
+                lookup_member_call(me.property.as_str())
+            }
+            Expression::MemberExpression(me) => {
+                let m = me.property.as_str();
+                // Module-alias path first, only when the object is an
+                // unshadowed module alias. The mutating `resolve` is
+                // deliberate: this is the real compilation path and the
+                // heuristic it replaced had the same side-effect profile.
+                let mut sig = None;
+                if let Expression::IdentifierExpression(obj_id) = &*me.object {
+                    if self.resolve(&obj_id.name).is_none() {
+                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name) {
+                            // A user-module function (`alias.fn`) is dynamic:
+                            // +1 via compile_return's convention.
+                            if self
+                                .function_by_name
+                                .contains_key(&format!("{}.{}", canon, m))
+                            {
+                                return true;
+                            }
+                            sig = lookup_std_module_call(canon, m);
+                        }
+                    }
+                }
+                // A std-module miss falls back to the member table (e.g.
+                // `alias.map(...)` where the method is a builtin), then to
+                // the dynamic checks below.
+                sig.or_else(|| lookup_member_call(m))
+            }
+            _ => None,
+        };
+        if let Some(sig) = sig {
+            return match sig.ret {
+                ReturnConvention::Owned => true,
+                ReturnConvention::Borrowed | ReturnConvention::Primitive => false,
+                // `set(dict, ..)` returns arg0 in place: result ownership
+                // follows the argument expression's ownership.
+                ReturnConvention::PassThrough(n) => ce
+                    .args
+                    .get(n)
+                    .map(|a| self.expr_transfers_ownership(&a.value))
+                    .unwrap_or(false),
+            };
         }
-        heuristic
+        // Dynamic callables — not table material, all +1 when they hit.
+        match &*ce.callee {
+            Expression::IdentifierExpression(id) => {
+                let name = id.name.as_str();
+                // Extern FFI: primitives or fresh host-allocated strings.
+                if self.ctx.extern_fn_indices.contains_key(name) {
+                    return true;
+                }
+                // A callable bound name is a closure value (closures
+                // return +1).
+                if self.resolve(name).is_some() {
+                    return true;
+                }
+                // Direct user function — bare, module-peer, or named import.
+                if self.resolves_to_user_fn(name) {
+                    return true;
+                }
+                // A type constructor lowers to a fresh dict literal.
+                if self.ctx.type_fields.contains_key(name) {
+                    return true;
+                }
+                false
+            }
+            // Only the UFCS member arm resolves user functions; a plain
+            // member miss is a borrowed builtin method (first/last/get/...),
+            // matching the replaced heuristic exactly.
+            Expression::MemberExpression(me) if is_ufcs => {
+                self.resolves_to_user_fn(me.property.as_str())
+            }
+            _ => false,
+        }
     }
 
     /// Side-effect-free twin of `resolve` for diagnostics: answers "would
@@ -13467,191 +13534,8 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// there, unlike their bare forms). Dynamic callables (user fns, closures,
     /// type constructors, externs) are intentionally not in the static table;
     /// a table miss on those is expected and silent.
-    fn abi_parity_log(&mut self, ce: &CallExpression, heuristic: bool) {
-        use fai_compiler::ownership_abi::{
-            lookup_bare_call, lookup_member_call, lookup_std_module_call, ReturnConvention,
-        };
-        let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
-        let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
-        let sig = match &*ce.callee {
-            Expression::IdentifierExpression(id) => lookup_bare_call(id.name.as_str()),
-            // UFCS `recv.method(...)`: the heuristic resolves `method` as a
-            // bare-global-first member name and never touches the receiver.
-            Expression::MemberExpression(me) if is_ufcs => {
-                lookup_member_call(me.property.as_str())
-            }
-            Expression::MemberExpression(me) => {
-                let m = me.property.as_str();
-                // Module-alias path first, mirroring the heuristic: only when
-                // the object is an unshadowed module alias. A user-module
-                // function (`alias.fn`) is dynamic — the heuristic classifies
-                // it owned via function_by_name, the table doesn't model user
-                // fns — so it's a silent miss, not a fall-through to the
-                // member table (which would log a false divergence for
-                // user fns named `get`/`message`/etc.).
-                if let Expression::IdentifierExpression(obj_id) = &*me.object {
-                    if !self.resolve_would_hit(&obj_id.name) {
-                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name) {
-                            if self
-                                .function_by_name
-                                .contains_key(&format!("{}.{}", canon, m))
-                            {
-                                return;
-                            }
-                            if let Some(sig) = lookup_std_module_call(canon, m) {
-                                Some(sig)
-                            } else {
-                                lookup_member_call(m)
-                            }
-                        } else {
-                            lookup_member_call(m)
-                        }
-                    } else {
-                        lookup_member_call(m)
-                    }
-                } else {
-                    lookup_member_call(m)
-                }
-            }
-            _ => None,
-        };
-        let Some(sig) = sig else { return };
-        let table = match sig.ret {
-            // PassThrough follows the same argument evaluation the heuristic
-            // performs (`set` ownership = arg0 ownership), so the two sides
-            // are equal by construction — re-evaluating the argument here
-            // would re-enter this wrapper (exponential on nested `set`
-            // chains) to learn nothing. Skip.
-            ReturnConvention::PassThrough(_) => return,
-            ReturnConvention::Owned => true,
-            ReturnConvention::Borrowed | ReturnConvention::Primitive => false,
-        };
-        if table != heuristic {
-            let module = if self.module_key.is_empty() {
-                "<entry>"
-            } else {
-                self.module_key.as_str()
-            };
-            eprintln!(
-                "[abi-check] DIVERGENCE at {module}:{}:{}: heuristic={heuristic} table={table} ({})",
-                ce.location.line, ce.location.column, sig.doc
-            );
-        }
-    }
-
-    fn call_returns_owned_heuristic(&mut self, ce: &CallExpression) -> bool {
-        let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
-        let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
-        match &*ce.callee {
-            Expression::IdentifierExpression(id) => {
-                let name = id.name.as_str();
-                // `set(dict, key, value)` returns its FIRST arg (mutated in
-                // place), so its result-ownership follows arg0: `set({}, ..)` on
-                // a fresh dict is owned (transfer); `set(d, ..)` on a borrowed var
-                // is borrowed. Every forui component builds props via
-                // `set({}, 'k', v)`, so a uniform "borrowed" classification
-                // over-retains and leaks the props dict per node. Checked before
-                // the bare-global shortcut (which would force `false`).
-                if name == "set" {
-                    return ce
-                        .args
-                        .first()
-                        .map(|a| self.expr_transfers_ownership(&a.value))
-                        .unwrap_or(false);
-                }
-                // `unwrap` returns one arg or the other but `compile_unwrap`
-                // normalises the result to a uniform `+1`, so it's owned (callers
-                // transfer rather than over-retain — `propOr` calls it per node).
-                if name == "unwrap" {
-                    return true;
-                }
-                // Bare-globals dispatch before user functions / bound closures,
-                // so a borrowed-returning one wins even if shadowed.
-                if Self::is_borrowed_bare_global(name) {
-                    return false;
-                }
-                // A fresh-allocating builtin returns a sole-owned object.
-                if Self::is_fresh_builtin_call(name) {
-                    return true;
-                }
-                // Extern FFI call — results are primitives or fresh
-                // host-allocated strings (`encode_return_for_guest`), both
-                // safe to transfer. Classified borrowed they get over-
-                // retained per call (the per-request DB-row leak, plan 116).
-                if self.ctx.extern_fn_indices.contains_key(name) {
-                    return true;
-                }
-                // A callable bound name is a closure value (closures return +1).
-                if self.resolve(name).is_some() {
-                    return true;
-                }
-                // Direct user function — bare, module-peer, or named import.
-                if self.resolves_to_user_fn(name) {
-                    return true;
-                }
-                // A type constructor (`Point(x: ..)`) lowers to a fresh dict
-                // literal — a sole-owned +1. Without this it's misclassified as
-                // borrowed and over-retained, leaking the whole instance (and
-                // every `type` value, e.g. all of forui's ViewNodes) per build.
-                if self.ctx.type_fields.contains_key(name) {
-                    return true;
-                }
-                false
-            }
-            Expression::MemberExpression(me) if is_ufcs => {
-                // UFCS `recv.method(...)` resolves `method` as a bare identifier
-                // (same resolution as `compile_call`: bare / module-peer /
-                // named import).
-                let m = me.property.as_str();
-                if Self::is_borrowed_bare_global(m) {
-                    return false;
-                }
-                if Self::is_fresh_builtin_call(m) {
-                    return true;
-                }
-                if self.resolves_to_user_fn(m) {
-                    return true;
-                }
-                false // builtin method (first / last / get / find / ...) → borrowed
-            }
-            Expression::MemberExpression(me) => {
-                let m = me.property.as_str();
-                // `alias.method(...)` — a user-module function or a std host
-                // call verified to return a fresh owned value. Checked BEFORE
-                // the bare-global heuristics: `env.get(...)` is a module
-                // call, not the borrowed dict-`get` builtin of the same
-                // spelling (compile_call dispatches module aliases first for
-                // the same reason). Only fires when the object is a module
-                // alias not shadowed by a local binding.
-                if let Expression::IdentifierExpression(obj_id) = &*me.object {
-                    if self.resolve(&obj_id.name).is_none() {
-                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name).cloned() {
-                            if self
-                                .function_by_name
-                                .contains_key(&format!("{}.{}", canon, me.property))
-                            {
-                                return true;
-                            }
-                            if Self::is_fresh_std_module_call(&canon, m) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                if Self::is_borrowed_bare_global(m) {
-                    return false;
-                }
-                // Fresh-allocating std method (`array.map`, `string.split`, …) or
-                // a closure stored in a field — both yield an owned +1.
-                if Self::is_fresh_builtin_call(m) {
-                    return true;
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
+    
+    
     /// Std-module host calls verified to return a FRESH owned (+1) object
     /// graph (each call allocates anew on the guest heap — host `reserve`
     /// or guest `RT_ALLOC_STRING`; a null result is a primitive no-op for
@@ -13661,11 +13545,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Curated: only entries whose host/lowering code was checked. Methods
     /// returning borrowed views (array element reads, dict gets) must stay
     /// out.
-    fn is_fresh_std_module_call(canon: &str, method: &str) -> bool {
-        // Delegated to the plan-117 signature table (single physical home).
-        fai_compiler::ownership_abi::lookup_std_module_call(canon, method).is_some()
-    }
-
+    
     /// RC transfer test (plan 113 R2): does compiling `expr` leave an OWNED (+1)
     /// value on the stack that the consuming context should TRANSFER (take
     /// without retaining)? True for fresh allocations (`is_fresh_value`) and for
