@@ -2255,6 +2255,14 @@ fn emit_free(
     // params: 0 = ptr (i32, logical obj ptr), 1 = size (i32, logical obj size)
     // locals: 2 = bucket_idx, 3 = bucket_addr (i32)
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
+    // FAI_NO_REUSE (UAF hunt): orphan every freed block instead of putting
+    // it back on the free list. Combined with FAI_RC_CHECK's poison, a
+    // freed block then stays poisoned forever (never reused/un-poisoned),
+    // so a stale retain/release/access of a dangling reference traps AT
+    // THE ACT (TRAP_RC_*_POISON) with the offending backtrace — catching
+    // the corruptor, not just the downstream dirtied block. Leaks heavily;
+    // diagnostic-only.
+    let no_reuse = std::env::var_os("FAI_NO_REUSE").is_some();
     let mut f = Function::new([(2, ValType::I32)]);
     // `--check-leaks` ledger event, with the logical ptr/size before the
     // rc-prefix conversion below rewrites them to block base/size.
@@ -2341,6 +2349,8 @@ fn emit_free(
     }
     // Push onto the SIZE-BUCKETED free list (O(1)); blocks too large for the
     // bucketed range go on the single linear fallback list. Mirrors emit_alloc.
+    // Skipped entirely under FAI_NO_REUSE (the block is orphaned).
+    if !no_reuse {
     // bucket_idx = block_size / 8
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::I32Const(3));
@@ -2382,6 +2392,7 @@ fn emit_free(
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::GlobalSet(freelist_global));
     f.instruction(&Instruction::End);
+    } // !no_reuse
     // Checked-mode: poison the object tag slot (base+8 = the logical obj_addr,
     // untouched by the free-list node at base/base+4) so a stale reference that
     // reaches an RC op before the block is reused traps. (plan 113 R2)

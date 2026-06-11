@@ -613,12 +613,23 @@ fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
             "rc-check: release of freed object at 0x{:x}",
             (a as u64) & ADDR_MASK,
         ),
-        c if c == cg::TRAP_RC_OVER_RELEASE => format!(
-            "rc-check: over-release (rc {}) of {} at 0x{:x}",
-            b,
-            describe_boxed_value(data, a as u64),
-            (a as u64) & ADDR_MASK,
-        ),
+        c if c == cg::TRAP_RC_OVER_RELEASE => {
+            let mut msg = format!(
+                "rc-check: over-release (rc {}) of {} at 0x{:x}",
+                b,
+                describe_boxed_value(data, a as u64),
+                (a as u64) & ADDR_MASK,
+            );
+            // Name the object's allocation site from the leak ledger
+            // (FAI_CHECK_LEAKS): the boxed value's logical pointer is its
+            // object address, recorded as a live alloc. This says WHAT was
+            // over-released and where it was born — the missing-retain site.
+            let logical = (a as u64 & ADDR_MASK) as u32;
+            if let Some(desc) = super::super::leak_ledger::describe_block(logical) {
+                msg.push_str(&format!(" — {}", desc));
+            }
+            msg
+        }
         c if c == cg::TRAP_OOM => format!(
             "out of memory: failed to grow linear memory ({} bytes requested, heap needs 0x{:x})",
             a, b,
