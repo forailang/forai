@@ -57,6 +57,11 @@ struct Ledger {
     guest_events: u64,
     unknown_frees: u64,
     unknown_free_samples: Vec<(u32, u32)>,
+    /// Last allocation record for recently-freed addresses, so a
+    /// free-list corruption trap can name the victim block even though
+    /// it left the live map at free time. Cleared wholesale when it
+    /// grows past a bound — debug-mode memory hygiene, not accounting.
+    recent_frees: HashMap<u32, AllocRecord>,
     live_bytes: u64,
     /// Periodic summary for servers (`--check-leaks=interval:N`).
     interval: Option<Duration>,
@@ -157,7 +162,13 @@ pub(crate) fn record_free(addr: u32, size: u32) {
         }
         led.guest_events += 1;
         match led.map.remove(&addr) {
-            Some(rec) => led.live_bytes = led.live_bytes.saturating_sub(rec.size as u64),
+            Some(rec) => {
+                led.live_bytes = led.live_bytes.saturating_sub(rec.size as u64);
+                if led.recent_frees.len() > 100_000 {
+                    led.recent_frees.clear();
+                }
+                led.recent_frees.insert(addr, rec);
+            }
             None => {
                 led.unknown_frees += 1;
                 if led.unknown_free_samples.len() < MAX_ANOMALY_SAMPLES {
@@ -166,6 +177,63 @@ pub(crate) fn record_free(addr: u32, size: u32) {
             }
         }
     });
+}
+
+/// Name the block at `addr` (a logical object pointer) for trap
+/// reports: its live/freed state, size, and allocation site chain.
+/// Lets a free-list corruption trap say WHAT got scribbled, which
+/// usually identifies the writer. `None` when the ledger is disarmed
+/// or the address was never recorded.
+pub(crate) fn describe_block(addr: u32) -> Option<String> {
+    LEDGER.with(|l| {
+        let led = l.borrow();
+        if !led.enabled {
+            return None;
+        }
+        let (rec, state) = match led.map.get(&addr) {
+            Some(r) => (r.clone(), "live"),
+            None => match led.recent_frees.get(&addr) {
+                Some(r) => (r.clone(), "freed"),
+                None => return None,
+            },
+        };
+        let dbg_owned;
+        let dbg: &DbgTable = match &led.dbg {
+            Some(d) => d,
+            None => {
+                dbg_owned = DbgTable::default();
+                &dbg_owned
+            }
+        };
+        let mut sites: Vec<String> = Vec::new();
+        for idx in &rec.frames {
+            let Some(name) = dbg.func_name(*idx) else {
+                continue;
+            };
+            if name.starts_with("rt_") || name.starts_with("__") {
+                continue;
+            }
+            sites.push(name.to_string());
+            if sites.len() == 3 {
+                break;
+            }
+        }
+        let site = if sites.is_empty() {
+            if rec.host {
+                "<host import>".to_string()
+            } else {
+                "<runtime>".to_string()
+            }
+        } else if rec.host {
+            format!("host import ← {}", sites.join(" ← "))
+        } else {
+            sites.join(" ← ")
+        };
+        Some(format!(
+            "{} {}B block allocated in {}",
+            state, rec.size, site
+        ))
+    })
 }
 
 /// Render the periodic `--check-leaks=interval:N` report: a compact

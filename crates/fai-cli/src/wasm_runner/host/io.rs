@@ -4,6 +4,7 @@
 use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
+use super::super::nan_box::VAL_NULL;
 use super::super::output;
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -45,6 +46,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         let bytes = content.as_bytes();
+                        // Legacy scratch-buffer ABI: callers allocate a fixed
+                        // 64 KiB buffer, which this copy used to overflow on
+                        // larger files (silent heap corruption — the brain
+                        // suite found it as free-list poisoning). The direct
+                        // codegen now uses `file_read_str`; refuse oversized
+                        // content here so any straggler caller gets a clean
+                        // failure instead of a scribbled heap.
+                        if bytes.len() > 65536 {
+                            return -1;
+                        }
                         let data = mem.data_mut(&mut caller);
                         let dst = buf_ptr as usize;
                         if dst + bytes.len() <= data.len() {
@@ -55,6 +66,33 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         }
                     }
                     Err(_) => -1,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.file_read_str(path_ptr, path_len) -> i64 — NaN-boxed String with
+    // the full file contents (host-allocated, any size), or VAL_NULL on
+    // failure. Replaces the fixed-buffer `read_file` ABI above.
+    linker
+        .func_wrap(
+            "env",
+            "file_read_str",
+            |mut caller: Caller<'_, ()>, path_ptr: i32, path_len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let path = {
+                    let data = mem.data(&caller);
+                    let end = (path_ptr + path_len) as usize;
+                    if end > data.len() {
+                        return VAL_NULL;
+                    }
+                    std::str::from_utf8(&data[path_ptr as usize..end])
+                        .unwrap_or("")
+                        .to_string()
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => wasm_alloc_str(&mut caller, &mem, &content),
+                    Err(_) => VAL_NULL,
                 }
             },
         )
@@ -430,10 +468,26 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "env",
             "__fai_trap_report",
             |mut caller: Caller<'_, ()>, code: i32, a: i64, b: i64| {
-                let msg = match caller.get_export("memory").and_then(|m| m.into_memory()) {
+                let mut msg = match caller.get_export("memory").and_then(|m| m.into_memory()) {
                     Some(mem) => format_trap_report(code, a, b, mem.data(&caller)),
                     None => format_trap_report(code, a, b, &[]),
                 };
+                // Attach the guest call chain (skipping runtime helpers)
+                // so a named trap also says WHERE — the compact test
+                // reporter shows only this message, not wasmtime's raw
+                // backtrace, and a reason without a location is half a
+                // diagnosis.
+                let sites: Vec<String> = wasmtime::WasmBacktrace::capture(&caller)
+                    .frames()
+                    .iter()
+                    .filter_map(|f| f.func_name())
+                    .filter(|n| !n.starts_with("rt_") && !n.starts_with("__"))
+                    .take(5)
+                    .map(|s| s.to_string())
+                    .collect();
+                if !sites.is_empty() {
+                    msg.push_str(&format!("\n    at {}", sites.join(" ← ")));
+                }
                 set_trap_msg(msg);
             },
         )
@@ -528,6 +582,17 @@ pub(crate) fn take_trap_msg() -> Option<String> {
 // `fai-codegen-wasm/src/runtime.rs` (`TRAP_*`); keep in sync with the
 // JS twins in `fai-cli/src/lib.rs`.
 
+/// Append the leak-ledger identity of the block at base address `a`
+/// (logical pointer = base + 8) to a free-list trap message, when the
+/// ledger is armed (`FAI_CHECK_LEAKS`). Naming the victim block usually
+/// identifies the writer.
+fn append_block_identity(msg: &mut String, base: i64) {
+    let logical = (base as u32).wrapping_add(8);
+    if let Some(desc) = super::super::leak_ledger::describe_block(logical) {
+        msg.push_str(&format!(" — victim: {}", desc));
+    }
+}
+
 /// Render a `__fai_trap_report(code, a, b)` into a readable reason.
 fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
     use fai_codegen_wasm as cg;
@@ -560,6 +625,43 @@ fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
         c if c == cg::TRAP_SCHED_STALL => format!(
             "scheduler stall: poll resumed {} tasks without quiescing (livelock; \
              task t{} was about to run again)",
+            a, b,
+        ),
+        c if c == cg::TRAP_FREELIST_CORRUPT => {
+            let mut msg = format!(
+                "rc-check: corrupt free-list node 0x{:x} (heap_ptr 0x{:x}) — a freed \
+                 block's link word was overwritten, or a garbage pointer was freed",
+                a, b,
+            );
+            append_block_identity(&mut msg, a);
+            msg
+        }
+        c if c == cg::TRAP_FREED_DIRTY => {
+            // `b` packs (bucket_idx << 32 | tag_word); bucket idx 0 means
+            // the report came from a path that only passes the tag.
+            let tag = (b as u64) & 0xFFFF_FFFF;
+            let bucket = (b as u64) >> 32;
+            let mut msg = format!(
+                "rc-check: freed block at 0x{:x} was written through a stale pointer \
+                 while on the free list (tag word now 0x{:x}, expected poison)",
+                a, tag,
+            );
+            if bucket > 0 {
+                msg.push_str(&format!(" [block size {}B]", bucket * 8));
+            }
+            append_block_identity(&mut msg, a);
+            msg
+        }
+        c if c == cg::TRAP_DOUBLE_FREE => {
+            let mut msg = format!(
+                "rc-check: double free of block at 0x{:x} (block size {})",
+                a, b
+            );
+            append_block_identity(&mut msg, a);
+            msg
+        }
+        c if c == cg::TRAP_INDEX_OOB => format!(
+            "rc-check: index store out of bounds — xs[{}] = ... on an array of {} elements",
             a, b,
         ),
         _ => format!("trap report (code {}, a=0x{:x}, b=0x{:x})", code, a, b),

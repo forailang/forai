@@ -32,10 +32,10 @@ use crate::runtime::{
     IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
     IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
     IMPORT_PROCESS_STOP,
-    IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM, IMPORT_READ_FILE,
+    IMPORT_FILE_READ_STR, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM,
     IMPORT_REMOTE_CALL, IMPORT_SET_HTML, IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN,
     IMPORT_TRAP_REPORT,
-    IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET,
+    IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET,
     IMPORT_TCP_ACCEPT, IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN,
     IMPORT_TCP_READ, IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_UDP_BIND, IMPORT_UDP_BROADCAST,
     IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK, METHOD_APPEND,
@@ -275,12 +275,6 @@ enum ModuleCall {
         import_idx: u32,
         has_body: bool,
     },
-    /// `std.file.read(path) -> String?`. The import's buffer arg has
-    /// no forai-visible counterpart — the guest allocates a scratch
-    /// buffer, hands its pointer to the host, and on success wraps
-    /// the written bytes as a new `String`; on -1 returns `null`.
-    /// The buffer size matches the bytecode runtime helper (64 KiB).
-    FileRead,
     /// `std.time.unix() -> Int`. The host's `now_ms` returns f64
     /// milliseconds; `time.unix` divides by 1000, truncates to i32
     /// seconds, and NaN-boxes as Int. Mirrors
@@ -307,11 +301,6 @@ enum ModuleCall {
     /// stringifies and pushes `(ptr, len)`. Can't fit `Simple`
     /// because arity varies across call sites.
     CliReadLine,
-    /// `std.storage.get(key) -> String?`. Same buffer-alloc pattern
-    /// as `file.read`: stringify key, allocate scratch buffer,
-    /// dispatch to `IMPORT_STORAGE_GET`, return `null` on `-1` or
-    /// wrap the scratch bytes as a `String`.
-    StorageGet,
     /// `std.convert.toInt(v) -> Int`. Type-aware at codegen:
     /// Int passthrough, Float truncates, String routes to
     /// `RT_PARSE_INT`. Other types fall through unchanged.
@@ -396,9 +385,6 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
 
     // Special shapes first — methods that don't fit the flat
     // (arg_shapes, result_shape) mould get their own variant.
-    if (module, method) == ("std.file", "read") {
-        return Some(ModuleCall::FileRead);
-    }
     if (module, method) == ("std.time", "unix") {
         return Some(ModuleCall::TimeUnix);
     }
@@ -490,13 +476,6 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
     if (module, method) == ("std.cli", "readLine") {
         return Some(ModuleCall::CliReadLine);
     }
-    // std.storage — the forai surface names the methods
-    // `storageGet`/`storageSet`/etc. (not `get`/`set`), matching the
-    // checker's BuiltinDoc.name. Users write
-    // `storage.storageGet(key)` after `use std.storage`.
-    if (module, method) == ("std.storage", "storageGet") {
-        return Some(ModuleCall::StorageGet);
-    }
     // std.convert — RT-helper dispatch + pass-throughs.
     if module == "std.convert" {
         match method {
@@ -566,7 +545,11 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
 
     let (import_idx, args, result): (u32, &'static [AS], RS) = match (module, method) {
         // std.file — buffer-free variants. `read` is handled as a
-        // `FileRead` special above; the rest follow the flat pattern.
+        // `read` returns a host-allocated boxed String (or null) — no
+        // guest scratch buffer, so file size is unbounded. Plan 116:
+        // the old fixed-64KiB scratch ABI let the host overflow the
+        // guest heap on larger files.
+        ("std.file", "read") => (IMPORT_FILE_READ_STR, &[AS::String], RS::Boxed),
         ("std.file", "write") => (IMPORT_WRITE_FILE, &[AS::String, AS::String], RS::MakeBool),
         ("std.file", "exists") => (IMPORT_FILE_EXISTS, &[AS::String], RS::MakeBool),
         ("std.file", "list") => (IMPORT_FILE_LIST, &[AS::String], RS::Boxed),
@@ -706,6 +689,9 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         // std.storage — `storageGet` is special-cased above
         // (buffer-alloc). Methods use the full `storage<Op>` names
         // per the checker's BuiltinDoc.name.
+        // `storageGet` mirrors `std.file.read`: host-allocated boxed
+        // String result (or null), replacing the fixed-buffer ABI.
+        ("std.storage", "storageGet") => (IMPORT_STORAGE_GET_STR, &[AS::String], RS::Boxed),
         ("std.storage", "storageSet") => (IMPORT_STORAGE_SET, &[AS::String, AS::String], RS::Void),
         ("std.storage", "storageRemove") => (IMPORT_STORAGE_REMOVE, &[AS::String], RS::Void),
         ("std.storage", "storageClear") => (IMPORT_STORAGE_CLEAR, &[], RS::Void),
@@ -9061,6 +9047,14 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
                 }
                 self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
+                // RT_SET_FIELD now returns the (possibly reallocated) dict
+                // pointer. This `obj.field = v` statement path is used for
+                // records/instances (fixed shape — never grow, pointer
+                // unchanged) and the rare dict member-write; we can't rebind
+                // an arbitrary lvalue here, so drop the result. String-keyed
+                // dict growth goes through `dictionary.set`, which threads
+                // the returned pointer.
+                self.emit(Instruction::Drop);
                 Ok(())
             }
             AssignmentTarget::Index { object } => {
@@ -9083,10 +9077,44 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // through it (RC, plan 113 R1).
                 self.compile_expr_as(&ie.object, ValueShape::Boxed)?;
                 self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
-                self.emit(Instruction::I32Const(8));
-                self.emit(Instruction::I32Add);
+                let arr_addr = self.alloc_i32_local();
+                self.emit(Instruction::LocalSet(arr_addr));
                 self.compile_expr_as(&ie.index, ValueShape::RawInt)?;
                 self.emit(Instruction::I32WrapI64);
+                let idx = self.alloc_i32_local();
+                self.emit(Instruction::LocalSet(idx));
+                // Checked-mode (plan 116): an out-of-range index store is
+                // silent heap corruption — i = -1 lands on the array's own
+                // tag/count header; past-end clobbers the next block. Trap
+                // with a named reason at the write site instead.
+                if std::env::var_os("FAI_RC_CHECK").is_some() {
+                    self.emit(Instruction::LocalGet(idx));
+                    self.emit(Instruction::LocalGet(arr_addr));
+                    self.emit(Instruction::I32Load(MemArg {
+                        offset: 4,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                    self.emit(Instruction::I32GeU); // unsigned: negative idx → huge
+                    self.emit_open(Instruction::If(BlockType::Empty));
+                    self.emit(Instruction::I32Const(crate::runtime::TRAP_INDEX_OOB));
+                    self.emit(Instruction::LocalGet(idx));
+                    self.emit(Instruction::I64ExtendI32S);
+                    self.emit(Instruction::LocalGet(arr_addr));
+                    self.emit(Instruction::I32Load(MemArg {
+                        offset: 4,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                    self.emit(Instruction::I64ExtendI32U);
+                    self.emit_import_call(IMPORT_TRAP_REPORT);
+                    self.emit(Instruction::Unreachable);
+                    self.emit_close();
+                }
+                self.emit(Instruction::LocalGet(arr_addr));
+                self.emit(Instruction::I32Const(8));
+                self.emit(Instruction::I32Add);
+                self.emit(Instruction::LocalGet(idx));
                 self.emit(Instruction::I32Const(8));
                 self.emit(Instruction::I32Mul);
                 self.emit(Instruction::I32Add);
@@ -10234,7 +10262,6 @@ impl<'a, 'c> Builder<'a, 'c> {
                 import_idx,
                 has_body,
             } => self.compile_http_request_call(*import_idx, *has_body, call_args),
-            ModuleCall::FileRead => self.compile_file_read(call_args),
             ModuleCall::TimeUnix => self.compile_time_unix(call_args),
             ModuleCall::MathUnaryFloatToInt(op) => {
                 self.compile_math_unary_float_to_int(op.clone(), call_args)
@@ -10245,7 +10272,6 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             ModuleCall::MathPow => self.compile_math_pow(call_args),
             ModuleCall::CliReadLine => self.compile_cli_read_line(call_args),
-            ModuleCall::StorageGet => self.compile_storage_get(call_args),
             ModuleCall::ConvertToInt => self.compile_convert_to_int_call(call_args),
             ModuleCall::ConvertToFloat => self.compile_convert_to_float_call(call_args),
             ModuleCall::ConvertToString => self.compile_convert_to_string(call_args),
@@ -10873,84 +10899,6 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
-    /// `std.file.read(path) -> String?`. Mirrors the bytecode
-    /// runtime helper at `runtime.rs::emit_native_method_dispatch`
-    /// for `METHOD_FILE_READ`:
-    ///
-    /// 1. Stringify `path`, extract the obj-address for
-    ///    `(path_ptr, path_len)`.
-    /// 2. Allocate a 64 KiB scratch buffer via `RT_ALLOC`.
-    /// 3. Call `IMPORT_READ_FILE(path_ptr, path_len, buf_ptr)`.
-    ///    Returns content length or `-1` on error.
-    /// 4. On `-1`, push `VAL_NULL` in place of the result. On
-    ///    success, call `RT_ALLOC_STRING(buf_ptr, content_len)` to
-    ///    wrap the buffer contents as a fresh `String` object.
-    fn compile_file_read(
-        &mut self,
-        call_args: &[fai_compiler::ast::CallArgument],
-    ) -> Result<(), BuildError> {
-        if call_args.len() != 1 {
-            return Err(BuildError::UnsupportedExpression(
-                "ModuleCall/file.read-arg-count",
-            ));
-        }
-
-        // Unbox the path into an i32 object-address local so we can
-        // reuse it for both path_ptr and path_len loads.
-        self.compile_expr(&call_args[0].value)?;
-        self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
-        self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
-        let path_addr = self.alloc_i32_local();
-        self.emit(Instruction::LocalSet(path_addr));
-
-        // 64 KiB scratch buffer. Matches the bytecode runtime helper.
-        let buf_ptr = self.alloc_i32_local();
-        self.emit(Instruction::I32Const(65536));
-        self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
-        self.emit(Instruction::LocalSet(buf_ptr));
-
-        // read_file(path_ptr, path_len, buf_ptr) -> content_len or -1
-        self.emit(Instruction::LocalGet(path_addr));
-        self.emit(Instruction::I32Const(8));
-        self.emit(Instruction::I32Add);
-        self.emit(Instruction::LocalGet(path_addr));
-        self.emit(Instruction::I32Load(mem_off(4)));
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit_import_call(IMPORT_READ_FILE);
-        let content_len = self.alloc_i32_local();
-        self.emit(Instruction::LocalSet(content_len));
-
-        // Branch on the sentinel. `If(Result(i64))` — each arm leaves
-        // exactly one i64 on the stack, so the result type balances.
-        self.emit(Instruction::LocalGet(content_len));
-        self.emit(Instruction::I32Const(-1));
-        self.emit(Instruction::I32Eq);
-        self.emit_open(Instruction::If(BlockType::Result(ValType::I64)));
-        self.emit(Instruction::I64Const(VAL_NULL));
-        self.emit(Instruction::Else);
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit(Instruction::LocalGet(content_len));
-        self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
-        self.emit_close();
-        // Free the scratch buffer — RT_ALLOC_STRING copied the bytes out, so
-        // the block is dead. Without this every `file.read` leaked 64 KiB
-        // (plan 116). RT_FREE pops its own (ptr, size); the boxed result
-        // stays on the stack beneath.
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit(Instruction::I32Const(65536));
-        self.emit(Instruction::Call(self.rt().base + RT_FREE));
-        // Release an OWNED path temp (a fresh literal / concat — the common
-        // `file.read('config/app.toml')` shape leaked the path string per
-        // call). A borrowed path (identifier) is aliased by VALUE_TO_STR
-        // and stays the caller's — skip. Stack-neutral above the result.
-        if self.expr_transfers_ownership(&call_args[0].value) {
-            self.emit(Instruction::LocalGet(path_addr));
-            self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
-            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-        }
-        Ok(())
-    }
-
     /// `std.cli.readLine(prompt?) -> String`. Optional arg — zero
     /// args pushes `(0, 0)`, one arg stringifies + pushes
     /// `(ptr, len)`. Result is a NaN-boxed String from the host.
@@ -10971,66 +10919,6 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
         }
         self.emit_import_call(IMPORT_CLI_READ_LINE);
-        Ok(())
-    }
-
-    /// `std.storage.get(key) -> String?`. Mirrors `file.read`'s
-    /// buffer-alloc pattern: stringify key, allocate a 64 KiB
-    /// scratch buffer, dispatch, then either push `VAL_NULL` on
-    /// `-1` or wrap the scratch bytes via `RT_ALLOC_STRING`.
-    fn compile_storage_get(
-        &mut self,
-        call_args: &[fai_compiler::ast::CallArgument],
-    ) -> Result<(), BuildError> {
-        if call_args.len() != 1 {
-            return Err(BuildError::UnsupportedExpression(
-                "ModuleCall/storage.get-arg-count",
-            ));
-        }
-        // Stringify key and capture its obj-address.
-        self.compile_expr(&call_args[0].value)?;
-        self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
-        self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
-        let key_addr = self.alloc_i32_local();
-        self.emit(Instruction::LocalSet(key_addr));
-
-        let buf_ptr = self.alloc_i32_local();
-        self.emit(Instruction::I32Const(65536));
-        self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
-        self.emit(Instruction::LocalSet(buf_ptr));
-
-        // storage_get(key_ptr, key_len, buf_ptr) -> value_len or -1
-        self.emit(Instruction::LocalGet(key_addr));
-        self.emit(Instruction::I32Const(8));
-        self.emit(Instruction::I32Add);
-        self.emit(Instruction::LocalGet(key_addr));
-        self.emit(Instruction::I32Load(mem_off(4)));
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit_import_call(IMPORT_STORAGE_GET);
-        let value_len = self.alloc_i32_local();
-        self.emit(Instruction::LocalSet(value_len));
-
-        self.emit(Instruction::LocalGet(value_len));
-        self.emit(Instruction::I32Const(-1));
-        self.emit(Instruction::I32Eq);
-        self.emit_open(Instruction::If(BlockType::Result(ValType::I64)));
-        self.emit(Instruction::I64Const(VAL_NULL));
-        self.emit(Instruction::Else);
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit(Instruction::LocalGet(value_len));
-        self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
-        self.emit_close();
-        // Free the scratch buffer (mirrors `compile_file_read`) — without
-        // this every `storage.get` leaked 64 KiB (plan 116).
-        self.emit(Instruction::LocalGet(buf_ptr));
-        self.emit(Instruction::I32Const(65536));
-        self.emit(Instruction::Call(self.rt().base + RT_FREE));
-        // Release an OWNED key temp (mirrors `compile_file_read`).
-        if self.expr_transfers_ownership(&call_args[0].value) {
-            self.emit(Instruction::LocalGet(key_addr));
-            self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
-            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-        }
         Ok(())
     }
 
@@ -12680,9 +12568,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
         }
         self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
+        // RT_SET_FIELD returns the dict pointer — identical to the input
+        // unless an at-capacity dict was reallocated to fit the new key.
+        // Capture it so the result is the live block, not a stale pointer
+        // to a grown-away dict.
+        self.emit(Instruction::LocalSet(dict));
         self.release_stash(key_stash);
 
-        // Push the dict as the result.
+        // Push the (possibly reallocated) dict as the result.
         self.emit(Instruction::LocalGet(dict));
         Ok(())
     }
@@ -17636,9 +17529,8 @@ mod tests {
 
     #[test]
     fn direct_module_file_read_returns_null_on_error() {
-        // `read_file` returns -1 when the path doesn't exist. The
-        // direct builder checks this sentinel and pushes VAL_NULL
-        // instead of wrapping the scratch buffer as a String.
+        // `file_read_str` returns VAL_NULL when the path doesn't
+        // exist; the builder passes the boxed result straight through.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "use std.file\n",
             "\n",
@@ -17648,18 +17540,21 @@ mod tests {
             "  file.read('/nope')\n",
             "end\n",
         )));
-        let result =
-            run_module_with_override(&wasm, runtime::IMPORT_READ_FILE, Val::I32(-1)) as u64;
-        let expected = (runtime::QNAN as u64) | (runtime::TAG_NULL as u64);
-        assert_eq!(result, expected);
+        let null_bits = (runtime::QNAN as u64) | (runtime::TAG_NULL as u64);
+        let result = run_module_with_override(
+            &wasm,
+            runtime::IMPORT_FILE_READ_STR,
+            Val::I64(null_bits as i64),
+        ) as u64;
+        assert_eq!(result, null_bits);
     }
 
     #[test]
-    fn direct_module_file_read_wraps_empty_buffer() {
-        // Success path: host returns 0 bytes read. The builder wraps
-        // the scratch buffer as a String object — we check that the
-        // result carries the object-tag high bits (QNAN | SIGN_BIT),
-        // proving we didn't take the null branch.
+    fn direct_module_file_read_passes_boxed_string_through() {
+        // Success path: the host allocates the String and returns its
+        // NaN-boxed value — the builder must not rewrap or unbox it.
+        // Override with a recognizable object bit pattern and assert
+        // it round-trips untouched.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "use std.file\n",
             "\n",
@@ -17669,13 +17564,13 @@ mod tests {
             "  file.read('/tmp/empty')\n",
             "end\n",
         )));
-        // Default stub returns 0 for read_file.
-        let result = run_module(&wasm) as u64;
-        let obj_high = (runtime::QNAN as u64) | (0x8000_0000_0000_0000_u64); // SIGN_BIT marks an object tag
-        assert_eq!(
-            result & 0xFFFF_0000_0000_0000,
-            obj_high & 0xFFFF_0000_0000_0000
-        );
+        let obj_bits = (runtime::QNAN as u64) | 0x8000_0000_0000_0000_u64 | 0x1230;
+        let result = run_module_with_override(
+            &wasm,
+            runtime::IMPORT_FILE_READ_STR,
+            Val::I64(obj_bits as i64),
+        ) as u64;
+        assert_eq!(result, obj_bits);
     }
 
     #[test]
@@ -18030,9 +17925,8 @@ mod tests {
 
     #[test]
     fn direct_module_storage_get_null_on_missing() {
-        // `storageGet` returns `String?` (optional). Override the
-        // host to signal "absent" (-1) and assert the dispatcher
-        // emits VAL_NULL in place of wrapping the scratch buffer.
+        // `storageGet` returns `String?` (optional). The host returns
+        // VAL_NULL for an absent key; the builder passes it through.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "use std.storage\n",
             "\n",
@@ -18042,17 +17936,20 @@ mod tests {
             "  storage.storageGet('missing')\n",
             "end\n",
         )));
-        let result =
-            run_module_with_override(&wasm, runtime::IMPORT_STORAGE_GET, Val::I32(-1)) as u64;
-        let expected = (runtime::QNAN as u64) | (runtime::TAG_NULL as u64);
-        assert_eq!(result, expected);
+        let null_bits = (runtime::QNAN as u64) | (runtime::TAG_NULL as u64);
+        let result = run_module_with_override(
+            &wasm,
+            runtime::IMPORT_STORAGE_GET_STR,
+            Val::I64(null_bits as i64),
+        ) as u64;
+        assert_eq!(result, null_bits);
     }
 
     #[test]
     fn direct_module_storage_get_wraps_buffer_on_success() {
         // Default stub returns 0 (len=0). The builder wraps the
-        // scratch bytes as a String object — assert the high bits
-        // show an object tag (QNAN | SIGN_BIT).
+        // host-allocated boxed String — assert the boxed value rounds
+        // trip through the builder untouched.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "use std.storage\n",
             "\n",
@@ -18062,12 +17959,13 @@ mod tests {
             "  storage.storageGet('k')\n",
             "end\n",
         )));
-        let result = run_module(&wasm) as u64;
-        let obj_high = (runtime::QNAN as u64) | 0x8000_0000_0000_0000_u64;
-        assert_eq!(
-            result & 0xFFFF_0000_0000_0000,
-            obj_high & 0xFFFF_0000_0000_0000
-        );
+        let obj_bits = (runtime::QNAN as u64) | 0x8000_0000_0000_0000_u64 | 0x1230;
+        let result = run_module_with_override(
+            &wasm,
+            runtime::IMPORT_STORAGE_GET_STR,
+            Val::I64(obj_bits as i64),
+        ) as u64;
+        assert_eq!(result, obj_bits);
     }
 
     // ── std.convert ─────────────────────────────────────────────

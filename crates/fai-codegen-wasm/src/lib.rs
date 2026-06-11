@@ -23,7 +23,8 @@ mod runtime;
 // Trap-report codes (plan 116): shared with the CLI runner, which
 // renders them into readable trap reasons.
 pub use runtime::{
-    TRAP_FORCE_UNWRAP_NULL, TRAP_OOM, TRAP_RC_OVER_RELEASE, TRAP_RC_RELEASE_POISON,
+    TRAP_DOUBLE_FREE, TRAP_FORCE_UNWRAP_NULL, TRAP_FREED_DIRTY, TRAP_FREELIST_CORRUPT,
+    TRAP_INDEX_OOB, TRAP_OOM, TRAP_RC_OVER_RELEASE, TRAP_RC_RELEASE_POISON,
     TRAP_RC_RETAIN_POISON, TRAP_SCHED_STALL, TRAP_TASK_OVERFLOW, TRAP_UNCAUGHT_ERROR,
 };
 // Check-leaks codegen gate (plan 116 phase 5): the CLI flips this

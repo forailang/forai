@@ -505,7 +505,16 @@ pub const IMPORT_FREE_EVENT: u32 = 106;
 /// `env.process_available() -> i32` — 1 on native, 0 in browser stubs.
 /// Appended after the ledger imports to keep existing indices stable.
 pub const IMPORT_PROCESS_AVAILABLE: u32 = 107;
-pub const IMPORT_COUNT: u32 = 108;
+/// `env.file_read_str(path_ptr, path_len) -> i64` — file contents as a
+/// host-allocated NaN-boxed String, or VAL_NULL on failure. Replaces the
+/// guest-scratch-buffer `read_file` ABI, whose fixed 64 KiB buffer the
+/// host overflowed on larger files (silent heap corruption).
+pub const IMPORT_FILE_READ_STR: u32 = 108;
+/// `env.storage_get_str(key_ptr, key_len) -> i64` — stored value as a
+/// host-allocated NaN-boxed String, or VAL_NULL when absent. Replaces
+/// the guest-scratch-buffer `storage_get` ABI for the same reason.
+pub const IMPORT_STORAGE_GET_STR: u32 = 109;
+pub const IMPORT_COUNT: u32 = 110;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -533,6 +542,27 @@ pub const TRAP_UNCAUGHT_ERROR: i32 = 7;
 /// `b` = the task id that was about to be resumed. Plan 116 phase 2:
 /// converts a silent 100%-CPU hang into a reportable trap.
 pub const TRAP_SCHED_STALL: i32 = 8;
+/// Free-list integrity (FAI_RC_CHECK): a node about to be popped, or a
+/// block being freed, is misaligned or outside the heap (below the
+/// bucket region or at/above the bump pointer). Someone overwrote a
+/// freed block's link word, or freed a garbage pointer. `a` = the bad
+/// address, `b` = current heap_ptr.
+pub const TRAP_FREELIST_CORRUPT: i32 = 9;
+/// Free-list integrity (FAI_RC_CHECK): a block reached rt_alloc's pop
+/// with its poisoned tag word overwritten — something wrote through a
+/// stale pointer while the block sat on the free list. `a` = block
+/// base, `b` = the tag word found (expected OBJ_TAG_POISON).
+pub const TRAP_FREED_DIRTY: i32 = 10;
+/// Free-list integrity (FAI_RC_CHECK): rt_free was handed a block whose
+/// tag word is already poisoned — a double free. `a` = block base,
+/// `b` = block size.
+pub const TRAP_DOUBLE_FREE: i32 = 11;
+/// Index store out of bounds (FAI_RC_CHECK): `xs[i] = v` with `i`
+/// outside `0..count`. The unchecked store would land outside the
+/// element region (i = -1 overwrites the array's own tag/count header —
+/// the write-after-free signature TRAP_FREED_DIRTY catches downstream).
+/// `a` = the index (signed), `b` = the array count.
+pub const TRAP_INDEX_OOB: i32 = 12;
 
 // ── Check-leaks codegen gate (plan 116 phase 5) ───────────────────
 // When enabled, `rt_alloc`/`rt_free` call the `__fai_alloc_event` /
@@ -817,8 +847,8 @@ pub fn emit_all(
         emit_parse_float(base),                    // rt_parse_float
         emit_free(freelist_global, live_count_global, bucket_base, import_remap), // rt_free
         emit_copy_deep(base),                      // rt_copy_deep
-        emit_retain(base, import_remap),           // rt_retain
-        emit_release(base, import_remap),          // rt_release
+        emit_retain(base, bucket_base, import_remap), // rt_retain
+        emit_release(base, bucket_base, import_remap), // rt_release
         emit_live_objects(live_count_global),      // rt_live_objects
     ]
 }
@@ -1749,6 +1779,106 @@ fn emit_itoa() -> Function {
     f
 }
 
+/// FAI_HEAP_VERIFY: emit a loop scanning every free-bucket head for an
+/// implausible pointer (TRAP_FREELIST_CORRUPT) or an overwritten poison
+/// tag (TRAP_FREED_DIRTY). `idx_local`/`node_local` are caller-provided
+/// scratch i32 locals. Emitted into rt_alloc/rt_retain/rt_release under
+/// the env flag so a stale-pointer write is caught within a statement
+/// or two of the writer, with the writer's backtrace.
+fn emit_heads_scan(
+    f: &mut Function,
+    bucket_base: u32,
+    import_remap: &[Option<u32>],
+    idx_local: u32,
+    node_local: u32,
+) {
+    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::LocalSet(idx_local));
+    f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(idx_local));
+    f.instruction(&Instruction::I32Const(NUM_FREE_BUCKETS as i32));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::BrIf(1)); // idx >= buckets → done
+    // node = mem[bucket_base + idx*4]
+    f.instruction(&Instruction::I32Const(bucket_base as i32));
+    f.instruction(&Instruction::LocalGet(idx_local));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load(mem0()));
+    f.instruction(&Instruction::LocalSet(node_local));
+    f.instruction(&Instruction::LocalGet(node_local));
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    // corrupt = (node & 7) | node < heap_start | node >= heap_ptr
+    f.instruction(&Instruction::LocalGet(node_local));
+    f.instruction(&Instruction::I32Const(7));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::LocalGet(node_local));
+    f.instruction(&Instruction::I32Const(
+        (bucket_base + FREE_BUCKET_REGION_BYTES) as i32,
+    ));
+    f.instruction(&Instruction::I32LtU);
+    f.instruction(&Instruction::I32Or);
+    f.instruction(&Instruction::LocalGet(node_local));
+    f.instruction(&Instruction::GlobalGet(0));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::I32Or);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    emit_trap_report_unreachable(
+        f,
+        import_remap,
+        TRAP_FREELIST_CORRUPT,
+        |f| {
+            f.instruction(&Instruction::LocalGet(node_local));
+            f.instruction(&Instruction::I64ExtendI32U);
+        },
+        |f| {
+            f.instruction(&Instruction::GlobalGet(0));
+            f.instruction(&Instruction::I64ExtendI32U);
+        },
+    );
+    f.instruction(&Instruction::End);
+    // dirty = mem[node+8] != OBJ_TAG_POISON (frees poison under
+    // FAI_RC_CHECK — FAI_HEAP_VERIFY implies users set both).
+    // `b` packs (bucket_idx << 32 | tag_word) so the report can name
+    // the block's size class alongside the overwriting value.
+    f.instruction(&Instruction::LocalGet(node_local));
+    f.instruction(&Instruction::I32Load(off8));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    emit_trap_report_unreachable(
+        f,
+        import_remap,
+        TRAP_FREED_DIRTY,
+        |f| {
+            f.instruction(&Instruction::LocalGet(node_local));
+            f.instruction(&Instruction::I64ExtendI32U);
+        },
+        |f| {
+            f.instruction(&Instruction::LocalGet(idx_local));
+            f.instruction(&Instruction::I64ExtendI32U);
+            f.instruction(&Instruction::I64Const(32));
+            f.instruction(&Instruction::I64Shl);
+            f.instruction(&Instruction::LocalGet(node_local));
+            f.instruction(&Instruction::I32Load(off8));
+            f.instruction(&Instruction::I64ExtendI32U);
+            f.instruction(&Instruction::I64Or);
+        },
+    );
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End); // node != 0
+    f.instruction(&Instruction::LocalGet(idx_local));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(idx_local));
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End); // loop
+    f.instruction(&Instruction::End); // block
+}
+
 // ── $rt_alloc(size: i32) -> i32 ───────────────────────────────────
 // Bump allocate `size` bytes (aligned to 8). Returns address.
 
@@ -1759,10 +1889,72 @@ fn emit_alloc(
     import_remap: &[Option<u32>],
 ) -> Function {
     // locals: 1=addr, 2=new_ptr, 3=mem_bytes, 4=prev/bucket_addr, 5=cur/head,
-    // 6=orig_size, 7=bucket_idx (all i32)
+    // 6=orig_size, 7=bucket_idx, 8/9=verify scan idx/node (all i32)
     let check_leaks = check_leaks_enabled();
-    let mut f = Function::new([(7, ValType::I32)]);
+    let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
+    let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mut f = Function::new([(9, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
+    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    // Checked-mode free-list validation (plan 116): a node in local 5 is
+    // about to be reused. Trap with a named reason if its address is
+    // implausible (link word overwritten → TRAP_FREELIST_CORRUPT) or if
+    // its poisoned tag word was overwritten while it sat on the free
+    // list (write-after-free → TRAP_FREED_DIRTY). rt_free poisons every
+    // freed block's tag under FAI_RC_CHECK, so a clean node always
+    // reads OBJ_TAG_POISON here.
+    let validate_node = |f: &mut Function, bucket_base: u32| {
+        // corrupt = (node & 7) != 0  |  node < heap_start  |  node >= heap_ptr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(7));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(
+            (bucket_base + FREE_BUCKET_REGION_BYTES) as i32,
+        ));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_trap_report_unreachable(
+            f,
+            import_remap,
+            TRAP_FREELIST_CORRUPT,
+            |f| {
+                f.instruction(&Instruction::LocalGet(5));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::GlobalGet(0));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
+        f.instruction(&Instruction::End);
+        // dirty = mem[node+8] != OBJ_TAG_POISON
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Load(off8));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_trap_report_unreachable(
+            f,
+            import_remap,
+            TRAP_FREED_DIRTY,
+            |f| {
+                f.instruction(&Instruction::LocalGet(5));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(5));
+                f.instruction(&Instruction::I32Load(off8));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
+        f.instruction(&Instruction::End);
+    };
     // `--check-leaks` ledger event: __fai_alloc_event(base+8, logical_size)
     // right before each return path hands out the logical pointer.
     let alloc_event = |f: &mut Function, base_local: u32| {
@@ -1772,6 +1964,17 @@ fn emit_alloc(
         f.instruction(&Instruction::LocalGet(6));
         emit_import_call(f, IMPORT_ALLOC_EVENT, import_remap);
     };
+    // FAI_HEAP_VERIFY (plan 116): scan every free-bucket HEAD on every
+    // allocation and trap at the first implausible or dirtied node. This
+    // narrows "something wrote through a stale pointer while the block
+    // sat on the free list" from detection-at-reuse (whenever that bucket
+    // is next popped — possibly thousands of allocs later) down to the
+    // first allocation after the bad write, so the trap backtrace lands
+    // next to the writer. Heads-only keeps it O(NUM_FREE_BUCKETS) per
+    // alloc; a mid-chain dirty node surfaces once it becomes head.
+    if heap_verify {
+        emit_heads_scan(&mut f, bucket_base, import_remap, 8, 9);
+    }
     // Stash the LOGICAL size requested (before the rc-prefix inflation below) so
     // each return path can stamp it into the prefix's spare word at obj_addr-4.
     // RT_RELEASE reads it back to free the block at its true allocated size —
@@ -1837,6 +2040,9 @@ fn emit_alloc(
     // if head != 0: pop + return
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    if rc_check {
+        validate_node(&mut f, bucket_base);
+    }
     // mem[bucket_addr] = head.next
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::LocalGet(5));
@@ -1869,6 +2075,9 @@ fn emit_alloc(
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::I32Eqz);
     f.instruction(&Instruction::BrIf(1)); // cur == 0 → not found, break to bump
+    if rc_check {
+        validate_node(&mut f, bucket_base);
+    }
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::I32Load(mem0()));
     f.instruction(&Instruction::LocalGet(0));
@@ -2039,6 +2248,59 @@ fn emit_free(
     f.instruction(&Instruction::I32Const(!7));
     f.instruction(&Instruction::I32And);
     f.instruction(&Instruction::LocalSet(1));
+    // Checked-mode (plan 116): catch bad frees AT the free site, before
+    // they poison the free list. A misaligned/out-of-heap base is a
+    // garbage pointer (TRAP_FREELIST_CORRUPT); a base whose tag word is
+    // already OBJ_TAG_POISON was freed before (TRAP_DOUBLE_FREE).
+    if rc_check {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(7));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(
+            (bucket_base + FREE_BUCKET_REGION_BYTES) as i32,
+        ));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_FREELIST_CORRUPT,
+            |f| {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::GlobalGet(0));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_trap_report_unreachable(
+            &mut f,
+            import_remap,
+            TRAP_DOUBLE_FREE,
+            |f| {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+            |f| {
+                f.instruction(&Instruction::LocalGet(1));
+                f.instruction(&Instruction::I64ExtendI32U);
+            },
+        );
+        f.instruction(&Instruction::End);
+    }
     // Push onto the SIZE-BUCKETED free list (O(1)); blocks too large for the
     // bucketed range go on the single linear fallback list. Mirrors emit_alloc.
     // bucket_idx = block_size / 8
@@ -2620,11 +2882,15 @@ fn emit_concat_fn(base: u32) -> Function {
 // ── $rt_retain(v: i64) -> i64 — reference-count increment (plan 113) ──
 // Bump the count in the 8-byte prefix at obj_addr-8; no-op + passthrough for
 // primitives. Returns `v` so call sites can retain inline.
-fn emit_retain(base: u32, import_remap: &[Option<u32>]) -> Function {
-    // param 0: v (i64). local 1 = rc slot address (i32).
+fn emit_retain(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Function {
+    // param 0: v (i64). local 1 = rc slot address; 2/3 = scan scratch (i32).
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
-    let mut f = Function::new([(1, ValType::I32)]);
+    let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mut f = Function::new([(3, ValType::I32)]);
     let empty = wasm_encoder::BlockType::Empty;
+    if heap_verify {
+        emit_heads_scan(&mut f, bucket_base, import_remap, 2, 3);
+    }
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_IS_OBJ));
     f.instruction(&Instruction::If(empty));
@@ -2674,12 +2940,17 @@ fn emit_retain(base: u32, import_remap: &[Option<u32>]) -> Function {
 // counts drop too) and free the block via the per-tag child traversal. No-op on
 // primitives (the `is_obj` guard). The acyclic owned graph guarantees the
 // recursion terminates.
-fn emit_release(base: u32, import_remap: &[Option<u32>]) -> Function {
-    // param 0: v. locals: 1=addr, 2=tag, 3=count, 4=i, 5=size, 6=entry, 7=rc.
+fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Function {
+    // param 0: v. locals: 1=addr, 2=tag, 3=count, 4=i, 5=size, 6=entry, 7=rc,
+    // 8/9 = FAI_HEAP_VERIFY scan scratch.
     let rc_check = std::env::var_os("FAI_RC_CHECK").is_some();
-    let mut f = Function::new([(7, ValType::I32)]);
+    let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+    let mut f = Function::new([(9, ValType::I32)]);
     let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
     let empty = wasm_encoder::BlockType::Empty;
+    if heap_verify {
+        emit_heads_scan(&mut f, bucket_base, import_remap, 8, 9);
+    }
 
     // if !is_obj(v) { return }
     f.instruction(&Instruction::LocalGet(0));
@@ -3443,17 +3714,12 @@ fn emit_method_check(
 fn emit_set_field(base: u32) -> Function {
     // locals: 4=addr(i32), 5=count(i32), 6=i(i32), 7=entry_addr(i32),
     //         8=key_addr(i32), 9=key_len(i32), 10=entry_base(i32),
-    //         11=is_instance(i32)
-    let mut f = Function::new([
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-        (1, ValType::I32),
-    ]);
+    //         11=is_instance(i32), 12=cap(i32), 13=new_addr(i32),
+    //         14=gi(i32 grow-copy index), 15=src_entry(i32),
+    //         16=dst_entry(i32). Returns i64 (the dict pointer).
+    let mut f = Function::new([(13, ValType::I32)]);
+    let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
+    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
     f.instruction(&Instruction::LocalSet(4));
@@ -3473,6 +3739,7 @@ fn emit_set_field(base: u32) -> Function {
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::I32Eqz);
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(0)); // not a dict/instance → return v unchanged
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
     // is_instance = (tag == 7)
@@ -3552,11 +3819,8 @@ fn emit_set_field(base: u32) -> Function {
             f.instruction(&Instruction::Call(base + RT_RELEASE));
             f.instruction(&Instruction::LocalGet(7));
             f.instruction(&Instruction::LocalGet(3)); // val
-            f.instruction(&Instruction::I64Store(MemArg {
-                offset: 8,
-                align: 0,
-                memory_index: 0,
-            }));
+            f.instruction(&Instruction::I64Store(off8));
+            f.instruction(&Instruction::LocalGet(0)); // address unchanged → return v
             f.instruction(&Instruction::Return);
         }
         f.instruction(&Instruction::End);
@@ -3574,10 +3838,111 @@ fn emit_set_field(base: u32) -> Function {
     // fields since the checker rejects them at compile time).
     f.instruction(&Instruction::LocalGet(11));
     f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(0)); // instance: no append → return v
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
-    // Dict: append new entry at addr + 8 + count*16.
-    // First, allocate the key as a NaN-boxed string from (name_ptr, name_len).
+    // Dict append. The block was sized for `cap` entries
+    // (`cap = (logical_size - 8) / 16`, logical size in the rc-prefix
+    // word at addr-4). If it's full, grow: allocate a bigger block,
+    // shallow-copy the header + entries, and RETAIN each moved key/value
+    // so both blocks hold a ref. We do NOT free the old block here — the
+    // caller's `var` reassignment releases the old dict (which recursively
+    // releases its children, dropping them back to the count the new
+    // block now owns). That leaves the new block's children correctly
+    // owned; the only cost is the old header block leaking by one rc on
+    // a grow (sound and bounded — far better than the silent heap
+    // overflow this replaces).
+    // cap = (mem[addr-4] - 8) / 16
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::I32Load(mem0()));
+    f.instruction(&Instruction::I32Const(8));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::I32Const(16));
+    f.instruction(&Instruction::I32DivU);
+    f.instruction(&Instruction::LocalSet(12));
+    // if count >= cap: grow
+    f.instruction(&Instruction::LocalGet(5));
+    f.instruction(&Instruction::LocalGet(12));
+    f.instruction(&Instruction::I32GeU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // new_addr = alloc(8 + (cap*2)*16). cap is always >= 16 for dicts
+        // (literal floor), so cap*2 stays comfortably bounded.
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(32)); // 2 * 16
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(13));
+        // header: tag + count
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_DICT));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Store(off4));
+        // copy + retain each of `count` entries
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(14));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+            // src_entry = addr + 8 + gi*16; dst_entry = new_addr + 8 + gi*16
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(16));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(13));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(16));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(16));
+            // dst.key = src.key; retain it
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::I64Store(mem0()));
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Drop);
+            // dst.val = src.val; retain it
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::I64Load(off8));
+            f.instruction(&Instruction::I64Store(off8));
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::I64Load(off8));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Drop);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(14));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End); // loop
+        f.instruction(&Instruction::End); // block
+        // addr = new_addr (subsequent append + return use the grown block)
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::LocalSet(4));
+    }
+    f.instruction(&Instruction::End); // grow
+    // Append new entry at addr + 8 + count*16.
     f.instruction(&Instruction::LocalGet(4)); // addr
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Add);
@@ -3595,22 +3960,17 @@ fn emit_set_field(base: u32) -> Function {
                                                    // Write value
     f.instruction(&Instruction::LocalGet(7));
     f.instruction(&Instruction::LocalGet(3)); // val
-    f.instruction(&Instruction::I64Store(MemArg {
-        offset: 8,
-        align: 0,
-        memory_index: 0,
-    })); // store val at entry_addr+8
-         // Increment count
+    f.instruction(&Instruction::I64Store(off8)); // store val at entry_addr+8
+                                                 // Increment count
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::I32Const(1));
     f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Store(MemArg {
-        offset: 4,
-        align: 0,
-        memory_index: 0,
-    }));
-    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::I32Store(off4));
+    // Return the (possibly new) dict pointer, NaN-boxed.
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+    f.instruction(&Instruction::End); // function end
     f
 }
 
@@ -5077,14 +5437,75 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
                 f.instruction(&Instruction::I32Add);
                 f.instruction(&Instruction::LocalSet(13)); // addr_j1
 
-                // Compare: if arr[j] > arr[j+1] (as i32), swap
+                // Decide whether to swap (arr[j] should sort AFTER arr[j+1]).
+                // Strings compare lexically via RT_STR_CMP; everything else
+                // keeps the raw i32 compare (ints, and — as before — boxed
+                // pointers for mixed/other types). Without the string case,
+                // `array.sort` on strings ordered by allocation address, not
+                // content — which silently broke filename-ordered migration
+                // runners and any string sort. locals: 14/17 = a/b obj addr,
+                // 15/16 = a/b boxed value (i64 scratch, free in sort).
+                let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
                 f.instruction(&Instruction::LocalGet(12));
                 f.instruction(&Instruction::I64Load(mem0()));
-                f.instruction(&Instruction::I32WrapI64); // arr[j] as i32
+                f.instruction(&Instruction::LocalSet(15)); // a
                 f.instruction(&Instruction::LocalGet(13));
                 f.instruction(&Instruction::I64Load(mem0()));
-                f.instruction(&Instruction::I32WrapI64); // arr[j+1] as i32
-                f.instruction(&Instruction::I32GtS);
+                f.instruction(&Instruction::LocalSet(16)); // b
+                // both_str = is_str(a) && is_str(b)
+                f.instruction(&Instruction::LocalGet(15));
+                f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::LocalGet(15));
+                f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                f.instruction(&Instruction::I32Load(mem0()));
+                f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::LocalGet(16));
+                f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::LocalGet(16));
+                f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                f.instruction(&Instruction::I32Load(mem0()));
+                f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                {
+                    // RT_STR_CMP(a_ptr, a_len, b_ptr, b_len) > 0
+                    f.instruction(&Instruction::LocalGet(15));
+                    f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                    f.instruction(&Instruction::LocalTee(14)); // a_addr
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(14));
+                    f.instruction(&Instruction::I32Load(off4)); // a_len
+                    f.instruction(&Instruction::LocalGet(16));
+                    f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                    f.instruction(&Instruction::LocalTee(17)); // b_addr
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(17));
+                    f.instruction(&Instruction::I32Load(off4)); // b_len
+                    f.instruction(&Instruction::Call(base + RT_STR_CMP));
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::I32GtS);
+                }
+                f.instruction(&Instruction::Else);
+                {
+                    f.instruction(&Instruction::LocalGet(15));
+                    f.instruction(&Instruction::I32WrapI64);
+                    f.instruction(&Instruction::LocalGet(16));
+                    f.instruction(&Instruction::I32WrapI64);
+                    f.instruction(&Instruction::I32GtS);
+                }
+                f.instruction(&Instruction::End);
                 f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                 {
                     // Swap: temp = arr[j]; arr[j] = arr[j+1]; arr[j+1] = temp
@@ -7668,10 +8089,13 @@ pub fn type_signatures() -> Vec<(Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I64, ValType::I32, ValType::I32],
             vec![ValType::I64],
         ),
-        // RT_SET_FIELD: (i64, i32, i32, i64) -> void
+        // RT_SET_FIELD: (i64, i32, i32, i64) -> i64 — returns the dict
+        // pointer, which differs from the input only when an at-capacity
+        // dict had to be reallocated to fit a new key (callers must use
+        // the returned value).
         (
             vec![ValType::I64, ValType::I32, ValType::I32, ValType::I64],
-            vec![],
+            vec![ValType::I64],
         ),
         // RT_PRINT_VAL_NEW: (i64) -> void
         (vec![ValType::I64], vec![]),
@@ -8231,6 +8655,20 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         // target so the availability probe can report false in the
         // browser (the std.process run/session imports are stripped).
         ("process_available", vec![], vec![ValType::I32]),
+        // IMPORT_FILE_READ_STR: (path_ptr, path_len) -> i64 boxed String
+        // or VAL_NULL. Host-allocated; no guest scratch buffer to overflow.
+        (
+            "file_read_str",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_STORAGE_GET_STR: (key_ptr, key_len) -> i64 boxed String
+        // or VAL_NULL. Host-allocated; no guest scratch buffer to overflow.
+        (
+            "storage_get_str",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
     ]
 }
 

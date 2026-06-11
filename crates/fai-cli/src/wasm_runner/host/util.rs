@@ -25,6 +25,10 @@ thread_local! {
     /// runs the module to completion on this thread — the same trick
     /// `output::CaptureGuard` uses for stdout capture.
     static CURRENT_EXTERNS: RefCell<Vec<ExternInfo>> = RefCell::new(Vec::new());
+    /// The running module's allocator bucket region base (from the
+    /// `fai-dbg` heap metadata), for FAI_HEAP_VERIFY's host-side scan.
+    /// Zero = unknown → scan disabled.
+    static CURRENT_BUCKET_BASE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Per-run pointer tracker. Opaque integer handles are issued to
     /// the guest for every non-null pointer returned from C, so
     /// subsequent calls can re-materialise the pointer safely.
@@ -140,6 +144,54 @@ fn encode_return_for_guest(
     val.to_bits() as i64
 }
 
+/// FAI_HEAP_VERIFY: host-side mirror of the guest allocator's bucket
+/// scan. Reads every free-bucket head out of guest memory and reports
+/// the first implausible or non-poisoned node. Run before/after an FFI
+/// dispatch, a "clean before, dirty after" result convicts that extern
+/// call of writing guest memory it doesn't own.
+fn freelist_scan(caller: &mut Caller<'_, ()>, mem: &Memory) -> Option<String> {
+    const NUM_BUCKETS: usize = 1024;
+    const OBJ_TAG_POISON: i32 = 0x7E_DEAD;
+    let bucket_base = CURRENT_BUCKET_BASE.with(|b| b.get()) as usize;
+    if bucket_base == 0 {
+        return None; // module carries no fai-dbg heap metadata
+    }
+    let heap_ptr = caller
+        .get_export("__heap_ptr")
+        .and_then(|e| e.into_global())
+        .map(|g| g.get(&mut *caller).unwrap_i32() as u32)?;
+    let data = mem.data(&caller);
+    let read = |addr: usize| -> Option<i32> {
+        Some(i32::from_le_bytes(data.get(addr..addr + 4)?.try_into().ok()?))
+    };
+    for idx in 0..NUM_BUCKETS {
+        let node = read(bucket_base + idx * 4)? as u32;
+        if node == 0 {
+            continue;
+        }
+        if node % 8 != 0 || node < (bucket_base + NUM_BUCKETS * 4) as u32 || node >= heap_ptr {
+            return Some(format!(
+                "bucket[{}] head 0x{:x} out of range (heap_ptr 0x{:x})",
+                idx, node, heap_ptr
+            ));
+        }
+        let tag = read(node as usize + 8)?;
+        if tag != OBJ_TAG_POISON {
+            return Some(format!(
+                "bucket[{}] head 0x{:x} tag word 0x{:x} (expected poison)",
+                idx, node, tag
+            ));
+        }
+    }
+    None
+}
+
+/// Install the running module's bucket-region base for the host-side
+/// FAI_HEAP_VERIFY scan (from the `fai-dbg` heap metadata).
+pub(crate) fn set_bucket_base(base: u32) {
+    CURRENT_BUCKET_BASE.with(|b| b.set(base));
+}
+
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.call_ffi(ext_fn_idx: i32, arg_count: i32, args_ptr: i32) -> i64
     // Reads `arg_count` boxed Values from `args_ptr` in linear memory,
@@ -164,6 +216,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                     Some(m) => m,
                     None => return VAL_NULL,
+                };
+
+                let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
+                let dirty_before = if heap_verify {
+                    freelist_scan(&mut caller, &mem)
+                } else {
+                    None
                 };
                 let mut raw_args: Vec<i64> = Vec::with_capacity(arg_count as usize);
                 {
@@ -226,6 +285,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         )
                     }
                 });
+
+                if heap_verify && dirty_before.is_none() {
+                    if let Some(dirt) = freelist_scan(&mut caller, &mem) {
+                        eprintln!(
+                            "[heap-verify] guest free list dirtied DURING FFI call \
+                             {}::{} — {}",
+                            info.library, info.function, dirt
+                        );
+                    }
+                }
 
                 match result {
                     Ok(call_result) => {

@@ -3532,6 +3532,8 @@ const env = {{
     }}
   }},
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
+  storage_get_str(){{return 0x7FFD000000000000n}},
+  file_read_str(){{return 0x7FFD000000000000n}},
   storage_set(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
   storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}},
@@ -3683,6 +3685,8 @@ const env={{
   remote_call(a,b,c,d,e,f,g,h){{const u=readStr(a,b),fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);const body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});console.log('FAI remote_call request', {{url:u,fn:fn_name,args:ar,hash:ha}});try{{const x=new XMLHttpRequest();x.open('POST',u.replace(/\/+$/,'')+'/fai/rpc',false);x.setRequestHeader('Content-Type','application/json');x.send(body);const resp=JSON.parse(x.responseText);console.log('FAI remote_call response', {{fn:fn_name,ok:resp.ok,value:resp.value,error:resp.error}});if(resp.ok)return jsToWasm(resp.value);console.warn('FAI remote_call returned error', resp);return NULL_VAL}}catch(e){{console.error('FAI remote_call failed', e);return NULL_VAL}}}},
   float_to_str(v,p){{const s=(v===Math.floor(v)&&isFinite(v))?String(BigInt(v)):String(v);const b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p,b.length).set(b);return b.length}},
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
+  storage_get_str(kp,kl){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return NULL_VAL;return writeStrToWasm(v)}}catch(e){{return NULL_VAL}}}},
+  file_read_str(){{return NULL_VAL}},
   storage_set(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
   storage_clear(){{try{{window.localStorage.clear()}}catch(e){{}}}},
@@ -3970,6 +3974,8 @@ var env={{
   get_location_path:function(){{return writeStrToWasm(window.location.pathname)}},
   push_history_state:function(p,l){{history.pushState(null,'',readStr(p,l))}},
   storage_get:function(kp,kl,bp){{try{{var k=readStr(kp,kl);var v=window.localStorage.getItem(k);if(v===null)return -1;var b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
+  storage_get_str:function(kp,kl){{try{{var k=readStr(kp,kl);var v=window.localStorage.getItem(k);if(v===null)return NULL_VAL;return writeStrToWasm(v)}}catch(e){{return NULL_VAL}}}},
+  file_read_str:function(){{return NULL_VAL}},
   storage_set:function(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
   storage_remove:function(kp,kl){{try{{window.localStorage.removeItem(readStr(kp,kl))}}catch(e){{}}}},
   storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}},
@@ -4044,6 +4050,10 @@ var env={{
       case 6: msg='force-unwrap (`!`) of null'; break;
       case 7: msg='uncaught error: '+describeVal(a); break;
       case 8: msg='scheduler stall: poll resumed '+a+' tasks without quiescing (livelock; task t'+b+' was about to run again)'; break;
+      case 9: msg='rc-check: corrupt free-list node 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' (heap_ptr 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
+      case 10: msg='rc-check: freed block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' was written through a stale pointer while on the free list (tag word now 0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')'; break;
+      case 11: msg='rc-check: double free of block at 0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+' (block size '+b+')'; break;
+      case 12: msg='rc-check: index store out of bounds — xs['+a+'] = ... on an array of '+b+' elements'; break;
       default: msg='trap report (code '+code+', a=0x'+BigInt.asUintN(64,BigInt(a)).toString(16)+', b=0x'+BigInt.asUintN(64,BigInt(b)).toString(16)+')';
     }}
     window.__FAI_TRAP_MSG=msg;console.error('FAI trap:',msg);

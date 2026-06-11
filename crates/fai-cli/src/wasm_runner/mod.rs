@@ -177,6 +177,7 @@ pub fn run_wasm_with_externs_opts(
     // Debug side-table (plan 116): function index → name/file/line,
     // used to decorate trap backtraces. Empty for pre-116 binaries.
     let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
+    host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
     // Arm (or clear) the heap allocation ledger for this run. Always
     // reset: a previous `--check-leaks` run on this thread must not
     // bleed records into this one. The ledger gets its own handle on
@@ -432,6 +433,18 @@ pub fn run_wasm_tests_with_externs(
     mut on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
     let _extern_guard = ExternGuard::set(externs);
+    // Debug instrumentation for test runs is env-driven (the test
+    // pipeline has no per-run RunOptions): FAI_HEAP_VERIFY feeds the
+    // host-side free-list scan its bucket base; FAI_CHECK_LEAKS arms
+    // the allocation ledger so corruption traps can name victim blocks.
+    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some()
+        || std::env::var_os("FAI_CHECK_LEAKS").is_some();
+    if debug_env {
+        let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
+        host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
+        let leaks = std::env::var_os("FAI_CHECK_LEAKS").is_some();
+        leak_ledger::reset(leaks, None, leaks.then(|| dbg.clone()));
+    }
     let engine = shared_engine();
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
     let mut store = Store::new(engine, ());

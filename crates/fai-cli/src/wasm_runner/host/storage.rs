@@ -8,6 +8,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use wasmtime::*;
 
+use super::super::heap::wasm_alloc_str;
+use super::super::nan_box::VAL_NULL;
+
 thread_local! {
     static STORE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
@@ -34,6 +37,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 match value {
                     Some(v) => {
                         let bytes = v.as_bytes();
+                        // Legacy scratch-buffer ABI: refuse values beyond the
+                        // fixed 64 KiB caller buffer instead of overflowing
+                        // the guest heap (mirrors the browser JS host, which
+                        // always had this guard). New codegen uses
+                        // `storage_get_str` below.
+                        if bytes.len() > 65536 {
+                            return -1;
+                        }
                         let data = mem.data_mut(&mut caller);
                         let dst = buf_ptr as usize;
                         if dst + bytes.len() <= data.len() {
@@ -44,6 +55,32 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         }
                     }
                     None => -1,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.storage_get_str(key_ptr, key_len) -> i64 — NaN-boxed String value
+    // (host-allocated, any size), or VAL_NULL when the key is absent.
+    linker
+        .func_wrap(
+            "env",
+            "storage_get_str",
+            |mut caller: Caller<'_, ()>, key_ptr: i32, key_len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key = {
+                    let data = mem.data(&caller);
+                    let end = (key_ptr + key_len) as usize;
+                    if end > data.len() {
+                        return VAL_NULL;
+                    }
+                    std::str::from_utf8(&data[key_ptr as usize..end])
+                        .unwrap_or("")
+                        .to_string()
+                };
+                match STORE.with(|s| s.borrow().get(&key).cloned()) {
+                    Some(v) => wasm_alloc_str(&mut caller, &mem, &v),
+                    None => VAL_NULL,
                 }
             },
         )

@@ -356,6 +356,23 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         )))
                         .build()
                         .new_agent();
+                    // Legacy fixed-buffer ABI: callers hand a 64 KiB scratch
+                    // buffer; cap the copy so an oversized response fails
+                    // cleanly instead of scribbling the guest heap (or
+                    // panicking past memory end).
+                    let mut write_capped = |caller: &mut Caller<'_, ()>, text: &str| -> i32 {
+                        let bytes = text.as_bytes();
+                        if bytes.len() > 65536 {
+                            return -1;
+                        }
+                        let dest = result_buf_ptr as usize;
+                        let data = mem.data_mut(&mut *caller);
+                        if dest + bytes.len() > data.len() {
+                            return -1;
+                        }
+                        data[dest..dest + bytes.len()].copy_from_slice(bytes);
+                        bytes.len() as i32
+                    };
                     match agent
                         .post(&url)
                         .header("Content-Type", "application/json")
@@ -363,19 +380,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     {
                         Ok(resp) => {
                             let resp_body = resp.into_body().read_to_string().unwrap_or_default();
-                            let bytes = resp_body.as_bytes();
-                            let dest = result_buf_ptr as usize;
-                            mem.data_mut(&mut caller)[dest..dest + bytes.len()]
-                                .copy_from_slice(bytes);
-                            bytes.len() as i32
+                            write_capped(&mut caller, &resp_body)
                         }
                         Err(e) => {
                             let err = format!("{{\"ok\":false,\"error\":\"{}\"}}", e);
-                            let bytes = err.as_bytes();
-                            let dest = result_buf_ptr as usize;
-                            mem.data_mut(&mut caller)[dest..dest + bytes.len()]
-                                .copy_from_slice(bytes);
-                            bytes.len() as i32
+                            write_capped(&mut caller, &err)
                         }
                     }
                 }
