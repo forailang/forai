@@ -39,6 +39,18 @@ pub enum Statement {
     Return(ReturnStatement),
     Expression(ExpressionStatement),
     FunctionTypeDef(FunctionTypeDefDeclaration),
+    /// A standalone comment block sitting in statement position inside a
+    /// block body (not a declaration's doc comment). Carried through the
+    /// AST purely so `fai fmt` can round-trip in-body comments; the
+    /// checker and codegen treat it as a no-op.
+    Comment(CommentStatement),
+}
+
+#[derive(Debug)]
+pub struct CommentStatement {
+    /// Comment lines with the leading `# ` already stripped by the lexer.
+    pub lines: Vec<String>,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug)]

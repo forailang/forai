@@ -90,7 +90,7 @@ fn format_program(program: &Program) -> String {
             program
                 .leading_comments
                 .iter()
-                .map(|c| format!("# {}", c))
+                .map(|c| comment_line("", c))
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -269,14 +269,14 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             let mut lines = Vec::new();
             if let Some(doc) = &ftd.doc_comment {
                 for line in doc.lines() {
-                    lines.push(format!("{}# {}", indent, line));
+                    lines.push(comment_line(indent, line));
                 }
             }
             lines.push(format!("{}type def {}", indent, ftd.name));
             for p in &ftd.params {
                 if let Some(doc) = &p.doc_comment {
                     for line in doc.lines() {
-                        lines.push(format!("{}# {}", inner, line));
+                        lines.push(comment_line(&inner, line));
                     }
                 }
                 let mutable_text = if p.is_mutable { ", mutable" } else { "" };
@@ -303,6 +303,12 @@ fn format_statement(stmt: &Statement, indent: &str) -> String {
             lines.push(format!("{}end", indent));
             lines.join("\n")
         }
+        Statement::Comment(c) => c
+            .lines
+            .iter()
+            .map(|line| comment_line(indent, line))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -365,7 +371,7 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
     // Doc comment
     if let Some(doc) = &f.doc_comment {
         for line in doc.lines() {
-            lines.push(format!("{}# {}", indent, line));
+            lines.push(comment_line(indent, line));
         }
     }
 
@@ -377,7 +383,7 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
     for tp in &f.type_params {
         if let Some(doc) = &tp.doc_comment {
             for line in doc.lines() {
-                lines.push(format!("{}# {}", inner, line));
+                lines.push(comment_line(&inner, line));
             }
         }
         lines.push(format!("{}@type {}", inner, tp.name));
@@ -387,7 +393,7 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
     for p in &f.params {
         if let Some(doc) = &p.doc_comment {
             for line in doc.lines() {
-                lines.push(format!("{}# {}", inner, line));
+                lines.push(comment_line(&inner, line));
             }
         }
         let mutable_text = if p.is_mutable { ", mutable" } else { "" };
@@ -409,7 +415,7 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
     for r in &f.return_types {
         if let Some(doc) = &r.doc_comment {
             for line in doc.lines() {
-                lines.push(format!("{}# {}", inner, line));
+                lines.push(comment_line(&inner, line));
             }
         }
         let name_text = match &r.name {
@@ -559,6 +565,16 @@ fn format_try_stmt(t: &TryStatement, indent: &str) -> String {
 
 /// One indentation level. Canonical fai style is 4 spaces.
 const INDENT_STEP: &str = "    ";
+
+/// Render one comment line, omitting the trailing space for an empty
+/// comment so `#` round-trips as `#` rather than `# `.
+fn comment_line(indent: &str, line: &str) -> String {
+    if line.is_empty() {
+        format!("{}#", indent)
+    } else {
+        format!("{}# {}", indent, line)
+    }
+}
 
 fn format_block(statements: &[Statement], indent: &str) -> String {
     let next_indent = format!("{}{}", indent, INDENT_STEP);
@@ -1098,6 +1114,51 @@ mod tests {
             body,
             formatted
         );
+    }
+
+    #[test]
+    fn preserves_in_body_comments() {
+        let src = "# F.\ndef f\n    @return Int\ndo\n    let x = 1\n    # in-body comment survives\n    let y = 2\n    x + y\nend\n";
+        let out = rt(src);
+        assert!(
+            out.contains("# in-body comment survives"),
+            "in-body comment dropped:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn preserves_comments_inside_it_blocks() {
+        let src =
+            "test t\n    it 'works'\n        # comment in it-block survives\n        assert.isTrue(true)\n    end\nend\n";
+        let out = rt(src);
+        assert!(
+            out.contains("# comment in it-block survives"),
+            "it-block comment dropped:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn empty_comment_line_has_no_trailing_space() {
+        // A bare `#` doc line must round-trip as `#`, not `# ` (which would
+        // make fmt non-idempotent).
+        let src = "# Line one.\n#\n# Line two.\ndef f\n    @return Int\ndo\n    1\nend\n";
+        let out = rt(src);
+        assert!(out.contains("\n#\n"), "bare # line not preserved:\n{}", out);
+        assert!(
+            !out.contains("# \n"),
+            "fmt left a trailing space on an empty comment:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn in_body_comment_is_idempotent() {
+        let src = "# F.\ndef f\n    @return Int\ndo\n    # leading\n    let x = 1\n    x\nend\n";
+        let once = rt(src);
+        let twice = rt(&once);
+        assert_eq!(once, twice, "fmt not idempotent on in-body comments");
     }
 
     #[test]

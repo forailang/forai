@@ -1406,10 +1406,42 @@ impl Parser {
         let mut stmts = Vec::new();
         self.skip_newlines();
         while !self.is_at_end() && !stop.contains(&self.peek().token_type) {
+            // `skip_newlines` accumulates comments into `pending_doc`. If
+            // the upcoming statement is a declaration it will claim them as
+            // its doc comment; otherwise they are an in-body comment that
+            // would otherwise be dropped, so emit them as a standalone
+            // Comment statement to survive a fmt round-trip.
+            if !self.pending_doc.is_empty() && !self.next_is_doc_target() {
+                stmts.push(self.take_pending_comment_statement());
+            }
             stmts.push(self.parse_statement()?);
             self.skip_newlines();
         }
+        // Comments sitting just before the block's closing token belong to
+        // this block; flush them so they are not lost.
+        if !self.pending_doc.is_empty() {
+            stmts.push(self.take_pending_comment_statement());
+        }
         Ok(stmts)
+    }
+
+    /// True when the next token starts a declaration that consumes the
+    /// pending comments as its doc comment (so they must NOT be flushed as
+    /// a standalone Comment statement).
+    fn next_is_doc_target(&self) -> bool {
+        matches!(
+            self.peek().token_type,
+            TokenType::Def | TokenType::Remote | TokenType::Type | TokenType::Enum
+        )
+    }
+
+    /// Drain the accumulated pending comments into a Comment statement.
+    fn take_pending_comment_statement(&mut self) -> Statement {
+        let lines = std::mem::take(&mut self.pending_doc);
+        Statement::Comment(CommentStatement {
+            lines,
+            location: self.peek_location(),
+        })
     }
 
     fn parse_type_node(&mut self) -> Result<TypeNode, String> {
