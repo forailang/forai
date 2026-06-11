@@ -1,0 +1,19 @@
+# expect: ok
+# stdout: ok
+# leak: expected phase6
+#
+# events.on retains the handler closure host-side; events.off removes
+# the subscription WITHOUT releasing it (host/events.rs unregister) —
+# the closure and its captures stay live forever.
+
+use std.events
+
+def main
+    @return Void
+do
+    let sub = events.on('ping') do with e Event
+        print('never')
+    end
+    events.off(sub)
+    print('ok')
+end

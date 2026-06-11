@@ -1,0 +1,32 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+#
+# The run-path gate can't observe spy host state: mock/mockReset only
+# execute in the test step, whose instance is separate from the
+# leak-gated run. Host-side mock-value retention asymmetry
+# (host/spy.rs, plan 117 phase 6) is exercised through
+# `fai test --check-leaks` in the project-level lane instead.
+# Greets.
+def greet
+    @return String
+do
+    'real'
+end
+
+test greet
+    it 'mocks and resets'
+        mock(greet, 'mocked')
+        assert.equal(greet(), 'mocked')
+        mockReset(greet)
+        assert.equal(greet(), 'real')
+    end
+end
+
+def main
+    @return Void
+do
+    if greet() == 'real'
+        print('ok')
+    end
+end

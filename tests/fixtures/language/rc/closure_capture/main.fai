@@ -1,0 +1,45 @@
+# expect: ok
+# stdout: ok
+# leak: expected async-runtime-root
+#
+# The closure machinery itself balances — what stays live is the async
+# scheduler's 224 KB startup buffer (sched_start_async): any program
+# with a typedef'd callback compiles through the async engine, whose
+# runtime state is root-set at exit, not an unbalanced credit. Flip
+# this only when exit teardown (or sync-path compilation of pure-sync
+# callbacks) lands.
+
+type def Transform
+    @param n Int
+    @return Int
+end
+
+# Applies a transform to a value.
+def apply
+    @param cb Transform
+    @param value Int
+    @return Int
+do
+    cb(value)
+end
+
+test apply
+    it 'applies'
+        let r = apply(do with n Int
+            n + 1
+        end, 1)
+        assert.equal(r, 2)
+    end
+end
+
+def main
+    @return Void
+do
+    let base = 10
+    let r = apply(do with n Int
+        n + base
+    end, 5)
+    if r == 15
+        print('ok')
+    end
+end

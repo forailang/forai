@@ -1,0 +1,21 @@
+# expect: ok
+# stdout:
+#   fired
+#   ok
+# leak: expected phase6
+#
+# A `once` subscriber is dropped from the registry after it fires,
+# without releasing the retained handler closure
+# (host/events.rs snapshot_and_drop_once).
+
+use std.events
+
+def main
+    @return Void
+do
+    events.once('ping') do with e Event
+        print('fired')
+    end
+    events.emit('ping', 'x')
+    print('ok')
+end

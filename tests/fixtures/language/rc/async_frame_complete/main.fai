@@ -1,0 +1,31 @@
+# expect: ok
+# stdout: ok
+# leak: expected async-runtime-root
+#
+# Spawned task frames are released on completion (plan 115) — what
+# stays live is the async scheduler's startup buffer, runtime root-set
+# at exit. Flip only when exit teardown lands. If this fixture's count
+# ever grows beyond the scheduler buffer, frames regressed.
+# Async work that suspends and returns.
+def fetch
+    @return Int
+do
+    sleep(1)
+    10
+end
+
+test fetch
+    it 'returns'
+        fetch()
+    end
+end
+
+def main
+    @return Void
+do
+    nowait fetch()
+    let direct = fetch()
+    if direct == 10
+        print('ok')
+    end
+end

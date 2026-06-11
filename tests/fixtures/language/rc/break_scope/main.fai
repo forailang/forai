@@ -1,0 +1,16 @@
+# expect: ok
+# stdout: done
+# leak: expected phase5
+def main
+    @return Void
+do
+    var n = 0
+    while n < 10
+        let xs = [1 2 3]
+        n = n + 1
+        if n > 2
+            break
+        end
+    end
+    print('done')
+end

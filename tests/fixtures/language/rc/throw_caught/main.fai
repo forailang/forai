@@ -1,0 +1,16 @@
+# expect: ok
+# stdout: boom
+# leak: expected phase5
+
+use std.error
+
+def main
+    @return Void
+do
+    try
+        let xs = [1 2 3]
+        throw Error('boom')
+    catch e
+        print(e.message)
+    end
+end

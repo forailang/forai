@@ -1,0 +1,21 @@
+# expect: ok
+# stdout: done
+# leak: expected phase5
+
+use std.error
+
+def main
+    @return Void
+do
+    var n = 0
+    while n < 3
+        n = n + 1
+        try
+            let xs = [1 2 3]
+            throw Error('x')
+        catch e
+            let m = e.message
+        end
+    end
+    print('done')
+end

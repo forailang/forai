@@ -1,0 +1,21 @@
+# expect: ok
+# stdout: ok
+# leak: expected phase6
+#
+# clearAll drops every Subscription without releasing the retained
+# handler closures (host/events.rs clear_all).
+
+use std.events
+
+def main
+    @return Void
+do
+    events.on('a') do with e Event
+        print('never-a')
+    end
+    events.on('b') do with e Event
+        print('never-b')
+    end
+    events.clearAll()
+    print('ok')
+end

@@ -1,0 +1,13 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+def main
+    @return Void
+do
+    var xs Int[] = [1]
+    xs = [2 3]
+    xs = [4]
+    if xs[0] == 4
+        print('ok')
+    end
+end

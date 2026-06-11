@@ -1,0 +1,26 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+# Builds a fresh array.
+def makeArr
+    @return Int[]
+do
+    [1 2 3]
+end
+
+test makeArr
+    it 'builds'
+        makeArr()
+    end
+end
+
+def main
+    @return Void
+do
+    makeArr()
+    makeArr()
+    let kept = makeArr()
+    if kept[0] == 1
+        print('ok')
+    end
+end

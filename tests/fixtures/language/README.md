@@ -109,6 +109,35 @@ always-exported `__live_objects` counter via `window.__fai_live_objects()`
 with the same two-sided semantics. Categories that cannot run in the browser
 simply never carry `browser:`.
 
+### Leak baseline suite (`rc/`, `rc_browser/`)
+
+The plan-118 baseline: every plan-117 feature category pinned with a
+`leak:` directive. This table is the authoritative category map. Guest-pure
+categories compile identically for both wasm targets and are validated
+natively; the browser-specific leak surface (JS host imports) is covered by
+`rc_browser/`. The brain request loop (category 14) lives in the brain
+project's test lane, not here.
+
+| # | Category | Fixtures | State |
+|---|----------|----------|-------|
+| 1 | binding + discard | `rc/binding_discard`, `rc/binding_scope_exit`, `rc/print_int_scratch` | flat; print(Int) scratch → expected phase4 |
+| 2 | assignment/overwrite | `rc/assign_overwrite` | flat |
+| 3 | destructuring | `rc/destructure_tuple` | tuple leaks → expected phase4 |
+| 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort` | append flat; map/filter boxed arg temps → phase4; fresh receiver → phase6 |
+| 5 | dict/field stores | `rc/dict_field_store` | flat |
+| 6 | std host imports | `rc/std_json_roundtrip` | flat |
+| 7 | FFI externs | `rc/ffi_libc_abs` | flat (primitive returns) |
+| 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | handler closures retained, never released → expected phase6 |
+| 9 | async frames | `rc/async_frame_complete` | frames released; scheduler buffer → expected async-runtime-root |
+| 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | skipped scope drops → expected phase5; fallthrough flat |
+| 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try` | skipped drops on throw/break → expected phase5 |
+| 12 | closures | `rc/closure_capture` | balances; typedef callbacks pull async scheduler → expected async-runtime-root |
+| 13 | spy/mock | `rc/spy_mock_reset` | run-path flat; host retention is the `fai test --check-leaks` lane's oracle (phase 6 audit) |
+| 14 | brain request loop | brain project inline suite | see plans/118 U8 |
+
+Browser-host leak surface: `rc_browser/flat_baseline` (flat),
+`rc_browser/sethtml_literal_arg` (literal arg temp → expected phase4).
+
 ## Gates
 
 For `expect: ok` fixtures:

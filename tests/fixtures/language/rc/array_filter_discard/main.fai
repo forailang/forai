@@ -1,0 +1,22 @@
+# expect: ok
+# stdout: ok
+# leak: expected phase4
+#
+# The discarded filter RESULT is released correctly — what leaks are
+# the call's owned BOXED ARG TEMPS: the input array literal and the
+# callback closure (plan 117 phase 4).
+
+use std.array
+
+def main
+    @return Void
+do
+    array.filter([
+        1
+        2
+        3
+    ]) do with n Int
+        n > 1
+    end
+    print('ok')
+end

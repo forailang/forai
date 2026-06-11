@@ -1,0 +1,13 @@
+# expect: ok
+# stdout: done
+# leak: flat
+def main
+    @return Void
+do
+    var n = 0
+    while n < 4
+        let xs = [1 2 3]
+        n = n + xs[2] - 2
+    end
+    print('done')
+end

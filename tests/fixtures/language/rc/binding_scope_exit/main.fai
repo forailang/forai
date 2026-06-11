@@ -1,0 +1,16 @@
+# expect: ok
+# stdout:
+#   in
+#   done
+# leak: flat
+def main
+    @return Void
+do
+    if true
+        let xs = [1 2 3]
+        if xs[0] == 1
+            print('in')
+        end
+    end
+    print('done')
+end

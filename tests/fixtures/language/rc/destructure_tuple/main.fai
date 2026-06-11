@@ -1,0 +1,30 @@
+# expect: ok
+# stdout: ok
+# leak: expected phase4
+# Returns its arguments swapped.
+def swap
+    @param a Int
+    @param b Int
+    @return first Int
+    @return second Int
+do
+    b, a
+end
+
+test swap
+    it 'swaps'
+        let x, y = swap(1, 2)
+        assert.equal(x, 2)
+    end
+end
+
+def main
+    @return Void
+do
+    let x, y = swap(2, 1)
+    if x == 1
+        if y == 2
+            print('ok')
+        end
+    end
+end

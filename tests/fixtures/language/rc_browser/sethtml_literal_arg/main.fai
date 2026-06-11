@@ -1,0 +1,18 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: Hi
+# leak: expected phase4
+#
+# Passing a string LITERAL to a browser host import strands the owned
+# arg temp (the literal allocates fresh, the host copies the bytes,
+# nothing releases the guest string) — the plan-117 phase-4 arg-temp
+# class. A let-bound argument is flat (see flat_baseline).
+
+use std.browser
+
+def main
+    @return Void
+do
+    browser.setHtml('<main><h1 class="message">Hi</h1></main>')
+end

@@ -1,0 +1,10 @@
+# expect: ok
+# stdout: v2
+# leak: flat
+def main
+    @return Void
+do
+    let d = set({}, 'k', 'v1')
+    set(d, 'k', 'v2')
+    print(getString(d, 'k'))
+end

@@ -1,0 +1,18 @@
+# expect: ok
+# stdout: ok
+# leak: expected phase6
+
+use std.array
+
+def main
+    @return Void
+do
+    let sorted = array.sort([
+        3
+        1
+        2
+    ])
+    if sorted[0] == 1
+        print('ok')
+    end
+end

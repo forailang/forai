@@ -1,0 +1,12 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+def main
+    @return Void
+do
+    let xs = [1 2 3]
+    let more = append(xs, 8)
+    if more[3] == 8
+        print('ok')
+    end
+end

@@ -1,0 +1,15 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: Hello
+# leak: flat
+
+use std.browser
+
+def main
+    @return Void
+do
+    let xs = [1 2 3]
+    let html = '<main><h1 class="message">Hello</h1></main>'
+    browser.setHtml(html)
+end

@@ -1,0 +1,8 @@
+# expect: ok
+# stdout: 7
+# leak: expected phase4
+def main
+    @return Void
+do
+    print(7)
+end
