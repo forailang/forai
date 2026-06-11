@@ -323,10 +323,14 @@ fn report_check_leaks(
 /// Leak oracle (plan 113). When `FAI_LEAK_CHECK` is set, read the
 /// `__live_objects` counter the runtime maintains (++ in rt_alloc, -- in
 /// rt_free) after the program finishes and report how many heap objects are
-/// still live. Once reference counting is emitted at every reference site (P3),
-/// a no-leak program returns to its root set (0 for a no-global program), so
-/// this becomes a hard pass/fail oracle; for now it is observational, since
-/// nothing releases yet.
+/// still live.
+///
+/// DEPRECATED (plan 118 U1): superseded by `--check-leaks` and the
+/// ledger's stable sentinel (`leak_ledger::sentinel_line`), which carry
+/// attribution this counter can't. Kept because it needs no rebuild
+/// flag; its `[leak-check]` prefix intentionally differs from the
+/// `[check-leaks]` sentinel so parsers can't confuse the two. Do not
+/// add new consumers.
 fn report_leak_check(instance: &wasmtime::Instance, store: &mut wasmtime::Store<()>) {
     if std::env::var_os("FAI_LEAK_CHECK").is_none() {
         return;

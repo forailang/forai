@@ -18,7 +18,7 @@
 //! `FAI_RC_CHECK`, which only sees rc-prefixed objects.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -179,6 +179,102 @@ pub(crate) fn record_free(addr: u32, size: u32) {
     });
 }
 
+/// A point-in-time view of the ledger for per-test delta assertions
+/// (plan 117 phase 2, `fai test --check-leaks`). Cheap to take: the
+/// live address set plus counters, no record clones.
+#[derive(Clone, Default)]
+pub(crate) struct LedgerSnapshot {
+    addrs: HashSet<u32>,
+    live_bytes: u64,
+}
+
+/// What changed since a [`LedgerSnapshot`]. `new_count`/`new_bytes`
+/// are the leak signal: entries live now that were not live at the
+/// snapshot. `freed_count` is the negative direction — entries live at
+/// the snapshot that have since been freed (e.g. a host-built object
+/// released by the guest); informational, never a leak, and the reason
+/// per-test deltas must come from the ledger rather than the bare
+/// `__live_objects` counter (which host allocs never increment, so it
+/// can go negative across a case).
+pub(crate) struct LedgerDelta {
+    pub new_count: usize,
+    pub new_bytes: u64,
+    pub freed_count: usize,
+    /// Grouped Tier-1/Tier-2a report of the NEW entries (same shape as
+    /// the exit report's group lines). Empty string when no new entries.
+    pub report: String,
+}
+
+/// Take a snapshot of the current live set. `None` when the ledger is
+/// disarmed (snapshotting a disarmed ledger would silently assert
+/// against an empty set — better the caller knows).
+pub(crate) fn snapshot() -> Option<LedgerSnapshot> {
+    LEDGER.with(|l| {
+        let led = l.borrow();
+        if !led.enabled {
+            return None;
+        }
+        Some(LedgerSnapshot {
+            addrs: led.map.keys().copied().collect(),
+            live_bytes: led.live_bytes,
+        })
+    })
+}
+
+/// Compute the delta since `snap`. `data` is the guest memory (for
+/// object tags in the report; pass `&[]` when unavailable). Site
+/// attribution uses the debug table armed at [`reset`]. `None` when
+/// the ledger is disarmed.
+pub(crate) fn delta_since(snap: &LedgerSnapshot, data: &[u8]) -> Option<LedgerDelta> {
+    LEDGER.with(|l| {
+        let led = l.borrow();
+        if !led.enabled {
+            return None;
+        }
+        let mut new_map: HashMap<u32, AllocRecord> = HashMap::new();
+        for (addr, rec) in &led.map {
+            if !snap.addrs.contains(addr) {
+                new_map.insert(*addr, rec.clone());
+            }
+        }
+        let freed_count = snap
+            .addrs
+            .iter()
+            .filter(|a| !led.map.contains_key(a))
+            .count();
+        let new_bytes: u64 = new_map.values().map(|r| r.size as u64).sum();
+        let dbg_owned;
+        let dbg: &DbgTable = match &led.dbg {
+            Some(d) => d,
+            None => {
+                dbg_owned = DbgTable::default();
+                &dbg_owned
+            }
+        };
+        let report = if new_map.is_empty() {
+            String::new()
+        } else {
+            render_groups(&new_map, data, dbg, MAX_REPORT_GROUPS)
+        };
+        Some(LedgerDelta {
+            new_count: new_map.len(),
+            new_bytes,
+            freed_count,
+            report,
+        })
+    })
+}
+
+/// STABLE CONTRACT (plan 117 phase 2 / plan 118): this exact line shape
+/// is parsed by the fixture harness's `leak:` directive gate (from
+/// `fai run --check-leaks` stderr) and by CI tooling. Suffixes — the
+/// `__live_objects` self-check parenthetical and the group lines — come
+/// AFTER this prefix; parsers must tolerate them. Do not reword without
+/// updating fai-feature-tests' parser and plans/118.
+pub(crate) fn sentinel_line(objects: usize, bytes: u64) -> String {
+    format!("[check-leaks] live heap: {} objects, {} bytes", objects, bytes)
+}
+
 /// Name the block at `addr` (a logical object pointer) for trap
 /// reports: its live/freed state, size, and allocation site chain.
 /// Lets a free-list corruption trap say WHAT got scribbled, which
@@ -313,11 +409,7 @@ pub(crate) fn render_report(
         None => &[],
     };
 
-    let mut out = format!(
-        "[check-leaks] live heap: {} objects, {} bytes",
-        map.len(),
-        live_bytes,
-    );
+    let mut out = sentinel_line(map.len(), live_bytes);
     // Self-check: the ledger and the runtime's scalar counter must
     // describe the same heap. `__live_objects` only counts guest
     // (`rt_alloc`) allocations but is decremented by every `rt_free`,
@@ -479,5 +571,71 @@ mod tests {
             assert!(led.map.is_empty());
             assert_eq!(led.unknown_frees, 0);
         });
+    }
+
+    #[test]
+    fn snapshot_delta_reports_new_entries() {
+        reset(true, None, None);
+        record_alloc(0x100, 56, false, vec![]);
+        let snap = snapshot().expect("armed ledger snapshots");
+        record_alloc(0x200, 24, false, vec![]);
+        let delta = delta_since(&snap, &[]).expect("armed ledger deltas");
+        assert_eq!(delta.new_count, 1);
+        assert_eq!(delta.new_bytes, 24);
+        assert_eq!(delta.freed_count, 0);
+        assert!(delta.report.contains("24B"), "report: {}", delta.report);
+        reset(false, None, None);
+    }
+
+    #[test]
+    fn snapshot_delta_clean_when_balanced() {
+        reset(true, None, None);
+        let snap = snapshot().unwrap();
+        record_alloc(0x100, 56, false, vec![]);
+        record_free(0x100, 56);
+        let delta = delta_since(&snap, &[]).unwrap();
+        assert_eq!(delta.new_count, 0);
+        assert_eq!(delta.new_bytes, 0);
+        assert_eq!(delta.freed_count, 0);
+        assert!(delta.report.is_empty());
+        reset(false, None, None);
+    }
+
+    #[test]
+    fn snapshot_delta_counts_host_release_as_freed_not_leak() {
+        // A host-built object (reserve) released by the guest during the
+        // window: __live_objects would go NEGATIVE for this case; the
+        // ledger delta reports it as freed_count, new_count stays 0.
+        reset(true, None, None);
+        record_alloc(0x300, 40, true, vec![]);
+        let snap = snapshot().unwrap();
+        record_free(0x300, 40);
+        let delta = delta_since(&snap, &[]).unwrap();
+        assert_eq!(delta.new_count, 0);
+        assert_eq!(delta.freed_count, 1);
+        reset(false, None, None);
+    }
+
+    #[test]
+    fn snapshot_disarmed_returns_none() {
+        reset(false, None, None);
+        assert!(snapshot().is_none());
+        assert!(delta_since(&LedgerSnapshot::default(), &[]).is_none());
+    }
+
+    #[test]
+    fn sentinel_format_is_pinned() {
+        // STABLE CONTRACT: the fixture harness parses this exact shape
+        // from `fai run --check-leaks` stderr (plan 118 U1/U3). If this
+        // test fails, you changed the sentinel — update the harness
+        // parser and plans/118 together with it, or revert.
+        assert_eq!(
+            sentinel_line(3, 99),
+            "[check-leaks] live heap: 3 objects, 99 bytes"
+        );
+        assert_eq!(
+            sentinel_line(0, 0),
+            "[check-leaks] live heap: 0 objects, 0 bytes"
+        );
     }
 }
