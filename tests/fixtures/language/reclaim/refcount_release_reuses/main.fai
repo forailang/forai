@@ -5,7 +5,7 @@
 # to the allocator's free list, so the next same-size allocation reuses it
 # instead of bumping the heap. __heapPtr (the bump high-water) is therefore
 # unchanged across the release + re-alloc. Validates free-at-zero end to end.
-# 
+#
 # The released value is an UNBOUND temporary, not a `var`: a tracked binding is
 # also auto-released at scope exit (RC, plan 113), so manually `__release`-ing it
 # would double-free. Releasing a fresh temp frees it exactly once, keeping this

@@ -2,13 +2,13 @@
 # stdout:
 #   18
 # Two regressions exercised together (both surfaced dogfooding `brain`):
-# 
+#
 # 1. A *direct* call to a scheduler function (`makeStore`, which forks via
 #    `nowait`) forces the caller (`component`) to be async. Scheduler fns are
 #    compiled as resume fns (`()->()`), so they can only be invoked through the
 #    spawn/await convention — a sync caller would emit a direct `call` to a
 #    resume fn and produce invalid wasm.
-# 
+#
 # 2. A top-level `var base Int = …` in an async segment, captured by a closure,
 #    is a cell. The segment-statement lowering must store the initial value
 #    *through* the cell address, not `LocalSet` it over the address.

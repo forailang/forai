@@ -7,7 +7,7 @@
 # prefix word at obj_addr-4 and `rt_release` frees by it, so a released dict's
 # block is reused exactly by the next same-shape dict — `__heapPtr` (the bump
 # high-water) is unchanged across release + re-alloc (plan 115).
-# 
+#
 # Released value is an UNBOUND temp, not a binding: a tracked binding auto-frees
 # at scope exit, so manual `__release` would double-free. Keeps it clean under
 # `FAI_RC_CHECK`.
