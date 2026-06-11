@@ -173,6 +173,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
     m.insert(
         "std.process".into(),
         vec![
+            ("available", "processAvailable"),
             ("run", "processRun"),
             ("start", "processStart"),
             ("write", "processWrite"),

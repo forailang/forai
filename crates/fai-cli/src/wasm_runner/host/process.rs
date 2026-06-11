@@ -34,6 +34,16 @@ struct ShellSession {
 type SharedBuffer = Arc<Mutex<Vec<u8>>>;
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
+    // env.process_available() -> i32 (1/0). Native always reports true;
+    // the browser linker stubs this to 0.
+    linker
+        .func_wrap(
+            "env",
+            "process_available",
+            |_caller: Caller<'_, ()>| -> i32 { 1 },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     linker
         .func_wrap(
             "env",
@@ -364,7 +374,12 @@ fn stop_session(session_id: &str) -> String {
 
 fn command_builder(command: &str, cwd: &str, env_json: &str) -> Command {
     let mut cmd = Command::new("bash");
-    cmd.arg("-lc").arg(command).current_dir(cwd);
+    cmd.arg("-lc").arg(command);
+    // An empty cwd means "inherit the host cwd"; passing "" to
+    // `current_dir` makes spawn fail with NotFound.
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(env_json) {
         if let Some(obj) = value.as_object() {
             for (key, value) in obj {

@@ -865,7 +865,14 @@ descriptions are available via `fai doc <name>` at any time.
 Available modules: `std.string`, `std.array`, `std.dictionary`, `std.math`,
 `std.convert`, `std.json`, `std.http.request`, `std.http.server`, `std.file`,
 `std.path`, `std.env`, `std.events`, `std.error`, `std.time`, `std.log`,
-`std.cli`, `std.net`, `std.ffi`.
+`std.cli`, `std.net`, `std.ffi`, `std.process`, `std.crypto`.
+
+Some modules are native-host only and expose an availability probe so code
+that also runs in the browser can branch instead of trapping:
+`process.available()`, `crypto.available()`, `net.available()`. For example,
+`std.process` runs shell commands (`process.run`) and long-running command
+sessions (`process.start`/`write`/`read`/`stop`), returning JSON result
+strings — see `fai doc std.process`.
 
 Most stdlib functions are also available as bare builtins where the checker
 imports them globally, but module-qualified calls are preferred in examples when

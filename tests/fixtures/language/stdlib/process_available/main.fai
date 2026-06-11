@@ -1,0 +1,11 @@
+# expect: ok
+# stdout:
+#   true
+
+use std.process
+
+def main
+    @return Void
+do
+    print(process.available())
+end

@@ -502,7 +502,10 @@ pub const IMPORT_ALLOC_EVENT: u32 = 105;
 /// with no matching live allocation surfaces double-free / heap corruption
 /// that `--check-rc` (which only sees rc-prefixed objects) can miss.
 pub const IMPORT_FREE_EVENT: u32 = 106;
-pub const IMPORT_COUNT: u32 = 107;
+/// `env.process_available() -> i32` — 1 on native, 0 in browser stubs.
+/// Appended after the ledger imports to keep existing indices stable.
+pub const IMPORT_PROCESS_AVAILABLE: u32 = 107;
+pub const IMPORT_COUNT: u32 = 108;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -8224,6 +8227,10 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         // check-leaks codegen is enabled.
         ("__fai_alloc_event", vec![ValType::I32, ValType::I32], vec![]),
         ("__fai_free_event", vec![ValType::I32, ValType::I32], vec![]),
+        // IMPORT_PROCESS_AVAILABLE: () -> i32 — stays linked on every
+        // target so the availability probe can report false in the
+        // browser (the std.process run/session imports are stripped).
+        ("process_available", vec![], vec![ValType::I32]),
     ]
 }
 

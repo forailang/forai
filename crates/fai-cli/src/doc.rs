@@ -471,6 +471,45 @@ for success. `file.list` returns entry names in the directory; join them with
 "#,
         },
         StdlibModuleOverview {
+            name: "process",
+            doc: r#"
+`std.process` runs shell commands and manages long-running command sessions.
+Native-only: `process.available()` returns `false` in browser builds, where
+the other functions are not linked. Commands run via `bash -lc`, so pipes,
+globs, and env expansion work.
+
+```fai
+use std.process
+use std.json
+
+if process.available()
+    let raw = process.run('ls -la', '.', '{}', 5000, 65536)
+    let result Dictionary = json.parse(raw)
+    if getBool(result, 'ok')!
+        print(getString(result, 'stdout')!)
+    end
+end
+```
+
+`process.run(command, cwd, envJson, timeoutMs, maxOutputBytes)` blocks until
+the command exits or the timeout kills it, and returns a JSON string:
+`{ok, command, cwd, exitCode, stdout, stderr, timedOut, durationMs,
+truncated}`. `ok` is true only for a zero exit without timeout; `exitCode`
+is null when the process was killed. An empty `cwd` inherits the host
+working directory. `envJson` is a JSON object of extra environment
+variables. `timeoutMs` is clamped to 30000 and `maxOutputBytes` to 65536;
+zero or negative values select those maximums.
+
+Sessions keep a command running across calls:
+`process.start(command, cwd, envJson, lifetimeMs)` returns
+`{ok, sessionId, ...}`; `process.write(sessionId, input)` sends stdin;
+`process.read(sessionId, maxOutputBytes)` drains buffered output and
+reports `{running, exitCode, stdout, stderr, ...}`;
+`process.stop(sessionId)` kills and removes the session. Sessions expire
+after `lifetimeMs` (clamped to 600000) and are cleaned up lazily.
+"#,
+        },
+        StdlibModuleOverview {
             name: "path",
             doc: r#"
 `std.path` provides small path string helpers. Use it with `std.file` when

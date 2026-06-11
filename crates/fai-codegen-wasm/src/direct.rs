@@ -30,7 +30,8 @@ use crate::runtime::{
     IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY,
     IMPORT_LOG_ERROR, IMPORT_LOG_INFO, IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS,
     IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
-    IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START, IMPORT_PROCESS_STOP,
+    IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
+    IMPORT_PROCESS_STOP,
     IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM, IMPORT_READ_FILE,
     IMPORT_REMOTE_CALL, IMPORT_SET_HTML, IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN,
     IMPORT_TRAP_REPORT,
@@ -571,6 +572,9 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ("std.file", "list") => (IMPORT_FILE_LIST, &[AS::String], RS::Boxed),
 
         // std.process — command/session helpers return JSON strings.
+        // `available` reports false on the browser target (probe stays
+        // linked there; the run/session imports are stripped).
+        ("std.process", "available") => (IMPORT_PROCESS_AVAILABLE, &[], RS::MakeBool),
         ("std.process", "run") => (
             IMPORT_PROCESS_RUN,
             &[AS::String, AS::String, AS::String, AS::Int, AS::Int],

@@ -1,7 +1,7 @@
 # expect: ok
 # browser:
 #   selector: #availability-result
-#   text: net=false ffi=false file=false
+#   text: net=false ffi=false file=false process=false
 
 use std.browser
 
@@ -10,6 +10,8 @@ use std.net
 use std.ffi
 
 use std.file
+
+use std.process
 
 # Render a Bool as text.
 def boolText
@@ -33,5 +35,5 @@ end
 def main
     @return Void
 do
-    browser.setHtml('<div id="availability-result">net=' + boolText(net.available()) + ' ffi=' + boolText(ffi.available('c')) + ' file=' + boolText(file.exists('/tmp/anything')) + '</div>')
+    browser.setHtml('<div id="availability-result">net=' + boolText(net.available()) + ' ffi=' + boolText(ffi.available('c')) + ' file=' + boolText(file.exists('/tmp/anything')) + ' process=' + boolText(process.available()) + '</div>')
 end

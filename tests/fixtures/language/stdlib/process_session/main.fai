@@ -1,0 +1,36 @@
+# expect: ok
+# stdout:
+#   true
+#   ping
+#   true
+
+use std.process
+
+use std.json
+
+use std.string
+
+def main
+    @return Void
+do
+    let startRaw = process.start('cat', '.', '{}', 10000)
+    let started Dictionary = json.parse(startRaw)
+    print(getBool(started, 'ok'))
+    let sessionId = getString(started, 'sessionId')!
+    process.write(sessionId, 'ping\n')
+    var output = ''
+    var attempts = 0
+    while attempts < 100 and output == ''
+        let readRaw = process.read(sessionId, 65536)
+        let readResult Dictionary = json.parse(readRaw)
+        output = string.trim(getString(readResult, 'stdout')!)
+        if output == ''
+            process.run('sleep 0.05', '.', '{}', 5000, 65536)
+        end
+        attempts = attempts + 1
+    end
+    print(output)
+    let stopRaw = process.stop(sessionId)
+    let stopped Dictionary = json.parse(stopRaw)
+    print(getBool(stopped, 'ok'))
+end

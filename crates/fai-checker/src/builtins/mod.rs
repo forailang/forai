@@ -194,6 +194,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.file", name: "list",   builtin_name: "fileList",   doc: "List all file names in a directory." },
 
         // std.process
+        BuiltinDoc { module: "std.process", name: "available", builtin_name: "processAvailable", doc: "Return true if process execution is available on this host (native only)." },
         BuiltinDoc { module: "std.process", name: "run",   builtin_name: "processRun",   doc: "Run a bash command and return a JSON result string." },
         BuiltinDoc { module: "std.process", name: "start", builtin_name: "processStart", doc: "Start a bash command session and return a JSON result string." },
         BuiltinDoc { module: "std.process", name: "write", builtin_name: "processWrite", doc: "Write input to a process session and return a JSON result string." },

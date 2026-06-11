@@ -284,6 +284,25 @@ fn cmd_build(args: &[String]) {
     // `--project client` so the pipeline steps and build scope to that
     // target instead of trying to format "client" as a file path.
     let (args, project) = lift_target_name_positional(args, project);
+    // A bare-name positional that survived the lift is neither a
+    // sub-project in fai.toml nor something the fmt step could read as
+    // a path — fail with guidance now instead of letting fmt report a
+    // bare "error reading <name>: No such file or directory".
+    if project.is_none() {
+        let output_value_idx = args.iter().position(|a| a == "-o").map(|i| i + 1);
+        let bare_name = args.iter().enumerate().find(|(i, a)| {
+            Some(*i) != output_value_idx
+                && !a.starts_with("--")
+                && a.as_str() != "-o"
+                && !a.contains('.')
+                && !a.contains('/')
+        });
+        if let Some((_, name)) = bare_name {
+            if !std::path::Path::new(name).exists() {
+                fail_unknown_build_target(name);
+            }
+        }
+    }
     let positional = args.iter().find(|a| !a.starts_with("--") && a != &"-o");
     let is_non_fai = positional
         .map(|p| !p.ends_with(".fai") && (p.contains('.') || p.contains('/')))
@@ -352,6 +371,47 @@ fn lift_target_name_positional(
         .filter_map(|(i, a)| if i == name_idx { None } else { Some(a.clone()) })
         .collect();
     (remaining, Some(lifted))
+}
+
+/// Report `fai build <name>` where `<name>` is neither a sub-project in
+/// fai.toml nor an existing file/directory, then exit. Explains what went
+/// wrong and shows how to define the target or pass a file instead.
+fn fail_unknown_build_target(name: &str) -> ! {
+    eprintln!(
+        "error: '{}' is not a build target in fai.toml, and no file or directory named '{}' exists",
+        name, name
+    );
+    eprintln!();
+    let known: Vec<String> = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_project_root(&cwd))
+        .map(|root| {
+            let toml = std::fs::read_to_string(root.join("fai.toml")).unwrap_or_default();
+            let info = parse_project_info(&toml);
+            let mut names: Vec<String> = info.sub_projects.keys().cloned().collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default();
+    if known.is_empty() {
+        eprintln!("This project's fai.toml defines no named targets. To make");
+        eprintln!("'{}' buildable as a target, add a section like:", name);
+        eprintln!();
+        eprintln!("  [project.{}]", name);
+        eprintln!("  target = \"wasm-html\"        # or \"native\"");
+        eprintln!("  main = \"main.fai\"");
+        eprintln!("  build_dir = \"build/{}\"", name);
+    } else {
+        eprintln!("Available targets: {}", known.join(", "));
+        eprintln!();
+        eprintln!(
+            "To add '{}' as a target, define a [project.{}] section in fai.toml.",
+            name, name
+        );
+    }
+    eprintln!();
+    eprintln!("Alternatively, pass a source file or directory directly: fai build <file>.fai");
+    std::process::exit(1);
 }
 
 /// Print the top-level `checking N .fai files in <project> ...` banner.
@@ -3902,6 +3962,7 @@ var env={{
   json_parse:function(p,l){{try{{return jsToWasm(JSON.parse(readStr(p,l)))}}catch(e){{return QNAN|TAG_NULL}}}},
   json_stringify:function(v){{try{{return writeStrToWasm(JSON.stringify(wasmToJs(v)))}}catch(e){{return writeStrToWasm('null')}}}},
   crypto_available:function(){{return 0}},
+  process_available:function(){{return 0}},
   remote_call:function(a,b,c,d,e,f,g,h){{var fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);var body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});function throwBack(msg){{var box=jsToWasm({{message:msg,kind:'remote'}});instance.exports.__error_flag.value=1;instance.exports.__error_value.value=BigInt.asIntN(64,BigInt(box));return NULL_VAL}}var x=new XMLHttpRequest();try{{x.open('POST','/fai/rpc',false);x.setRequestHeader('Content-Type','application/json');x.send(body)}}catch(e){{return throwBack('network error: '+(e&&e.message?e.message:'request failed'))}}if(x.status===0)return throwBack('network error: request blocked or offline');if(x.status<200||x.status>=300)return throwBack('HTTP '+x.status+(x.statusText?': '+x.statusText:''));var resp;try{{resp=JSON.parse(x.responseText)}}catch(e){{return throwBack('invalid JSON in response')}}if(resp.ok)return jsToWasm(resp.value);return throwBack(resp.error||'remote call failed')}},
   remote_begin:function(taskId,a,b,c,d,e,f,g,h){{var fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);var body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});function done(res){{__faiRpcResults[taskId]=res;if(instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);faiServiceScheduler()}}fetch('/fai/rpc',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:body}}).then(function(r){{var st=r.status;return r.text().then(function(t){{if(st<200||st>=300){{done({{err:'HTTP '+st}});return}}var resp;try{{resp=JSON.parse(t)}}catch(e){{done({{err:'invalid JSON in response'}});return}}if(resp.ok)done({{val:jsToWasm(resp.value)}});else done({{err:resp.error||'remote call failed'}})}})}}).catch(function(e){{done({{err:'network error: '+(e&&e.message?e.message:'request failed')}})}})}},
   remote_result:function(taskId){{var res=__faiRpcResults[taskId];delete __faiRpcResults[taskId];if(!res)return NULL_VAL;if(res.err!==undefined){{var box=jsToWasm({{message:res.err,kind:'remote'}});instance.exports.__error_flag.value=1;instance.exports.__error_value.value=BigInt.asIntN(64,BigInt(box));return NULL_VAL}}return res.val}},

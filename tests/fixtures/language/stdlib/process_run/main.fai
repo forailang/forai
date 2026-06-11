@@ -1,0 +1,41 @@
+# expect: ok
+# stdout:
+#   true
+#   0
+#   hello
+#   false
+#   3
+#   true
+#   0123
+#   true
+#   injected
+
+use std.process
+
+use std.json
+
+use std.string
+
+def main
+    @return Void
+do
+    let raw = process.run('printf hello && exit 0', '.', '{}', 5000, 65536)
+    let result Dictionary = json.parse(raw)
+    print(getBool(result, 'ok'))
+    print(getInt(result, 'exitCode'))
+    print(string.trim(getString(result, 'stdout')!))
+    let bad = process.run('exit 3', '.', '{}', 5000, 65536)
+    let badResult Dictionary = json.parse(bad)
+    print(getBool(badResult, 'ok'))
+    print(getInt(badResult, 'exitCode'))
+    let slow = process.run('sleep 2', '.', '{}', 200, 65536)
+    let slowResult Dictionary = json.parse(slow)
+    print(getBool(slowResult, 'timedOut'))
+    let cut = process.run('printf 0123456789', '.', '{}', 5000, 4)
+    let cutResult Dictionary = json.parse(cut)
+    print(getString(cutResult, 'stdout'))
+    print(getBool(cutResult, 'truncated'))
+    let env = process.run('echo $FAI_FIXTURE_VAR', '', '{"FAI_FIXTURE_VAR":"injected"}', 5000, 65536)
+    let envResult Dictionary = json.parse(env)
+    print(string.trim(getString(envResult, 'stdout')!))
+end
