@@ -151,6 +151,9 @@ fn print_usage() {
     eprintln!("                      itemized live set at exit/trap, grouped by alloc site.");
     eprintln!("  FAI_TRACE_TESTS     Print each test case's name on stderr before it runs,");
     eprintln!("                      so a trap/hang is attributable to the exact case.");
+    eprintln!("  FAI_ABI_CHECK       Compile-time only: log '[abi-check] DIVERGENCE' when");
+    eprintln!("                      the plan-117 ownership signature table disagrees with");
+    eprintln!("                      the legacy codegen heuristic. Never changes output.");
     eprintln!();
     eprintln!("Shorthand:");
     eprintln!("  forai <file.fai>        Same as 'forai run <file.fai>'");

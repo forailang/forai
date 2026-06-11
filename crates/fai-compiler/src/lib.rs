@@ -2,6 +2,7 @@ pub mod ast;
 pub mod escape_analysis;
 pub mod dep_url;
 pub mod module;
+pub mod ownership_abi;
 
 /// Back-compat alias. The bytecode compiler in `compiler.rs` was
 /// deleted in Plan 94 Phase H; `DiscoveredModule` moved to its

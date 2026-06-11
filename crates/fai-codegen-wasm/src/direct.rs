@@ -224,6 +224,27 @@ enum ArgShape {
     Boxed,
 }
 
+thread_local! {
+    /// Lazily-read FAI_ABI_CHECK gate (plan 117 phase 1). Read the env var
+    /// once per thread instead of on every `call_returns_owned` invocation —
+    /// that function runs at every bind/store/reassign/return/discard site,
+    /// and `std::env::var` takes the process env lock each call. Mirrors the
+    /// cached-flag pattern runtime.rs uses for FAI_RC_CHECK/CHECK_LEAKS.
+    static ABI_CHECK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the plan-117 table-vs-heuristic parity logging is enabled.
+fn abi_check_enabled() -> bool {
+    ABI_CHECK.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = std::env::var_os("FAI_ABI_CHECK").is_some();
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
 /// How to wrap the import's return value back into a forai value.
 #[derive(Clone, Copy)]
 enum ResultShape {
@@ -13337,10 +13358,11 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// field reads). Fresh-returning bare-globals are intentionally absent —
     /// transferring their (genuinely fresh) result is correct.
     fn is_borrowed_bare_global(name: &str) -> bool {
-        matches!(
-            name,
-            "unwrap" | "get" | "getString" | "getInt" | "getBool" | "set" | "message" | "kind"
-        )
+        // Delegated to the plan-117 signature table so the name list has one
+        // physical home and cannot drift from the parity instrument's copy.
+        // The dispatch ORDER (set/unwrap overridden before this check) still
+        // lives in call_returns_owned_heuristic, unchanged.
+        fai_compiler::ownership_abi::is_borrowed_bare_global(name)
     }
 
     /// Builtins that ALWAYS return a freshly `RT_ALLOC`-d (rc-prefixed) object
@@ -13360,40 +13382,9 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// transferring an aliasing result would be a use-after-free; the bar is
     /// "provably +1".
     fn is_fresh_builtin_call(name: &str) -> bool {
-        matches!(
-            name,
-            // Collection builders (guest RT_ALLOC, or rc-prefixed host reserve).
-            "append"
-                | "getKeys"
-                | "map"
-                | "filter"
-                | "slice"
-                | "reverse"
-                | "sort"
-                | "split"
-                | "copy"
-                | "Error"
-                | "all"
-                // String transforms — each verified to ALWAYS allocate a fresh
-                // string (single RT_ALLOC/RT_ALLOC_STRING + return, no aliasing
-                // fast path). `replace` aliases its input only on the empty-find
-                // path, which now retains before returning, so it too is
-                // uniformly +1. `toString` is intentionally absent — it returns
-                // a String argument as-is (RT_VALUE_TO_STR), so it can alias.
-                | "trim"
-                | "trimStart"
-                | "trimEnd"
-                | "toUpper"
-                | "toLower"
-                | "substring"
-                | "repeat"
-                | "join"
-                | "replace"
-                // `toString` aliases a String arg via RT_VALUE_TO_STR, but its
-                // codegen (`emit_to_string_owned`) retains on that alias path, so
-                // the result is uniformly +1 — safe to treat as owned/transferring.
-                | "toString"
-        )
+        // Delegated to the plan-117 signature table (single physical home for
+        // the name list; per-name verification notes live there too).
+        fai_compiler::ownership_abi::is_fresh_builtin_call(name)
     }
 
     /// Ownership inference (plan 113 R2). True if `ce` resolves to a call that
@@ -13435,7 +13426,120 @@ impl<'a, 'c> Builder<'a, 'c> {
         )
     }
 
+    /// Ownership classifier (plan 113 R2). Returns whether `ce` yields an
+    /// OWNED (+1) value the caller must take. This is the heuristic that still
+    /// drives behavior; `call_returns_owned` wraps it with the plan-117
+    /// signature-table parity check (logging only, behavior unchanged).
     fn call_returns_owned(&mut self, ce: &CallExpression) -> bool {
+        let heuristic = self.call_returns_owned_heuristic(ce);
+        // Plan 117 phase 1: with FAI_ABI_CHECK set, consult the central
+        // ownership signature table alongside the heuristic and log any
+        // divergence. This proves the table is equivalent to the heuristic
+        // over the whole test corpus before phase 3 swaps the lookups in.
+        // Off by default; never affects the returned value.
+        if abi_check_enabled() {
+            self.abi_parity_log(ce, heuristic);
+        }
+        heuristic
+    }
+
+    /// Side-effect-free twin of `resolve` for diagnostics: answers "would
+    /// `resolve` find a binding?" WITHOUT allocating an upvalue slot on first
+    /// outer-scope reference. The parity logger must use this instead of
+    /// `resolve` — an early upvalue capture from the logging path would
+    /// reorder env-slot indices and make FAI_ABI_CHECK builds emit different
+    /// wasm than unchecked builds, breaking the "logging only" contract.
+    fn resolve_would_hit(&self, name: &str) -> bool {
+        self.lookup(name).is_some()
+            || self.upvalue_by_name.contains_key(name)
+            || self
+                .outer_scope
+                .map_or(false, |outer| outer.lookup(name).is_some())
+            || self.ctx.module_vars.contains_key(name)
+    }
+
+    /// Log a divergence between the signature table and the heuristic for the
+    /// statically-classified callables the table covers. Mirrors the
+    /// heuristic's three dispatch arms exactly (bare identifier, UFCS member,
+    /// plain member) — member-position names go through `lookup_member_call`,
+    /// never the bare table, because the heuristic's member arms check the
+    /// borrowed bare-globals first (so member `set`/`unwrap` are Borrowed
+    /// there, unlike their bare forms). Dynamic callables (user fns, closures,
+    /// type constructors, externs) are intentionally not in the static table;
+    /// a table miss on those is expected and silent.
+    fn abi_parity_log(&mut self, ce: &CallExpression, heuristic: bool) {
+        use fai_compiler::ownership_abi::{
+            lookup_bare_call, lookup_member_call, lookup_std_module_call, ReturnConvention,
+        };
+        let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
+        let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
+        let sig = match &*ce.callee {
+            Expression::IdentifierExpression(id) => lookup_bare_call(id.name.as_str()),
+            // UFCS `recv.method(...)`: the heuristic resolves `method` as a
+            // bare-global-first member name and never touches the receiver.
+            Expression::MemberExpression(me) if is_ufcs => {
+                lookup_member_call(me.property.as_str())
+            }
+            Expression::MemberExpression(me) => {
+                let m = me.property.as_str();
+                // Module-alias path first, mirroring the heuristic: only when
+                // the object is an unshadowed module alias. A user-module
+                // function (`alias.fn`) is dynamic — the heuristic classifies
+                // it owned via function_by_name, the table doesn't model user
+                // fns — so it's a silent miss, not a fall-through to the
+                // member table (which would log a false divergence for
+                // user fns named `get`/`message`/etc.).
+                if let Expression::IdentifierExpression(obj_id) = &*me.object {
+                    if !self.resolve_would_hit(&obj_id.name) {
+                        if let Some(canon) = self.ctx.module_aliases.get(&obj_id.name) {
+                            if self
+                                .function_by_name
+                                .contains_key(&format!("{}.{}", canon, m))
+                            {
+                                return;
+                            }
+                            if let Some(sig) = lookup_std_module_call(canon, m) {
+                                Some(sig)
+                            } else {
+                                lookup_member_call(m)
+                            }
+                        } else {
+                            lookup_member_call(m)
+                        }
+                    } else {
+                        lookup_member_call(m)
+                    }
+                } else {
+                    lookup_member_call(m)
+                }
+            }
+            _ => None,
+        };
+        let Some(sig) = sig else { return };
+        let table = match sig.ret {
+            // PassThrough follows the same argument evaluation the heuristic
+            // performs (`set` ownership = arg0 ownership), so the two sides
+            // are equal by construction — re-evaluating the argument here
+            // would re-enter this wrapper (exponential on nested `set`
+            // chains) to learn nothing. Skip.
+            ReturnConvention::PassThrough(_) => return,
+            ReturnConvention::Owned => true,
+            ReturnConvention::Borrowed | ReturnConvention::Primitive => false,
+        };
+        if table != heuristic {
+            let module = if self.module_key.is_empty() {
+                "<entry>"
+            } else {
+                self.module_key.as_str()
+            };
+            eprintln!(
+                "[abi-check] DIVERGENCE at {module}:{}:{}: heuristic={heuristic} table={table} ({})",
+                ce.location.line, ce.location.column, sig.doc
+            );
+        }
+    }
+
+    fn call_returns_owned_heuristic(&mut self, ce: &CallExpression) -> bool {
         let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
         let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
         match &*ce.callee {
@@ -13558,13 +13662,8 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// returning borrowed views (array element reads, dict gets) must stay
     /// out.
     fn is_fresh_std_module_call(canon: &str, method: &str) -> bool {
-        matches!(
-            (canon, method),
-            ("std.json", "parse" | "stringify")
-                | ("std.env", "get")
-                | ("std.file", "read")
-                | ("std.http.server", "ok" | "text" | "html" | "json" | "redirect")
-        )
+        // Delegated to the plan-117 signature table (single physical home).
+        fai_compiler::ownership_abi::lookup_std_module_call(canon, method).is_some()
     }
 
     /// RC transfer test (plan 113 R2): does compiling `expr` leave an OWNED (+1)
