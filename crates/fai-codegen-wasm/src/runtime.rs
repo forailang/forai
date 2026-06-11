@@ -5453,6 +5453,17 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
             dst_mem: 0,
         });
 
+        // RC (plan 113 R1): the sorted array co-owns every element copied
+        // from the source — the MemoryCopy above shallow-copies the boxed
+        // refs, so without a retain both arrays "own" the same elements
+        // with one count, and releasing the source later double-frees each
+        // element this array still points at. `array.slice`/`reverse`
+        // already do this; `sort` was the lone gap (it predates heap-
+        // element support — the old i32 compare only handled primitives,
+        // which need no retain). local 14 = scratch index; the bubble-sort
+        // comparison below reuses it fresh per iteration.
+        emit_retain_array_elems(f, base, /*dst*/ 9, /*count*/ 8, /*idx*/ 14);
+
         // Bubble sort: outer loop i from 0 to count-1
         // local 10 = i (outer), local 11 = j (inner), local 12 = addr_j, local 13 = addr_j1
         f.instruction(&Instruction::I32Const(0));
