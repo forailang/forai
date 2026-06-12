@@ -15,7 +15,7 @@ use wasmtime::*;
 
 use super::super::output;
 
-use super::super::heap::{decode_closure_header, reserve, wasm_alloc_str};
+use super::super::heap::{decode_closure_header, host_retain_value, reserve, wasm_alloc_str};
 use super::super::nan_box::{
     encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_INT, VAL_NULL,
 };
@@ -178,13 +178,12 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, id: i32, pat_ptr: i32, pat_len: i32, handler_val: i64| {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let pattern = read_mem_str(mem.data(&caller), pat_ptr as usize, pat_len as usize);
-                // The router keeps the handler closure for the life of the server,
-                // so it must co-own it: retain on store, or the guest releasing
-                // its owned handler-arg temp after `server.get` frees the closure
-                // and the next request finds a recycled block (RC, plan 113/115).
-                super::super::heap::host_retain(mem.data_mut(&mut caller), handler_val);
                 WASM_ROUTER_STORE.with(|store| {
                     if let Some(r) = store.borrow_mut().get_mut(&(id as u32)) {
+                        // The router keeps the handler closure for the life of
+                        // the server, so it must co-own it: retain on store,
+                        // release on router teardown/reset.
+                        host_retain_value(&mut caller, handler_val);
                         r.routes.push(WasmRoute {
                             method: "GET".into(),
                             pattern,
@@ -205,10 +204,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, id: i32, pat_ptr: i32, pat_len: i32, handler_val: i64| {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let pattern = read_mem_str(mem.data(&caller), pat_ptr as usize, pat_len as usize);
-                // Retain — the router co-owns the handler for the server's life.
-                super::super::heap::host_retain(mem.data_mut(&mut caller), handler_val);
                 WASM_ROUTER_STORE.with(|store| {
                     if let Some(r) = store.borrow_mut().get_mut(&(id as u32)) {
+                        host_retain_value(&mut caller, handler_val);
                         r.routes.push(WasmRoute {
                             method: "POST".into(),
                             pattern,
@@ -330,6 +328,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     Ok(())
+}
+
+/// Drain router-owned guest handles for test teardown and finite run cleanup.
+/// Static routes use handler 0 and are ignored.
+pub(crate) fn drain_retained_values() -> Vec<i64> {
+    WASM_NEXT_ROUTER_ID.with(|next| next.set(1));
+    WASM_ROUTER_STORE.with(|store| {
+        store
+            .borrow_mut()
+            .drain()
+            .flat_map(|(_, router)| router.routes.into_iter())
+            .filter_map(|route| (route.handler != 0).then_some(route.handler))
+            .collect()
+    })
 }
 
 /// Peek at the request line (method + path) without consuming the stream.
@@ -1176,7 +1188,11 @@ fn invoke_handler_with_err(
             .ok_or_else(|| "__fai_drive_closure is not a func".to_string())?;
         let mut results = vec![Val::I64(0)];
         drive
-            .call(&mut *caller, &[Val::I64(handler_val), Val::I64(arg)], &mut results)
+            .call(
+                &mut *caller,
+                &[Val::I64(handler_val), Val::I64(arg)],
+                &mut results,
+            )
             .map_err(|e| format!("wasm trap: {}", e))?;
         return match results[0] {
             Val::I64(v) => Ok(v),

@@ -450,6 +450,62 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: ROwn,
         doc: "fresh subscription dict via heap::reserve",
     },
+    HostImportRow {
+        canon: "std.events",
+        method: "off",
+        import: "event_off",
+        ret: RPrim,
+        doc: "encoded bool; unregister releases host-retained handler",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "emit",
+        import: "event_emit",
+        ret: RPrim,
+        doc: "void host dispatch; data is borrowed for the dispatch",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "subscribers",
+        import: "event_subscribers",
+        ret: RPrim,
+        doc: "encoded subscriber count",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "clear",
+        import: "event_clear",
+        ret: RPrim,
+        doc: "void; releases host-retained handlers for one name",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "clearAll",
+        import: "event_clear_all",
+        ret: RPrim,
+        doc: "void; releases all host-retained handlers and deferred payloads",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "emitDeferred",
+        import: "event_emit_deferred",
+        ret: RPrim,
+        doc: "void; deferred queue retains payload until drain or clear",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "drain",
+        import: "event_drain",
+        ret: RPrim,
+        doc: "void; releases deferred queue payloads after dispatch",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "queueLen",
+        import: "event_queue_len",
+        ret: RPrim,
+        doc: "encoded deferred queue length",
+    },
     // std.html
     HostImportRow {
         canon: "std.html",
@@ -671,6 +727,41 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: ROwn,
         doc: "fresh response dict (host reserve)",
     },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "router",
+        import: "http_server_router",
+        ret: RPrim,
+        doc: "encoded router id; native router store owns no guest handles",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "get",
+        import: "http_server_router_get",
+        ret: RPrim,
+        doc: "void; stores and host-retains route handler closure",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "post",
+        import: "http_server_router_post",
+        ret: RPrim,
+        doc: "void; stores and host-retains route handler closure",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "serveFiles",
+        import: "http_server_router_serve_files",
+        ret: RPrim,
+        doc: "void; copies static directory string and stores no guest handle",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "listen",
+        import: "http_server_router_listen",
+        ret: RPrim,
+        doc: "void accept loop; borrows router id and dispatches retained route handlers",
+    },
     // std.cli
     HostImportRow {
         canon: "std.cli",
@@ -701,6 +792,57 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: ROwn,
         doc: "encode_return_for_guest: primitives or fresh host-allocated strings",
     },
+    // Test spy/mock imports. They are test-mode only, but still store guest
+    // handles in native host state when mocks are active.
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_set_mock",
+        ret: RPrim,
+        doc: "void; host retains stored persistent mock value",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_set_mock_once",
+        ret: RPrim,
+        doc: "void; host retains stored once-mock value until first use/reset",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_reset",
+        ret: RPrim,
+        doc: "void; releases retained mock values and clears borrowed call history",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_check_call",
+        ret: RPrim,
+        doc: "primitive flag; borrowed call args are recorded for same-test assertions",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_assert_called_with",
+        ret: RPrim,
+        doc: "primitive assertion flag; expected args are borrowed for comparison",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_assert_call_count",
+        ret: RPrim,
+        doc: "primitive assertion flag",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "spy_assert_not_called",
+        ret: RPrim,
+        doc: "primitive assertion flag",
+    },
     // TODO(plan-117 phase 4/5): async RPC plumbing — ownership across task
     // segments unverified; conservatively Borrowed until the async engine's
     // handling is read end to end.
@@ -725,10 +867,23 @@ struct HostImportArgRow {
     args: &'static [ArgConvention],
 }
 
-use ArgConvention::Borrowed as ABor;
+use ArgConvention::{Borrowed as ABor, CopiedByHost as ACopy, RetainedByCallee as ARet};
 
 const ARRAY_HOF_ARGS: &[ArgConvention] = &[ABor, ABor];
 const JSON_STRINGIFY_ARGS: &[ArgConvention] = &[ABor];
+const EVENT_SUBSCRIBE_ARGS: &[ArgConvention] = &[ACopy, ARet];
+const EVENT_EMIT_ARGS: &[ArgConvention] = &[ACopy, ABor];
+const EVENT_DEFERRED_ARGS: &[ArgConvention] = &[ACopy, ARet];
+const EVENT_OFF_ARGS: &[ArgConvention] = &[ABor];
+const EVENT_CLEAR_ARGS: &[ArgConvention] = &[ACopy];
+const SPY_SET_MOCK_ARGS: &[ArgConvention] = &[ACopy, ARet];
+const SPY_RESET_ARGS: &[ArgConvention] = &[ACopy];
+const SPY_CHECK_CALL_ARGS: &[ArgConvention] = &[ACopy, ACopy, ACopy, ACopy];
+const SPY_ASSERT_CALLED_WITH_ARGS: &[ArgConvention] = &[ACopy, ACopy, ACopy];
+const SPY_ASSERT_CALL_COUNT_ARGS: &[ArgConvention] = &[ACopy, ACopy];
+const HTTP_ROUTER_HANDLER_ARGS: &[ArgConvention] = &[ACopy, ACopy, ARet];
+const HTTP_ROUTER_SERVE_FILES_ARGS: &[ArgConvention] = &[ACopy, ACopy];
+const HTTP_ROUTER_LISTEN_ARGS: &[ArgConvention] = &[ACopy, ACopy];
 
 const HOST_IMPORT_ARGS: &[HostImportArgRow] = &[
     HostImportArgRow {
@@ -742,6 +897,74 @@ const HOST_IMPORT_ARGS: &[HostImportArgRow] = &[
     HostImportArgRow {
         import: "json_stringify",
         args: JSON_STRINGIFY_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_on",
+        args: EVENT_SUBSCRIBE_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_once",
+        args: EVENT_SUBSCRIBE_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_off",
+        args: EVENT_OFF_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_emit",
+        args: EVENT_EMIT_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_clear",
+        args: EVENT_CLEAR_ARGS,
+    },
+    HostImportArgRow {
+        import: "event_emit_deferred",
+        args: EVENT_DEFERRED_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_set_mock",
+        args: SPY_SET_MOCK_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_set_mock_once",
+        args: SPY_SET_MOCK_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_reset",
+        args: SPY_RESET_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_check_call",
+        args: SPY_CHECK_CALL_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_assert_called_with",
+        args: SPY_ASSERT_CALLED_WITH_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_assert_call_count",
+        args: SPY_ASSERT_CALL_COUNT_ARGS,
+    },
+    HostImportArgRow {
+        import: "spy_assert_not_called",
+        args: SPY_RESET_ARGS,
+    },
+    HostImportArgRow {
+        import: "http_server_router_get",
+        args: HTTP_ROUTER_HANDLER_ARGS,
+    },
+    HostImportArgRow {
+        import: "http_server_router_post",
+        args: HTTP_ROUTER_HANDLER_ARGS,
+    },
+    HostImportArgRow {
+        import: "http_server_router_serve_files",
+        args: HTTP_ROUTER_SERVE_FILES_ARGS,
+    },
+    HostImportArgRow {
+        import: "http_server_router_listen",
+        args: HTTP_ROUTER_LISTEN_ARGS,
     },
 ];
 
@@ -955,10 +1178,11 @@ mod tests {
 
     #[test]
     fn host_import_surface_is_fully_classified() {
-        // Plan 119 U1: the verified boxed-import surface. The count pin
-        // fails when a new boxed import lands without a row — extend the
-        // table (after reading the host code), don't bump blindly.
-        assert_eq!(HOST_IMPORTS.len(), 50, "boxed-import surface changed");
+        // Plan 119 U1 started this as the verified boxed-import surface; plan
+        // 117 phase 6 also records void/primitive imports whose arguments carry
+        // ownership conventions. The count pin fails when a host import lands
+        // without a row — extend the table after reading the host code.
+        assert_eq!(HOST_IMPORTS.len(), 70, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(
@@ -993,6 +1217,91 @@ mod tests {
 
         let sig = lookup_std_module_call("std.json", "stringify").expect("json.stringify");
         assert_eq!(sig.args, Some(vec![ArgConvention::Borrowed]));
+    }
+
+    #[test]
+    fn phase6_event_arg_conventions_are_table_driven() {
+        let sig = lookup_host_import("event_on").expect("event_on");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::RetainedByCallee
+            ])
+        );
+
+        let sig = lookup_host_import("event_once").expect("event_once");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::RetainedByCallee
+            ])
+        );
+
+        let sig = lookup_host_import("event_emit_deferred").expect("event_emit_deferred");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::RetainedByCallee
+            ])
+        );
+
+        let sig = lookup_host_import("event_emit").expect("event_emit");
+        assert_eq!(
+            sig.args,
+            Some(vec![ArgConvention::CopiedByHost, ArgConvention::Borrowed])
+        );
+    }
+
+    #[test]
+    fn phase6_spy_arg_conventions_are_table_driven() {
+        let sig = lookup_host_import("spy_set_mock").expect("spy_set_mock");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::RetainedByCallee
+            ])
+        );
+
+        let sig = lookup_host_import("spy_set_mock_once").expect("spy_set_mock_once");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::RetainedByCallee
+            ])
+        );
+
+        let sig = lookup_host_import("spy_reset").expect("spy_reset");
+        assert_eq!(sig.args, Some(vec![ArgConvention::CopiedByHost]));
+    }
+
+    #[test]
+    fn phase6_router_arg_conventions_are_table_driven() {
+        for import in ["http_server_router_get", "http_server_router_post"] {
+            let sig = lookup_host_import(import).unwrap_or_else(|| panic!("{import} missing"));
+            assert_eq!(
+                sig.args,
+                Some(vec![
+                    ArgConvention::CopiedByHost,
+                    ArgConvention::CopiedByHost,
+                    ArgConvention::RetainedByCallee
+                ]),
+                "{import}"
+            );
+        }
+
+        let sig = lookup_host_import("http_server_router_serve_files").expect("serveFiles");
+        assert_eq!(
+            sig.args,
+            Some(vec![
+                ArgConvention::CopiedByHost,
+                ArgConvention::CopiedByHost
+            ])
+        );
     }
 
     #[test]

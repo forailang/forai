@@ -1,6 +1,6 @@
 pub mod ast;
-pub mod escape_analysis;
 pub mod dep_url;
+pub mod escape_analysis;
 pub mod module;
 pub mod ownership_abi;
 

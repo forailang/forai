@@ -123,20 +123,22 @@ project's test lane, not here.
 | 1 | binding + discard | `rc/binding_discard`, `rc/binding_scope_exit`, `rc/print_int_scratch` | flat |
 | 2 | assignment/overwrite | `rc/assign_overwrite` | flat |
 | 3 | destructuring | `rc/destructure_tuple` | flat |
-| 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort` | append/map/filter flat; fresh receiver → phase6 |
+| 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort`, `rc/receiver_alias_array_rebuilders` | flat, including audited fresh receiver array rebuilders |
 | 5 | dict/field stores | `rc/dict_field_store` | flat |
 | 6 | std host imports | `rc/std_json_roundtrip`, `rc/std_path_join`, `rc/json_parse_array`, `rc/json_require_string` | flat — incl. the Owned string/graph classes and the verified-Borrowed alias class (plan 119; requireString returns the dict entry's own pointer) |
 | 7 | FFI externs | `rc/ffi_libc_abs` | flat (primitive returns) |
-| 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | handler closures retained, never released → expected phase6 |
+| 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | flat — host-retained handlers release on off/clear/once removal |
 | 9 | async frames | `rc/async_frame_complete` | frames released; scheduler buffer → expected async-runtime-root |
 | 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | flat |
 | 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try`, `rc/throw_through_two_frames` | flat, including in-function catch and cross-function propagation cleanup |
 | 12 | closures | `rc/closure_capture` | balances; typedef callbacks pull async scheduler → expected async-runtime-root |
 | 13 | spy/mock | `rc/spy_mock_reset` | run-path flat; host retention is the `fai test --check-leaks` lane's oracle (phase 6 audit) |
-| 14 | brain request loop | brain project inline suite | see plans/118 U8 |
+| 14 | router handlers | `rc/router_reset` | flat — retained route handlers release on finite run/test teardown |
+| 15 | brain request loop | brain project inline suite | see plans/118 U8 |
 
 Browser-host leak surface: `rc_browser/flat_baseline` (flat),
-`rc_browser/sethtml_literal_arg` (literal arg temp flat).
+`rc_browser/sethtml_literal_arg` (literal arg temp flat),
+`rc_browser/events_registry` (event registry flat).
 
 ## Gates
 

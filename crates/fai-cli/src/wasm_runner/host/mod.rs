@@ -18,7 +18,8 @@ mod spy;
 mod storage;
 pub(super) mod util;
 
-pub(crate) use spy::reset_all as reset_spy_state;
+pub(crate) use http_server::drain_retained_values as drain_router_retained_values;
+pub(crate) use spy::drain_retained_values as drain_spy_retained_values;
 
 #[cfg(test)]
 pub(super) use async_ops::clear_timer_requests;

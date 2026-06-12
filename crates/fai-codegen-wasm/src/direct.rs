@@ -3416,11 +3416,16 @@ pub fn assemble_wasm_module_with_test_flag(
     if closure_count > 0 {
         exports.export("__indirect_function_table", ExportKind::Table, 0);
     }
-    // Host-callable refcount release: the HTTP host reclaims per-request
-    // guest object graphs (request/response/event dicts it built) through
-    // this after writing the response. The async assembler exports it too;
-    // without it `host_release_value` silently no-ops and a sync-built
-    // server leaks the full request graph per request (plan 116).
+    // Host-callable refcount helpers: host registries retain guest handles
+    // they store and release them on unregister/reset/drop. The async
+    // assembler exports these too; without release, sync-built servers leak
+    // request graphs, and without retain, browser host registries cannot mirror
+    // native ownership safely (plans 116/117).
+    exports.export(
+        "__fai_retain",
+        ExportKind::Func,
+        actual_import_count + RT_RETAIN,
+    );
     exports.export(
         "__fai_release",
         ExportKind::Func,
@@ -5640,6 +5645,15 @@ fn build_resume_fn(
             b.emit(Instruction::I32LeS);
             b.emit(Instruction::I32And);
             b.emit(Instruction::If(wasm_encoder::BlockType::Empty));
+            // Drop the scheduler record's stored result. Any consumer already
+            // received its own retained +1 through `task_result`.
+            b.emit(Instruction::GlobalGet(layout.g_table_base));
+            b.emit(Instruction::LocalGet(pend));
+            b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            b.emit(Instruction::I32Mul);
+            b.emit(Instruction::I32Add);
+            b.emit(Instruction::I64Load(mem_off(crate::async_engine::O_RESULT)));
+            b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
             // task[pend].next = g_free_head; g_free_head = pend
             b.emit(Instruction::GlobalGet(layout.g_table_base));
             b.emit(Instruction::LocalGet(pend));
@@ -7028,6 +7042,7 @@ pub fn try_codegen_async_engine(
         alloc: actual_import_count + RT_ALLOC,
         free: actual_import_count + RT_FREE,
         retain: actual_import_count + RT_RETAIN,
+        release: actual_import_count + RT_RELEASE,
         ready_push: sb,
         ready_pop: sb + 1,
         spawn: sb + 2,
@@ -7488,10 +7503,15 @@ pub fn try_codegen_async_engine(
     // Host-driver entry: spawn+drive an async guest closure (route/event handler)
     // to completion. await = sb+11, drive_closure = sb+12 (appended last).
     exports.export("__fai_drive_closure", ExportKind::Func, sb + 12);
-    // Host-callable refcount release: lets the host reclaim per-request guest
-    // objects it owns (the request/response dicts it built) after writing the
-    // response, so a long-running server plateaus instead of leaking ~1 dict
-    // graph per request (plan 115). Points straight at the RT_RELEASE runtime fn.
+    // Host-callable refcount helpers: lets the host retain guest handles it
+    // stores and reclaim per-request guest objects it owns after writing the
+    // response, so a long-running server plateaus instead of leaking retained
+    // route/event graphs (plans 115/117).
+    exports.export(
+        "__fai_retain",
+        ExportKind::Func,
+        actual_import_count + runtime::RT_RETAIN,
+    );
     exports.export(
         "__fai_release",
         ExportKind::Func,
@@ -8759,6 +8779,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(args_ptr));
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for i in 0..arity {
             self.emit(Instruction::LocalGet(args_ptr));
             self.emit(Instruction::LocalGet(i));
@@ -8770,6 +8793,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(out_ptr));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
 
         // spy_check_call(fn_id, args_ptr, arity, out_ptr) -> i32
         self.emit(Instruction::I32Const(fn_id as i32));
@@ -8779,11 +8805,29 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit_import_call(crate::runtime::IMPORT_SPY_CHECK_CALL);
 
         // If the import returned 1, load *out_ptr and return it.
+        let mocked = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(mocked));
+        self.emit(Instruction::LocalGet(mocked));
         self.emit_open(Instruction::If(BlockType::Empty));
+        let mocked_value = self.alloc_local();
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit(Instruction::I64Load(mem0()));
+        self.emit(Instruction::LocalSet(mocked_value));
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(mocked_value));
         self.emit(Instruction::Return);
         self.emit_close();
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
         Ok(())
     }
 
@@ -10519,7 +10563,6 @@ impl<'a, 'c> Builder<'a, 'c> {
         let type_param_count = self.functions()[proto_idx as usize].type_param_count as usize;
         let real_param_count = expected - type_param_count;
         let defaults = self.functions()[proto_idx as usize].param_defaults.clone();
-
         // Named-param reorder: if the checker recorded a reorder map
         // for this call site, use it to pull caller args into
         // declaration order. Missing slots are filled from default
@@ -10531,8 +10574,12 @@ impl<'a, 'c> Builder<'a, 'c> {
                     "CallExpression/reorder-shape-mismatch",
                 ));
             }
-            // Owned argument temporaries to release after the call (RC, plan 113
-            // R2) — mirrors the positional path below.
+            // Owned argument temporaries to release after the call (RC, plan
+            // 113 R2) — mirrors the positional path below. User calls borrow
+            // their params; if a result aliases an arg, returning a borrowed
+            // arg retains it and storing a borrowed arg in a field/array retains
+            // it. That gives the result its own credit, so the caller must still
+            // release the fresh source argument credit after the call.
             let mut owned_arg_stashes: Vec<u32> = Vec::new();
             if type_param_count > 0 {
                 let type_args = self
@@ -10613,9 +10660,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         // unless freed once the call returns. `LocalTee` keeps each on the stack
         // for the call while saving a copy to release. A borrowed arg
         // (identifier / field — incl. `mutable` bindings) is owned by the
-        // caller's binding, so it is left alone. If the callee returns one of
-        // these args it retained it first (the +1 return convention), so the
-        // result survives our release.
+        // caller's binding, so it is left alone. Aliasing heap results are safe:
+        // user-function returns retain borrowed return values, and any store of
+        // a borrowed param into an owning field/array retains before returning.
         let mut owned_arg_stashes: Vec<u32> = Vec::new();
         if type_param_count > 0 {
             let type_args = self
@@ -10805,11 +10852,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         // Stash each arg in a local so the subsequent buffer
         // allocation doesn't clobber String pointers mid-build.
         let mut arg_locals: Vec<u32> = Vec::with_capacity(call_args.len());
+        let mut arg_owned: Vec<bool> = Vec::with_capacity(call_args.len());
         for a in call_args {
-            self.compile_expr(&a.value)?;
+            let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
             let local = self.alloc_local();
             self.emit(Instruction::LocalSet(local));
             arg_locals.push(local);
+            arg_owned.push(result.ownership == ExprOwnership::Owned);
         }
 
         let arity = call_args.len() as u32;
@@ -10817,6 +10866,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(buf));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for (i, &local) in arg_locals.iter().enumerate() {
             self.emit(Instruction::LocalGet(buf));
             self.emit(Instruction::LocalGet(local));
@@ -10827,18 +10879,45 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(out_ptr));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
 
         self.emit(Instruction::I32Const(fn_id as i32));
         self.emit(Instruction::LocalGet(buf));
         self.emit(Instruction::I32Const(arity as i32));
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit_import_call(crate::runtime::IMPORT_SPY_CHECK_CALL);
+        let mocked = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(mocked));
+        for (&local, owned) in arg_locals.iter().zip(arg_owned.iter()) {
+            if *owned {
+                self.emit(Instruction::LocalGet(local));
+                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            }
+        }
 
         // i32 on stack: 1 = mocked (use *out_ptr), 0 = run real call.
+        self.emit(Instruction::LocalGet(mocked));
         self.emit_open(Instruction::If(BlockType::Result(ValType::I64)));
+        let mocked_value = self.alloc_local();
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit(Instruction::I64Load(mem0()));
+        self.emit(Instruction::LocalSet(mocked_value));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(mocked_value));
         self.emit(Instruction::Else);
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
         // Real path — compile_module_call re-evaluates args.
         self.compile_module_call(call, call_args)?;
         self.emit_close();
@@ -11065,9 +11144,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             AssertionKind::StringEq => {
                 // stringify both, pass (ptr, len) pairs to RT_STR_EQ.
-                self.emit_string_arg_from_expr(&call_args[0].value)?;
-                self.emit_string_arg_from_expr(&call_args[1].value)?;
+                let left_stash = self.emit_string_arg_stashing(&call_args[0].value)?;
+                let right_stash = self.emit_string_arg_stashing(&call_args[1].value)?;
                 self.emit(Instruction::Call(self.rt().base + RT_STR_EQ));
+                let ok = self.alloc_i32_local();
+                self.emit(Instruction::LocalSet(ok));
+                self.release_stash(left_stash);
+                self.release_stash(right_stash);
+                self.emit(Instruction::LocalGet(ok));
             }
         }
 
@@ -11205,15 +11289,11 @@ impl<'a, 'c> Builder<'a, 'c> {
         // at (a use-after-free — observed as a closure-arity trap when a freed
         // node is later `call_indirect`'d). Those receiver temps leak, soundly.
         // Args 1..n never alias any result, so owned ones are always released.
-        // Arg 0 (receiver) is safe to release when the result CANNOT share a heap
-        // pointer with it: a primitive result (length/isEmpty/contains/indexOf/
-        // startsWith/endsWith), or a CROSS-TYPE transform — `join` (array → fresh
-        // string) and `split` (string → fresh array of fresh substrings) build a
-        // result of a different type with copied bytes, so nothing in the result
-        // points into the receiver. Still skipped: same-type string→string
-        // transforms (may alias the receiver on a fast path) and array-rebuilders
-        // (append/sort/reverse/slice — result shares element pointers) and
-        // element accessors (first/last — result IS a receiver element).
+        // Arg 0 (receiver) is safe to release when the result either cannot
+        // share a heap pointer with it, or the builder retains every shared
+        // child before returning. Still skipped: same-type string→string
+        // transforms with aliasing fast paths, and element accessors
+        // (first/last — result IS a receiver element).
         let result_cannot_alias_receiver = matches!(
             method_id,
             METHOD_LENGTH
@@ -11224,6 +11304,10 @@ impl<'a, 'c> Builder<'a, 'c> {
                 | METHOD_ENDS_WITH
                 | METHOD_JOIN
                 | METHOD_SPLIT
+                | METHOD_APPEND
+                | METHOD_SORT
+                | METHOD_SLICE
+                | METHOD_REVERSE
         );
         for (i, a) in call_args.iter().enumerate() {
             if i == 0 && !result_cannot_alias_receiver {
@@ -12585,8 +12669,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         // through as a no-op (matches `mock` with the same target).
         let Some(fn_id) = fn_id else {
             for a in call_args {
-                self.compile_expr(&a.value)?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.discard_value(result);
             }
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
@@ -12596,17 +12680,22 @@ impl<'a, 'c> Builder<'a, 'c> {
         // Stash each expected value in a local so the buffer
         // allocation doesn't clobber it during its own RT_ALLOC.
         let mut expected_locals = Vec::with_capacity(expected_count);
+        let mut expected_owned = Vec::with_capacity(expected_count);
         for a in &call_args[1..] {
-            self.compile_expr(&a.value)?;
+            let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
             let local = self.alloc_local();
             self.emit(Instruction::LocalSet(local));
             expected_locals.push(local);
+            expected_owned.push(result.ownership == ExprOwnership::Owned);
         }
 
         let buf = self.alloc_i32_local();
         self.emit(Instruction::I32Const((expected_count.max(1) * 8) as i32));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(buf));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for (i, &local) in expected_locals.iter().enumerate() {
             self.emit(Instruction::LocalGet(buf));
             self.emit(Instruction::LocalGet(local));
@@ -12617,6 +12706,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::LocalGet(buf));
         self.emit(Instruction::I32Const(expected_count as i32));
         self.emit_import_call(crate::runtime::IMPORT_SPY_ASSERT_CALLED_WITH);
+        let assertion_failed = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(assertion_failed));
+        for (&local, owned) in expected_locals.iter().zip(expected_owned.iter()) {
+            if *owned {
+                self.emit(Instruction::LocalGet(local));
+                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            }
+        }
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((expected_count.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(assertion_failed));
         // i32 result on stack: 0 pass, 1 fail.
         self.emit_open(Instruction::If(BlockType::Empty));
         self.emit(Instruction::Unreachable);
@@ -12645,8 +12746,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         );
         let Some(fn_id) = fn_id else {
             for a in call_args {
-                self.compile_expr(&a.value)?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.discard_value(result);
             }
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
@@ -12682,8 +12783,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.ctx.std_method_fn_ids,
         );
         let Some(fn_id) = fn_id else {
-            self.compile_expr(&call_args[0].value)?;
-            self.emit(Instruction::Drop);
+            let result = self.compile_expr_result_as(&call_args[0].value, ValueShape::Boxed)?;
+            self.discard_value(result);
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
         };
@@ -12721,23 +12822,31 @@ impl<'a, 'c> Builder<'a, 'c> {
         ) {
             Some(fn_id) => {
                 self.emit(Instruction::I32Const(fn_id as i32));
-                self.compile_expr(args[1])?;
+                let value = self.compile_expr_result_as(args[1], ValueShape::Boxed)?;
+                let release_after_call = if value.ownership == ExprOwnership::Owned {
+                    let local = self.alloc_local();
+                    self.emit(Instruction::LocalTee(local));
+                    Some(local)
+                } else {
+                    None
+                };
                 let import = if once {
                     crate::runtime::IMPORT_SPY_SET_MOCK_ONCE
                 } else {
                     crate::runtime::IMPORT_SPY_SET_MOCK
                 };
                 self.emit_import_call(import);
+                self.release_stash(release_after_call);
             }
             None => {
                 // Unresolvable target — preserve side effects and
                 // emit no host call. The corresponding call sites
                 // won't be instrumented either (they weren't in
                 // the mocked set), so this is consistent.
-                self.compile_expr(args[0])?;
-                self.emit(Instruction::Drop);
-                self.compile_expr(args[1])?;
-                self.emit(Instruction::Drop);
+                let target = self.compile_expr_result_as(args[0], ValueShape::Boxed)?;
+                self.discard_value(target);
+                let value = self.compile_expr_result_as(args[1], ValueShape::Boxed)?;
+                self.discard_value(value);
             }
         }
         self.emit(Instruction::I64Const(VAL_VOID));
@@ -12764,8 +12873,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.emit_import_call(crate::runtime::IMPORT_SPY_RESET);
             }
             None => {
-                self.compile_expr(args[0])?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(args[0], ValueShape::Boxed)?;
+                self.discard_value(result);
             }
         }
         self.emit(Instruction::I64Const(VAL_VOID));
@@ -13488,6 +13597,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::I32Load(mem_off(12)));
             self.emit(Instruction::Call(layout.alloc));
             self.emit(Instruction::LocalSet(frame_l));
+            // Fresh async frames must not inherit stale pending/local slots from
+            // a recycled heap block. The awaited-closure CFG reads pending slots
+            // after resume; stale ids there become invalid `task_result` reads.
+            self.emit(Instruction::LocalGet(frame_l));
+            self.emit(Instruction::I32Const(0));
+            self.emit(Instruction::LocalGet(addr_local));
+            self.emit(Instruction::I32Load(mem_off(12)));
+            self.emit(Instruction::MemoryFill(0));
             // frame[0] = env_ptr = addr + 16
             self.emit(Instruction::LocalGet(frame_l));
             self.emit(Instruction::LocalGet(addr_local));
@@ -13495,9 +13612,18 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::I32Add);
             self.emit(Instruction::I32Store(mem0()));
             // frame[8 + 8*i] = arg_i (params sit past the env slot)
-            for (i, l) in arg_locals.iter().enumerate() {
+            for (i, (arg, l)) in args.iter().zip(arg_locals.iter()).enumerate() {
                 self.emit(Instruction::LocalGet(frame_l));
+                let owned = self.expr_transfers_ownership(arg);
                 self.emit(Instruction::LocalGet(*l));
+                self.prepare_stack_for_owning_store(ExprResult {
+                    shape: ValueShape::Boxed,
+                    ownership: if owned {
+                        ExprOwnership::Owned
+                    } else {
+                        ExprOwnership::Borrowed
+                    },
+                });
                 self.emit(Instruction::I64Store(mem_off(8 + 8 * i as u64)));
             }
             // id = spawn(table_idx @ addr+4, frame)
@@ -13506,6 +13632,29 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::LocalGet(frame_l));
             self.emit(Instruction::Call(layout.spawn));
             self.emit(Instruction::LocalSet(id_l));
+            // Record frame size so completion can reclaim the closure frame.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalGet(addr_local));
+            self.emit(Instruction::I32Load(mem_off(12)));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_FRAME_SIZE,
+            )));
+            // This caller is the result consumer while the drive loop runs. If
+            // left detached (-1), a quickly completed child recycles itself and
+            // releases O_RESULT before the caller reaches `task_result`.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(-2));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_WAITER,
+            )));
             // saved_cur = g_current (re-entrant: an outer task may be live)
             self.emit(Instruction::GlobalGet(layout.g_current));
             self.emit(Instruction::LocalSet(saved_cur));
@@ -13545,9 +13694,63 @@ impl<'a, 'c> Builder<'a, 'c> {
             // g_current = saved_cur
             self.emit(Instruction::LocalGet(saved_cur));
             self.emit(Instruction::GlobalSet(layout.g_current));
-            // result = task_result(id)
+            // If the task finished, read and recycle its result. If browser
+            // polling yielded because the child is parked on host I/O, detach
+            // it again and return Void; the host wakeup will let it finish for
+            // side effects, but this sync caller cannot suspend to await it.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Load(mem_off(crate::async_engine::O_STATUS)));
+            self.emit(Instruction::I32Const(crate::async_engine::ST_COMPLETE));
+            self.emit(Instruction::I32GeS);
+            self.emit(Instruction::If(wasm_encoder::BlockType::Result(
+                ValType::I64,
+            )));
             self.emit(Instruction::LocalGet(id_l));
             self.emit(Instruction::Call(layout.task_result));
+            let async_result_l = self.alloc_local();
+            self.emit(Instruction::LocalSet(async_result_l));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I64Load(mem_off(crate::async_engine::O_RESULT)));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::GlobalGet(layout.g_free_head));
+            self.emit(Instruction::I32Store(mem_off(crate::async_engine::O_NEXT)));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::GlobalSet(layout.g_free_head));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(crate::async_engine::ST_FREED));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_STATUS,
+            )));
+            self.emit(Instruction::LocalGet(async_result_l));
+            self.emit(Instruction::Else);
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(-1));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_WAITER,
+            )));
+            self.emit(Instruction::I64Const(VAL_VOID));
+            self.emit(Instruction::End);
             self.emit(Instruction::Else);
             // ── sync: the original `call_indirect` (env-set + args inline) ──
             let saved_env = self.alloc_i32_local();
@@ -20303,6 +20506,34 @@ mod tests {
         .expect("dict + field access should compile via direct");
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 30;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_user_call_heap_result_can_embed_owned_arg() {
+        let wasm = try_compile_via_production(concat!(
+            "type Box\n",
+            "  items String[]\n",
+            "end\n",
+            "\n",
+            "# Wrap items in a box.\n",
+            "def wrap\n",
+            "    @param items String[]\n",
+            "    @return Box\n",
+            "do\n",
+            "  Box(items: items)\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let box = wrap(['a', 'b'])\n",
+            "  length(box.items)\n",
+            "end\n",
+        ))
+        .expect("heap-returning user call should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 2;
         assert_eq!(result, expected);
     }
 

@@ -2,11 +2,10 @@
 # stdout:
 #   fired
 #   ok
-# leak: expected phase6
+# leak: flat
 #
 # A `once` subscriber is dropped from the registry after it fires,
-# without releasing the retained handler closure
-# (host/events.rs snapshot_and_drop_once).
+# releasing the retained host handler closure exactly once.
 
 use std.events
 

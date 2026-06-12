@@ -5885,9 +5885,6 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         f.instruction(&Instruction::End); // end outer loop
         f.instruction(&Instruction::End); // end outer block
 
-        // RC: the sorted array co-owns the element refs copied from the source.
-        emit_retain_array_elems(f, base, 9, 8, 14);
-
         // Return NaN-boxed array
         f.instruction(&Instruction::LocalGet(9));
         f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));

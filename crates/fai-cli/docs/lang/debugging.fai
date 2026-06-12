@@ -59,12 +59,18 @@ end
 # The flag instruments codegen, so it needs to compile from source —
 # a prebuilt `.wasm` run with `--check-leaks` reports that it lacks
 # instrumentation. The report self-checks against `__live_objects`.
+# Host-built guest objects, such as request/event/router payloads, are
+# counted separately because they are allocated outside guest `rt_alloc`
+# but are still released through normal guest RC. A flat report can
+# therefore say `__live_objects=-N consistent; N host-side` natively, or
+# normalize the browser scalar through `window.__fai_live_objects()`.
 #
 # For servers (which never exit), `--check-leaks=interval:<ms>` prints
 # a compact summary line every <ms> ms — a non-plateauing live count
 # is the leak curve, no exit required. In the browser, build with
 # `FAI_CHECK_LEAKS=1 fai build --html` and call
-# `window.__fai_dump_leaks()` from DevTools or Playwright.
+# `window.__fai_dump_leaks()` from DevTools or Playwright. Browser
+# leak fixtures use the same host-normalized scalar as native.
 def doc_debugging_check_leaks
     @return Void
 do
@@ -87,6 +93,9 @@ end
 # anonymous heap leaks: missing retain/transfer at a store site, extra
 # cleanup of a tracked slot, skipped control-flow cleanup, or a
 # table-driven argument convention bug.
+# Host registries that retain guest handles (events, mocks, router
+# handlers) should show balanced helper ownership and flat leak output
+# on both native and browser targets when that import exists in both.
 #
 # Native:
 #   fai run app.fai --check-ownership

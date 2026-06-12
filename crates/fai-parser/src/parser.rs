@@ -99,10 +99,7 @@ impl Parser {
         // before `let`/`var`. Marks the binding as deliberately aliased.
         if self.check(TokenType::Identifier)
             && self.peek().lexeme == "shared"
-            && matches!(
-                self.peek_next().token_type,
-                TokenType::Let | TokenType::Var
-            )
+            && matches!(self.peek_next().token_type, TokenType::Let | TokenType::Var)
         {
             self.advance(); // consume `shared`
             let mutable = self.match_t(TokenType::Var);

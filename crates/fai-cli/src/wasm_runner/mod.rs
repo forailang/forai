@@ -300,6 +300,7 @@ pub fn run_wasm_with_externs_opts(
             .call(&mut store, 1)
             .map_err(|e| fmt_err("WASM async result error", e))?;
         print::print_return_value(result, &instance, &mut store);
+        reset_retained_host_state(&instance, &mut store)?;
         report_check_leaks(&instance, &mut store, &dbg);
         report_ownership_check();
         return Ok(());
@@ -316,6 +317,7 @@ pub fn run_wasm_with_externs_opts(
 
     print::print_return_value(result, &instance, &mut store);
 
+    reset_retained_host_state(&instance, &mut store)?;
     report_leak_check(&instance, &mut store);
     report_check_leaks(&instance, &mut store, &dbg);
     report_ownership_check();
@@ -363,6 +365,26 @@ fn report_leak_check(instance: &wasmtime::Instance, store: &mut wasmtime::Store<
         }
         None => eprintln!("[leak-check] module has no __live_objects export"),
     }
+}
+
+fn reset_retained_host_state(
+    instance: &wasmtime::Instance,
+    store: &mut wasmtime::Store<()>,
+) -> Result<(), String> {
+    let mut retained = host::drain_spy_retained_values();
+    retained.extend(host::drain_router_retained_values());
+    if retained.is_empty() {
+        return Ok(());
+    }
+    let release = instance
+        .get_typed_func::<i64, ()>(&mut *store, "__fai_release")
+        .map_err(|e| fmt_err("missing __fai_release export for spy reset", e))?;
+    for value in retained {
+        release
+            .call(&mut *store, value)
+            .map_err(|e| fmt_err("spy reset release failed", e))?;
+    }
+    Ok(())
 }
 
 /// Output captured from a single [`run_wasm_capturing`] invocation.
@@ -569,7 +591,7 @@ pub fn run_wasm_tests_with_externs(
             None
         };
         if test.has_before_all {
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             run_test
                 .call(&mut store, (suite_i as i32, TEST_HOOK_BEFORE_ALL_CASE_IDX))
                 .map_err(|e| fmt_err(&format!("beforeAll failed in '{}'", test.suite_name), e))?;
@@ -577,7 +599,7 @@ pub fn run_wasm_tests_with_externs(
         for (case_i, desc) in test.case_descriptions.iter().enumerate() {
             // Clear spy/mock state between cases so call counts and
             // mocked values don't bleed across `it(...)` blocks.
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             // FAI_TRACE_TESTS: name each case on the real stderr before it
             // runs (bypassing the per-test output capture), so a hang or
             // runaway is pinned to the test that never returns.
@@ -591,7 +613,12 @@ pub fn run_wasm_tests_with_externs(
             } else {
                 None
             };
-            let res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            let mut res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            if let Err(e) = reset_retained_host_state(&instance, &mut store) {
+                if res.is_ok() {
+                    res = Err(wasmtime::Error::msg(e));
+                }
+            }
             // Leak verdict for the case window. Only evaluated on a
             // clean return — a trapped case left guest state
             // indeterminate, and the trap is the failure that matters.
@@ -664,10 +691,11 @@ pub fn run_wasm_tests_with_externs(
             on_case(&outcome);
         }
         if test.has_after_all {
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             run_test
                 .call(&mut store, (suite_i as i32, TEST_HOOK_AFTER_ALL_CASE_IDX))
                 .map_err(|e| fmt_err(&format!("afterAll failed in '{}'", test.suite_name), e))?;
+            reset_retained_host_state(&instance, &mut store)?;
         }
         // Suite-level report (informational, never a failure): growth
         // since the pre-suite snapshot that per-case windows can't see —

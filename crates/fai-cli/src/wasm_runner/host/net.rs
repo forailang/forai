@@ -651,14 +651,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let (url, fn_name, args_json, hash) = {
                     let data = mem.data(&caller);
                     (
-                        String::from_utf8_lossy(&data[url_ptr as usize..(url_ptr + url_len) as usize])
-                            .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[url_ptr as usize..(url_ptr + url_len) as usize],
+                        )
+                        .into_owned(),
                         String::from_utf8_lossy(&data[fn_ptr as usize..(fn_ptr + fn_len) as usize])
                             .into_owned(),
-                        String::from_utf8_lossy(&data[args_ptr as usize..(args_ptr + args_len) as usize])
-                            .into_owned(),
-                        String::from_utf8_lossy(&data[hash_ptr as usize..(hash_ptr + hash_len) as usize])
-                            .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[args_ptr as usize..(args_ptr + args_len) as usize],
+                        )
+                        .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[hash_ptr as usize..(hash_ptr + hash_len) as usize],
+                        )
+                        .into_owned(),
                     )
                 };
                 #[cfg(feature = "http-client")]
@@ -688,9 +694,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             } else {
                                 match serde_json::from_str::<serde_json::Value>(&resp_body) {
                                     Ok(parsed) => {
-                                        if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            let value =
-                                                parsed.get("value").unwrap_or(&serde_json::Value::Null);
+                                        if parsed
+                                            .get("ok")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            let value = parsed
+                                                .get("value")
+                                                .unwrap_or(&serde_json::Value::Null);
                                             Ok(build_value(&mut caller, &mem, value))
                                         } else {
                                             Err(parsed

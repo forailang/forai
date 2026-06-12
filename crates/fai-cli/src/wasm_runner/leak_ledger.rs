@@ -270,7 +270,10 @@ pub(crate) fn delta_since(snap: &LedgerSnapshot, data: &[u8]) -> Option<LedgerDe
 /// AFTER this prefix; parsers must tolerate them. Do not reword without
 /// updating fai-feature-tests' parser and plans/118.
 pub(crate) fn sentinel_line(objects: usize, bytes: u64) -> String {
-    format!("[check-leaks] live heap: {} objects, {} bytes", objects, bytes)
+    format!(
+        "[check-leaks] live heap: {} objects, {} bytes",
+        objects, bytes
+    )
 }
 
 /// Name the block at `addr` (a logical object pointer) for trap
@@ -375,20 +378,21 @@ pub(crate) fn render_report(
     store: &mut Store<()>,
     dbg: &DbgTable,
 ) -> Option<String> {
-    let (map, host_allocs, guest_events, unknown_frees, samples, live_bytes) = LEDGER.with(|l| {
-        let led = l.borrow();
-        if !led.enabled {
-            return None;
-        }
-        Some((
-            led.map.clone(),
-            led.host_allocs,
-            led.guest_events,
-            led.unknown_frees,
-            led.unknown_free_samples.clone(),
-            led.live_bytes,
-        ))
-    })?;
+    let (map, host_allocs, guest_events, unknown_frees, samples, live_bytes) =
+        LEDGER.with(|l| {
+            let led = l.borrow();
+            if !led.enabled {
+                return None;
+            }
+            Some((
+                led.map.clone(),
+                led.host_allocs,
+                led.guest_events,
+                led.unknown_frees,
+                led.unknown_free_samples.clone(),
+                led.live_bytes,
+            ))
+        })?;
 
     if guest_events == 0 {
         return Some(
@@ -529,7 +533,9 @@ fn tag_name(tag: i32) -> &'static str {
 }
 
 fn read_i32(data: &[u8], addr: usize) -> Option<i32> {
-    Some(i32::from_le_bytes(data.get(addr..addr + 4)?.try_into().ok()?))
+    Some(i32::from_le_bytes(
+        data.get(addr..addr + 4)?.try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -553,7 +559,10 @@ mod tests {
             assert_eq!(led.unknown_frees, 1);
             // Self-check arithmetic: __live_objects would be
             // guest allocs (2) - frees (2) = 0 == 2 - 1 - 1.
-            assert_eq!(led.map.len() as i64 - led.host_allocs as i64 - led.unknown_frees as i64, 0);
+            assert_eq!(
+                led.map.len() as i64 - led.host_allocs as i64 - led.unknown_frees as i64,
+                0
+            );
         });
         reset(false, None, None);
         assert!(!is_enabled());

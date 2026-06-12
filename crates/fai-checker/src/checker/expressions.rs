@@ -1230,7 +1230,9 @@ mod tests {
         let actual = named_type_with_bindings("Signal", NamedCategory::Type, inst);
         let expected = named_type("Signal", NamedCategory::Type);
         assert!(c.bind_and_check_assignable(&actual, &expected, &mut bindings));
-        assert!(matches!(bindings.get("T"), Some(Type::Array(inner)) if matches!(**inner, Type::Int)));
+        assert!(
+            matches!(bindings.get("T"), Some(Type::Array(inner)) if matches!(**inner, Type::Int))
+        );
         // The return type param then concretizes through apply_generic_bindings.
         let resolved = apply_generic_bindings(&type_parameter("T"), &bindings);
         assert!(matches!(resolved, Type::Array(inner) if matches!(*inner, Type::Int)));

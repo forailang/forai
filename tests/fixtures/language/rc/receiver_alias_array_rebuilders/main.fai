@@ -1,0 +1,27 @@
+# expect: ok
+# stdout:
+#   ab
+#   x
+#   ba
+# leak: flat
+
+use std.array
+
+def main
+    @return Void
+do
+    let appended = append([
+        'a'
+    ], 'b')
+    print(appended[0] + appended[1])
+    let sliced = array.slice([
+        'x'
+        'y'
+    ], 0, 1)
+    print(sliced[0])
+    let reversed = array.reverse([
+        'a'
+        'b'
+    ])
+    print(reversed[0] + reversed[1])
+end

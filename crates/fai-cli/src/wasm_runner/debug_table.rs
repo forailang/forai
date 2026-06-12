@@ -68,9 +68,7 @@ impl DbgTable {
             match payload {
                 Ok(Payload::CustomSection(reader)) if reader.name() == "fai-dbg" => {
                     if let Ok(on_disk) = serde_json::from_slice::<OnDisk>(reader.data()) {
-                        table.heap_buckets = on_disk
-                            .heap
-                            .map(|h| (h.bucket_base, h.bucket_count));
+                        table.heap_buckets = on_disk.heap.map(|h| (h.bucket_base, h.bucket_count));
                         table.functions = on_disk
                             .functions
                             .into_iter()

@@ -1,9 +1,9 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase6
+# leak: flat
 #
-# clearAll drops every Subscription without releasing the retained
-# handler closures (host/events.rs clear_all).
+# clearAll releases every retained host subscription closure and any
+# queued deferred payloads.
 
 use std.events
 
