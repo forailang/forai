@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: done
-# leak: expected phase5
+# leak: flat
 def main
     @return Void
 do

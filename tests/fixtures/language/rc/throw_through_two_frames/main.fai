@@ -1,0 +1,64 @@
+# expect: ok
+# stdout:
+#   deep
+#   done
+# leak: flat
+
+use std.error
+
+# Throws a borrowed error after allocating local cleanup candidates.
+def inner
+    @return Void
+do
+    let scratch = [1 2 3]
+    let err = Error('deep')
+    if scratch[0] == 1
+        throw err
+    end
+end
+
+test inner
+    it 'throws the retained borrowed error'
+        var caught = ''
+        try
+            inner()
+        catch e
+            caught = e.message
+        end
+        assert.equals(caught, 'deep')
+    end
+end
+
+# Re-propagates the inner throw while owning local cleanup candidates.
+def outer
+    @return Void
+do
+    let scratch = [4 5 6]
+    inner()
+    print(scratch[0])
+end
+
+test outer
+    it 'repropagates through the caller frame'
+        var caught = ''
+        try
+            outer()
+        catch e
+            caught = e.message
+        end
+        assert.equals(caught, 'deep')
+    end
+end
+
+def main
+    @return Void
+do
+    try
+        let scratch = [7 8 9]
+        outer()
+        print(scratch[0])
+    catch e
+        print(e.message)
+    end
+    print('done')
+end

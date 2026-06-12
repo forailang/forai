@@ -129,8 +129,8 @@ project's test lane, not here.
 | 7 | FFI externs | `rc/ffi_libc_abs` | flat (primitive returns) |
 | 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | handler closures retained, never released → expected phase6 |
 | 9 | async frames | `rc/async_frame_complete` | frames released; scheduler buffer → expected async-runtime-root |
-| 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | skipped scope drops → expected phase5; fallthrough flat |
-| 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try` | skipped drops on throw/break → expected phase5 |
+| 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | flat |
+| 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try`, `rc/throw_through_two_frames` | flat, including in-function catch and cross-function propagation cleanup |
 | 12 | closures | `rc/closure_capture` | balances; typedef callbacks pull async scheduler → expected async-runtime-root |
 | 13 | spy/mock | `rc/spy_mock_reset` | run-path flat; host retention is the `fai test --check-leaks` lane's oracle (phase 6 audit) |
 | 14 | brain request loop | brain project inline suite | see plans/118 U8 |

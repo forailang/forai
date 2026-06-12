@@ -7886,8 +7886,8 @@ struct Builder<'a, 'c> {
     /// Phase 3 reclamation (plans/111): per-scope list of wasm locals holding
     /// confined fresh-literal (Array/Dict/Tuple) bindings — `rt_drop`'d when the
     /// scope exits. Parallel to `scopes`. `pop_scope` drops the top list on
-    /// fall-through; a `return`/tail drops every active list (it jumps past the
-    /// pop_scopes). `break`/`continue`/`throw` skip the drops (leak, sound).
+    /// fall-through; non-trap early exits use targeted cleanup depths so they
+    /// release the scopes they skip before branching.
     scope_drops: Vec<Vec<u32>>,
     /// Names that escape this function under a conservative intraprocedural
     /// analysis (every call assumed to retain). A binding is a drop candidate
@@ -7954,9 +7954,12 @@ struct Builder<'a, 'c> {
 /// Per-`try` bookkeeping for `throw` dispatch. Popped *before* the
 /// catch body compiles so a throw inside `catch` propagates to the
 /// next-outer try.
+#[derive(Clone, Copy)]
 struct TryFrame {
     /// Absolute `block_depth` of the inner `$catch` block.
     catch_abs: u32,
+    /// `scope_drops` depth that remains live at the catch handler.
+    cleanup_depth: usize,
     /// Local that holds the thrown value until the `$catch` block
     /// binds it to the user-declared `catch_name`.
     err_local: u32,
@@ -7966,6 +7969,7 @@ struct TryFrame {
 /// pushes one of these before emitting the outer `block` + inner
 /// `loop`; relative `br` depth at a use site is
 /// `current_block_depth - target_abs`.
+#[derive(Clone, Copy)]
 struct LoopFrame {
     /// Absolute `block_depth` after the outer `block` was opened —
     /// the `break` target.
@@ -7973,6 +7977,8 @@ struct LoopFrame {
     /// Absolute `block_depth` after the inner `loop` was opened —
     /// the `continue` target.
     continue_abs: u32,
+    /// `scope_drops` depth that remains live after `break`/`continue`.
+    cleanup_depth: usize,
 }
 
 impl<'a, 'c> Builder<'a, 'c> {
@@ -8976,6 +8982,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// )
     /// ```
     fn compile_while(&mut self, s: &WhileStatement) -> Result<(), BuildError> {
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty));
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty));
@@ -8983,6 +8990,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // Evaluate condition + branch out on falsy.
@@ -9009,21 +9017,23 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     fn compile_break(&mut self) -> Result<(), BuildError> {
-        let frame = self
+        let frame = *self
             .loops
             .last()
             .ok_or(BuildError::UnsupportedStatement("break outside loop"))?;
         let rel = self.block_depth - frame.break_abs;
+        self.emit_cleanup_to_depth(frame.cleanup_depth);
         self.emit(Instruction::Br(rel));
         Ok(())
     }
 
     fn compile_continue(&mut self) -> Result<(), BuildError> {
-        let frame = self
+        let frame = *self
             .loops
             .last()
             .ok_or(BuildError::UnsupportedStatement("continue outside loop"))?;
         let rel = self.block_depth - frame.continue_abs;
+        self.emit_cleanup_to_depth(frame.cleanup_depth);
         self.emit(Instruction::Br(rel));
         Ok(())
     }
@@ -9058,11 +9068,13 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// current error-handling contract.
     fn compile_try(&mut self, s: &TryStatement) -> Result<(), BuildError> {
         let err_local = self.alloc_local();
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty));
         self.emit_open(Instruction::Block(BlockType::Empty));
         let catch_abs = self.block_depth;
         self.tries.push(TryFrame {
             catch_abs,
+            cleanup_depth,
             err_local,
         });
 
@@ -9088,6 +9100,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // under the user-declared catch_name for the catch body.
         self.push_scope();
         self.bind(&s.catch_name, err_local);
+        self.note_droppable(err_local);
         for st in &s.catch_body {
             self.compile_stmt(st)?;
         }
@@ -9122,15 +9135,35 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// further up. This is the unwind path that makes
     /// cross-function throw + catch work.
     fn compile_throw(&mut self, s: &ThrowStatement) -> Result<(), BuildError> {
-        self.compile_expr(&s.expression)?;
-        if let Some(frame) = self.tries.last() {
+        let result = self.compile_expr_result_as(&s.expression, ValueShape::Boxed)?;
+        match result.ownership {
+            ExprOwnership::Borrowed => {
+                self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
+            ExprOwnership::Owned => {
+                self.emit_ownership_event_for_stack(
+                    OwnershipOp::Transfer,
+                    OWNERSHIP_SITE_UNKNOWN,
+                    0,
+                );
+            }
+            ExprOwnership::Primitive => {}
+        }
+        let thrown_local = self.alloc_local();
+        self.emit(Instruction::LocalSet(thrown_local));
+        if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
+            self.emit_cleanup_to_depth(frame.cleanup_depth);
             let err_local = frame.err_local;
+            self.emit(Instruction::LocalGet(thrown_local));
             self.emit(Instruction::LocalSet(err_local));
             self.emit(Instruction::Br(rel));
         } else {
+            self.emit_cleanup_to_depth(0);
             // Stash the value into the error globals; the caller
             // will pick it up via the post-call propagation check.
+            self.emit(Instruction::LocalGet(thrown_local));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
             self.emit(Instruction::I32Const(1));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
@@ -9152,12 +9185,20 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// return value. If the flag isn't set, the saved result is
     /// pushed back so the caller's expression context sees an i64
     /// exactly as if no check had run.
-    fn emit_post_call_propagation(&mut self) {
+    fn release_owned_arg_stashes(&mut self, owned_arg_stashes: &[u32]) {
+        for &t in owned_arg_stashes {
+            self.emit_ownership_event_for_local(OwnershipOp::Discard, OWNERSHIP_SITE_UNKNOWN, t, 0);
+            self.emit(Instruction::LocalGet(t));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
+    }
+
+    fn emit_post_call_propagation(&mut self, owned_arg_stashes: &[u32]) {
         let result_local = self.alloc_local();
         self.emit(Instruction::LocalSet(result_local));
         self.emit(Instruction::GlobalGet(GLOBAL_ERROR_FLAG));
         self.emit_open(Instruction::If(BlockType::Empty));
-        if let Some(frame) = self.tries.last() {
+        if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
             let err_local = frame.err_local;
             self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
@@ -9166,6 +9207,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
             self.emit(Instruction::I64Const(0));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+            self.release_owned_arg_stashes(owned_arg_stashes);
+            self.emit_cleanup_to_depth(frame.cleanup_depth);
             self.emit(Instruction::Br(rel));
         } else if self.fd.name == "<__start__>" {
             // Outermost frame — there is nowhere left to propagate.
@@ -9183,6 +9226,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         } else {
             // Push the saved result and return — it's a placeholder
             // the caller throws away once it sees the flag set.
+            self.release_owned_arg_stashes(owned_arg_stashes);
+            self.emit_cleanup_to_depth(0);
             self.emit(Instruction::LocalGet(result_local));
             self.emit(Instruction::Return);
         }
@@ -9298,6 +9343,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // item slot (NaN-boxed i64) — rebound each iteration.
         let item_local = self.alloc_local();
 
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty)); // $break
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty)); // $repeat
@@ -9307,6 +9353,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // if index >= length: break
@@ -9373,6 +9420,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // item slot (NaN-boxed) for the user's loop variable.
         let item_local = self.alloc_local();
 
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty)); // $break
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty)); // $repeat
@@ -9382,6 +9430,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // `..` is exclusive (exit when counter >= end); `...` is
@@ -9667,6 +9716,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.scope_drops.push(Vec::new());
     }
 
+    fn cleanup_depth(&self) -> usize {
+        self.scope_drops.len()
+    }
+
     fn pop_scope(&mut self) {
         // Fall-through exit of this scope: free its confined fresh-literal
         // bindings. (On a `return` that jumped out of this scope, this code is
@@ -9700,21 +9753,35 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
     }
 
-    /// Emit `rt_drop` for every confined binding in every active scope
-    /// (innermost → outermost). Used before a `return`/tail, which jumps past
-    /// the `pop_scope` of each enclosing scope.
-    fn emit_all_active_drops(&mut self) {
-        let locals: Vec<u32> = self.scope_drops.iter().rev().flatten().copied().collect();
+    /// Emit `rt_drop` for every confined binding in scopes deeper than
+    /// `target_depth` (innermost -> outermost). Used before any non-trap early
+    /// exit that jumps past lexical `pop_scope` cleanup.
+    fn emit_cleanup_to_depth(&mut self, target_depth: usize) {
+        let locals: Vec<u32> = self
+            .scope_drops
+            .iter()
+            .skip(target_depth)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         if locals.is_empty() {
             return;
         }
+        for l in locals {
+            self.release_owned_local(l, OwnershipOp::Cleanup);
+        }
+    }
+
+    /// Emit `rt_drop` for every confined binding in every active scope
+    /// (innermost -> outermost). Used before a `return`/tail, which jumps past
+    /// the `pop_scope` of each enclosing scope.
+    fn emit_all_active_drops(&mut self) {
         // RC release before a return/tail (which jumps past each pop_scope).
         // `compile_return`/`compile_tail_stmt` already retained a borrowed return
         // value before calling this, so releasing its owning local here leaves it
         // alive at +1 for the caller to take ownership of.
-        for l in locals {
-            self.release_owned_local(l, OwnershipOp::Cleanup);
-        }
+        self.emit_cleanup_to_depth(0);
     }
 
     fn has_active_drops(&self) -> bool {
@@ -10513,7 +10580,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
             self.emit(Instruction::Call(wasm_idx));
-            self.emit_post_call_propagation();
+            self.emit_post_call_propagation(&owned_arg_stashes);
             for t in owned_arg_stashes {
                 self.emit(Instruction::LocalGet(t));
                 self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
@@ -10591,10 +10658,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&owned_arg_stashes);
         // Result is on the stack (propagation re-pushed it); release the owned
-        // argument temporaries beneath it. On a throw, propagation branched away
-        // and this is skipped — the temps leak on the error path (sound).
+        // argument temporaries beneath it. On a throw, propagation releases the
+        // stashes before branching away.
         for t in owned_arg_stashes {
             self.emit(Instruction::LocalGet(t));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
@@ -11833,7 +11900,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&[]);
         let rows_local = self.alloc_local();
         self.emit(Instruction::LocalSet(rows_local));
 
@@ -13509,12 +13576,12 @@ impl<'a, 'c> Builder<'a, 'c> {
             });
             self.emit(Instruction::LocalGet(saved_env));
             self.emit(Instruction::GlobalSet(GLOBAL_ENV_PTR));
+            // This vector is only initialized on the sync branch of the emitted
+            // wasm `if`; release it before closing that branch so the async
+            // branch never sees unassigned stash locals during propagation.
+            self.release_owned_arg_stashes(&owned_arg_stashes);
             self.emit(Instruction::End); // end if
-            self.emit_post_call_propagation();
-            for t in owned_arg_stashes {
-                self.emit(Instruction::LocalGet(t));
-                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-            }
+            self.emit_post_call_propagation(&[]);
             return Ok(());
         }
 
@@ -13553,7 +13620,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // doesn't leak a closure's upvalue frame into outer scope.
         self.emit(Instruction::LocalGet(saved_env));
         self.emit(Instruction::GlobalSet(GLOBAL_ENV_PTR));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&owned_arg_stashes);
         for t in owned_arg_stashes {
             self.emit(Instruction::LocalGet(t));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));

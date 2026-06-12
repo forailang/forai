@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: boom
-# leak: expected phase5
+# leak: flat
 
 use std.error
 

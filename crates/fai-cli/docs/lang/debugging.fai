@@ -19,12 +19,12 @@
 def doc_debugging_overview
     @return Void
 do
-  # Environment fallbacks (same behavior, no flag):
-  #   FAI_WATCHDOG=10
-  #   FAI_CHECK_LEAKS=1            (or interval:<ms>)
-  #   FAI_OWNERSHIP_CHECK=1        (helper ownership event stream)
-  #   FAI_RC_CHECK=1               (checked refcount ops; CI oracle)
-  #   FAI_LEAK_CHECK=1             (scalar live-object count at exit)
+    # Environment fallbacks (same behavior, no flag):
+    #   FAI_WATCHDOG=10
+    #   FAI_CHECK_LEAKS=1            (or interval:<ms>)
+    #   FAI_OWNERSHIP_CHECK=1        (helper ownership event stream)
+    #   FAI_RC_CHECK=1               (checked refcount ops; CI oracle)
+    #   FAI_LEAK_CHECK=1             (scalar live-object count at exit)
 end
 
 # --watchdog[=secs] / --debug — kill a hung run (default 10s) and dump
@@ -37,15 +37,15 @@ end
 def doc_debugging_watchdog
     @return Void
 do
-  # fai run server.fai --watchdog=30
-  #
-  # WASM watchdog: no completion after 30s — killing the run
-  # post-mortem:
-  #   heap: heap_ptr=0x11e8, live objects=42, free blocks=3 (168 bytes)
-  #   async tasks (count 3, live 2, current -, root t1):
-  #     id    status    rstate  waiter  joins  wake      resume
-  #     t1    WAITING        2       -      1  -         main#resume
-  #     t2    WAITING        1      t1      0  in 59.8s  fetchAll#resume
+    # fai run server.fai --watchdog=30
+    #
+    # WASM watchdog: no completion after 30s — killing the run
+    # post-mortem:
+    #   heap: heap_ptr=0x11e8, live objects=42, free blocks=3 (168 bytes)
+    #   async tasks (count 3, live 2, current -, root t1):
+    #     id    status    rstate  waiter  joins  wake      resume
+    #     t1    WAITING        2       -      1  -         main#resume
+    #     t2    WAITING        1      t1      0  in 59.8s  fetchAll#resume
 end
 
 # --check-leaks — the heap allocation ledger. Instead of a scalar
@@ -68,23 +68,25 @@ end
 def doc_debugging_check_leaks
     @return Void
 do
-  # fai run app.fai --check-leaks
-  #
-  # [check-leaks] live heap: 12 objects, 388 bytes (__live_objects=12 consistent; 0 host-side)
-  #   count    bytes  what
-  #      10      290      29B  String allocated in makeLeak ← main ← <__start__>
-  #       1       88      88B  Array allocated in makeLeak ← main ← <__start__>
-  #
-  # fai run server.fai --check-leaks=interval:1000
-  # [check-leaks] live=1234 (+56) bytes=78901 (+1234) top: 264B×120, 29B×80
+    # fai run app.fai --check-leaks
+    #
+    # [check-leaks] live heap: 12 objects, 388 bytes (__live_objects=12 consistent; 0 host-side)
+    #   count    bytes  what
+    #      10      290      29B  String allocated in makeLeak ← main ← <__start__>
+    #       1       88      88B  Array allocated in makeLeak ← main ← <__start__>
+    #
+    # fai run server.fai --check-leaks=interval:1000
+    # [check-leaks] live=1234 (+56) bytes=78901 (+1234) top: 264B×120, 29B×80
 end
 
 # --check-ownership — the helper ownership ledger. This records the
 # phase-4 ownership-helper event stream: retain/transfer into owning
-# storage, cleanup of owning slots, discards, returns, and call-argument
-# conventions. It is meant to catch helper mistakes before they become
+# storage, cleanup of owning slots, discards, returns, call-argument
+# conventions, and cleanup-stack exits for return/break/continue/throw
+# propagation. It is meant to catch helper mistakes before they become
 # anonymous heap leaks: missing retain/transfer at a store site, extra
-# cleanup of a tracked slot, or a table-driven argument convention bug.
+# cleanup of a tracked slot, skipped control-flow cleanup, or a
+# table-driven argument convention bug.
 #
 # Native:
 #   fai run app.fai --check-ownership
@@ -101,6 +103,6 @@ end
 def doc_debugging_check_ownership
     @return Void
 do
-  # fai run app.fai --check-ownership
-  # [ownership-check] 42 event(s), 0 object(s) with helper imbalance
+    # fai run app.fai --check-ownership
+    # [ownership-check] 42 event(s), 0 object(s) with helper imbalance
 end
