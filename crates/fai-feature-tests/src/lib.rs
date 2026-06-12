@@ -77,6 +77,7 @@ pub struct BrowserAssertion {
     pub root_result: Option<String>,
     pub duration_less_than_ms: Option<u64>,
     pub duration_at_least_ms: Option<u64>,
+    pub ownership_balanced: bool,
 }
 
 #[derive(Debug)]
@@ -290,6 +291,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
         || browser.root_result.is_some()
         || browser.duration_less_than_ms.is_some()
         || browser.duration_at_least_ms.is_some()
+        || browser.ownership_balanced
     {
         Some(browser)
     } else {
@@ -316,7 +318,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
 fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), String> {
     let Some((key, value)) = line.split_once(':') else {
         return Err(format!(
-            "browser directive lines must be `selector:`, `text:`, `html:`, `rootResult:`, `durationLessThanMs:`, or `durationAtLeastMs:`, got `{}`",
+            "browser directive lines must be `selector:`, `text:`, `html:`, `rootResult:`, `durationLessThanMs:`, `durationAtLeastMs:`, or `ownership: balanced`, got `{}`",
             line
         ));
     };
@@ -342,9 +344,19 @@ fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), 
                 )
             })?)
         }
+        "ownership" => {
+            if value == "balanced" {
+                browser.ownership_balanced = true;
+            } else {
+                return Err(format!(
+                    "ownership must be `balanced` when present, got `{}`",
+                    value
+                ));
+            }
+        }
         other => {
             return Err(format!(
-                "unknown browser assertion `{}` (want selector|text|html|rootResult|durationLessThanMs|durationAtLeastMs)",
+                "unknown browser assertion `{}` (want selector|text|html|rootResult|durationLessThanMs|durationAtLeastMs|ownership)",
                 other
             ));
         }
@@ -489,11 +501,17 @@ fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
         detail: format!("failed to create {}: {}", build_dir.display(), e),
     })?;
 
-    let out = Command::new(fai_binary())
-        .args(["build", path.as_str(), "--html", "-o"])
-        .arg(&wasm_path)
-        .output()
-        .expect("failed to spawn fai binary");
+    let mut build = Command::new(fai_binary());
+    build.args(["build", path.as_str(), "--html", "-o"]);
+    build.arg(&wasm_path);
+    if fx
+        .browser
+        .as_ref()
+        .is_some_and(|assertion| assertion.ownership_balanced)
+    {
+        build.env("FAI_OWNERSHIP_CHECK", "1");
+    }
+    let out = build.output().expect("failed to spawn fai binary");
     if !out.status.success() {
         return Err(FixtureFailure {
             gate: "browser-build",
@@ -575,6 +593,9 @@ fn browser_assertion_json(assertion: &BrowserAssertion, leak: Option<&LeakExpect
     if let Some(ms) = assertion.duration_at_least_ms {
         parts.push(format!("\"durationAtLeastMs\":{}", ms));
     }
+    if assertion.ownership_balanced {
+        parts.push("\"ownership\":\"balanced\"".to_string());
+    }
     // Browser leak gate (plan 118 U4): a fixture carrying both `browser:`
     // and `leak:` runs the gate inside the browser — same two-sided
     // semantics as the native gate. The always-exported __live_objects
@@ -582,9 +603,10 @@ fn browser_assertion_json(assertion: &BrowserAssertion, leak: Option<&LeakExpect
     // it through window.__fai_live_objects() after the root completes.
     match leak {
         Some(LeakExpectation::Flat) => parts.push("\"leak\":\"flat\"".to_string()),
-        Some(LeakExpectation::Expected(tag)) => {
-            parts.push(format!("\"leak\":\"expected\",\"leakTag\":\"{}\"", escape_json(tag)))
-        }
+        Some(LeakExpectation::Expected(tag)) => parts.push(format!(
+            "\"leak\":\"expected\",\"leakTag\":\"{}\"",
+            escape_json(tag)
+        )),
         None => {}
     }
     format!("{{{}}}", parts.join(","))
@@ -800,8 +822,14 @@ mod leak_directive_tests {
     #[test]
     fn sentinel_absent_or_malformed_is_none() {
         assert_eq!(parse_live_objects(""), None);
-        assert_eq!(parse_live_objects("[leak-check] live heap objects at exit: 3"), None);
-        assert_eq!(parse_live_objects("[check-leaks] live heap: many objects"), None);
+        assert_eq!(
+            parse_live_objects("[leak-check] live heap objects at exit: 3"),
+            None
+        );
+        assert_eq!(
+            parse_live_objects("[check-leaks] live heap: many objects"),
+            None
+        );
         assert_eq!(
             parse_live_objects("[check-leaks] no allocation events — not built with the flag"),
             None

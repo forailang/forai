@@ -1,0 +1,28 @@
+# expect: ok
+# browser:
+#   rootResult: caught: fixture failed
+def main
+    @return String
+do
+    try
+        let _ = fails()
+        'not caught'
+    catch e
+        'caught: ' + e.message
+    end
+end
+
+private:
+
+# Fails through the remote-call tail path.
+def fails
+    @return String
+do
+    remoteCall('', 'fixture.fail', '[]', '')
+end
+
+test fails
+    it 'is covered by the browser remote tail fixture'
+        print('placeholder')
+    end
+end

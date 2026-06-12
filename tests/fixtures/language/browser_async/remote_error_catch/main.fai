@@ -1,0 +1,13 @@
+# expect: ok
+# browser:
+#   rootResult: caught: fixture failed
+def main
+    @return String
+do
+    try
+        let _ = remoteCall('', 'fixture.fail', '[]', '')
+        'not caught'
+    catch e
+        'caught: ' + e.message
+    end
+end

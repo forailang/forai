@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase4
+# leak: flat
 # Returns its arguments swapped.
 def swap
     @param a Int

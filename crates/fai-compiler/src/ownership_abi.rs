@@ -43,6 +43,75 @@ pub enum ExprOwnership {
     Owned,
 }
 
+/// Stable operation IDs emitted by phase-4 ownership helpers.
+///
+/// These IDs are part of the native/browser diagnostic ABI. Append new
+/// operations; do not renumber existing ones.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OwnershipOp {
+    Retain = 1,
+    Release = 2,
+    Transfer = 3,
+    Borrow = 4,
+    Store = 5,
+    Overwrite = 6,
+    Cleanup = 7,
+    Return = 8,
+    Discard = 9,
+    CallArgument = 10,
+}
+
+impl OwnershipOp {
+    pub const ALL: [OwnershipOp; 10] = [
+        OwnershipOp::Retain,
+        OwnershipOp::Release,
+        OwnershipOp::Transfer,
+        OwnershipOp::Borrow,
+        OwnershipOp::Store,
+        OwnershipOp::Overwrite,
+        OwnershipOp::Cleanup,
+        OwnershipOp::Return,
+        OwnershipOp::Discard,
+        OwnershipOp::CallArgument,
+    ];
+
+    pub const fn id(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            OwnershipOp::Retain => "retain",
+            OwnershipOp::Release => "release",
+            OwnershipOp::Transfer => "transfer",
+            OwnershipOp::Borrow => "borrow",
+            OwnershipOp::Store => "store",
+            OwnershipOp::Overwrite => "overwrite",
+            OwnershipOp::Cleanup => "cleanup",
+            OwnershipOp::Return => "return",
+            OwnershipOp::Discard => "discard",
+            OwnershipOp::CallArgument => "call_argument",
+        }
+    }
+
+    pub const fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(OwnershipOp::Retain),
+            2 => Some(OwnershipOp::Release),
+            3 => Some(OwnershipOp::Transfer),
+            4 => Some(OwnershipOp::Borrow),
+            5 => Some(OwnershipOp::Store),
+            6 => Some(OwnershipOp::Overwrite),
+            7 => Some(OwnershipOp::Cleanup),
+            8 => Some(OwnershipOp::Return),
+            9 => Some(OwnershipOp::Discard),
+            10 => Some(OwnershipOp::CallArgument),
+            _ => None,
+        }
+    }
+}
+
 /// How a callee treats one argument it is passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgConvention {
@@ -62,6 +131,43 @@ pub enum ArgConvention {
     /// keep a guest handle (e.g. a path string copied out of guest memory).
     /// The caller still handles any owned temp it passed.
     CopiedByHost,
+}
+
+impl ArgConvention {
+    pub const ALL: [ArgConvention; 4] = [
+        ArgConvention::Borrowed,
+        ArgConvention::Consumed,
+        ArgConvention::RetainedByCallee,
+        ArgConvention::CopiedByHost,
+    ];
+
+    pub const fn id(self) -> u32 {
+        match self {
+            ArgConvention::Borrowed => 1,
+            ArgConvention::Consumed => 2,
+            ArgConvention::RetainedByCallee => 3,
+            ArgConvention::CopiedByHost => 4,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ArgConvention::Borrowed => "borrowed",
+            ArgConvention::Consumed => "consumed",
+            ArgConvention::RetainedByCallee => "retained_by_callee",
+            ArgConvention::CopiedByHost => "copied_by_host",
+        }
+    }
+
+    pub const fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(ArgConvention::Borrowed),
+            2 => Some(ArgConvention::Consumed),
+            3 => Some(ArgConvention::RetainedByCallee),
+            4 => Some(ArgConvention::CopiedByHost),
+            _ => None,
+        }
+    }
 }
 
 /// How a callable hands its result back to the caller.
@@ -240,79 +346,411 @@ use ReturnConvention::{Borrowed as RBor, Owned as ROwn, Primitive as RPrim};
 
 pub const HOST_IMPORTS: &[HostImportRow] = &[
     // std.file
-    HostImportRow { canon: "std.file", method: "read", import: "file_read_str", ret: ROwn, doc: "fresh string via wasm_alloc_str; null on error" },
-    HostImportRow { canon: "std.file", method: "list", import: "file_list", ret: ROwn, doc: "fresh Array<String> graph via heap::build_value" },
+    HostImportRow {
+        canon: "std.file",
+        method: "read",
+        import: "file_read_str",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str; null on error",
+    },
+    HostImportRow {
+        canon: "std.file",
+        method: "list",
+        import: "file_list",
+        ret: ROwn,
+        doc: "fresh Array<String> graph via heap::build_value",
+    },
     // std.process — every method returns a fresh status/output string.
-    HostImportRow { canon: "std.process", method: "run", import: "process_run", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.process", method: "start", import: "process_start", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.process", method: "write", import: "process_write", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.process", method: "read", import: "process_read", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.process", method: "stop", import: "process_stop", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.process",
+        method: "run",
+        import: "process_run",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.process",
+        method: "start",
+        import: "process_start",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.process",
+        method: "write",
+        import: "process_write",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.process",
+        method: "read",
+        import: "process_read",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.process",
+        method: "stop",
+        import: "process_stop",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // std.path
-    HostImportRow { canon: "std.path", method: "join", import: "path_join", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.path", method: "basename", import: "path_basename", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.path", method: "dirname", import: "path_dirname", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.path", method: "extname", import: "path_extname", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.path",
+        method: "join",
+        import: "path_join",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.path",
+        method: "basename",
+        import: "path_basename",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.path",
+        method: "dirname",
+        import: "path_dirname",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.path",
+        method: "extname",
+        import: "path_extname",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // std.env
-    HostImportRow { canon: "std.env", method: "get", import: "env_get", ret: ROwn, doc: "fresh string via wasm_alloc_str; null when unset" },
+    HostImportRow {
+        canon: "std.env",
+        method: "get",
+        import: "env_get",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str; null when unset",
+    },
     // std.events — the subscription dict is host-built fresh (heap::reserve
     // in build_subscription). Handler retention is the separate, pinned
     // phase-6 issue and does not change the RESULT's ownership.
-    HostImportRow { canon: "std.events", method: "on", import: "event_on", ret: ROwn, doc: "fresh subscription dict via heap::reserve" },
-    HostImportRow { canon: "std.events", method: "once", import: "event_once", ret: ROwn, doc: "fresh subscription dict via heap::reserve" },
+    HostImportRow {
+        canon: "std.events",
+        method: "on",
+        import: "event_on",
+        ret: ROwn,
+        doc: "fresh subscription dict via heap::reserve",
+    },
+    HostImportRow {
+        canon: "std.events",
+        method: "once",
+        import: "event_once",
+        ret: ROwn,
+        doc: "fresh subscription dict via heap::reserve",
+    },
     // std.html
-    HostImportRow { canon: "std.html", method: "escape", import: "html_escape", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.html",
+        method: "escape",
+        import: "html_escape",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // std.json
-    HostImportRow { canon: "std.json", method: "parse", import: "json_parse", ret: ROwn, doc: "fresh graph via heap::build_value; null on parse error" },
-    HostImportRow { canon: "std.json", method: "stringify", import: "json_stringify", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.json",
+        method: "parse",
+        import: "json_parse",
+        ret: ROwn,
+        doc: "fresh graph via heap::build_value; null on parse error",
+    },
+    HostImportRow {
+        canon: "std.json",
+        method: "stringify",
+        import: "json_stringify",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // VERIFIED ALIAS — exhibit A for the verification rule: the host
     // returns the dict entry's own string pointer (host/json.rs, no
     // reserve, no retain). An Owned entry here is a use-after-free.
-    HostImportRow { canon: "std.json", method: "requireString", import: "json_require_string", ret: RBor, doc: "returns the dict entry's own string pointer — alias, never Owned" },
+    HostImportRow {
+        canon: "std.json",
+        method: "requireString",
+        import: "json_require_string",
+        ret: RBor,
+        doc: "returns the dict entry's own string pointer — alias, never Owned",
+    },
     // std.crypto
-    HostImportRow { canon: "std.crypto", method: "hmacSha256Hex", import: "crypto_hmac_sha256_hex", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.crypto", method: "sha256Hex", import: "crypto_sha256_hex", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.crypto", method: "hexEncode", import: "crypto_hex_encode", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.crypto", method: "base64Encode", import: "crypto_base64_encode", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.crypto", method: "base64Decode", import: "crypto_base64_decode", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "hmacSha256Hex",
+        import: "crypto_hmac_sha256_hex",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "sha256Hex",
+        import: "crypto_sha256_hex",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "hexEncode",
+        import: "crypto_hex_encode",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "base64Encode",
+        import: "crypto_base64_encode",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "base64Decode",
+        import: "crypto_base64_decode",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // std.net
-    HostImportRow { canon: "std.net.tcp", method: "accept", import: "tcp_accept", ret: ROwn, doc: "fresh conn dict via heap::build_value; null on error" },
-    HostImportRow { canon: "std.net.tcp", method: "read", import: "tcp_read", ret: ROwn, doc: "fresh string via wasm_alloc_str; null on error" },
-    HostImportRow { canon: "std.net.tcp", method: "readLine", import: "tcp_read_line", ret: ROwn, doc: "fresh string via wasm_alloc_str; null on error" },
-    HostImportRow { canon: "std.net.tcp", method: "address", import: "tcp_address", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
-    HostImportRow { canon: "std.net.udp", method: "receive", import: "udp_receive", ret: ROwn, doc: "fresh value via heap::build_value/wasm_alloc_str; null on error" },
+    HostImportRow {
+        canon: "std.net.tcp",
+        method: "accept",
+        import: "tcp_accept",
+        ret: ROwn,
+        doc: "fresh conn dict via heap::build_value; null on error",
+    },
+    HostImportRow {
+        canon: "std.net.tcp",
+        method: "read",
+        import: "tcp_read",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str; null on error",
+    },
+    HostImportRow {
+        canon: "std.net.tcp",
+        method: "readLine",
+        import: "tcp_read_line",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str; null on error",
+    },
+    HostImportRow {
+        canon: "std.net.tcp",
+        method: "address",
+        import: "tcp_address",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.net.udp",
+        method: "receive",
+        import: "udp_receive",
+        ret: ROwn,
+        doc: "fresh value via heap::build_value/wasm_alloc_str; null on error",
+    },
     // std.storage
-    HostImportRow { canon: "std.storage", method: "storageGet", import: "storage_get_str", ret: ROwn, doc: "fresh string via wasm_alloc_str; null on miss" },
+    HostImportRow {
+        canon: "std.storage",
+        method: "storageGet",
+        import: "storage_get_str",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str; null on miss",
+    },
     // std.array — results verified one by one; find is an ALIAS.
-    HostImportRow { canon: "std.array", method: "map", import: "array_map", ret: ROwn, doc: "fresh array via alloc_array_of" },
-    HostImportRow { canon: "std.array", method: "filter", import: "array_filter", ret: ROwn, doc: "fresh array via alloc_array_of" },
-    HostImportRow { canon: "std.array", method: "find", import: "array_find", ret: RBor, doc: "returns the matching ELEMENT — an alias of the array's slot, never Owned" },
-    HostImportRow { canon: "std.array", method: "isAny", import: "array_is_any", ret: RPrim, doc: "encoded bool (boxed wire shape, no heap object)" },
-    HostImportRow { canon: "std.array", method: "isAll", import: "array_is_all", ret: RPrim, doc: "encoded bool (boxed wire shape, no heap object)" },
+    HostImportRow {
+        canon: "std.array",
+        method: "map",
+        import: "array_map",
+        ret: ROwn,
+        doc: "fresh array via alloc_array_of",
+    },
+    HostImportRow {
+        canon: "std.array",
+        method: "filter",
+        import: "array_filter",
+        ret: ROwn,
+        doc: "fresh array via alloc_array_of",
+    },
+    HostImportRow {
+        canon: "std.array",
+        method: "find",
+        import: "array_find",
+        ret: RBor,
+        doc: "returns the matching ELEMENT — an alias of the array's slot, never Owned",
+    },
+    HostImportRow {
+        canon: "std.array",
+        method: "isAny",
+        import: "array_is_any",
+        ret: RPrim,
+        doc: "encoded bool (boxed wire shape, no heap object)",
+    },
+    HostImportRow {
+        canon: "std.array",
+        method: "isAll",
+        import: "array_is_all",
+        ret: RPrim,
+        doc: "encoded bool (boxed wire shape, no heap object)",
+    },
     // std.http.request — every verb returns a fresh response dict.
-    HostImportRow { canon: "std.http.request", method: "get", import: "http_request_get", ret: ROwn, doc: "fresh response dict via build_http_response_dict; null on error" },
-    HostImportRow { canon: "std.http.request", method: "post", import: "http_request_post", ret: ROwn, doc: "fresh response dict via build_http_response_dict; null on error" },
-    HostImportRow { canon: "std.http.request", method: "put", import: "http_request_put", ret: ROwn, doc: "fresh response dict via build_http_response_dict; null on error" },
-    HostImportRow { canon: "std.http.request", method: "patch", import: "http_request_patch", ret: ROwn, doc: "fresh response dict via build_http_response_dict; null on error" },
-    HostImportRow { canon: "std.http.request", method: "delete", import: "http_request_delete", ret: ROwn, doc: "fresh response dict via build_http_response_dict; null on error" },
+    HostImportRow {
+        canon: "std.http.request",
+        method: "get",
+        import: "http_request_get",
+        ret: ROwn,
+        doc: "fresh response dict via build_http_response_dict; null on error",
+    },
+    HostImportRow {
+        canon: "std.http.request",
+        method: "post",
+        import: "http_request_post",
+        ret: ROwn,
+        doc: "fresh response dict via build_http_response_dict; null on error",
+    },
+    HostImportRow {
+        canon: "std.http.request",
+        method: "put",
+        import: "http_request_put",
+        ret: ROwn,
+        doc: "fresh response dict via build_http_response_dict; null on error",
+    },
+    HostImportRow {
+        canon: "std.http.request",
+        method: "patch",
+        import: "http_request_patch",
+        ret: ROwn,
+        doc: "fresh response dict via build_http_response_dict; null on error",
+    },
+    HostImportRow {
+        canon: "std.http.request",
+        method: "delete",
+        import: "http_request_delete",
+        ret: ROwn,
+        doc: "fresh response dict via build_http_response_dict; null on error",
+    },
     // std.http.server response builders — single backing import.
-    HostImportRow { canon: "std.http.server", method: "ok", import: "http_server_response", ret: ROwn, doc: "fresh response dict (host reserve)" },
-    HostImportRow { canon: "std.http.server", method: "text", import: "http_server_response", ret: ROwn, doc: "fresh response dict (host reserve)" },
-    HostImportRow { canon: "std.http.server", method: "html", import: "http_server_response", ret: ROwn, doc: "fresh response dict (host reserve)" },
-    HostImportRow { canon: "std.http.server", method: "json", import: "http_server_response", ret: ROwn, doc: "fresh response dict (host reserve)" },
-    HostImportRow { canon: "std.http.server", method: "redirect", import: "http_server_response", ret: ROwn, doc: "fresh response dict (host reserve)" },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "ok",
+        import: "http_server_response",
+        ret: ROwn,
+        doc: "fresh response dict (host reserve)",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "text",
+        import: "http_server_response",
+        ret: ROwn,
+        doc: "fresh response dict (host reserve)",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "html",
+        import: "http_server_response",
+        ret: ROwn,
+        doc: "fresh response dict (host reserve)",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "json",
+        import: "http_server_response",
+        ret: ROwn,
+        doc: "fresh response dict (host reserve)",
+    },
+    HostImportRow {
+        canon: "std.http.server",
+        method: "redirect",
+        import: "http_server_response",
+        ret: ROwn,
+        doc: "fresh response dict (host reserve)",
+    },
     // std.cli
-    HostImportRow { canon: "std.cli", method: "readLine", import: "cli_read_line", ret: ROwn, doc: "fresh string via wasm_alloc_str" },
+    HostImportRow {
+        canon: "std.cli",
+        method: "readLine",
+        import: "cli_read_line",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
     // Imports with no module-call form (bare globals / machinery).
-    HostImportRow { canon: "", method: "", import: "get_location_path", ret: ROwn, doc: "browser JS writeStrToWasm writes the rc=1 prefix (fresh); native host stubs to null" },
-    HostImportRow { canon: "", method: "", import: "run_all", ret: ROwn, doc: "reserve'd tuple, rc=1, co-owns each result (plan 113)" },
-    HostImportRow { canon: "", method: "", import: "call_ffi", ret: ROwn, doc: "encode_return_for_guest: primitives or fresh host-allocated strings" },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "get_location_path",
+        ret: ROwn,
+        doc: "browser JS writeStrToWasm writes the rc=1 prefix (fresh); native host stubs to null",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "run_all",
+        ret: ROwn,
+        doc: "reserve'd tuple, rc=1, co-owns each result (plan 113)",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "call_ffi",
+        ret: ROwn,
+        doc: "encode_return_for_guest: primitives or fresh host-allocated strings",
+    },
     // TODO(plan-117 phase 4/5): async RPC plumbing — ownership across task
     // segments unverified; conservatively Borrowed until the async engine's
     // handling is read end to end.
-    HostImportRow { canon: "", method: "", import: "remote_call", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
-    HostImportRow { canon: "", method: "", import: "remote_result", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "remote_call",
+        ret: RBor,
+        doc: "TODO unverified async RPC plumbing — conservatively borrowed",
+    },
+    HostImportRow {
+        canon: "",
+        method: "",
+        import: "remote_result",
+        ret: RBor,
+        doc: "TODO unverified async RPC plumbing — conservatively borrowed",
+    },
 ];
+
+struct HostImportArgRow {
+    import: &'static str,
+    args: &'static [ArgConvention],
+}
+
+use ArgConvention::Borrowed as ABor;
+
+const ARRAY_HOF_ARGS: &[ArgConvention] = &[ABor, ABor];
+const JSON_STRINGIFY_ARGS: &[ArgConvention] = &[ABor];
+
+const HOST_IMPORT_ARGS: &[HostImportArgRow] = &[
+    HostImportArgRow {
+        import: "array_map",
+        args: ARRAY_HOF_ARGS,
+    },
+    HostImportArgRow {
+        import: "array_filter",
+        args: ARRAY_HOF_ARGS,
+    },
+    HostImportArgRow {
+        import: "json_stringify",
+        args: JSON_STRINGIFY_ARGS,
+    },
+];
+
+pub fn lookup_host_import_args(import: &str) -> Option<&'static [ArgConvention]> {
+    HOST_IMPORT_ARGS
+        .iter()
+        .find(|r| r.import == import)
+        .map(|r| r.args)
+}
 
 /// Look up the ownership signature of a std-module call (`canon.method`),
 /// e.g. `std.json` / `parse`. Backed by [`HOST_IMPORTS`] — the verified
@@ -321,7 +759,11 @@ pub fn lookup_std_module_call(canon: &str, method: &str) -> Option<Signature> {
     HOST_IMPORTS
         .iter()
         .find(|r| !r.canon.is_empty() && r.canon == canon && r.method == method)
-        .map(|r| Signature::ret_only(r.ret, r.doc))
+        .map(|r| Signature {
+            args: lookup_host_import_args(r.import).map(|args| args.to_vec()),
+            ret: r.ret,
+            doc: r.doc,
+        })
 }
 
 /// Look up ownership by wasm `env` import name — the form the emission
@@ -334,7 +776,11 @@ pub fn lookup_host_import(import: &str) -> Option<Signature> {
     HOST_IMPORTS
         .iter()
         .find(|r| r.import == import)
-        .map(|r| Signature::ret_only(r.ret, r.doc))
+        .map(|r| Signature {
+            args: lookup_host_import_args(r.import).map(|args| args.to_vec()),
+            ret: r.ret,
+            doc: r.doc,
+        })
 }
 
 /// Borrowed-returning bare-globals: element reads, dict-field accessors, and
@@ -393,6 +839,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ownership_op_ids_are_stable() {
+        let ids: Vec<u32> = OwnershipOp::ALL.iter().map(|op| op.id()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        for op in OwnershipOp::ALL {
+            assert_eq!(OwnershipOp::from_id(op.id()), Some(op));
+            assert!(!op.name().is_empty());
+        }
+        assert_eq!(OwnershipOp::from_id(0), None);
+        assert_eq!(OwnershipOp::from_id(11), None);
+    }
+
+    #[test]
+    fn arg_convention_ids_are_stable() {
+        let ids: Vec<u32> = ArgConvention::ALL.iter().map(|c| c.id()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+
+        for convention in ArgConvention::ALL {
+            assert_eq!(ArgConvention::from_id(convention.id()), Some(convention));
+            assert!(!convention.name().is_empty());
+        }
+        assert_eq!(ArgConvention::from_id(0), None);
+        assert_eq!(ArgConvention::from_id(5), None);
+    }
+
+    #[test]
     fn set_is_passthrough_arg0() {
         let sig = lookup_bare_call("set").expect("set must be classified");
         assert_eq!(sig.ret, ReturnConvention::PassThrough(0));
@@ -425,9 +897,27 @@ mod tests {
     /// Every fresh builtin, exhaustively — a partial sample would let a
     /// list edit slip through untested.
     const ALL_FRESH_BUILTINS: [&str; 21] = [
-        "append", "getKeys", "map", "filter", "slice", "reverse", "sort", "split", "copy",
-        "Error", "all", "trim", "trimStart", "trimEnd", "toUpper", "toLower", "substring",
-        "repeat", "join", "replace", "toString",
+        "append",
+        "getKeys",
+        "map",
+        "filter",
+        "slice",
+        "reverse",
+        "sort",
+        "split",
+        "copy",
+        "Error",
+        "all",
+        "trim",
+        "trimStart",
+        "trimEnd",
+        "toUpper",
+        "toLower",
+        "substring",
+        "repeat",
+        "join",
+        "replace",
+        "toString",
     ];
 
     #[test]
@@ -471,7 +961,11 @@ mod tests {
         assert_eq!(HOST_IMPORTS.len(), 50, "boxed-import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
-            assert!(!row.doc.is_empty(), "{} needs a verification doc", row.import);
+            assert!(
+                !row.doc.is_empty(),
+                "{} needs a verification doc",
+                row.import
+            );
             // Module-call rows resolve through the std lookup; all rows
             // resolve through the import-name lookup.
             if !row.canon.is_empty() {
@@ -484,6 +978,21 @@ mod tests {
             }
             assert!(lookup_host_import(row.import).is_some(), "{}", row.import);
         }
+    }
+
+    #[test]
+    fn phase4_host_arg_conventions_are_table_driven() {
+        for import in ["array_map", "array_filter"] {
+            let sig = lookup_host_import(import).unwrap_or_else(|| panic!("{import} missing"));
+            assert_eq!(
+                sig.args,
+                Some(vec![ArgConvention::Borrowed, ArgConvention::Borrowed]),
+                "{import}"
+            );
+        }
+
+        let sig = lookup_std_module_call("std.json", "stringify").expect("json.stringify");
+        assert_eq!(sig.args, Some(vec![ArgConvention::Borrowed]));
     }
 
     #[test]

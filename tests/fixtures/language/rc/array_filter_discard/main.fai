@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase4
+# leak: flat
 #
 # The discarded filter RESULT is released correctly — what leaks are
 # the call's owned BOXED ARG TEMPS: the input array literal and the

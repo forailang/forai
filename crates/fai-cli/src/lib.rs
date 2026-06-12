@@ -100,7 +100,8 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  fmt [path] [--check]    fmt");
     eprintln!("  check [file]            fmt → check");
-    eprintln!("  test [file] [--checked] [--check-leaks] fmt → check → test");
+    eprintln!("  test [file] [--checked] [--check-leaks] [--check-ownership]");
+    eprintln!("                          fmt → check → test");
     eprintln!("  run [file]              fmt → check → test → run");
     eprintln!("  build [target]          fmt → check → test → build");
     eprintln!("  new <name>              Create a new project");
@@ -120,16 +121,20 @@ fn print_usage() {
     eprintln!("                          exit/trap, grouped by size + allocation site");
     eprintln!("  run --check-leaks=interval:<ms>  Also print a live-set summary every");
     eprintln!("                          <ms> ms (for servers that never exit)");
+    eprintln!("  run --check-ownership   Record helper ownership events and print a");
+    eprintln!("                          compact balance summary at exit/trap");
     eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
     eprintln!("  test --checked          Build tests with cheap always-on memory");
-    eprintln!("  test --check-leaks      Per-test leak assertion: a case that does not");
-    eprintln!("                          return the heap to its baseline fails with a");
-    eprintln!("                          delta report. --allow-leak=<suite[::case]>");
-    eprintln!("                          (repeatable, exact match) exempts known leaks.");
     eprintln!("                          guards: trap an out-of-bounds index store");
     eprintln!("                          (xs[i]=v) and any single alloc past 256 MB");
     eprintln!("                          at the source, with a named reason. Use this");
     eprintln!("                          first when a test suite corrupts the heap.");
+    eprintln!("  test --check-leaks      Per-test leak assertion: a case that does not");
+    eprintln!("                          return the heap to its baseline fails with a");
+    eprintln!("                          delta report. --allow-leak=<suite[::case]>");
+    eprintln!("                          (repeatable, exact match) exempts known leaks.");
+    eprintln!("  test --check-ownership  Record helper ownership events and print a");
+    eprintln!("                          compact balance summary for the test run.");
     eprintln!();
     eprintln!("Debugging (set as environment variables, e.g. FAI_RC_CHECK=1 fai test):");
     eprintln!("  These instrument the generated wasm for memory-corruption hunts.");
@@ -153,6 +158,8 @@ fn print_usage() {
     eprintln!("                      a backtrace (find who clobbers a specific address).");
     eprintln!("  FAI_CHECK_LEAKS     Allocation ledger (same as 'run --check-leaks'):");
     eprintln!("                      itemized live set at exit/trap, grouped by alloc site.");
+    eprintln!("  FAI_OWNERSHIP_CHECK Helper ownership event stream (same as");
+    eprintln!("                      'run/test --check-ownership').");
     eprintln!("  FAI_TRACE_TESTS     Print each test case's name on stderr before it runs,");
     eprintln!("                      so a trap/hang is attributable to the exact case.");
     eprintln!("  FAI_ABI_CHECK       Compile-time only: log '[abi-check] DIVERGENCE' when");
@@ -202,6 +209,8 @@ fn cmd_test(args: &[String]) {
     let (args, verbose) = extract_verbose_flag(args);
     let (args, checked) = extract_checked_flag(&args);
     // `fai test --check-leaks` (plan 118 U2): per-case leak assertion.
+    // `fai test --check-ownership` (plan 117 phase 4): aggregate helper
+    // ownership event recording for the whole test wasm run.
     // `--allow-leak=<name>` (repeatable) exempts an exact `suite` or
     // `suite::case` name — for the known host leaks (events.off/clear,
     // spy reset, ...) until plan-117 phases 4-6 fix them.
@@ -210,6 +219,18 @@ fn cmd_test(args: &[String]) {
         let mut found = false;
         for a in args {
             if a == "--check-leaks" {
+                found = true;
+            } else {
+                rest.push(a);
+            }
+        }
+        (rest, found)
+    };
+    let (args, check_ownership) = {
+        let mut rest = Vec::new();
+        let mut found = false;
+        for a in args {
+            if a == "--check-ownership" {
                 found = true;
             } else {
                 rest.push(a);
@@ -231,6 +252,7 @@ fn cmd_test(args: &[String]) {
     };
     let test_opts = wasm_runner::TestRunOptions {
         check_leaks,
+        check_ownership,
         allow_leaks,
     };
     let (args, project) = extract_project_flag(&args);
@@ -255,6 +277,9 @@ fn cmd_test(args: &[String]) {
     // runaway allocator needs naming.
     if test_opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some() {
         fai_codegen_wasm::set_check_leaks(true);
+    }
+    if test_opts.check_ownership || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some() {
+        fai_codegen_wasm::set_ownership_check(true);
     }
     // `--checked` (plan 116): build the test wasm with the cheap,
     // always-safe corruption guards (alloc-guard past 256 MB + index-store
@@ -300,6 +325,11 @@ fn cmd_run(args: &[String]) {
             if let Some(name) = project.as_deref() {
                 build_args.retain(|a| a != name);
             }
+            // Debug instrumentation flags need their codegen half armed before
+            // project-mode `step_build`, where the wasm is produced.
+            if args.iter().any(|a| a == "--check-ownership") {
+                fai_codegen_wasm::set_ownership_check(true);
+            }
             // `--check-leaks` instruments codegen, and in project mode
             // the codegen happens HERE (step_build), not in step_run —
             // arm the gate before building or the artifact carries no
@@ -319,7 +349,8 @@ fn cmd_run(args: &[String]) {
                 // Users who want a self-contained build-dir runtime can
                 // still `cd build/<target>` and run the wasm directly.
                 // Forward the debug flags (--watchdog/--debug/
-                // --check-leaks) so the runner half still sees them.
+                // --check-leaks/--check-ownership) so the runner half
+                // still sees them.
                 let mut run_args: Vec<String> = vec![wasm];
                 run_args.extend(args.iter().filter(|a| a.starts_with("--")).cloned());
                 step_run(&run_args, None, &reporter);
@@ -881,7 +912,11 @@ fn step_test_with_opts(args: &[String], reporter: &Reporter, opts: &wasm_runner:
 /// `prepare_module_directory_for_tests` so there's no notion of an
 /// "entry file" — every `.fai` file in `src_path` contributes its
 /// declarations and tests to the same module.
-fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter, opts: &wasm_runner::TestRunOptions) {
+fn run_tests_module(
+    src_path: &std::path::Path,
+    reporter: &Reporter,
+    opts: &wasm_runner::TestRunOptions,
+) {
     let src_path_str = src_path.to_string_lossy().to_string();
     let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path_str) {
         Ok(p) => p,
@@ -1354,9 +1389,15 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
         // Codegen gate — must be set before compile_fai_to_wasm below.
         fai_codegen_wasm::set_check_leaks(true);
     }
+    let check_ownership = args.iter().any(|a| a == "--check-ownership")
+        || wasm_runner::RunOptions::from_env().check_ownership;
+    if check_ownership {
+        fai_codegen_wasm::set_ownership_check(true);
+    }
     let run_opts = wasm_runner::RunOptions {
         watchdog_secs,
         check_leaks,
+        check_ownership,
     };
 
     // Check if the first positional arg is a target name or a file path.
@@ -3647,7 +3688,8 @@ const env = {{
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
-  __fai_free_event(){{}}
+  __fai_free_event(){{}},
+  __fai_ownership_event(){{}}
 }};
 let instance;
 let asyncRootDone = false;
@@ -3800,7 +3842,8 @@ const env={{
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
-  __fai_free_event(){{}}
+  __fai_free_event(){{}},
+  __fai_ownership_event(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
@@ -4028,6 +4071,13 @@ var faiLeak={{on:new URLSearchParams(location.search).get('fai_check_leaks')==='
 function faiLeakAlloc(addr,size,host){{if(!host&&!faiLeak.on)faiLeak.on=true;if(!faiLeak.on)return;if(host)faiLeak.hostAllocs++;else faiLeak.guestEvents++;var old=faiLeak.map.get(addr);if(old!==undefined)faiLeak.bytes-=old;faiLeak.map.set(addr,size);faiLeak.bytes+=size}}
 function faiLeakFree(addr,size){{if(!faiLeak.on)return;faiLeak.guestEvents++;var s=faiLeak.map.get(addr);if(s===undefined){{faiLeak.unknownFrees++}}else{{faiLeak.map.delete(addr);faiLeak.bytes-=s}}}}
 window.__fai_dump_leaks=function(){{var by={{}};faiLeak.map.forEach(function(size){{by[size]=(by[size]||0)+1}});var rows=Object.keys(by).map(function(s){{return{{size:+s,count:by[s]}}}}).sort(function(a,b){{return b.size*b.count-a.size*a.count}});var live=instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null;var out='[check-leaks] live heap: '+faiLeak.map.size+' objects, '+faiLeak.bytes+' bytes ('+faiLeak.hostAllocs+' host-side, '+faiLeak.unknownFrees+' unknown frees'+(live===null?'':', __live_objects='+live)+')';if(faiLeak.guestEvents===0)out+='\n  no guest events — module not built with --check-leaks';rows.slice(0,40).forEach(function(r){{out+='\n  '+r.count+' × '+r.size+'B = '+(r.count*r.size)+'B'}});console.log(out);return out}};
+var faiOwnership={{on:new URLSearchParams(location.search).get('fai_ownership_check')==='1',events:[],credits:new Map(),unmatched:[]}};
+function faiOwnershipAddr(value){{var u=BigInt.asUintN(64,value);return (u&OBJ_MASK)===OBJ_MASK?Number(u&0x0000FFFFFFFFFFFFn):0}}
+function faiOwnershipDelta(op){{return op===1||op===3?1:(op===2||op===7||op===9?-1:0)}}
+function faiOwnershipAllowsUntracked(op){{return op===2||op===9}}
+function faiOwnershipEvent(op,site,value,aux){{if(!faiOwnership.on)return;var addr=faiOwnershipAddr(value),delta=faiOwnershipDelta(op),event={{op:op,site:site,value:'0x'+BigInt.asUintN(64,value).toString(16),addr:addr?('0x'+addr.toString(16)):'',aux:aux}};if(addr&&delta){{var cur=faiOwnership.credits.get(addr)||0;if(delta>0){{faiOwnership.credits.set(addr,cur+delta)}}else if(cur>0){{faiOwnership.credits.set(addr,cur+delta)}}else if(!faiOwnershipAllowsUntracked(op)){{faiOwnership.unmatched.push(event)}}}}faiOwnership.events.push(event)}}
+window.__fai_assert_ownership=function(){{var bad=[];faiOwnership.credits.forEach(function(v,k){{if(v!==0)bad.push({{addr:'0x'+k.toString(16),credits:v}})}});return{{ok:bad.length===0&&faiOwnership.unmatched.length===0,eventCount:faiOwnership.events.length,imbalances:bad,unmatched:faiOwnership.unmatched.slice()}}}};
+window.__fai_dump_ownership=function(){{var a=window.__fai_assert_ownership(),count=a.imbalances.length+a.unmatched.length,out='[ownership-check] '+a.eventCount+' event(s), '+count+' object(s) with helper imbalance';a.imbalances.slice(0,8).forEach(function(i){{out+='\n  '+i.addr+': helper credits '+(i.credits>0?'+':'')+i.credits}});a.unmatched.slice(0,8-a.imbalances.length).forEach(function(e){{out+='\n  unmatched op='+e.op+' site='+e.site+' value='+e.value+' aux='+e.aux}});faiOwnership.events.slice(-40).forEach(function(e){{out+='\n  op='+e.op+' site='+e.site+' value='+e.value+' aux='+e.aux}});console.log(out);return out}};
 function faiBuildEvent(name,dataVal){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var kn=writeStrToWasm('name'),vn=writeStrToWasm(name),kd=writeStrToWasm('data');m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=kn;bi[1]=vn;bi[2]=kd;bi[3]=BigInt.asIntN(64,BigInt(dataVal));return OBJ_MASK|BigInt(addr)}}
 function faiBuildSubscription(id,name){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var ki=writeStrToWasm('id'),kn=writeStrToWasm('name'),vn=writeStrToWasm(name),iv=INT_MASK|BigInt.asUintN(32,BigInt(id));m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=ki;bi[1]=iv;bi[2]=kn;bi[3]=vn;return OBJ_MASK|BigInt(addr)}}
 function faiReadSubscription(subVal){{var n=BigInt.asIntN(64,BigInt(subVal));var u=BigInt.asUintN(64,n);if((u&OBJ_MASK)!==OBJ_MASK)return null;var a=Number(u&0x0000FFFFFFFFFFFFn),dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==3)return null;var cnt=dv.getInt32(a+4,true),id=null,name=null;for(var i=0;i<cnt;i++){{var ea=a+8+i*16,bi=new BigInt64Array(instance.exports.memory.buffer,ea,2),k=readNanBoxedStr(bi[0]),v=BigInt.asUintN(64,bi[1]);if(k==='id')id=Number(BigInt.asIntN(32,v&0xFFFFFFFFn));else if(k==='name')name=readNanBoxedStr(bi[1])}}if(id===null||name===null)return null;return{{id:id,name:name}}}}
@@ -4128,6 +4178,7 @@ var env={{
   cli_move_to:function(){{}},
   __fai_alloc_event:function(addr,size){{faiLeakAlloc(addr>>>0,size>>>0,false)}},
   __fai_free_event:function(addr,size){{faiLeakFree(addr>>>0,size>>>0)}},
+  __fai_ownership_event:function(op,site,value,aux){{faiOwnershipEvent(op|0,site|0,BigInt.asIntN(64,BigInt(value)),aux|0)}},
   __fai_set_trap_msg:function(p,l){{var m=readStr(p,l);window.__FAI_TRAP_MSG=m;console.error('FAI trap:',m)}},
   __fai_trap_report:function(code,a,b){{
     // Plan 116: structured trap reason, mirrored from the native host
@@ -6500,10 +6551,7 @@ mod tests {
                 "end\n",
             ),
         );
-        assert!(
-            stderr.contains("live heap: 0 objects, 0 bytes"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("live heap: 0 objects, 0 bytes"), "{stderr}",);
         assert!(stderr.contains("consistent"), "{stderr}");
     }
 
@@ -6613,8 +6661,14 @@ mod tests {
         let path = dir.join("src/main.fai");
         std::fs::write(&path, main_src).unwrap();
         let _cg = fai_codegen_wasm::CheckLeaksGuard::new();
-        let wasm =
-            compile_fai_to_wasm(main_src, path.to_str().unwrap(), false, Vec::new(), None, None);
+        let wasm = compile_fai_to_wasm(
+            main_src,
+            path.to_str().unwrap(),
+            false,
+            Vec::new(),
+            None,
+            None,
+        );
         let guard = wasm_runner::output::CaptureGuard::new();
         wasm_runner::run_wasm_with_externs_opts(
             &wasm,
@@ -6666,10 +6720,7 @@ mod tests {
                 "end\n",
             ),
         );
-        assert!(
-            stderr.contains("live heap: 0 objects, 0 bytes"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("live heap: 0 objects, 0 bytes"), "{stderr}",);
         assert!(stderr.contains("consistent"), "{stderr}");
     }
 
@@ -6912,10 +6963,7 @@ mod tests {
         .expect("program should run");
         let stderr = guard.stderr();
         drop(guard);
-        assert!(
-            stderr.contains("not built with --check-leaks"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("not built with --check-leaks"), "{stderr}",);
     }
 
     /// Shared mutex for tests that call `set_current_dir` — CWD is

@@ -9,6 +9,7 @@
 #   fai run main.fai --watchdog[=secs]             # hang killer + dump
 #   fai run main.fai --check-leaks                 # heap allocation ledger
 #   fai run main.fai --check-leaks=interval:1000   # + periodic summary
+#   fai run main.fai --check-ownership             # helper ownership ledger
 #
 # Always on (no flag needed): trap backtraces are named and
 # source-mapped (`migrate (src/migrate.fai:16)`), trap reasons are
@@ -21,6 +22,7 @@ do
   # Environment fallbacks (same behavior, no flag):
   #   FAI_WATCHDOG=10
   #   FAI_CHECK_LEAKS=1            (or interval:<ms>)
+  #   FAI_OWNERSHIP_CHECK=1        (helper ownership event stream)
   #   FAI_RC_CHECK=1               (checked refcount ops; CI oracle)
   #   FAI_LEAK_CHECK=1             (scalar live-object count at exit)
 end
@@ -75,4 +77,30 @@ do
   #
   # fai run server.fai --check-leaks=interval:1000
   # [check-leaks] live=1234 (+56) bytes=78901 (+1234) top: 264B×120, 29B×80
+end
+
+# --check-ownership — the helper ownership ledger. This records the
+# phase-4 ownership-helper event stream: retain/transfer into owning
+# storage, cleanup of owning slots, discards, returns, and call-argument
+# conventions. It is meant to catch helper mistakes before they become
+# anonymous heap leaks: missing retain/transfer at a store site, extra
+# cleanup of a tracked slot, or a table-driven argument convention bug.
+#
+# Native:
+#   fai run app.fai --check-ownership
+#   fai test app.fai --check-ownership
+#
+# Browser:
+#   FAI_OWNERSHIP_CHECK=1 fai build app.fai --html
+#   open with ?fai_ownership_check=1
+#   window.__fai_assert_ownership()
+#   window.__fai_dump_ownership()
+#
+# The checker is opt-in. Normal builds do not import
+# __fai_ownership_event, so older/minimal hosts still instantiate them.
+def doc_debugging_check_ownership
+    @return Void
+do
+  # fai run app.fai --check-ownership
+  # [ownership-check] 42 event(s), 0 object(s) with helper imbalance
 end
