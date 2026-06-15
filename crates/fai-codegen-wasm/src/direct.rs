@@ -2045,6 +2045,7 @@ pub fn build_program_full(
     // through `compile_call` — and `compile_call` looks the name up in
     // `extern_fn_indices`, which previously only saw the entry file.
     let mut extern_fn_indices = collect_extern_fn_indices_from(&ast.statements);
+    OFFLOADABLE_EXTERNS.with(|m| *m.borrow_mut() = offloadable_extern_indices(&ast.statements));
     // Per-extern `is_out` flags per parameter. Needed so
     // `compile_extern_call` can emit the readback for OUT slots
     // after the host writes the C-returned pointer into guest
@@ -2759,6 +2760,65 @@ fn collect_extern_fn_indices_from(stmts: &[fai_compiler::ast::Statement]) -> Has
         }
     }
     indices
+}
+
+thread_local! {
+    /// Extern functions whose blocking call is offloaded to the boundary
+    /// (plan 101 U8): name → its `ext_fn_idx` (same numbering as
+    /// `collect_extern_fn_indices_from`, since the host indexes `CURRENT_EXTERNS`
+    /// by it). Populated per build; only scalar-signature externs are included
+    /// (see `extern_is_offloadable`). Compile is single-threaded, so a
+    /// thread-local mirrors the host's `CURRENT_EXTERNS`.
+    static OFFLOADABLE_EXTERNS: RefCell<HashMap<String, u16>> = RefCell::new(HashMap::new());
+}
+
+/// True if an extern's signature is all-scalar (Int/Float/Bool, no `out` params,
+/// scalar-or-void return) — the v1 offload restriction, so the worker can build
+/// its `Value`s from raw arg bits with no guest memory / pointer marshalling.
+pub(crate) fn extern_is_offloadable(f: &fai_compiler::ast::ExternFunctionDecl) -> bool {
+    let scalar = |t: &fai_compiler::ast::TypeNode| {
+        !t.is_array
+            && !t.is_optional
+            && matches!(t.name.as_deref(), Some("Int") | Some("Float") | Some("Bool"))
+    };
+    f.params.iter().all(|p| !p.is_out && scalar(&p.type_node))
+        && f.return_type.as_ref().is_none_or(scalar)
+}
+
+/// Map of offloadable extern name → `ext_fn_idx`, numbered identically to
+/// `collect_extern_fn_indices_from` (every extern fn advances the counter; only
+/// offloadable ones are inserted).
+fn offloadable_extern_indices(stmts: &[fai_compiler::ast::Statement]) -> HashMap<String, u16> {
+    let mut out = HashMap::new();
+    let mut next = 0u16;
+    for s in stmts {
+        if let fai_compiler::ast::Statement::ExternBlockDeclaration(ext) = s {
+            for f in &ext.functions {
+                let idx = next;
+                next = next.checked_add(1).expect("too many extern fns");
+                if extern_is_offloadable(f) {
+                    out.insert(f.name.clone(), idx);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// If `expr` is a direct call to an offloadable extern, return its `ext_fn_idx`,
+/// argument expressions, and location. Used to lower `let x = externCall(...)`
+/// to a boundary suspension (`Term::AwaitFfi`).
+fn offloadable_extern_call_args(
+    expr: &Expression,
+) -> Option<(u16, Vec<&Expression>, &fai_compiler::ast::SourceLocation)> {
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    let Expression::IdentifierExpression(id) = &*call.callee else {
+        return None;
+    };
+    let idx = OFFLOADABLE_EXTERNS.with(|m| m.borrow().get(&id.name).copied())?;
+    Some((idx, call.args.iter().map(|a| &a.value).collect(), &call.location))
 }
 
 /// A spy target the mock/assert calls refer to.
@@ -3841,6 +3901,14 @@ fn stmts_have_loop_control(stmts: &[Statement]) -> bool {
 }
 
 fn stmt_has_user_call(stmt: &Statement, fns: &AsyncResolve<'_>) -> bool {
+    // `let/var x = <offloadable extern call>` is a boundary suspension point
+    // (plan 101 U8). Detected positionally so nested extern calls (e.g. a fast
+    // `sqlite3_column_int(...)` inside another expression) stay sync-inline.
+    if let Some((_, v)) = single_binding(stmt) {
+        if offloadable_extern_call_args(v).is_some() {
+            return true;
+        }
+    }
     let value = match stmt {
         Statement::LetStatement(ls) => Some(&ls.value),
         Statement::VarStatement(vs) => Some(&vs.value),
@@ -3974,6 +4042,9 @@ enum Incoming {
     /// Resume of an `AwaitRemote`: bind `remote_result(g_current)` to `bind`
     /// (or discard if `None`).
     AwaitedRemote { bind: Option<String> },
+    /// Resume of an `AwaitFfi`: bind `ffi_result(g_current)` to `bind`
+    /// (or discard if `None`).
+    AwaitedFfi { bind: Option<String> },
 }
 
 /// A basic block in the resumable function's CFG: what to assign at entry
@@ -4012,6 +4083,17 @@ enum Term<'a> {
     /// `remote_result(g_current)`. Browser does the request with async `fetch`,
     /// so the UI thread stays free while it's in flight.
     AwaitRemote {
+        args: Vec<&'a Expression>,
+        loc: &'a fai_compiler::ast::SourceLocation,
+        next: usize,
+    },
+    /// `let x = externCall(args)` for an offloadable (scalar) extern — lowered
+    /// as a suspending host op (plan 101 U8): `ffi_begin(g_current, ext_idx,
+    /// count, args_buf)` offloads the blocking C call to the boundary and parks
+    /// the task; on resume the next block binds the value via
+    /// `ffi_result(g_current)`.
+    AwaitFfi {
+        ext_idx: u16,
         args: Vec<&'a Expression>,
         loc: &'a fai_compiler::ast::SourceLocation,
         next: usize,
@@ -4515,6 +4597,21 @@ impl<'a> CfgBuilder<'a> {
                 self.blocks[next].incoming = Incoming::AwaitedRemote {
                     bind: Some(name.to_string()),
                 };
+                return Ok(Flow::Continue(next));
+            }
+            // `let x = externCall(...)` for an offloadable scalar extern —
+            // offload the blocking C call to the boundary and bind on resume
+            // (plan 101 U8). `let _ =` discards.
+            if let Some((ext_idx, fargs, loc)) = offloadable_extern_call_args(value) {
+                let next = self.new_block();
+                self.blocks[cur].term = Term::AwaitFfi {
+                    ext_idx,
+                    args: fargs,
+                    loc,
+                    next,
+                };
+                let bind = if name == "_" { None } else { Some(name.to_string()) };
+                self.blocks[next].incoming = Incoming::AwaitedFfi { bind };
                 return Ok(Flow::Continue(next));
             }
             if let Some((callee, args, loc)) = user_callee(value, self.fns) {
@@ -5582,6 +5679,31 @@ fn build_resume_fn(
                 b.emit(Instruction::Drop);
             }
         }
+        if let Incoming::AwaitedFfi { bind } = &blk.incoming {
+            // The offloaded extern call finished; read its result for this task.
+            if let Some(name) = bind {
+                let l = *var_local
+                    .get(name)
+                    .ok_or(BuildError::UnsupportedExpression("async-unknown-ffi-bind"))?;
+                if cell_vars.contains(name) {
+                    b.emit(Instruction::GlobalGet(layout.g_current));
+                    b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                    b.emit_cell_store(l, true);
+                } else {
+                    b.emit(Instruction::GlobalGet(layout.g_current));
+                    b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                    if release_set.contains(name) {
+                        b.emit(Instruction::LocalGet(l));
+                        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
+                    }
+                    b.emit(Instruction::LocalSet(l));
+                }
+            } else {
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                b.emit(Instruction::Drop);
+            }
+        }
 
         for stmt in &blk.stmts {
             if let Statement::NowaitStatement(nw) = stmt {
@@ -5663,6 +5785,56 @@ fn build_resume_fn(
                     b.emit_string_arg_from_expr(a)?;
                 }
                 b.emit_import_call(crate::runtime::IMPORT_REMOTE_BEGIN);
+                store_vars(&mut b);
+                emit_store_current_rstate(&mut b, layout, *next as i32);
+                b.emit(Instruction::Return);
+            }
+            Term::AwaitFfi { ext_idx, args, loc: _, next } => {
+                // Park the task (status WAITING, O_WAKE = -1) and offload the
+                // blocking extern call to the boundary; the driver loop resumes
+                // it via `__fai_resume_task` when the worker finishes.
+                let rec = |b: &mut Builder| {
+                    b.emit(Instruction::GlobalGet(layout.g_table_base));
+                    b.emit(Instruction::GlobalGet(layout.g_current));
+                    b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+                    b.emit(Instruction::I32Mul);
+                    b.emit(Instruction::I32Add);
+                };
+                rec(&mut b);
+                b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
+                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_STATUS)));
+                rec(&mut b);
+                b.emit(Instruction::F64Const(-1.0));
+                b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
+                // Build the args buffer (one NaN-boxed i64 per arg), as a sync
+                // extern call would; `ffi_begin` copies the args out before the
+                // task parks, so the buffer can be freed right after.
+                let arg_count = args.len() as i32;
+                let buf = b.alloc_i32_local();
+                b.emit(Instruction::I32Const((arg_count * 8).max(8)));
+                b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_ALLOC));
+                b.emit(Instruction::LocalSet(buf));
+                for (i, a) in args.iter().enumerate() {
+                    b.emit(Instruction::LocalGet(buf));
+                    b.emit(Instruction::I32Const((i as i32) * 8));
+                    b.emit(Instruction::I32Add);
+                    b.compile_expr_as(a, ValueShape::Boxed)?;
+                    b.emit(Instruction::I64Store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
+                // ffi_begin(g_current, ext_idx, arg_count, args_buf)
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit(Instruction::I32Const(*ext_idx as i32));
+                b.emit(Instruction::I32Const(arg_count));
+                b.emit(Instruction::LocalGet(buf));
+                b.emit_import_call(crate::runtime::IMPORT_FFI_BEGIN);
+                // rt_free(ptr, size) — same size passed to rt_alloc above.
+                b.emit(Instruction::LocalGet(buf));
+                b.emit(Instruction::I32Const((arg_count * 8).max(8)));
+                b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_FREE));
                 store_vars(&mut b);
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Return);
@@ -6867,6 +7039,7 @@ pub fn try_codegen_async_engine(
     let mut type_fields: HashMap<String, Vec<fai_compiler::ast::FieldDeclaration>> = HashMap::new();
     let mut module_constants: HashMap<String, fai_compiler::ast::Expression> = HashMap::new();
     let mut extern_fn_indices = collect_extern_fn_indices_from(&ast.statements);
+    OFFLOADABLE_EXTERNS.with(|m| *m.borrow_mut() = offloadable_extern_indices(&ast.statements));
     let mut extern_out_params: HashMap<String, Vec<bool>> = HashMap::new();
     fn collect_consts(
         stmts: &[Statement],

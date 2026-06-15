@@ -24,6 +24,10 @@ pub enum AsyncCauseKind {
     /// Calls `remoteCall(...)` — the RPC client transport, lowered as a
     /// suspending host op so the task yields while the request is in flight.
     RemoteCall,
+    /// `let/var x = externCall(...)` for an offloadable (scalar) extern — the
+    /// blocking C call is offloaded to the boundary, so the binding is a
+    /// suspension point (plan 101 U8). Detected positionally.
+    ExternCall,
     /// Invokes a closure *value* (a closure-typed parameter, or a computed
     /// callee like `handlers[i]()` / `cb!()`). Whether that closure suspends
     /// isn't knowable statically, so — staying true to "everything is async" —
@@ -102,7 +106,56 @@ struct BodyEffects {
     calls: Vec<CallSite>,
 }
 
+thread_local! {
+    /// Names of offloadable (scalar-signature) extern functions for the program
+    /// under analysis — `let x = <one of these>(...)` is a suspension point.
+    /// Populated at `analyze` entry; classification is shared with codegen via
+    /// `crate::direct::extern_is_offloadable` so the two never diverge.
+    static OFFLOADABLE_EXTERN_NAMES: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn collect_offloadable_extern_names(
+    ast: &fai_compiler::ast::Program,
+    modules: &[DiscoveredModule],
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut scan = |stmts: &[Statement]| {
+        for s in stmts {
+            if let Statement::ExternBlockDeclaration(ext) = s {
+                for f in &ext.functions {
+                    if crate::direct::extern_is_offloadable(f) {
+                        names.insert(f.name.clone());
+                    }
+                }
+            }
+        }
+    };
+    scan(&ast.statements);
+    for m in modules {
+        scan(&m.statements);
+    }
+    names
+}
+
+/// `Some(location)` if `expr` is a direct call to an offloadable extern.
+fn offloadable_extern_call_loc(expr: &Expression) -> Option<SourceLocation> {
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    let Expression::IdentifierExpression(id) = &*call.callee else {
+        return None;
+    };
+    if OFFLOADABLE_EXTERN_NAMES.with(|s| s.borrow().contains(&id.name)) {
+        Some(call.location.clone())
+    } else {
+        None
+    }
+}
+
 pub fn analyze(ast: &fai_compiler::ast::Program, modules: &[DiscoveredModule]) -> AsyncAnalysis {
+    OFFLOADABLE_EXTERN_NAMES
+        .with(|s| *s.borrow_mut() = collect_offloadable_extern_names(ast, modules));
     let module_function_exports = module_function_exports(modules);
     let mut nodes = Vec::new();
     nodes.extend(collect_functions(
@@ -359,9 +412,15 @@ fn collect_statement_effects(
 ) {
     match stmt {
         Statement::LetStatement(ls) => {
+            if let Some(loc) = offloadable_extern_call_loc(&ls.value) {
+                set_direct_cause(effects, AsyncCauseKind::ExternCall, loc);
+            }
             collect_expression_effects(&ls.value, node, known_functions, effects)
         }
         Statement::VarStatement(VarStatement { value, .. }) => {
+            if let Some(loc) = offloadable_extern_call_loc(value) {
+                set_direct_cause(effects, AsyncCauseKind::ExternCall, loc);
+            }
             collect_expression_effects(value, node, known_functions, effects)
         }
         Statement::AssignmentStatement(AssignmentStatement { target, value, .. }) => {

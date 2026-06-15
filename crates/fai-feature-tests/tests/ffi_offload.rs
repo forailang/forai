@@ -122,7 +122,6 @@ fn single_ffi_handler_responds() {
 }
 
 #[test]
-#[ignore = "red target for plan 101 U8/U9: enable once extern FFI calls are async-colored and offloaded"]
 fn concurrent_blocking_ffi_overlaps() {
     let port = free_port();
     let server = boot_server(port);
