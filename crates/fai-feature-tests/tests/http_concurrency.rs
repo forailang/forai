@@ -233,6 +233,95 @@ fn sequential_soak_reuses_task_slots() {
     }
 }
 
+/// Run a server with `--check-leaks` that exits after `max` requests, firing
+/// exactly that many at `/quick`, and return the live-object count the leak
+/// ledger reports at exit. Panics if the server doesn't exit or print a report.
+fn live_objects_after(max: usize, path: &str) -> u64 {
+    let port = free_port();
+    let dir = workspace_root().join("target").join("tmp").join(format!(
+        "http_leak_{}_{}",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("server.fai");
+    std::fs::write(&src, server_source(port)).unwrap();
+
+    let mut child = Command::new(fai_binary())
+        .arg("run")
+        .arg("--check-leaks")
+        .arg(&src)
+        .env("FAI_HTTP_MAX_REQUESTS", max.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fai run --check-leaks");
+
+    // Fire exactly `max` requests sequentially — no separate liveness probe,
+    // since any accepted connection counts toward the cap. The first request
+    // retries through server startup; each completes a full round trip, so the
+    // server accepts exactly `max` connections and then drains and exits.
+    let startup = Instant::now() + Duration::from_secs(20);
+    for i in 0..max {
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(mut stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(15)))
+                        .unwrap();
+                    stream
+                        .write_all(
+                            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .unwrap();
+                    let mut resp = String::new();
+                    stream.read_to_string(&mut resp).unwrap();
+                    assert!(resp.contains("200"), "request {i} failed:\n{resp}");
+                    break;
+                }
+                Err(_) if Instant::now() < startup => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    panic!("request {i} could not connect: {e}");
+                }
+            }
+        }
+    }
+
+    // The process should now drain and exit on its own.
+    let output = child.wait_with_output().expect("wait for server exit");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("[check-leaks] live heap:"))
+        .unwrap_or_else(|| panic!("no [check-leaks] report in stderr:\n{stderr}"));
+    // "[check-leaks] live heap: N objects, M bytes ..."
+    line.split("live heap:")
+        .nth(1)
+        .and_then(|rest| rest.trim().split(' ').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("could not parse live-object count from: {line}"))
+}
+
+#[test]
+fn per_request_lifecycle_does_not_leak() {
+    // A per-request leak (request/response graph, task slot, or closure not
+    // reclaimed) would make the live-object count at exit grow with the number
+    // of requests served. Serving 4x as many requests must leave the same live
+    // set — only the server's persistent structures remain (R14).
+    let few = live_objects_after(10, "/quick");
+    let many = live_objects_after(40, "/quick");
+    assert_eq!(
+        few, many,
+        "live objects grew with request count ({few} -> {many}): per-request leak"
+    );
+}
+
 #[test]
 fn mixed_sync_and_async_concurrent() {
     // A sync request must be served promptly even while a slow async handler is

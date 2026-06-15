@@ -279,38 +279,58 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // Sync handlers and 404s still resolve inline. The effect: while
                 // one handler awaits I/O (sleep, a DB query, a fetch), the others
                 // keep running on this single thread instead of waiting in line.
+                // FAI_HTTP_MAX_REQUESTS bounds how many connections to accept
+                // before draining in-flight work and returning (so the program
+                // exits and the runner's --check-leaks/ownership report runs).
+                // Unset → serve forever, the normal case.
+                let max_requests: Option<u64> = std::env::var("FAI_HTTP_MAX_REQUESTS")
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                let mut accepted: u64 = 0;
                 let mut pending: Vec<PendingRequest> = Vec::new();
                 let _ = listener.set_nonblocking(true);
                 loop {
-                    // 1. Drain every connection ready right now.
-                    loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => {
-                                accept_connection(&mut caller, id as u32, stream, &mut pending);
+                    let accepting = max_requests.map_or(true, |m| accepted < m);
+
+                    // 1. Drain every connection ready right now (while accepting).
+                    if accepting {
+                        loop {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    accept_connection(&mut caller, id as u32, stream, &mut pending);
+                                    accepted += 1;
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
                             }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(_) => break,
                         }
                     }
 
-                    // 2. Nothing in flight: block for the next connection rather
-                    // than spinning, then loop back to the non-blocking drain.
+                    // 2. Request cap reached and all in-flight work drained →
+                    // exit the server loop so the program can terminate.
+                    if !accepting && pending.is_empty() {
+                        break;
+                    }
+
+                    // 3. Idle but still accepting: block for the next connection
+                    // rather than spinning, then loop back to the drain.
                     if pending.is_empty() {
                         let _ = listener.set_nonblocking(false);
                         if let Ok((stream, _)) = listener.accept() {
                             let _ = listener.set_nonblocking(true);
                             accept_connection(&mut caller, id as u32, stream, &mut pending);
+                            accepted += 1;
                         } else {
                             let _ = listener.set_nonblocking(true);
                         }
                         continue;
                     }
 
-                    // 3. Advance in-flight handler tasks; finish completed ones.
+                    // 4. Advance in-flight handler tasks; finish completed ones.
                     guest_poll(&mut caller);
                     finish_completed(&mut caller, &mut pending);
 
-                    // 4. While handlers remain parked (e.g. on a sleep timer),
+                    // 5. While handlers remain parked (e.g. on a sleep timer),
                     // poll again shortly without a hot spin. Boundary-backed
                     // waits (U6/U9) will replace this with a real wakeup.
                     if !pending.is_empty() {
