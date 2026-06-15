@@ -469,7 +469,7 @@ mod tests {
         // Plan 119 U1: the verified boxed-import surface. The count pin
         // fails when a new boxed import lands without a row — extend the
         // table (after reading the host code), don't bump blindly.
-        assert_eq!(HOST_IMPORTS.len(), 50, "boxed-import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 51, "boxed-import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(!row.doc.is_empty(), "{} needs a verification doc", row.import);
