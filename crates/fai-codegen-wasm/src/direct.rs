@@ -2776,13 +2776,37 @@ thread_local! {
 /// scalar-or-void return) — the v1 offload restriction, so the worker can build
 /// its `Value`s from raw arg bits with no guest memory / pointer marshalling.
 pub(crate) fn extern_is_offloadable(f: &fai_compiler::ast::ExternFunctionDecl) -> bool {
-    let scalar = |t: &fai_compiler::ast::TypeNode| {
+    // Word-sized arg types the offload path can pass: pointer handles are
+    // resolved to raw addresses and strings to leaked C allocations on the main
+    // thread before the worker runs the call. Float/Double args (separate FP
+    // registers), out-params, and variadics are NOT offloaded — those externs
+    // stay synchronous. The return may also be Float/Double/Void.
+    let word_arg = |t: &fai_compiler::ast::TypeNode| {
         !t.is_array
             && !t.is_optional
-            && matches!(t.name.as_deref(), Some("Int") | Some("Float") | Some("Bool"))
+            && matches!(
+                t.name.as_deref(),
+                Some("Int") | Some("Bool") | Some("String") | Some("Ptr") | Some("Pointer")
+            )
     };
-    f.params.iter().all(|p| !p.is_out && scalar(&p.type_node))
-        && f.return_type.as_ref().is_none_or(scalar)
+    let ret_ok = |t: &fai_compiler::ast::TypeNode| {
+        !t.is_array
+            && !t.is_optional
+            && matches!(
+                t.name.as_deref(),
+                Some("Int")
+                    | Some("Bool")
+                    | Some("String")
+                    | Some("Ptr")
+                    | Some("Pointer")
+                    | Some("Float")
+                    | Some("Double")
+                    | Some("Void")
+            )
+    };
+    f.fixed_arg_count.is_none()
+        && f.params.iter().all(|p| !p.is_out && word_arg(&p.type_node))
+        && f.return_type.as_ref().is_none_or(ret_ok)
 }
 
 /// Map of offloadable extern name → `ext_fn_idx`, numbered identically to
@@ -15183,6 +15207,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",
@@ -18402,6 +18453,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",
@@ -19050,6 +19128,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",
@@ -20034,6 +20139,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",
@@ -20176,6 +20308,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",
@@ -21326,6 +21485,33 @@ mod tests {
             let wt_params: Vec<WtValType> = params.iter().copied().map(conv).collect();
             let wt_results: Vec<WtValType> = results.iter().copied().map(conv).collect();
             let results_clone = results.clone();
+            // Mock the FFI boundary: `ffi_begin` parks the task expecting the
+            // driver loop to resume it once the worker finishes. Here there's no
+            // loop, so resume immediately (`ffi_result` then returns the default
+            // 0); enough for async extern-call programs to complete.
+            if name == "ffi_begin" {
+                linker
+                    .func_new(
+                        "env",
+                        name,
+                        FuncType::new(&engine, wt_params, wt_results),
+                        move |mut caller, args, _rets| {
+                            let task_id = match args.first() {
+                                Some(Val::I32(t)) => *t,
+                                _ => return Ok(()),
+                            };
+                            if let Some(f) = caller
+                                .get_export("__fai_resume_task")
+                                .and_then(|e| e.into_func())
+                            {
+                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
             linker
                 .func_new(
                     "env",

@@ -20,6 +20,7 @@ mod marshal;
 mod ptr_tracker;
 
 pub use marshal::FfiType;
+pub use marshal::{convert_offload_return, RawReturn};
 pub use ptr_tracker::PtrTracker;
 
 // ── Error type ──────────────────────────────────────────────────────
@@ -233,6 +234,78 @@ fn call_with_options(
     Ok(CallResult {
         return_value: result,
         out_values,
+    })
+}
+
+/// A marshaled, `Send` extern call ready to run on a boundary worker thread
+/// (plan 101). Args are resolved to raw words on the main thread — pointer
+/// handles to addresses, strings to leaked C allocations — so the worker only
+/// runs the C call and returns a raw result the main thread converts.
+pub struct PreparedFfiCall {
+    fn_ptr: usize,
+    words: Vec<usize>,
+    return_type: FfiType,
+}
+
+// SAFETY: `fn_ptr` is a process-global C function address and `words` are
+// scalars carrying no pointers into thread-local or GC-managed state. Running
+// the call on another thread touches none of this process's Rust state; the
+// result conversion (which does) stays on the main thread.
+unsafe impl Send for PreparedFfiCall {}
+
+impl PreparedFfiCall {
+    /// Run the C call on the current thread, returning its raw result. Intended
+    /// to run on a boundary worker; `convert_offload_return` (main thread) turns
+    /// the raw result into a `Value`.
+    pub fn raw_call(&self) -> Result<RawReturn, FfiError> {
+        unsafe { marshal::raw_word_call(self.fn_ptr, &self.words, &self.return_type) }
+            .map_err(|message| FfiError { message })
+    }
+
+    pub fn return_type(&self) -> FfiType {
+        self.return_type.clone()
+    }
+}
+
+/// Resolve and marshal an offloadable extern call on the main thread, producing
+/// a `Send` value a worker can run. Errors if the signature isn't offloadable
+/// (a float arg or an out-param), so the caller can keep such externs sync.
+pub fn prepare_offload(
+    lib: &str,
+    func: &str,
+    args: &[Value],
+    param_types: &[FfiType],
+    return_type: &FfiType,
+    ptr_tracker: &mut PtrTracker,
+) -> Result<PreparedFfiCall, FfiError> {
+    if args.len() != param_types.len() {
+        return Err(FfiError {
+            message: format!(
+                "{}.{}: expected {} args, got {}",
+                lib,
+                func,
+                param_types.len(),
+                args.len()
+            ),
+        });
+    }
+    let fn_ptr = get_function(lib, func)?;
+    let mut c_args = marshal::MarshaledArgs::new();
+    for (i, (val, ty)) in args.iter().zip(param_types.iter()).enumerate() {
+        c_args.push(val, ty, ptr_tracker).map_err(|e| FfiError {
+            message: format!("{}.{} arg {}: {}", lib, func, i, e),
+        })?;
+    }
+    let words = c_args.into_offload_words().ok_or_else(|| FfiError {
+        message: format!(
+            "{}.{}: offload supports only word-sized args and no out-params",
+            lib, func
+        ),
+    })?;
+    Ok(PreparedFfiCall {
+        fn_ptr: fn_ptr as usize,
+        words,
+        return_type: return_type.clone(),
     })
 }
 

@@ -146,6 +146,137 @@ impl MarshaledArgs {
             self.args[arg_idx] = CArg::Word(slot_ptr);
         }
     }
+
+    /// For the boundary-offload path: the marshaled args as plain words, if the
+    /// signature is all word-sized (Int/Bool/String/Ptr — pointers already
+    /// resolved to raw addresses, strings to leaked C allocations) and has no
+    /// out-params. `None` for float args or out-params, which the offload path
+    /// does not support (the caller keeps those externs synchronous). The
+    /// returned words are `Send` and carry no thread-local state, so the call
+    /// can run on a worker thread.
+    pub fn into_offload_words(self) -> Option<Vec<usize>> {
+        if !self.out_ptr_slots.is_empty() {
+            return None;
+        }
+        let mut words = Vec::with_capacity(self.args.len());
+        for a in &self.args {
+            match a {
+                CArg::Word(w) => words.push(*w),
+                CArg::Float(_) => return None,
+            }
+        }
+        Some(words)
+    }
+}
+
+/// The raw result of an offloaded extern call, before conversion to a `Value`
+/// (which needs the main thread's pointer tracker / GC heap). `Send`/`Copy`.
+#[derive(Clone, Copy)]
+pub enum RawReturn {
+    Word(usize),
+    Float(f64),
+}
+
+/// Run an all-word-arg C call and return the raw result — the transmute+call
+/// half of `ffi_call_all_words`, with no `Value` conversion or tracker, so it
+/// can run on a boundary worker thread. Mirrors that function's dispatch.
+///
+/// # Safety
+/// `fn_ptr` must be a valid C function pointer whose signature matches `w` and
+/// `return_type`.
+pub unsafe fn raw_word_call(
+    fn_ptr: usize,
+    w: &[usize],
+    return_type: &FfiType,
+) -> Result<RawReturn, std::string::String> {
+    let fn_ptr = fn_ptr as *const c_void;
+    if matches!(return_type, FfiType::Double) {
+        let raw: f64 = match w.len() {
+            0 => (std::mem::transmute::<_, extern "C" fn() -> f64>(fn_ptr))(),
+            1 => (std::mem::transmute::<_, extern "C" fn(usize) -> f64>(fn_ptr))(w[0]),
+            2 => (std::mem::transmute::<_, extern "C" fn(usize, usize) -> f64>(fn_ptr))(w[0], w[1]),
+            n => return Err(format!("unsupported arg count {} for float return", n)),
+        };
+        return Ok(RawReturn::Float(raw));
+    }
+    if matches!(return_type, FfiType::Void) {
+        match w.len() {
+            0 => (std::mem::transmute::<_, extern "C" fn()>(fn_ptr))(),
+            1 => (std::mem::transmute::<_, extern "C" fn(usize)>(fn_ptr))(w[0]),
+            2 => (std::mem::transmute::<_, extern "C" fn(usize, usize)>(fn_ptr))(w[0], w[1]),
+            3 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize)>(fn_ptr))(
+                w[0], w[1], w[2],
+            ),
+            4 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize)>(fn_ptr))(
+                w[0], w[1], w[2], w[3],
+            ),
+            5 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize, usize)>(
+                fn_ptr,
+            ))(w[0], w[1], w[2], w[3], w[4]),
+            6 => (std::mem::transmute::<
+                _,
+                extern "C" fn(usize, usize, usize, usize, usize, usize),
+            >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5]),
+            7 => (std::mem::transmute::<
+                _,
+                extern "C" fn(usize, usize, usize, usize, usize, usize, usize),
+            >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5], w[6]),
+            8 => (std::mem::transmute::<
+                _,
+                extern "C" fn(usize, usize, usize, usize, usize, usize, usize, usize),
+            >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]),
+            n => return Err(format!("unsupported arg count {} (max 8)", n)),
+        };
+        return Ok(RawReturn::Word(0));
+    }
+    let raw: usize = match w.len() {
+        0 => (std::mem::transmute::<_, extern "C" fn() -> usize>(fn_ptr))(),
+        1 => (std::mem::transmute::<_, extern "C" fn(usize) -> usize>(fn_ptr))(w[0]),
+        2 => (std::mem::transmute::<_, extern "C" fn(usize, usize) -> usize>(fn_ptr))(w[0], w[1]),
+        3 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize) -> usize>(fn_ptr))(
+            w[0], w[1], w[2],
+        ),
+        4 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize) -> usize>(
+            fn_ptr,
+        ))(w[0], w[1], w[2], w[3]),
+        5 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize, usize) -> usize>(
+            fn_ptr,
+        ))(w[0], w[1], w[2], w[3], w[4]),
+        6 => (std::mem::transmute::<
+            _,
+            extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize,
+        >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5]),
+        7 => (std::mem::transmute::<
+            _,
+            extern "C" fn(usize, usize, usize, usize, usize, usize, usize) -> usize,
+        >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5], w[6]),
+        8 => (std::mem::transmute::<
+            _,
+            extern "C" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize,
+        >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]),
+        n => return Err(format!("unsupported arg count {} (max 8)", n)),
+    };
+    Ok(RawReturn::Word(raw))
+}
+
+/// Convert an offloaded call's raw result to a `Value` on the main thread
+/// (pointer returns are tracked, string returns allocate on the GC heap).
+pub fn convert_offload_return(
+    raw: RawReturn,
+    return_type: &FfiType,
+    ptr_tracker: &mut PtrTracker,
+) -> Value {
+    match return_type {
+        FfiType::Void => Value::void(),
+        FfiType::Double => match raw {
+            RawReturn::Float(f) => convert_float_return(f),
+            RawReturn::Word(w) => convert_float_return(w as f64),
+        },
+        _ => match raw {
+            RawReturn::Word(w) => convert_word_return(w, return_type, ptr_tracker),
+            RawReturn::Float(f) => convert_word_return(f as usize, return_type, ptr_tracker),
+        },
+    }
 }
 
 // ── Return value conversion ─────────────────────────────────────────

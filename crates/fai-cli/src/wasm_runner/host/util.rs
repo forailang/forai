@@ -329,12 +329,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
 
     // env.ffi_begin(task_id, ext_fn_idx, arg_count, args_ptr) -> ()
     // The async (suspending) FFI path (plan 101 U7-U9): offload the blocking C
-    // call to a boundary worker and leave the task parked. The codegen only
-    // emits this for scalar-signature externs (Int/Float/Bool, no Ptr/String/
-    // out-params), so the worker can build its `Value`s locally and hand back
-    // just the NaN-boxed result bits — no guest memory, Store, or PtrTracker
-    // crosses the thread boundary. The driver loop pumps the completion and
-    // resumes the task; the guest then reads the value with `ffi_result`.
+    // call to a boundary worker and leave the task parked. Marshalling happens
+    // HERE on the main thread — args are decoded from guest memory (strings) and
+    // pointer handles resolved to raw addresses via PTR_TRACKER — producing a
+    // Send `PreparedFfiCall`. The worker only runs the raw C call; `ffi_result`
+    // converts the raw result back on the main thread. The codegen emits this
+    // only for word-arg externs (Int/Bool/String/Ptr, no Float arg, no
+    // out-params), which is exactly what the offload path supports.
     linker
         .func_wrap(
             "env",
@@ -362,56 +363,70 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         raw_args.push(i64::from_le_bytes(buf));
                     }
                 }
+                // Decode + marshal on the main thread: strings need guest memory,
+                // pointer handles need PTR_TRACKER.
+                let data_snapshot = mem.data(&caller).to_vec();
+                let values: Vec<fai_core::value::Value> = raw_args
+                    .iter()
+                    .zip(info.param_types.iter())
+                    .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, &data_snapshot))
+                    .collect();
+                let prepared = PTR_TRACKER.with(|t| {
+                    let mut tracker = t.borrow_mut();
+                    fai_ffi::prepare_offload(
+                        &info.library,
+                        &info.function,
+                        &values,
+                        &info.param_types,
+                        &info.return_type,
+                        &mut tracker,
+                    )
+                });
                 super::boundary::with_boundary(|b| {
                     b.submit(task_id, move || {
-                        // Scalar args don't read guest memory, so decode against
-                        // an empty slice on this worker thread.
-                        let values: Vec<fai_core::value::Value> = raw_args
-                            .iter()
-                            .zip(info.param_types.iter().chain(std::iter::repeat(&FfiType::Int)))
-                            .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, &[]))
-                            .collect();
-                        let fixed = info.param_types.len();
-                        let supplied = values.len();
-                        let mut tracker = PtrTracker::new();
-                        let result = if supplied > fixed {
-                            fai_ffi::call_variadic(
-                                &info.library,
-                                &info.function,
-                                &values,
-                                &info.param_types,
-                                &info.return_type,
-                                &mut tracker,
-                                fixed,
-                            )
-                        } else {
-                            fai_ffi::call(
-                                &info.library,
-                                &info.function,
-                                &values,
-                                &info.param_types,
-                                &info.return_type,
-                                &mut tracker,
-                            )
+                        // Worker thread: run only the raw C call. On a prepare
+                        // failure (e.g. missing symbol) surface the error string;
+                        // ffi_result turns it into null so the task still resumes.
+                        let outcome: Result<(fai_ffi::RawReturn, FfiType), String> = match prepared {
+                            Ok(call) => {
+                                let rt = call.return_type();
+                                call.raw_call().map(|raw| (raw, rt)).map_err(|e| e.message)
+                            }
+                            Err(e) => Err(e.message),
                         };
-                        let bits: i64 = match result {
-                            Ok(call_result) => call_result.return_value.to_bits() as i64,
-                            Err(_) => VAL_NULL,
-                        };
-                        Box::new(bits) as Box<dyn std::any::Any + Send>
+                        Box::new(outcome) as Box<dyn std::any::Any + Send>
                     });
                 });
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.ffi_result(task_id) -> i64 — the NaN-boxed result the worker computed
-    // for the offloaded extern call (or null if it failed / went missing).
+    // env.ffi_result(task_id) -> i64 — convert the worker's raw result into a
+    // guest value on the main thread (pointer returns tracked via PTR_TRACKER,
+    // string returns copied into guest memory). Null on failure / missing.
     linker
-        .func_wrap("env", "ffi_result", |_caller: Caller<'_, ()>, task_id: i32| -> i64 {
-            match super::boundary::take_ready(task_id) {
-                Some(Ok(boxed)) => boxed.downcast::<i64>().map(|b| *b).unwrap_or(VAL_NULL),
-                _ => VAL_NULL,
+        .func_wrap("env", "ffi_result", |mut caller: Caller<'_, ()>, task_id: i32| -> i64 {
+            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                return VAL_NULL;
+            };
+            let outcome = match super::boundary::take_ready(task_id) {
+                Some(Ok(boxed)) => {
+                    match boxed.downcast::<Result<(fai_ffi::RawReturn, FfiType), String>>() {
+                        Ok(b) => *b,
+                        Err(_) => return VAL_NULL,
+                    }
+                }
+                _ => return VAL_NULL,
+            };
+            match outcome {
+                Ok((raw, ty)) => {
+                    let value = PTR_TRACKER.with(|t| {
+                        let mut tracker = t.borrow_mut();
+                        fai_ffi::convert_offload_return(raw, &ty, &mut tracker)
+                    });
+                    encode_return_for_guest(&value, &ty, &mut caller, &mem)
+                }
+                Err(_) => VAL_NULL,
             }
         })
         .map_err(|e| format!("linker error: {}", e))?;

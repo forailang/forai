@@ -191,7 +191,6 @@ fn pointer_arg_offload_is_correct() {
 }
 
 #[test]
-#[ignore = "red target: enable once pointer/string-arg externs offload (fai_ffi marshal/raw/unmarshal split)"]
 fn concurrent_pointer_ffi_overlaps() {
     if !have_cc() {
         eprintln!("skipping: no cc");
