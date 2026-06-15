@@ -144,7 +144,6 @@ fn server_responds() {
 }
 
 #[test]
-#[ignore = "red target for plan 101 U3/U4: enable once the driver loop serves requests concurrently"]
 fn concurrent_requests_overlap() {
     let server = boot_server();
     let port = server.port;

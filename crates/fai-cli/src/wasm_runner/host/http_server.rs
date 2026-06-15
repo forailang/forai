@@ -272,64 +272,294 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 super::events::dispatch_event(&mut caller, "http:listening", started);
                 // The payload is host-owned; its dispatch is over.
                 host_release_value(&mut caller, started);
-                for conn in listener.incoming() {
-                    let stream = match conn {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    if is_options_request(&stream) {
-                        drain_request(&stream);
-                        write_cors_preflight(stream);
-                        continue;
-                    }
-                    // Try static file serving first (handles binary files directly).
-                    // If no static file matches, fall through to the WASM handler.
-                    let method_buf = peek_request_method_path(&stream);
-                    if let Some((method, path)) = &method_buf {
-                        if method == "GET" {
-                            if let Some(static_response) =
-                                try_serve_static_from_router(id as u32, path)
-                            {
-                                drain_request(&stream);
-                                write_raw_response(stream, static_response);
-                                continue;
+                // Unified driver loop (plan 101 U3/U4). Accept connections
+                // without blocking, spawn each async handler as a scheduler
+                // task, poll the scheduler to advance every in-flight handler,
+                // and write each connection's response when its task completes.
+                // Sync handlers and 404s still resolve inline. The effect: while
+                // one handler awaits I/O (sleep, a DB query, a fetch), the others
+                // keep running on this single thread instead of waiting in line.
+                let mut pending: Vec<PendingRequest> = Vec::new();
+                let _ = listener.set_nonblocking(true);
+                loop {
+                    // 1. Drain every connection ready right now.
+                    loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                accept_connection(&mut caller, id as u32, stream, &mut pending);
                             }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
                         }
                     }
-                    let request_val = {
-                        let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                        parse_http_request_into_guest(&mut caller, &mem, &stream)
-                    };
-                    super::events::dispatch_event(&mut caller, "http:beforeRequest", request_val);
-                    let response = dispatch_router_request(&mut caller, id as u32, request_val);
-                    let pair = build_request_response(&mut caller, request_val, response);
-                    super::events::dispatch_event(&mut caller, "http:afterResponse", pair);
-                    // Drain any deferred events queued during the
-                    // request — `http:beforeRequest` / `http:afterResponse`
-                    // subscribers can `emitDeferred(...)` for fire-and-
-                    // forget logging or metrics. Drain happens after
-                    // afterResponse so subscribers see the response in
-                    // its final shape, but before we write the wire
-                    // response so a deferred subscriber that throws
-                    // doesn't block the client. See Phase 5 of
-                    // plans/event-system.md.
-                    super::events::drain_queue(&mut caller);
-                    write_http_response(&mut caller, stream, response);
-                    // Reclaim the per-request graph (plan 115). `pair` is a
-                    // non-retaining dict holding the sole refs to `request_val`
-                    // and `response`, so one release of `pair` deep-frees the
-                    // pair, both dicts, and everything nested. A beforeRequest
-                    // listener that retained the request (e.g. session setup)
-                    // keeps it alive via its own ref. Must run AFTER
-                    // write_http_response has read the response bytes.
-                    host_release_value(&mut caller, pair);
+
+                    // 2. Nothing in flight: block for the next connection rather
+                    // than spinning, then loop back to the non-blocking drain.
+                    if pending.is_empty() {
+                        let _ = listener.set_nonblocking(false);
+                        if let Ok((stream, _)) = listener.accept() {
+                            let _ = listener.set_nonblocking(true);
+                            accept_connection(&mut caller, id as u32, stream, &mut pending);
+                        } else {
+                            let _ = listener.set_nonblocking(true);
+                        }
+                        continue;
+                    }
+
+                    // 3. Advance in-flight handler tasks; finish completed ones.
+                    guest_poll(&mut caller);
+                    finish_completed(&mut caller, &mut pending);
+
+                    // 4. While handlers remain parked (e.g. on a sleep timer),
+                    // poll again shortly without a hot spin. Boundary-backed
+                    // waits (U6/U9) will replace this with a real wakeup.
+                    if !pending.is_empty() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
     Ok(())
+}
+
+/// A request whose async handler is running as a scheduler task; its response
+/// is written to `stream` once `task_id` completes (plan 101 U4).
+struct PendingRequest {
+    stream: std::net::TcpStream,
+    request_val: i64,
+    task_id: i32,
+}
+
+// Task status words — mirror fai_codegen_wasm::async_engine ST_* (stable ABI).
+const ST_COMPLETE: i32 = 3;
+const ST_FAILED: i32 = 4;
+
+/// Accept one connection. OPTIONS preflight and static files are served inline.
+/// Otherwise the request is parsed; an async handler is spawned as a scheduler
+/// task (its response written later, when the task completes), while a sync
+/// handler or a 404 resolves inline exactly as before.
+fn accept_connection(
+    caller: &mut Caller<'_, ()>,
+    router_id: u32,
+    stream: std::net::TcpStream,
+    pending: &mut Vec<PendingRequest>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    if is_options_request(&stream) {
+        drain_request(&stream);
+        write_cors_preflight(stream);
+        return;
+    }
+    // Static files first (binary-safe direct serving); else the WASM handler.
+    let method_buf = peek_request_method_path(&stream);
+    if let Some((method, path)) = &method_buf {
+        if method == "GET" {
+            if let Some(static_response) = try_serve_static_from_router(router_id, path) {
+                drain_request(&stream);
+                write_raw_response(stream, static_response);
+                return;
+            }
+        }
+    }
+    let request_val = {
+        let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+        parse_http_request_into_guest(caller, &mem, &stream)
+    };
+    super::events::dispatch_event(caller, "http:beforeRequest", request_val);
+
+    // Async handler → spawn as a task and defer its response. Sync handlers,
+    // 404s, and handler errors all resolve inline via dispatch_router_request.
+    if let Some(handler) = find_matching_handler(caller, router_id, request_val) {
+        if handler_is_async(caller, handler) {
+            if let Some(task_id) = spawn_handler(caller, handler, request_val) {
+                pending.push(PendingRequest {
+                    stream,
+                    request_val,
+                    task_id,
+                });
+                return;
+            }
+            // Spawn failed: fall through to inline dispatch as a safety net.
+        }
+    }
+    let response = dispatch_router_request(caller, router_id, request_val);
+    complete_request(caller, stream, request_val, response);
+}
+
+/// Write the response for every pending request whose handler task finished
+/// this poll, and reclaim its slot. A failed task answers 500 rather than
+/// writing its non-response result value.
+fn finish_completed(caller: &mut Caller<'_, ()>, pending: &mut Vec<PendingRequest>) {
+    let mut i = 0;
+    while i < pending.len() {
+        let status = guest_task_status(caller, pending[i].task_id);
+        if status >= ST_COMPLETE {
+            let p = pending.swap_remove(i);
+            let response = if status == ST_FAILED {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                build_response_dict(caller, &mem, KIND_TEXT, 500, "Handler error")
+            } else {
+                guest_task_result(caller, p.task_id)
+            };
+            complete_request(caller, p.stream, p.request_val, response);
+            // Slot was marked host-driven, so reclaim it ourselves now that we
+            // have read the result (mirrors __fai_drive_closure's inline free).
+            guest_free_task(caller, p.task_id);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The afterResponse → drain → write → reclaim sequence, shared by inline and
+/// task-completed requests. `pair` co-owns request_val + response, so releasing
+/// it deep-frees the per-request graph (plan 115). Must run after the bytes are
+/// written.
+fn complete_request(
+    caller: &mut Caller<'_, ()>,
+    stream: std::net::TcpStream,
+    request_val: i64,
+    response: i64,
+) {
+    let pair = build_request_response(caller, request_val, response);
+    super::events::dispatch_event(caller, "http:afterResponse", pair);
+    // Deferred events (emitDeferred) flush after afterResponse sees the final
+    // response shape, but before the wire write so a throwing subscriber can't
+    // block the client. See plans/event-system.md Phase 5.
+    super::events::drain_queue(caller);
+    write_http_response(caller, stream, response);
+    host_release_value(caller, pair);
+}
+
+/// The handler closure for the first route matching the request's method and
+/// path, or None (→ inline 404). Mirrors dispatch_router_request's matching
+/// without invoking, so the caller can choose spawn-vs-inline.
+fn find_matching_handler(
+    caller: &mut Caller<'_, ()>,
+    router_id: u32,
+    request_val: i64,
+) -> Option<i64> {
+    let (method, path) = {
+        let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+        let v = request_val as u64;
+        if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+            return None;
+        }
+        let addr = (v & ADDR_MASK) as usize;
+        (
+            read_dict_string(&mem, caller, addr, "method").unwrap_or_default(),
+            read_dict_string(&mem, caller, addr, "path").unwrap_or_else(|| "/".into()),
+        )
+    };
+    let routes: Vec<(String, String, i64)> = WASM_ROUTER_STORE.with(|store| {
+        store
+            .borrow()
+            .get(&router_id)
+            .map(|r| {
+                r.routes
+                    .iter()
+                    .map(|rt| (rt.method.clone(), rt.pattern.clone(), rt.handler))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    for (route_method, pattern, handler) in &routes {
+        let method_matches = route_method == &method || route_method == "*";
+        if !method_matches || pattern == "__static__" {
+            continue;
+        }
+        if pattern == "*" || pattern == &path {
+            return Some(*handler);
+        }
+    }
+    None
+}
+
+/// True if the closure is an async resume fn (`frame_size > 0`), which must be
+/// spawned as a task rather than called directly.
+fn handler_is_async(caller: &mut Caller<'_, ()>, handler_val: i64) -> bool {
+    let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        return false;
+    };
+    let v = handler_val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return false;
+    }
+    let addr = (v & ADDR_MASK) as usize;
+    let data = mem.data(&*caller);
+    decode_closure_header(data, addr)
+        .map(|h| h.frame_size > 0)
+        .unwrap_or(false)
+}
+
+/// Run one scheduler poll cycle (advances every READY task once).
+fn guest_poll(caller: &mut Caller<'_, ()>) {
+    if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
+        let _ = f.call(&mut *caller, &[], &mut [Val::I32(0)]);
+    }
+}
+
+/// Spawn an async handler closure as a scheduler task, returning its id.
+fn spawn_handler(caller: &mut Caller<'_, ()>, handler: i64, arg: i64) -> Option<i32> {
+    let f = caller
+        .get_export("__fai_spawn_closure")
+        .and_then(|e| e.into_func())?;
+    let mut out = [Val::I64(0)];
+    f.call(&mut *caller, &[Val::I64(handler), Val::I64(arg)], &mut out)
+        .ok()?;
+    match out[0] {
+        Val::I64(v) => Some(v as i32),
+        _ => None,
+    }
+}
+
+/// A spawned task's status word; treats a missing export or trap as FAILED so a
+/// wedged task still gets a 500 rather than hanging the connection.
+fn guest_task_status(caller: &mut Caller<'_, ()>, id: i32) -> i32 {
+    let Some(f) = caller
+        .get_export("__fai_task_status")
+        .and_then(|e| e.into_func())
+    else {
+        return ST_FAILED;
+    };
+    let mut out = [Val::I32(0)];
+    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
+        return ST_FAILED;
+    }
+    match out[0] {
+        Val::I32(v) => v,
+        _ => ST_FAILED,
+    }
+}
+
+/// A completed task's NaN-boxed result value.
+fn guest_task_result(caller: &mut Caller<'_, ()>, id: i32) -> i64 {
+    let Some(f) = caller
+        .get_export("__fai_task_result")
+        .and_then(|e| e.into_func())
+    else {
+        return VAL_NULL;
+    };
+    let mut out = [Val::I64(0)];
+    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
+        return VAL_NULL;
+    }
+    match out[0] {
+        Val::I64(v) => v,
+        _ => VAL_NULL,
+    }
+}
+
+/// Recycle a host-driven task's slot once its result has been read.
+fn guest_free_task(caller: &mut Caller<'_, ()>, id: i32) {
+    if let Some(f) = caller
+        .get_export("__fai_free_task")
+        .and_then(|e| e.into_func())
+    {
+        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut []);
+    }
 }
 
 /// Peek at the request line (method + path) without consuming the stream.
