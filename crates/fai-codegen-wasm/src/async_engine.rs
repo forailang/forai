@@ -900,6 +900,25 @@ pub fn emit_task_status(l: &SchedLayout) -> Function {
     f
 }
 
+/// `__fai_free_task(id: i32)`: recycle a host-driven task's slot onto the free
+/// list. A task spawned by `__fai_spawn_closure` is marked host-driven (-2) so
+/// the scheduler won't recycle it on completion — the host reads its result
+/// first, then calls this to release the slot, exactly as `__fai_drive_closure`
+/// does inline. Without it the slot table would grow one entry per request.
+pub fn emit_free_task(l: &SchedLayout) -> Function {
+    // param: id = 0 (i32)
+    let mut f = Function::new([]);
+    // task[id].O_NEXT = g_free_head
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::GlobalGet(l.g_free_head));
+    f.instruction(&Instruction::I32Store(ma(O_NEXT)));
+    // g_free_head = id
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::GlobalSet(l.g_free_head));
+    f.instruction(&Instruction::End);
+    f
+}
+
 // ─── Resume-body building blocks (used by the direct-builder lowering) ──
 
 /// Emit `current_task.resume_state` load (an i32 on the stack).

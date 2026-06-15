@@ -7172,6 +7172,7 @@ pub fn try_codegen_async_engine(
     // host driver loop's spawn-without-drive and task-status entries (plan 101).
     funcs.function(t_i64i64_i64); // __fai_spawn_closure (i64,i64)->i64
     funcs.function(t_i32_i32); // __fai_task_status (i32)->i32
+    funcs.function(t_i32_void); // __fai_free_task (i32)->()
     module.section(&funcs);
 
     // Table = [async resume fns (0..nasync)] ++ [sync-fn closures (nasync..)].
@@ -7267,8 +7268,10 @@ pub fn try_codegen_async_engine(
     let nclosures = (async_closures.len() + sync_closures.len()) as u32;
     let spawn_closure_idx = sb + 13 + nclosures;
     let task_status_idx = sb + 14 + nclosures;
+    let free_task_idx = sb + 15 + nclosures;
     exports.export("__fai_spawn_closure", ExportKind::Func, spawn_closure_idx);
     exports.export("__fai_task_status", ExportKind::Func, task_status_idx);
+    exports.export("__fai_free_task", ExportKind::Func, free_task_idx);
     // Host-callable refcount release: lets the host reclaim per-request guest
     // objects it owns (the request/response dicts it built) after writing the
     // response, so a long-running server plateaus instead of leaking ~1 dict
@@ -7370,6 +7373,7 @@ pub fn try_codegen_async_engine(
     // host-driver-loop entries (plan 101). Indices computed at the export below.
     code.function(&async_engine::emit_spawn_closure(&layout));
     code.function(&async_engine::emit_task_status(&layout));
+    code.function(&async_engine::emit_free_task(&layout));
     module.section(&code);
 
     if !extended.is_empty() {
