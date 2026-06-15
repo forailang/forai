@@ -54,6 +54,20 @@ impl Drop for ExternGuard {
     }
 }
 
+/// Submit a failed boundary completion for `task_id` so a parked FFI task still
+/// resumes (and `ffi_result` yields null) when `ffi_begin` can't set up the call
+/// — e.g. the extern metadata wasn't registered. Without this the task would
+/// park forever, since the offload-and-resume only happens through the boundary.
+fn submit_ffi_error(task_id: i32, msg: &str) {
+    let msg = msg.to_string();
+    super::boundary::with_boundary(|b| {
+        b.submit(task_id, move || {
+            Box::new(Err::<(fai_ffi::RawReturn, FfiType), String>(msg))
+                as Box<dyn std::any::Any + Send>
+        });
+    });
+}
+
 /// Decode a NaN-boxed i64 from the guest into a host-side `Value` that
 /// `fai_ffi::call` can consume. The marshaller dereferences object
 /// pointers as host pointers, so any object reference we pass must live
@@ -345,9 +359,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     .with(|slot| slot.borrow().get(ext_fn_idx as usize).cloned())
                 {
                     Some(info) => info,
-                    None => return,
+                    None => {
+                        submit_ffi_error(task_id, "unknown extern");
+                        return;
+                    }
                 };
                 let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    submit_ffi_error(task_id, "no guest memory");
                     return;
                 };
                 let mut raw_args: Vec<i64> = Vec::with_capacity(arg_count as usize);
@@ -356,6 +374,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     for i in 0..arg_count as usize {
                         let off = args_ptr as usize + i * 8;
                         if off + 8 > data.len() {
+                            submit_ffi_error(task_id, "args out of bounds");
                             return;
                         }
                         let mut buf = [0u8; 8];

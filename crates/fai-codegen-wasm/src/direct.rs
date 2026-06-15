@@ -4674,6 +4674,29 @@ impl<'a> CfgBuilder<'a> {
         }
         // assignment `v = expr` (no awaits in the value)
         if let Statement::AssignmentStatement(asg) = stmt {
+            // `x = externCall(...)` (offloadable extern, single-var target) —
+            // offload + bind the result back into the existing local on resume
+            // (plan 101 U10: the per-row `step = sqlite3_step(stmt)` reassignment
+            // in a collect loop). Mirrors the let/var binding case.
+            if let AssignmentTarget::Variables { names } = &asg.target {
+                if names.len() == 1 {
+                    if let Some((ext_idx, fargs, loc)) =
+                        offloadable_extern_call_args(&asg.value)
+                    {
+                        let next = self.new_block();
+                        self.blocks[cur].term = Term::AwaitFfi {
+                            ext_idx,
+                            args: fargs,
+                            loc,
+                            next,
+                        };
+                        self.blocks[next].incoming = Incoming::AwaitedFfi {
+                            bind: Some(names[0].clone()),
+                        };
+                        return Ok(Flow::Continue(next));
+                    }
+                }
+            }
             if expr_has_user_call(&asg.value, self.fns) {
                 return Err(());
             }

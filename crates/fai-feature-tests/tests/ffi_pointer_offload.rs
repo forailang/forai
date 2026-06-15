@@ -27,6 +27,7 @@ const STUB_C: &str = r#"
 #include <stdlib.h>
 void* make_ctx(int n) { int* p = malloc(sizeof(int)); *p = n; return p; }
 int slow_use_ctx(void* c) { usleep(500000); return *(int*)c; }
+int use_ctx(void* c) { return *(int*)c; }
 int str_len(const char* s) { return (int)strlen(s); }
 "#;
 
@@ -56,6 +57,7 @@ fn server_source(port: u16) -> String {
          extern ffistub\n\
          \x20 def make_ctx(n: Int) -> Ptr\n\
          \x20 def slow_use_ctx(ctx: Ptr) -> Int\n\
+         \x20 def use_ctx(ctx: Ptr) -> Int\n\
          \x20 def str_len(s: String) -> Int\n\
          end\n\
          \n\
@@ -71,6 +73,18 @@ fn server_source(port: u16) -> String {
          \x20 server.get(router, '/strlen') do with req HttpRequest\n\
          \x20   let n = str_len('hello')\n\
          \x20   server.text(200, toString(n))\n\
+         \x20 end\n\
+         \x20 server.get(router, '/loop') do with req HttpRequest\n\
+         \x20   let c = make_ctx(7)\n\
+         \x20   var n = use_ctx(c)\n\
+         \x20   var sum = 0\n\
+         \x20   var i = 0\n\
+         \x20   while i < 3\n\
+         \x20     sum = sum + n\n\
+         \x20     n = use_ctx(c)\n\
+         \x20     i = i + 1\n\
+         \x20   end\n\
+         \x20   server.text(200, toString(sum))\n\
          \x20 end\n\
          \x20 server.listen(router, {port})\n\
          end\n",
@@ -188,6 +202,23 @@ fn pointer_arg_offload_is_correct() {
     // dereferences it on a worker and returns 42 — proves Ptr return + Ptr arg
     // round-trip through the boundary.
     assert!(resp.contains("42"), "expected body 42, got:\n{resp}");
+}
+
+#[test]
+fn loop_with_assignment_offload_is_correct() {
+    if !have_cc() {
+        eprintln!("skipping: no cc");
+        return;
+    }
+    // Mirrors forsqlite's collect_rows shape: a `var x = extern()` binding plus
+    // a per-iteration `x = extern()` reassignment, both offloaded, with the
+    // suspension inside a `while` loop. use_ctx returns 7, summed over 3
+    // iterations = 21. Proves assignment-position AwaitFfi and suspension inside
+    // a loop both work.
+    let server = boot_server();
+    let resp = get(server.port, "/loop");
+    assert!(resp.contains("200"), "got:\n{resp}");
+    assert!(resp.contains("21"), "expected body 21, got:\n{resp}");
 }
 
 #[test]
