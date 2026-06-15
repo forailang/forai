@@ -107,6 +107,23 @@ end
 #   window.__fai_assert_ownership()
 #   window.__fai_dump_ownership()
 #
+# Reports resolve helper-site ids through the embedded debug table:
+# `direct:cleanup:cleanup owned value (src/main.fai:13)` names the
+# operation family, helper family, reason, and source line. Dirty reports
+# include recent per-object history so a duplicate cleanup or missing retain
+# can be read as a chain instead of a raw net credit.
+#
+# App-bug reduction workflow:
+#   1. Run with --check-ownership and note the operation family.
+#   2. Copy the closest `tests/fixtures/language/rc/` or `rc_browser/`
+#      category into a smaller repro.
+#   3. Add `# ownership: balanced` when the reduced native fixture is clean,
+#      or `#   ownership: balanced` under `browser:` for browser cases.
+#   4. Use `FAI_OWNERSHIP_SEED=suppress-retain fai test ... --check-ownership`
+#      only for instrumentation self-tests; `suppress-retain`,
+#      `suppress-transfer`, and `suppress-cleanup` have real failing probes.
+#      Unknown seed names warn and remain inactive.
+#
 # The checker is opt-in. Normal builds do not import
 # __fai_ownership_event, so older/minimal hosts still instantiate them.
 def doc_debugging_check_ownership
@@ -114,4 +131,11 @@ def doc_debugging_check_ownership
 do
     # fai run app.fai --check-ownership
     # [ownership-check] 42 event(s), 0 object(s) with helper imbalance
+    #
+    # fai test app.fai --check-ownership
+    # [ownership-check] 5 event(s), 1 object(s) with helper imbalance
+    #   unmatched cleanup direct:cleanup:cleanup owned value (src/main.fai:13) aux=none value=0xfffc...
+    #     history:
+    #       store direct:store:store owned value (src/main.fai:13) aux=none value=0xfffc...
+    #       return direct:return:return owned value (src/main.fai:5) aux=none value=0xfffc...
 end

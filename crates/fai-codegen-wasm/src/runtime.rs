@@ -532,7 +532,12 @@ pub const IMPORT_MEM_WATCH: u32 = 111;
 /// codegen site id, `value` carries the boxed value/address when relevant,
 /// and `aux` carries the slot/convention discriminator for the operation.
 pub const IMPORT_OWNERSHIP_EVENT: u32 = 112;
-pub const IMPORT_COUNT: u32 = 113;
+/// `env.replace_location(ptr, len) -> void` — replaces the current
+/// browser location with a document navigation.
+pub const IMPORT_REPLACE_LOCATION: u32 = 113;
+/// `env.crypto_hmac_sha1_base64(key_ptr, key_len, msg_ptr, msg_len) -> i64`.
+pub const IMPORT_CRYPTO_HMAC_SHA1_BASE64: u32 = 114;
+pub const IMPORT_COUNT: u32 = 115;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -756,6 +761,7 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             // the availability probe can report false in the browser; the
             // compute functions are stripped (calling one traps).
             avail[IMPORT_CRYPTO_HMAC_SHA256_HEX as usize] = false;
+            avail[IMPORT_CRYPTO_HMAC_SHA1_BASE64 as usize] = false;
             avail[IMPORT_CRYPTO_SHA256_HEX as usize] = false;
             avail[IMPORT_CRYPTO_HEX_ENCODE as usize] = false;
             avail[IMPORT_CRYPTO_CONSTANT_TIME_EQUALS as usize] = false;
@@ -4504,7 +4510,8 @@ fn emit_retain_array_elems(
 
 fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
     // locals: 3=addr(i32), 4=method_id(i32), 5=arg0(i64), 6=arg1(i64),
-    // 7..14=i32 temps, 15..16=i64 temps, 17..18=extra i32 temps
+    // 7..14=i32 temps, 15..16=i64 temps, 17..18=extra i32 temps,
+    // 19=extra i64 temp.
     //
     // The last two i32 temps (17, 18) were added for METHOD_REPLACE
     // which needs more persistent state than 7..14 provide (6 arg-field
@@ -4519,6 +4526,7 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         (8, ValType::I32),
         (2, ValType::I64),
         (2, ValType::I32),
+        (1, ValType::I64),
     ]);
     // addr = obj_addr(callee)
     f.instruction(&Instruction::LocalGet(0));
@@ -5603,8 +5611,10 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
 
-        // Start with first element as result
+        // Start with first element as result. It is borrowed from the array
+        // until the first concat creates a fresh accumulator.
         // local 15 = accumulator (i64 NaN-boxed string)
+        // local 17 = accumulator-owned flag (i32)
         f.instruction(&Instruction::LocalGet(7));
         f.instruction(&Instruction::I64Load(MemArg {
             offset: 8,
@@ -5613,6 +5623,8 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         })); // arr[0]
         f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
         f.instruction(&Instruction::LocalSet(15)); // result = toString(arr[0])
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(17));
 
         // local 11 = i (loop from 1)
         f.instruction(&Instruction::I32Const(1));
@@ -5627,14 +5639,26 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
             f.instruction(&Instruction::I32GeU);
             f.instruction(&Instruction::BrIf(1));
 
-            // result = concat(result, sep_string)
+            // temp = concat(result, sep_string). The separator copy and any
+            // previously owned accumulator are internal temps and can be
+            // released once temp supersedes them.
             f.instruction(&Instruction::LocalGet(15));
             f.instruction(&Instruction::LocalGet(9)); // sep_ptr
             f.instruction(&Instruction::LocalGet(10)); // sep_len
             f.instruction(&Instruction::Call(base + RT_ALLOC_STRING)); // NaN-boxed sep
+            f.instruction(&Instruction::LocalTee(16));
             f.instruction(&Instruction::Call(base + RT_CONCAT));
+            f.instruction(&Instruction::LocalSet(19));
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::LocalGet(17));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::End);
 
             // result = concat(result, toString(arr[i]))
+            f.instruction(&Instruction::LocalGet(19));
             f.instruction(&Instruction::LocalGet(7)); // arr_addr
             f.instruction(&Instruction::I32Const(8));
             f.instruction(&Instruction::I32Add);
@@ -5646,6 +5670,10 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
             f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
             f.instruction(&Instruction::Call(base + RT_CONCAT));
             f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(19));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(17));
 
             // i++
             f.instruction(&Instruction::LocalGet(11));
@@ -5656,6 +5684,17 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         }
         f.instruction(&Instruction::End); // end loop
         f.instruction(&Instruction::End); // end block
+
+        // One-element arrays never enter the loop, so the accumulator is still
+        // borrowed from arr[0]. Retain it here to keep join's Owned result
+        // contract uniform.
+        f.instruction(&Instruction::LocalGet(17));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::End);
 
         f.instruction(&Instruction::LocalGet(15));
         f.instruction(&Instruction::Return);
@@ -9026,6 +9065,13 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             "__fai_ownership_event",
             vec![ValType::I32, ValType::I32, ValType::I64, ValType::I32],
             vec![],
+        ),
+        // IMPORT_REPLACE_LOCATION: (path_ptr, path_len) -> void.
+        ("replace_location", vec![ValType::I32, ValType::I32], vec![]),
+        (
+            "crypto_hmac_sha1_base64",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![ValType::I64],
         ),
     ]
 }

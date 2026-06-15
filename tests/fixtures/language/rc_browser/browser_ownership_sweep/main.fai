@@ -1,0 +1,20 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: browser sweep
+# leak: flat
+# ownership: balanced
+
+use std.browser
+
+def main
+    @return Void
+do
+    var i = 0
+    while i < 20
+        let path = getLocationPath()
+        let html = '<main><h1 class="message">browser sweep</h1><p>' + path + '</p></main>'
+        browser.setHtml(html)
+        i = i + 1
+    end
+end

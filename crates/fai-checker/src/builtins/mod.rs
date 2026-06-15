@@ -185,6 +185,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.browser", name: "setHtmlAt", builtin_name: "setHtmlAt", doc: "Replace a selected browser element with HTML." },
         BuiltinDoc { module: "std.browser", name: "getLocationPath", builtin_name: "getLocationPath", doc: "Return the browser location path." },
         BuiltinDoc { module: "std.browser", name: "pushHistoryState", builtin_name: "pushHistoryState", doc: "Push a browser history path." },
+        BuiltinDoc { module: "std.browser", name: "replaceLocation", builtin_name: "replaceLocation", doc: "Replace the browser location with a document navigation." },
         BuiltinDoc { module: "std.browser", name: "remoteCall", builtin_name: "remoteCall", doc: "Call a forai remote endpoint from browser code." },
 
         // std.file
@@ -285,6 +286,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         // std.crypto
         BuiltinDoc { module: "std.crypto", name: "available",          builtin_name: "cryptoAvailable",          doc: "Return true if crypto primitives are available on this host (native only)." },
         BuiltinDoc { module: "std.crypto", name: "hmacSha256Hex",      builtin_name: "cryptoHmacSha256Hex",      doc: "Return the lowercase hex HMAC-SHA256 of message under key (both UTF-8)." },
+        BuiltinDoc { module: "std.crypto", name: "hmacSha1Base64",     builtin_name: "cryptoHmacSha1Base64",     doc: "Return the standard padded base64 HMAC-SHA1 of message under key (both UTF-8)." },
         BuiltinDoc { module: "std.crypto", name: "sha256Hex",          builtin_name: "cryptoSha256Hex",          doc: "Return the lowercase hex SHA-256 digest of the UTF-8 input." },
         BuiltinDoc { module: "std.crypto", name: "hexEncode",          builtin_name: "cryptoHexEncode",          doc: "Return the lowercase hex encoding of the UTF-8 input bytes." },
         BuiltinDoc { module: "std.crypto", name: "constantTimeEquals", builtin_name: "cryptoConstantTimeEquals", doc: "Compare two strings in constant time. False on length mismatch." },

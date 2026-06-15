@@ -152,13 +152,32 @@ try {
     }
   }
 
+  if (assertion.clickSelector !== undefined) {
+    const count = assertion.clickCount ?? 1;
+    await page.waitForSelector(assertion.clickSelector, { timeout: assertion.timeoutMs ?? 5000 });
+    for (let i = 0; i < count; i++) {
+      await page.locator(assertion.clickSelector).click();
+    }
+    await page.waitForTimeout(0);
+  }
+
   if (assertion.leak !== undefined) {
     // Browser leak gate (plan 118 U4): after the root completes, read
-    // the always-exported __live_objects counter through the runtime's
-    // window accessor. Two-sided, mirroring the native gate.
+    // the generated runtime leak dump. This must be a real guest-instrumented
+    // run; the dump function exists in all browser runtimes, so reject the
+    // explicit "no guest events" hint instead of silently trusting the scalar.
     await page.waitForFunction(() => window.__FAI_ROOT_DONE === true, null, {
       timeout: assertion.timeoutMs ?? 5000,
     });
+    const dump = await page.evaluate(() =>
+      typeof window.__fai_dump_leaks === 'function' ? window.__fai_dump_leaks() : null
+    );
+    if (dump === null) {
+      throw new Error('leak gate: window.__fai_dump_leaks unavailable — runtime JS predates browser leak diagnostics');
+    }
+    if (dump.includes('no guest events')) {
+      throw new Error(`leak gate: browser guest leak hooks were not active\n${dump}`);
+    }
     const live = await page.evaluate(() =>
       typeof window.__fai_live_objects === 'function' ? window.__fai_live_objects() : null
     );
@@ -169,7 +188,7 @@ try {
       throw new Error(`leak gate: __live_objects is NEGATIVE (${live}) — host/guest free imbalance, investigate`);
     }
     if (assertion.leak === 'flat' && live > 0) {
-      throw new Error(`marked leak: flat but ${live} object(s) live after root — an unexpected leak (regression)`);
+      throw new Error(`marked leak: flat but ${live} object(s) live after root — an unexpected leak (regression)\n${dump}`);
     }
     if (assertion.leak === 'expected' && live === 0) {
       throw new Error(`marked leak: expected ${assertion.leakTag ?? ''} but ran FLAT — the leak is fixed; flip the marker to leak: flat`);

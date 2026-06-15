@@ -1,0 +1,21 @@
+# expect: ok
+# leak: flat
+# Template interpolation allocates literal/expression part strings and
+# intermediate concat results. Looping catches any unbalanced part cleanup.
+def main
+    @return Void
+do
+    var round = 0
+    while round < 100
+        var i = 0
+        let path = '0.0.2'
+        while i < 20
+            var childPath = "{{path}}.{{i}}"
+            if path == ''
+                childPath = toString(i)
+            end
+            i = i + 1
+        end
+        round = round + 1
+    end
+end

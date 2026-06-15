@@ -12,6 +12,7 @@
 /crates/fai-cli/public/
 /tests/browser-harness/node_modules/
 *.wasm
+*.dbg.json
 *.wat
 *.js.map
 interface.json

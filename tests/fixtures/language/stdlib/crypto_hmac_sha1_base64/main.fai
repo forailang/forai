@@ -1,0 +1,10 @@
+use std.crypto
+
+def main
+    @return Void
+do
+    if crypto.available()
+        let sig = crypto.hmacSha1Base64('Jefe', 'what do ya want for nothing?')
+        assert.equals(sig, '7/zfauXrL6LSdBbV8YTfnCWafHk=')
+    end
+end

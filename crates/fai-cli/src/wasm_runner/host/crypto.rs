@@ -1,4 +1,4 @@
-//! Crypto host imports: SHA-256, HMAC-SHA256, hex, base64, and a
+//! Crypto host imports: SHA-256, HMAC-SHA256, HMAC-SHA1, hex, base64, and a
 //! constant-time string compare. All native-only; the browser target
 //! strips every function except `crypto_available` (which reports false
 //! there). String args arrive as (ptr, len) into guest memory; string
@@ -7,6 +7,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use wasmtime::*;
@@ -14,6 +15,7 @@ use wasmtime::*;
 use super::super::heap::wasm_alloc_str;
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<Sha1>;
 
 /// Read a (ptr, len) guest string into an owned String. Out-of-bounds
 /// ranges yield an empty string rather than panicking the host.
@@ -68,6 +70,28 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 mac.update(msg.as_bytes());
                 let digest = mac.finalize().into_bytes();
                 wasm_alloc_str(&mut caller, &mem, &to_hex(&digest))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_hmac_sha1_base64(key_ptr, key_len, msg_ptr, msg_len) -> i64.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_hmac_sha1_base64",
+            |mut caller: Caller<'_, ()>,
+             key_ptr: i32,
+             key_len: i32,
+             msg_ptr: i32,
+             msg_len: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key = read_str(&caller, &mem, key_ptr, key_len);
+                let msg = read_str(&caller, &mem, msg_ptr, msg_len);
+                let mut mac = HmacSha1::new_from_slice(key.as_bytes()).unwrap();
+                mac.update(msg.as_bytes());
+                let digest = mac.finalize().into_bytes();
+                wasm_alloc_str(&mut caller, &mem, &STANDARD.encode(digest))
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -177,6 +201,17 @@ mod tests {
         assert_eq!(
             to_hex(&mac.finalize().into_bytes()),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hmac_sha1_rfc2202_case2_base64() {
+        // RFC 2202 test case 2: key "Jefe", data "what do ya want for nothing?".
+        let mut mac = HmacSha1::new_from_slice(b"Jefe").unwrap();
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            STANDARD.encode(mac.finalize().into_bytes()),
+            "7/zfauXrL6LSdBbV8YTfnCWafHk="
         );
     }
 

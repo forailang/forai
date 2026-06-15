@@ -82,6 +82,7 @@ pub(crate) fn reserve(caller: &mut Caller<'_, ()>, mem: &Memory, logical_size: u
             }
         }
     }
+    super::ownership_balance::record_alloc(logical);
     logical
 }
 

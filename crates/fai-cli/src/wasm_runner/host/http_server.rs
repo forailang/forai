@@ -152,6 +152,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |_caller: Caller<'_, ()>, _p: i32, _l: i32| {},
         )
         .map_err(|e| format!("linker error: {}", e))?;
+    linker
+        .func_wrap(
+            "env",
+            "replace_location",
+            |_caller: Caller<'_, ()>, _p: i32, _l: i32| {},
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
 
     // env.http_server_router() -> i32 (router ID)
     linker

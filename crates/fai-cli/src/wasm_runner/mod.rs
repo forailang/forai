@@ -193,7 +193,10 @@ pub fn run_wasm_with_externs_opts(
         opts.check_leaks.and_then(|c| c.interval_ms),
         opts.check_leaks.is_some().then(|| dbg.clone()),
     );
-    ownership_balance::reset(opts.check_ownership);
+    ownership_balance::reset(
+        opts.check_ownership,
+        opts.check_ownership.then(|| dbg.clone()),
+    );
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
@@ -517,9 +520,15 @@ pub fn run_wasm_tests_with_externs(
     // (observability) or opts.check_leaks (per-case assertion, plan 118).
     let leaks = opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some();
     let ownership = opts.check_ownership || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some();
-    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks;
-    if debug_env {
-        let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
+    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks || ownership;
+    let dbg = if debug_env {
+        Some(std::rc::Rc::new(debug_table::DbgTable::from_wasm(
+            wasm_bytes,
+        )))
+    } else {
+        None
+    };
+    if let Some(dbg) = &dbg {
         host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
         // FAI_CHECK_LEAKS_INTERVAL_MS streams a periodic live-set report
         // (top groups WITH allocation sites) during a test run — the way
@@ -530,7 +539,7 @@ pub fn run_wasm_tests_with_externs(
             .and_then(|s| s.parse::<u64>().ok());
         leak_ledger::reset(leaks, interval_ms, leaks.then(|| dbg.clone()));
     }
-    ownership_balance::reset(ownership);
+    ownership_balance::reset(ownership, if ownership { dbg.clone() } else { None });
     let engine = shared_engine();
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
     let mut store = Store::new(engine, ());
@@ -716,7 +725,11 @@ pub fn run_wasm_tests_with_externs(
         }
         summary.suites.push(suite_report);
     }
+    let ownership_failed = ownership_balance::has_imbalance();
     report_ownership_check();
+    if ownership_failed {
+        summary.failed += 1;
+    }
     Ok(summary)
 }
 

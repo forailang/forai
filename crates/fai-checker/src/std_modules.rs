@@ -150,6 +150,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("setHtmlAt", "setHtmlAt"),
             ("getLocationPath", "getLocationPath"),
             ("pushHistoryState", "pushHistoryState"),
+            ("replaceLocation", "replaceLocation"),
             ("remoteCall", "remoteCall"),
         ]
         .into_iter()
@@ -335,6 +336,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
         vec![
             ("available", "cryptoAvailable"),
             ("hmacSha256Hex", "cryptoHmacSha256Hex"),
+            ("hmacSha1Base64", "cryptoHmacSha1Base64"),
             ("sha256Hex", "cryptoSha256Hex"),
             ("hexEncode", "cryptoHexEncode"),
             ("constantTimeEquals", "cryptoConstantTimeEquals"),

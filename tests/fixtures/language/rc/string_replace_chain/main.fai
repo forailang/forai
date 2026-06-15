@@ -1,0 +1,30 @@
+# expect: ok
+# leak: flat
+
+use std.string
+
+# Exercise nested string.replace calls. Each replace returns an owned +1:
+# non-empty find allocates a fresh string, and empty find retains the receiver.
+def escape
+    @param text String
+    @return String
+do
+    string.replace(string.replace(string.replace(text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;')
+end
+
+test escape
+    it 'escapes html markers'
+        assert.equals(escape('<a&b>'), '&lt;a&amp;b&gt;')
+    end
+end
+
+def main
+    @return Void
+do
+    var i = 0
+    while i < 20
+        let out = escape('<a&b>')
+        assert.equals(out, '&lt;a&amp;b&gt;')
+        i = i + 1
+    end
+end

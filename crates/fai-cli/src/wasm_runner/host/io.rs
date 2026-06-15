@@ -620,6 +620,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "__fai_alloc_event",
             |mut caller: Caller<'_, ()>, addr: i32, size: i32| {
                 use super::super::leak_ledger;
+                super::super::ownership_balance::record_alloc(addr as u32);
                 if !leak_ledger::is_enabled() {
                     return;
                 }
@@ -651,6 +652,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "__fai_free_event",
             |_caller: Caller<'_, ()>, addr: i32, size: i32| {
                 use super::super::leak_ledger;
+                super::super::ownership_balance::record_free(addr as u32);
                 if leak_ledger::is_enabled() {
                     leak_ledger::record_free(addr as u32, size as u32);
                 }

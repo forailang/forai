@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub const FIXTURES_SUBPATH: &str = "tests/fixtures/language";
+pub const PROJECT_FIXTURES_SUBPATH: &str = "tests/fixtures/projects";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expect {
@@ -57,9 +58,19 @@ pub enum LeakExpectation {
     Expected(String),
 }
 
+/// `# ownership:` directive (plan 123 U6). Native fixtures opt into the
+/// helper ownership checker separately from leak gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipExpectation {
+    /// `# ownership: balanced` — `fai run --check-ownership` must report zero
+    /// helper imbalances.
+    Balanced,
+}
+
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub path: PathBuf,
+    pub project_root: Option<PathBuf>,
     pub display_name: String,
     pub expect: Expect,
     pub stdout: Option<String>,
@@ -67,6 +78,7 @@ pub struct Fixture {
     pub error: Option<ErrorPattern>,
     pub skip: Option<String>,
     pub leak: Option<LeakExpectation>,
+    pub ownership: Option<OwnershipExpectation>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +89,8 @@ pub struct BrowserAssertion {
     pub root_result: Option<String>,
     pub duration_less_than_ms: Option<u64>,
     pub duration_at_least_ms: Option<u64>,
+    pub click_selector: Option<String>,
+    pub click_count: Option<u64>,
     pub ownership_balanced: bool,
 }
 
@@ -117,6 +131,10 @@ pub fn fixtures_root() -> PathBuf {
     workspace_root().join(FIXTURES_SUBPATH)
 }
 
+pub fn project_fixtures_root() -> PathBuf {
+    workspace_root().join(PROJECT_FIXTURES_SUBPATH)
+}
+
 pub fn fai_binary() -> PathBuf {
     let bin = workspace_root().join("target").join("debug").join("fai");
     assert!(
@@ -130,7 +148,9 @@ pub fn fai_binary() -> PathBuf {
 pub fn discover_fixtures() -> Vec<Fixture> {
     let root = fixtures_root();
     let mut out = Vec::new();
-    walk_fixture_dirs(&root, &root, &mut out);
+    walk_fixture_dirs(&root, &root, None, None, &mut out);
+    let project_root = project_fixtures_root();
+    walk_project_fixture_dirs(&project_root, &project_root, &mut out);
     out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     out
 }
@@ -141,7 +161,13 @@ pub fn discover_fixtures() -> Vec<Fixture> {
 /// the pipeline's sibling-scan (which aggregates public functions and
 /// test blocks across all `.fai` files in a directory) never crosses
 /// fixture boundaries.
-fn walk_fixture_dirs(root: &Path, dir: &Path, out: &mut Vec<Fixture>) {
+fn walk_fixture_dirs(
+    root: &Path,
+    dir: &Path,
+    project_root: Option<&Path>,
+    display_prefix: Option<&str>,
+    out: &mut Vec<Fixture>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -153,24 +179,55 @@ fn walk_fixture_dirs(root: &Path, dir: &Path, out: &mut Vec<Fixture>) {
         }
         let main_fai = path.join("main.fai");
         if main_fai.is_file() {
-            match parse_fixture(root, &path, &main_fai) {
+            match parse_fixture(root, &path, &main_fai, project_root, display_prefix) {
                 Ok(fx) => out.push(fx),
                 Err(e) => panic!("failed to parse fixture {}: {}", path.display(), e),
             }
         } else {
-            walk_fixture_dirs(root, &path, out);
+            walk_fixture_dirs(root, &path, project_root, display_prefix, out);
         }
     }
 }
 
-fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fixture, String> {
+fn walk_project_fixture_dirs(root: &Path, dir: &Path, out: &mut Vec<Fixture>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let main_fai = path.join("src").join("main.fai");
+        if path.join("fai.toml").is_file() && main_fai.is_file() {
+            match parse_fixture(root, &path, &main_fai, Some(&path), Some("projects")) {
+                Ok(fx) => out.push(fx),
+                Err(e) => panic!("failed to parse project fixture {}: {}", path.display(), e),
+            }
+        } else {
+            walk_project_fixture_dirs(root, &path, out);
+        }
+    }
+}
+
+fn parse_fixture(
+    root: &Path,
+    fixture_dir: &Path,
+    main_path: &Path,
+    project_root: Option<&Path>,
+    display_prefix: Option<&str>,
+) -> Result<Fixture, String> {
     let content = fs::read_to_string(main_path).map_err(|e| format!("read failed: {}", e))?;
     let rel = fixture_dir
         .strip_prefix(root)
         .map_err(|e| format!("strip_prefix failed: {}", e))?;
-    let display_name = rel
+    let mut display_name = rel
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "::");
+    if let Some(prefix) = display_prefix {
+        display_name = format!("{prefix}::{display_name}");
+    }
 
     // Directive block: leading `#` comment lines, terminated by the
     // first line that is not a comment (blank or code).
@@ -180,6 +237,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     let mut error: Option<ErrorPattern> = None;
     let mut skip: Option<String> = None;
     let mut leak: Option<LeakExpectation> = None;
+    let mut ownership: Option<OwnershipExpectation> = None;
 
     let mut active: Option<&'static str> = None;
     for raw in content.lines() {
@@ -260,6 +318,10 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
                     leak = Some(parse_leak_value(value)?);
                     active = Some("leak");
                 }
+                "ownership" => {
+                    ownership = Some(parse_ownership_value(value)?);
+                    active = Some("ownership");
+                }
                 _ => {
                     // Unknown directive: treat as a plain human comment.
                     active = None;
@@ -291,6 +353,7 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
         || browser.root_result.is_some()
         || browser.duration_less_than_ms.is_some()
         || browser.duration_at_least_ms.is_some()
+        || browser.click_selector.is_some()
         || browser.ownership_balanced
     {
         Some(browser)
@@ -302,9 +365,13 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
     if leak.is_some() && expect != Expect::Ok {
         return Err("`# leak:` requires `# expect: ok`".to_string());
     }
+    if ownership.is_some() && expect != Expect::Ok {
+        return Err("`# ownership:` requires `# expect: ok`".to_string());
+    }
 
     Ok(Fixture {
         path: main_path.to_path_buf(),
+        project_root: project_root.map(Path::to_path_buf),
         display_name,
         expect,
         stdout,
@@ -312,13 +379,14 @@ fn parse_fixture(root: &Path, fixture_dir: &Path, main_path: &Path) -> Result<Fi
         error,
         skip,
         leak,
+        ownership,
     })
 }
 
 fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), String> {
     let Some((key, value)) = line.split_once(':') else {
         return Err(format!(
-            "browser directive lines must be `selector:`, `text:`, `html:`, `rootResult:`, `durationLessThanMs:`, `durationAtLeastMs:`, or `ownership: balanced`, got `{}`",
+            "browser directive lines must be `selector:`, `text:`, `html:`, `rootResult:`, `durationLessThanMs:`, `durationAtLeastMs:`, `click:`, or `ownership: balanced`, got `{}`",
             line
         ));
     };
@@ -344,6 +412,21 @@ fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), 
                 )
             })?)
         }
+        "click" => {
+            let mut parts = value.rsplitn(2, char::is_whitespace);
+            let Some(count_raw) = parts.next().filter(|s| !s.is_empty()) else {
+                return Err("click must be `<selector> <count>`".to_string());
+            };
+            let Some(selector_raw) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                return Err("click must be `<selector> <count>`".to_string());
+            };
+            browser.click_count = Some(
+                count_raw
+                    .parse::<u64>()
+                    .map_err(|e| format!("click count must be an integer: {}", e))?,
+            );
+            browser.click_selector = Some(selector_raw.to_string());
+        }
         "ownership" => {
             if value == "balanced" {
                 browser.ownership_balanced = true;
@@ -356,7 +439,7 @@ fn parse_browser_line(browser: &mut BrowserAssertion, line: &str) -> Result<(), 
         }
         other => {
             return Err(format!(
-                "unknown browser assertion `{}` (want selector|text|html|rootResult|durationLessThanMs|durationAtLeastMs|ownership)",
+                "unknown browser assertion `{}` (want selector|text|html|rootResult|durationLessThanMs|durationAtLeastMs|click|ownership)",
                 other
             ));
         }
@@ -386,6 +469,9 @@ pub fn run_fixture(fx: &Fixture) -> Result<(), FixtureFailure> {
                 if let Some(leak) = &fx.leak {
                     assert_leak_gate(fx, leak)?;
                 }
+                if let Some(ownership) = &fx.ownership {
+                    assert_ownership_gate(fx, ownership)?;
+                }
             }
         }
         Expect::CheckError => {
@@ -407,11 +493,17 @@ pub fn run_fixture(fx: &Fixture) -> Result<(), FixtureFailure> {
     Ok(())
 }
 
-fn fai_command(args: &[&str]) -> Output {
-    Command::new(fai_binary())
-        .args(args)
-        .output()
-        .expect("failed to spawn fai binary")
+fn fixture_command(fx: &Fixture, verb: &str, extra_args: &[&str]) -> Output {
+    let mut cmd = Command::new(fai_binary());
+    cmd.arg(verb);
+    if fx.project_root.is_none() {
+        cmd.arg(fx.path.to_string_lossy().as_ref());
+    }
+    cmd.args(extra_args);
+    if let Some(root) = &fx.project_root {
+        cmd.current_dir(root);
+    }
+    cmd.output().expect("failed to spawn fai binary")
 }
 
 /// Parse a `# leak:` directive value. Pure so the grammar is unit-testable.
@@ -434,6 +526,17 @@ fn parse_leak_value(value: &str) -> Result<LeakExpectation, String> {
     ))
 }
 
+/// Parse an `# ownership:` directive value.
+fn parse_ownership_value(value: &str) -> Result<OwnershipExpectation, String> {
+    match value {
+        "balanced" => Ok(OwnershipExpectation::Balanced),
+        other => Err(format!(
+            "unknown ownership value '{}' (want `balanced`)",
+            other
+        )),
+    }
+}
+
 /// Extract the live-object count from `fai run --check-leaks` stderr.
 /// Parses the STABLE sentinel pinned by `leak_ledger::sentinel_line`:
 /// `[check-leaks] live heap: N objects, M bytes` (suffixes tolerated).
@@ -454,13 +557,35 @@ pub fn parse_live_objects(stderr: &str) -> Option<u64> {
     None
 }
 
+/// Extract the helper-imbalance count from the stable ownership report line:
+/// `[ownership-check] N event(s), M object(s) with helper imbalance`.
+pub fn parse_ownership_imbalances(stderr: &str) -> Option<u64> {
+    const MARKER: &str = " object(s) with helper imbalance";
+    for line in stderr.lines() {
+        let line = line.trim_start();
+        if !line.starts_with("[ownership-check] ") {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once(", ") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with(MARKER) {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<u64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
 /// The `# leak:` gate (plan 118 U3): re-run the fixture under
 /// `--check-leaks` and enforce the two-sided contract against the
 /// sentinel. Exit code stays 0 either way (the flag is observational by
 /// design) — the sentinel on stderr is the oracle.
 fn assert_leak_gate(fx: &Fixture, leak: &LeakExpectation) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy().to_string();
-    let out = fai_command(&["run", &path, "--check-leaks"]);
+    let out = fixture_command(fx, "run", &["--check-leaks"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let live = parse_live_objects(&stderr).ok_or_else(|| FixtureFailure {
         gate: "leak",
@@ -491,8 +616,43 @@ fn assert_leak_gate(fx: &Fixture, leak: &LeakExpectation) -> Result<(), FixtureF
     }
 }
 
+fn assert_ownership_gate(
+    fx: &Fixture,
+    ownership: &OwnershipExpectation,
+) -> Result<(), FixtureFailure> {
+    let out = fixture_command(fx, "run", &["--check-ownership"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(FixtureFailure {
+            gate: "ownership",
+            detail: format!(
+                "ownership-instrumented run failed before the gate could assert balance\n  stdout: {}\n  stderr: {}",
+                String::from_utf8_lossy(&out.stdout).trim(),
+                stderr.trim()
+            ),
+        });
+    }
+    let imbalances = parse_ownership_imbalances(&stderr).ok_or_else(|| FixtureFailure {
+        gate: "ownership",
+        detail: format!(
+            "no `[ownership-check]` sentinel on stderr — ownership-instrumented run \
+             produced no report. stderr:\n{}",
+            stderr
+        ),
+    })?;
+    match ownership {
+        OwnershipExpectation::Balanced if imbalances > 0 => Err(FixtureFailure {
+            gate: "ownership",
+            detail: format!(
+                "marked `ownership: balanced` but reported {} helper imbalance(s). stderr:\n{}",
+                imbalances, stderr
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy().to_string();
     let build_dir = browser_build_dir(fx);
     let wasm_path = build_dir.join("main.wasm");
     let _ = fs::remove_dir_all(&build_dir);
@@ -502,14 +662,24 @@ fn assert_browser_run(fx: &Fixture) -> Result<(), FixtureFailure> {
     })?;
 
     let mut build = Command::new(fai_binary());
-    build.args(["build", path.as_str(), "--html", "-o"]);
+    build.arg("build");
+    if fx.project_root.is_none() {
+        build.arg(fx.path.to_string_lossy().as_ref());
+    }
+    build.args(["--html", "-o"]);
     build.arg(&wasm_path);
+    if let Some(root) = &fx.project_root {
+        build.current_dir(root);
+    }
     if fx
         .browser
         .as_ref()
         .is_some_and(|assertion| assertion.ownership_balanced)
     {
         build.env("FAI_OWNERSHIP_CHECK", "1");
+    }
+    if fx.leak.is_some() {
+        build.env("FAI_CHECK_LEAKS", "1");
     }
     let out = build.output().expect("failed to spawn fai binary");
     if !out.status.success() {
@@ -593,6 +763,13 @@ fn browser_assertion_json(assertion: &BrowserAssertion, leak: Option<&LeakExpect
     if let Some(ms) = assertion.duration_at_least_ms {
         parts.push(format!("\"durationAtLeastMs\":{}", ms));
     }
+    if let Some(selector) = &assertion.click_selector {
+        parts.push(format!("\"clickSelector\":\"{}\"", escape_json(selector)));
+        parts.push(format!(
+            "\"clickCount\":{}",
+            assertion.click_count.unwrap_or(1)
+        ));
+    }
     if assertion.ownership_balanced {
         parts.push("\"ownership\":\"balanced\"".to_string());
     }
@@ -629,8 +806,7 @@ fn escape_json(s: &str) -> String {
 }
 
 fn assert_fmt_check(fx: &Fixture) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy();
-    let out = fai_command(&["fmt", &path, "--check"]);
+    let out = fixture_command(fx, "fmt", &["--check"]);
     if out.status.success() {
         return Ok(());
     }
@@ -645,8 +821,7 @@ fn assert_fmt_check(fx: &Fixture) -> Result<(), FixtureFailure> {
 }
 
 fn assert_check_ok(fx: &Fixture) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy();
-    let out = fai_command(&["check", &path, "--check"]);
+    let out = fixture_command(fx, "check", &["--check"]);
     if out.status.success() {
         return Ok(());
     }
@@ -661,8 +836,7 @@ fn assert_check_ok(fx: &Fixture) -> Result<(), FixtureFailure> {
 }
 
 fn assert_check_error(fx: &Fixture) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy();
-    let out = fai_command(&["check", &path, "--check"]);
+    let out = fixture_command(fx, "check", &["--check"]);
     if out.status.success() {
         return Err(FixtureFailure {
             gate: "check",
@@ -685,8 +859,7 @@ fn assert_check_error(fx: &Fixture) -> Result<(), FixtureFailure> {
 }
 
 fn assert_run_ok(fx: &Fixture) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy();
-    let out = fai_command(&["run", &path, "--check"]);
+    let out = fixture_command(fx, "run", &["--check"]);
     if !out.status.success() {
         return Err(FixtureFailure {
             gate: "run",
@@ -716,8 +889,7 @@ fn assert_run_ok(fx: &Fixture) -> Result<(), FixtureFailure> {
 }
 
 fn assert_run_error(fx: &Fixture, phase: &str) -> Result<(), FixtureFailure> {
-    let path = fx.path.to_string_lossy();
-    let out = fai_command(&["run", &path, "--check"]);
+    let out = fixture_command(fx, "run", &["--check"]);
     if out.status.success() {
         return Err(FixtureFailure {
             gate: "run",

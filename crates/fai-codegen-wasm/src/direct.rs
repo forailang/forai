@@ -13,7 +13,7 @@ use fai_compiler::ast::{
     ForStatement, FunctionDeclaration, IfStatement, LetStatement, Statement, ThrowStatement,
     TryStatement, TypeNode, UnaryExpression, VarStatement, WhileStatement,
 };
-use fai_compiler::ownership_abi::{ArgConvention, ExprOwnership, OwnershipOp};
+use fai_compiler::ownership_abi::{ArgConvention, ExprOwnership, OwnershipAux, OwnershipOp};
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::program::FunctionInfo;
@@ -22,22 +22,23 @@ use crate::runtime::{
     IMPORT_ARRAY_MAP, IMPORT_CALL_FFI, IMPORT_CLI_CLEAR, IMPORT_CLI_MOVE_TO, IMPORT_CLI_READ_LINE,
     IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_CRYPTO_AVAILABLE, IMPORT_CRYPTO_BASE64_DECODE,
     IMPORT_CRYPTO_BASE64_ENCODE, IMPORT_CRYPTO_CONSTANT_TIME_EQUALS, IMPORT_CRYPTO_HEX_ENCODE,
-    IMPORT_CRYPTO_HMAC_SHA256_HEX, IMPORT_CRYPTO_SHA256_HEX, IMPORT_ENV_GET, IMPORT_ENV_LOAD,
-    IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT,
-    IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE,
-    IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS, IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS,
-    IMPORT_FILE_LIST, IMPORT_FILE_READ_STR, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE,
-    IMPORT_HTTP_REQUEST_DELETE, IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH,
-    IMPORT_HTTP_REQUEST_POST, IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE,
-    IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY, IMPORT_LOG_ERROR, IMPORT_LOG_INFO,
-    IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS, IMPORT_OWNERSHIP_EVENT,
-    IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
-    IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
-    IMPORT_PROCESS_STOP, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM,
-    IMPORT_REMOTE_CALL, IMPORT_SET_HTML, IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN,
-    IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET,
-    IMPORT_TCP_ACCEPT, IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN,
-    IMPORT_TCP_READ, IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND,
+    IMPORT_CRYPTO_HMAC_SHA1_BASE64, IMPORT_CRYPTO_HMAC_SHA256_HEX, IMPORT_CRYPTO_SHA256_HEX,
+    IMPORT_ENV_GET, IMPORT_ENV_LOAD, IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL,
+    IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT, IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF,
+    IMPORT_EVENT_ON, IMPORT_EVENT_ONCE, IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS,
+    IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS, IMPORT_FILE_LIST, IMPORT_FILE_READ_STR,
+    IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
+    IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH, IMPORT_HTTP_REQUEST_POST,
+    IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY,
+    IMPORT_LOG_ERROR, IMPORT_LOG_INFO, IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS,
+    IMPORT_OWNERSHIP_EVENT, IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME,
+    IMPORT_PATH_JOIN, IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN,
+    IMPORT_PROCESS_START, IMPORT_PROCESS_STOP, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE,
+    IMPORT_RANDOM, IMPORT_REMOTE_CALL, IMPORT_REPLACE_LOCATION, IMPORT_SET_HTML,
+    IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN, IMPORT_STORAGE_CLEAR,
+    IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET, IMPORT_TCP_ACCEPT,
+    IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN, IMPORT_TCP_READ,
+    IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND,
     IMPORT_UDP_BROADCAST, IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK,
     METHOD_APPEND, METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS,
     METHOD_INDEX_OF, METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT,
@@ -374,6 +375,11 @@ enum ModuleCall {
     /// `std.convert.parseFloat(s) -> Float?`. Same shape via
     /// `RT_PARSE_FLOAT`.
     ConvertParseFloat,
+    /// `std.json.requireString(dict, key) -> String?`. The raw host import
+    /// returns an alias to a string inside `dict`; this wrapper retains the
+    /// result before releasing an owned inline dict temp, so the std call has
+    /// an Owned result contract.
+    JsonRequireString,
     /// `assert.calledWith(target, ...args)` — target must resolve
     /// at compile time; `args` are serialised into a scratch buffer
     /// and compared against recorded calls via the host spy table.
@@ -544,6 +550,9 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
             _ => {}
         }
     }
+    if (module, method) == ("std.json", "requireString") {
+        return Some(ModuleCall::JsonRequireString);
+    }
     // std.string — every method dispatches through `RT_CALL_NATIVE`
     // with a method-id + arity. The runtime's string ops read args
     // 0 and 1 into pre-loaded locals and args 2+ from `args_ptr`
@@ -701,6 +710,11 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ("std.crypto", "available") => (IMPORT_CRYPTO_AVAILABLE, &[], RS::MakeBool),
         ("std.crypto", "hmacSha256Hex") => (
             IMPORT_CRYPTO_HMAC_SHA256_HEX,
+            &[AS::String, AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "hmacSha1Base64") => (
+            IMPORT_CRYPTO_HMAC_SHA1_BASE64,
             &[AS::String, AS::String],
             RS::Boxed,
         ),
@@ -1708,6 +1722,7 @@ pub fn build_function_with_spy(
     std_method_fn_ids: &HashMap<(String, String), u32>,
     module_context: Option<&str>,
 ) -> Result<BuildResult, BuildError> {
+    let ownership_sites = RefCell::new(Vec::new());
     build_function_with_spy_and_offset(
         fd,
         rt,
@@ -1728,6 +1743,7 @@ pub fn build_function_with_spy(
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &ownership_sites,
         None,
         None,
     )
@@ -1760,6 +1776,7 @@ pub fn build_function_with_spy_and_offset(
     module_constants: &HashMap<String, fai_compiler::ast::Expression>,
     extern_out_params: &HashMap<String, Vec<bool>>,
     module_vars: &HashMap<String, u32>,
+    ownership_sites: &RefCell<Vec<crate::debug_info::OwnershipSiteDebugEntry>>,
     file_path: Option<&str>,
     async_ctx: Option<AsyncClosureCtx<'_>>,
 ) -> Result<BuildResult, BuildError> {
@@ -1783,6 +1800,8 @@ pub fn build_function_with_spy_and_offset(
         module_constants,
         extern_out_params,
         module_vars,
+        ownership_sites,
+        file_path,
         async_ctx,
     };
     let main = {
@@ -1844,6 +1863,9 @@ pub struct BuiltProgram {
     /// to emit the right number of extra global slots, all
     /// initialised to `VAL_NULL`.
     pub module_var_count: u32,
+    /// Helper-level ownership instrumentation sites emitted by the
+    /// compiled functions.
+    pub ownership_sites: Vec<crate::debug_info::OwnershipSiteDebugEntry>,
 }
 
 /// Routing entry for one test case — the dispatcher uses the
@@ -2477,6 +2499,7 @@ pub fn build_program_full(
     let std_method_fn_ids = spy_targets.std_method_fn_ids;
 
     let strings = RefCell::new(StringInterner::default());
+    let ownership_sites = RefCell::new(Vec::new());
     let mut functions: Vec<(FunctionInfo, Function)> = Vec::with_capacity(decls.len());
     let mut closures: Vec<BuiltClosure> = Vec::new();
     for ((fd, ctx_mod, ctx_file), info) in decls.iter().zip(infos.iter().cloned()) {
@@ -2500,6 +2523,7 @@ pub fn build_program_full(
             &module_constants,
             &extern_out_params,
             &module_vars,
+            &ownership_sites,
             ctx_file.as_deref(),
             None,
         )?;
@@ -2582,6 +2606,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2650,6 +2675,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2709,6 +2735,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2731,6 +2758,7 @@ pub fn build_program_full(
         string_data: strings.into_inner().bytes,
         test_cases,
         module_var_count,
+        ownership_sites: ownership_sites.into_inner(),
     })
 }
 
@@ -3580,6 +3608,7 @@ pub fn assemble_wasm_module_with_test_flag(
         &crate::debug_info::DbgMeta {
             bucket_base: Some(bucket_base),
             bucket_count: crate::runtime::NUM_FREE_BUCKETS,
+            ownership_sites: program.ownership_sites.clone(),
         },
     );
 
@@ -5815,10 +5844,16 @@ fn build_resume_fn(
                 b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
                 // remote_begin(g_current, url*,len, fn*,len, args*,len, hash*,len)
                 b.emit(Instruction::GlobalGet(layout.g_current));
+                let mut stashes: Vec<u32> = Vec::new();
                 for a in args {
-                    b.emit_string_arg_from_expr(a)?;
+                    if let Some(t) = b.emit_string_arg_stashing(a)? {
+                        stashes.push(t);
+                    }
                 }
                 b.emit_import_call(crate::runtime::IMPORT_REMOTE_BEGIN);
+                for t in stashes {
+                    b.release_stash(Some(t));
+                }
                 store_vars(&mut b);
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Return);
@@ -7191,6 +7226,7 @@ pub fn try_codegen_async_engine(
             source_line: fd.location.line,
         })
         .collect();
+    let ownership_sites = RefCell::new(Vec::new());
     let ctx = BuildContext {
         rt,
         functions: &infos,
@@ -7212,6 +7248,8 @@ pub fn try_codegen_async_engine(
         module_constants: &module_constants,
         extern_out_params: &extern_out_params,
         module_vars: &module_vars,
+        ownership_sites: &ownership_sites,
+        file_path: None,
         async_ctx: Some(AsyncClosureCtx {
             async_set: &async_set,
             all_fns: &all_user_fns,
@@ -7295,6 +7333,7 @@ pub fn try_codegen_async_engine(
             &module_constants,
             &extern_out_params,
             &module_vars,
+            &ownership_sites,
             fctx,
             ctx.async_ctx,
         );
@@ -7683,6 +7722,7 @@ pub fn try_codegen_async_engine(
         &crate::debug_info::DbgMeta {
             bucket_base: Some(bucket_base),
             bucket_count: runtime::NUM_FREE_BUCKETS,
+            ownership_sites: ownership_sites.into_inner(),
         },
     );
 
@@ -7813,6 +7853,12 @@ struct BuildContext<'a> {
     /// writes to `GlobalSet`; initialisers are compiled into a
     /// synthesised module-init function.
     module_vars: &'a HashMap<String, u32>,
+    /// Shared ownership instrumentation site table. Each helper-level
+    /// ownership event allocates a dense nonzero id here and emits it
+    /// in `__fai_ownership_event`.
+    ownership_sites: &'a RefCell<Vec<crate::debug_info::OwnershipSiteDebugEntry>>,
+    /// Best known source file for the function currently being compiled.
+    file_path: Option<&'a str>,
     /// Async-engine context for compiling closures that await/fork as resume
     /// fns (A3.0). `None` on the pure-sync build path.
     async_ctx: Option<AsyncClosureCtx<'a>>,
@@ -7875,6 +7921,55 @@ impl<'o> OuterScopeView<'o> {
             });
         }
         None
+    }
+}
+
+fn ownership_reason(op: OwnershipOp) -> &'static str {
+    match op {
+        OwnershipOp::Retain => "retain borrowed value",
+        OwnershipOp::Release => "release owned value",
+        OwnershipOp::Transfer => "transfer owned value",
+        OwnershipOp::Borrow => "borrow value",
+        OwnershipOp::Store => "store owned value",
+        OwnershipOp::Overwrite => "overwrite owned slot",
+        OwnershipOp::Cleanup => "cleanup owned value",
+        OwnershipOp::Return => "return owned value",
+        OwnershipOp::Discard => "discard owned value",
+        OwnershipOp::CallArgument => "prepare call argument",
+    }
+}
+
+fn ownership_seed_suppresses(op: OwnershipOp) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static SEED: OnceLock<Option<OwnershipOp>> = OnceLock::new();
+        let seed = SEED.get_or_init(|| {
+            let value = std::env::var("FAI_OWNERSHIP_SEED").ok()?;
+            let Some(name) = value.strip_prefix("suppress-") else {
+                eprintln!(
+                    "[ownership-check] FAI_OWNERSHIP_SEED='{}' is not a known seed — seed inactive",
+                    value
+                );
+                return None;
+            };
+            for op in OwnershipOp::ALL {
+                if op.name() == name {
+                    return Some(op);
+                }
+            }
+            eprintln!(
+                "[ownership-check] FAI_OWNERSHIP_SEED='{}' names no ownership op — seed inactive",
+                value
+            );
+            None
+        });
+        return *seed == Some(op);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = op;
+        false
     }
 }
 
@@ -8106,11 +8201,46 @@ impl<'a, 'c> Builder<'a, 'c> {
             .is_some()
     }
 
+    fn current_source_file(&self) -> Option<String> {
+        if let Some(file) = self.ctx.file_path {
+            return Some(file.to_string());
+        }
+        if !self.module_key.is_empty() && self.module_key.contains('/') {
+            return Some(self.module_key.clone());
+        }
+        self.ctx
+            .functions
+            .iter()
+            .find(|info| info.name == self.fd.name)
+            .and_then(|info| info.source_file.clone())
+    }
+
+    fn ownership_site(&mut self, op: OwnershipOp, site_id: u32) -> u32 {
+        if site_id != OWNERSHIP_SITE_UNKNOWN {
+            return site_id;
+        }
+        let mut sites = self.ctx.ownership_sites.borrow_mut();
+        let id = sites.len() as u32 + 1;
+        sites.push(crate::debug_info::OwnershipSiteDebugEntry {
+            id,
+            op: op.name(),
+            helper: "direct",
+            reason: ownership_reason(op),
+            file: self.current_source_file(),
+            line: self.fd.location.line,
+        });
+        id
+    }
+
     #[allow(dead_code)]
     fn emit_ownership_event_const(&mut self, op: OwnershipOp, site_id: u32, value: i64, aux: i32) {
         if !self.ownership_events_enabled() {
             return;
         }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
         self.emit(Instruction::I32Const(op.id() as i32));
         self.emit(Instruction::I32Const(site_id as i32));
         self.emit(Instruction::I64Const(value));
@@ -8122,6 +8252,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         if !self.ownership_events_enabled() {
             return;
         }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
         let value = self.alloc_local();
         self.emit(Instruction::LocalTee(value));
         self.emit(Instruction::I32Const(op.id() as i32));
@@ -8141,6 +8275,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         if !self.ownership_events_enabled() {
             return;
         }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
         self.emit(Instruction::I32Const(op.id() as i32));
         self.emit(Instruction::I32Const(site_id as i32));
         self.emit(Instruction::LocalGet(value_local));
@@ -8506,17 +8644,18 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     fn assign_to_async_frame_slot(&mut self, local: u32, result: ExprResult, owns_slot: bool) {
+        let aux = OwnershipAux::AsyncFrameSlot.encode(local as u16);
         if owns_slot {
             self.prepare_stack_for_owning_store(result);
             self.emit(Instruction::LocalGet(local));
-            self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+            self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, aux);
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
             self.emit(Instruction::LocalSet(local));
             self.emit_ownership_event_for_local(
                 OwnershipOp::Overwrite,
                 OWNERSHIP_SITE_UNKNOWN,
                 local,
-                0,
+                aux,
             );
         } else {
             self.emit(Instruction::LocalSet(local));
@@ -8524,7 +8663,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     fn capture_into_closure(&mut self, upvalue_index: usize) {
-        let aux = upvalue_index as i32;
+        let aux = OwnershipAux::ClosureCapture.encode(upvalue_index as u16);
         self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, aux);
         self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
         self.emit_ownership_event_for_stack(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, aux);
@@ -10757,6 +10896,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     ) -> Result<Option<u32>, BuildError> {
         let result = self.compile_expr_result_as(e, ValueShape::Boxed)?;
         let mut release_after_call = None;
+        let aux = OwnershipAux::HostArgument.encode(convention.id() as u16);
         match convention {
             ArgConvention::Borrowed
             | ArgConvention::RetainedByCallee
@@ -10772,7 +10912,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit_ownership_event_for_stack(
                         OwnershipOp::Retain,
                         OWNERSHIP_SITE_UNKNOWN,
-                        convention.id() as i32,
+                        aux,
                     );
                     self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
                 }
@@ -10780,17 +10920,13 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit_ownership_event_for_stack(
                         OwnershipOp::Transfer,
                         OWNERSHIP_SITE_UNKNOWN,
-                        convention.id() as i32,
+                        aux,
                     );
                 }
                 ExprOwnership::Primitive => {}
             },
         }
-        self.emit_ownership_event_for_stack(
-            OwnershipOp::CallArgument,
-            OWNERSHIP_SITE_UNKNOWN,
-            convention.id() as i32,
-        );
+        self.emit_ownership_event_for_stack(OwnershipOp::CallArgument, OWNERSHIP_SITE_UNKNOWN, aux);
         Ok(release_after_call)
     }
 
@@ -10958,6 +11094,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             ModuleCall::ConvertToString => self.compile_convert_to_string(call_args),
             ModuleCall::ConvertParseInt => self.compile_convert_parse(RT_PARSE_INT, call_args),
             ModuleCall::ConvertParseFloat => self.compile_convert_parse(RT_PARSE_FLOAT, call_args),
+            ModuleCall::JsonRequireString => self.compile_json_require_string(call_args),
             ModuleCall::ConvertToBool => self.compile_convert_to_bool(call_args),
             ModuleCall::SpyAssertCalledWith => self.compile_spy_assert_called_with(call_args),
             ModuleCall::SpyAssertCallCount => self.compile_spy_assert_call_count(call_args),
@@ -11089,6 +11226,44 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         self.emit(Instruction::LocalGet(val));
         self.emit_close();
+        Ok(())
+    }
+
+    fn compile_json_require_string(
+        &mut self,
+        call_args: &[fai_compiler::ast::CallArgument],
+    ) -> Result<(), BuildError> {
+        if call_args.len() != 2 {
+            return Err(BuildError::UnsupportedExpression(
+                "ModuleCall/json-require-string-arg-count",
+            ));
+        }
+
+        let dict_result = self.compile_expr_result_as(&call_args[0].value, ValueShape::Boxed)?;
+        let dict = self.alloc_local();
+        self.emit(Instruction::LocalSet(dict));
+
+        self.emit(Instruction::LocalGet(dict));
+        let key_stash = self.emit_string_arg_stashing(&call_args[1].value)?;
+        self.emit_import_call(IMPORT_JSON_REQUIRE_STRING);
+
+        let result = self.alloc_local();
+        self.emit(Instruction::LocalSet(result));
+        self.release_stash(key_stash);
+
+        // json_require_string returns an alias into the dict. Retain that alias
+        // before releasing an owned inline dict temp so callers can treat this
+        // std call as returning an owned optional string.
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+        self.emit(Instruction::Drop);
+
+        if dict_result.ownership == ExprOwnership::Owned {
+            self.emit(Instruction::LocalGet(dict));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
+
+        self.emit(Instruction::LocalGet(result));
         Ok(())
     }
 
@@ -11279,21 +11454,12 @@ impl<'a, 'c> Builder<'a, 'c> {
         // literal or fresh-call argument is created here and only borrowed by the
         // callee, so it leaks unless freed after the call.
         //
-        // Arg 0 (the RECEIVER) is released ONLY for methods that return a
-        // PRIMITIVE (length/isEmpty/contains/indexOf/startsWith/endsWith): an
-        // Int/Bool result provably can't reference the receiver, so freeing a
-        // fresh receiver is safe. Heap-returning methods (split/replace/slice/
-        // sort/append/join/…) are NOT released at arg 0 — their result can share
-        // structure with the receiver (e.g. a builder that copies element refs),
-        // and freeing the receiver could free something the result still points
-        // at (a use-after-free — observed as a closure-arity trap when a freed
-        // node is later `call_indirect`'d). Those receiver temps leak, soundly.
-        // Args 1..n never alias any result, so owned ones are always released.
         // Arg 0 (receiver) is safe to release when the result either cannot
         // share a heap pointer with it, or the builder retains every shared
-        // child before returning. Still skipped: same-type string→string
-        // transforms with aliasing fast paths, and element accessors
-        // (first/last — result IS a receiver element).
+        // child before returning. This includes primitive readers, fresh string
+        // transforms, and array/dict rebuilders like slice/getKeys that retain
+        // copied elements. Still skipped: element accessors (first/last), where
+        // the result is the receiver's child alias.
         let result_cannot_alias_receiver = matches!(
             method_id,
             METHOD_LENGTH
@@ -11302,8 +11468,17 @@ impl<'a, 'c> Builder<'a, 'c> {
                 | METHOD_INDEX_OF
                 | METHOD_STARTS_WITH
                 | METHOD_ENDS_WITH
+                | METHOD_GET_KEYS
+                | METHOD_REPLACE
                 | METHOD_JOIN
                 | METHOD_SPLIT
+                | METHOD_TRIM
+                | METHOD_TRIM_START
+                | METHOD_TRIM_END
+                | METHOD_TO_UPPER
+                | METHOD_TO_LOWER
+                | METHOD_SUBSTRING
+                | METHOD_REPEAT
                 | METHOD_APPEND
                 | METHOD_SORT
                 | METHOD_SLICE
@@ -12326,9 +12501,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     ) -> Result<(), BuildError> {
         use fai_compiler::ast::TemplateStringPart;
 
-        // Helper: emit one part as a boxed String on the stack.
-        // Text parts intern + RT_ALLOC_STRING; expressions stringify
-        // via RT_VALUE_TO_STR.
+        // Helper: emit one owned (+1) boxed String on the stack.
+        // Text parts are fresh allocations; expression parts go through
+        // `emit_to_string_owned` so string aliases are retained and owned
+        // expression temps are released.
         let emit_part = |this: &mut Self, part: &TemplateStringPart| -> Result<(), BuildError> {
             match part {
                 TemplateStringPart::Text { value } => {
@@ -12338,8 +12514,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                     this.emit(Instruction::Call(this.rt().base + RT_ALLOC_STRING));
                 }
                 TemplateStringPart::Expression { expression } => {
-                    this.compile_expr_as(expression, ValueShape::Boxed)?;
-                    this.emit(Instruction::Call(this.rt().base + RT_VALUE_TO_STR));
+                    this.emit_to_string_owned(expression)?;
                 }
             }
             Ok(())
@@ -12355,9 +12530,19 @@ impl<'a, 'c> Builder<'a, 'c> {
 
         emit_part(self, &parts[0])?;
         for p in &parts[1..] {
+            let left = self.alloc_local();
+            self.emit(Instruction::LocalTee(left));
             emit_part(self, p)?;
+            let right = self.alloc_local();
+            self.emit(Instruction::LocalTee(right));
             // Two strings on the stack — concatenate into one.
             self.emit(Instruction::Call(self.rt().base + RT_CONCAT));
+            // RT_CONCAT reads its operands and returns a fresh string; it does
+            // not consume either operand's ownership.
+            self.emit(Instruction::LocalGet(left));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::LocalGet(right));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         }
         Ok(())
     }
@@ -12411,7 +12596,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             ));
         }
         self.compile_expr(&call_args[0].value)?;
+        let stash = self.stash_if_owned(&call_args[0].value);
         self.emit(Instruction::Call(self.rt().base + helper));
+        self.release_stash(stash);
         Ok(())
     }
 
@@ -12426,10 +12613,16 @@ impl<'a, 'c> Builder<'a, 'c> {
         if args.len() != 4 {
             return Err(BuildError::UnsupportedExpression("remoteCall-arg-count"));
         }
+        let mut stashes: Vec<u32> = Vec::new();
         for a in args {
-            self.emit_string_arg_from_expr(a)?;
+            if let Some(t) = self.emit_string_arg_stashing(a)? {
+                stashes.push(t);
+            }
         }
         self.emit_import_call(IMPORT_REMOTE_CALL);
+        for t in stashes {
+            self.release_stash(Some(t));
+        }
         Ok(())
     }
 
@@ -12582,6 +12775,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             "setHtmlAt" => self.compile_bare_set_html_at(args).map(Some),
             "getLocationPath" => self.compile_bare_get_location_path(args).map(Some),
             "pushHistoryState" => self.compile_bare_push_history_state(args).map(Some),
+            "replaceLocation" => self.compile_bare_replace_location(args).map(Some),
 
             // ── dict helpers ──────────────────────────────────
             "getString" | "getInt" | "getBool" | "get" => {
@@ -13104,7 +13298,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             return Err(BuildError::UnsupportedExpression("parse-arg-count"));
         }
         self.compile_expr(args[0])?;
+        let stash = self.stash_if_owned(args[0]);
         self.emit(Instruction::Call(self.rt().base + rt_fn));
+        self.release_stash(stash);
         Ok(())
     }
 
@@ -13212,6 +13408,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
+    fn compile_bare_replace_location(&mut self, args: &[&Expression]) -> Result<(), BuildError> {
+        if args.len() != 1 {
+            return Err(BuildError::UnsupportedExpression(
+                "replaceLocation-arg-count",
+            ));
+        }
+        self.emit_string_arg_from_expr(args[0])?;
+        self.emit_import_call(IMPORT_REPLACE_LOCATION);
+        self.emit(Instruction::I64Const(VAL_VOID));
+        Ok(())
+    }
+
     /// `Error(msg)` bare-global form of `error.Error(msg)` — same
     /// heap-allocated `{message: msg}` dict.
     fn compile_bare_error_ctor(&mut self, args: &[&Expression]) -> Result<(), BuildError> {
@@ -13305,9 +13513,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.compile_expr_as(args[2], ValueShape::Boxed)?;
         // The dict co-owns the stored value (RC, plan 113 R1): retain if
         // borrowed. RT_SET_FIELD releases any value it overwrites.
-        if !self.expr_transfers_ownership(args[2]) {
+        if self.expr_transfers_ownership(args[2]) {
+            self.emit_ownership_event_for_stack(OwnershipOp::Transfer, OWNERSHIP_SITE_UNKNOWN, 0);
+        } else {
+            self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
             self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
         }
+        self.emit_ownership_event_for_stack(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, 0);
         self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
         // RT_SET_FIELD returns the dict pointer — identical to the input
         // unless an at-capacity dict was reallocated to fit the new key.
@@ -14033,6 +14245,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 type_param_count: fd.type_params.len() as u16,
                 include_in_coverage: false,
                 param_defaults: param_defaults_for(fd),
+                source_file: self.current_source_file(),
                 source_line: fd.location.line,
                 ..Default::default()
             },
@@ -14138,10 +14351,9 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// sole-owned value — a literal, or a `+` (concat String / numeric). Storing
     /// or binding such a value TRANSFERS its single owning reference (no retain).
     /// Everything else (identifier / field / index / call / unwrap reads, and
-    /// `and`/`or` which return a borrowed OPERAND, and interpolation which can be
-    /// the degenerate `"{x}"` returning `x`) is BORROWED — co-owning it requires a
-    /// retain. Conservative: not-provably-fresh → retain (over-retain leaks; the
-    /// opposite would be a use-after-free).
+    /// `and`/`or` which return a borrowed OPERAND) is BORROWED — co-owning it
+    /// requires a retain. Conservative: not-provably-fresh → retain (over-retain
+    /// leaks; the opposite would be a use-after-free).
     fn is_fresh_value(expr: &Expression) -> bool {
         match expr {
             Expression::StringExpression(_)
@@ -14151,6 +14363,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             | Expression::ArrayExpression(_)
             | Expression::DictionaryExpression(_)
             | Expression::TupleExpression(_)
+            | Expression::TemplateStringExpression(_)
             // A `do...end` / function expression allocates a fresh closure
             // object (RT_MAKE_OBJ) — sole-owned, so binding/storing it transfers
             // the single ref. Without this it would be treated as borrowed and
@@ -14726,6 +14939,7 @@ mod tests {
         let std_method_fn_ids = HashMap::new();
         let strings = RefCell::new(StringInterner::default());
         let closures = RefCell::new(Vec::new());
+        let ownership_sites = RefCell::new(Vec::new());
         let module_constants = HashMap::new();
         let extern_out_params: HashMap<String, Vec<bool>> = HashMap::new();
         let module_vars: HashMap<String, u32> = HashMap::new();
@@ -14750,6 +14964,8 @@ mod tests {
             module_constants: &module_constants,
             extern_out_params: &extern_out_params,
             module_vars: &module_vars,
+            ownership_sites: &ownership_sites,
+            file_path: None,
             async_ctx: None,
         };
         let mut builder = Builder::new(main, &ctx, None);
@@ -15276,6 +15492,7 @@ mod tests {
         top_level: Vec<(FunctionInfo, Function)>,
         closures: Vec<BuiltClosure>,
         string_data: Vec<u8>,
+        ownership_sites: Vec<crate::debug_info::OwnershipSiteDebugEntry>,
     }
 
     /// Compile every top-level function in `src` directly to wasm.
@@ -15354,6 +15571,7 @@ mod tests {
         }
         let named_imports: HashMap<String, String> = HashMap::new();
         let strings = RefCell::new(StringInterner::default());
+        let ownership_sites = RefCell::new(Vec::new());
         let remap = identity_import_remap();
         let mut top_level = Vec::with_capacity(decls.len());
         let mut all_closures = Vec::new();
@@ -15380,6 +15598,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &ownership_sites,
                 None,
                 None,
             )
@@ -15391,6 +15610,7 @@ mod tests {
             top_level,
             closures: all_closures,
             string_data: strings.into_inner().bytes,
+            ownership_sites: ownership_sites.into_inner(),
         }
     }
 
@@ -15696,6 +15916,7 @@ mod tests {
             &crate::debug_info::DbgMeta {
                 bucket_base: Some(bucket_base),
                 bucket_count: runtime::NUM_FREE_BUCKETS,
+                ownership_sites: program.ownership_sites.clone(),
             },
         );
 
@@ -15720,6 +15941,7 @@ mod tests {
             )],
             closures: Vec::new(),
             string_data: Vec::new(),
+            ownership_sites: Vec::new(),
         })
     }
 
@@ -20106,6 +20328,61 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test]
+    fn direct_remote_call_releases_owned_string_arguments() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let _ = remoteCall('http://localhost:3040', 'data.chat.listMessages', '[29]', '')\n",
+            "  42\n",
+            "end\n",
+        )));
+        let mut body_targets: Vec<Vec<u32>> = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let mut targets = Vec::new();
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                if let wasmparser::Operator::Call { function_index } = op {
+                    targets.push(function_index);
+                }
+            }
+            body_targets.push(targets);
+        }
+        let remote_import = if body_targets
+            .iter()
+            .any(|targets| targets.contains(&runtime::IMPORT_REMOTE_BEGIN))
+        {
+            runtime::IMPORT_REMOTE_BEGIN
+        } else {
+            runtime::IMPORT_REMOTE_CALL
+        };
+        let targets = body_targets
+            .iter()
+            .find(|targets| targets.contains(&remote_import))
+            .expect("a lowered body should call remote_call/remote_begin");
+        let remote_pos = targets
+            .iter()
+            .position(|target| *target == remote_import)
+            .expect("body should call remote_call/remote_begin");
+        let release = rt_base_for_standalone() + runtime::RT_RELEASE;
+        let releases_after_remote = targets[remote_pos + 1..]
+            .iter()
+            .filter(|target| **target == release)
+            .count();
+        assert!(
+            releases_after_remote >= 4,
+            "remoteCall must release url/fn/args/hash string temps after host import"
+        );
+    }
+
     // ── extern FFI ──────────────────────────────────────────────
     //
     // `extern { ... }` blocks declare C-ABI functions. Callers
@@ -20408,6 +20685,136 @@ mod tests {
             }
         }
         import_names
+    }
+
+    fn wasm_import_index(wasm: &[u8], name: &str) -> Option<u32> {
+        let mut index = 0u32;
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::ImportSection(section) = payload.expect("payload") {
+                for imp in section {
+                    let imp = imp.expect("import entry");
+                    match imp.ty {
+                        wasmparser::TypeRef::Func(_) => {
+                            if imp.name == name {
+                                return Some(index);
+                            }
+                            index += 1;
+                        }
+                        wasmparser::TypeRef::Table(_)
+                        | wasmparser::TypeRef::Memory(_)
+                        | wasmparser::TypeRef::Global(_)
+                        | wasmparser::TypeRef::Tag(_) => {}
+                    }
+                }
+                break;
+            }
+        }
+        None
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnershipEvent {
+        op: &'static str,
+        site: i32,
+        aux: String,
+    }
+
+    fn ownership_event_args(wasm: &[u8]) -> Vec<OwnershipEvent> {
+        let event_index =
+            wasm_import_index(wasm, "__fai_ownership_event").expect("ownership event import");
+        let mut events = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let mut recent_i32_consts = Vec::new();
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                match op {
+                    wasmparser::Operator::I32Const { value } => {
+                        recent_i32_consts.push(value);
+                        if recent_i32_consts.len() > 8 {
+                            recent_i32_consts.remove(0);
+                        }
+                    }
+                    wasmparser::Operator::Call { function_index }
+                        if function_index == event_index =>
+                    {
+                        let op_id = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .nth(2)
+                            .copied()
+                            .expect("ownership event op argument");
+                        let site = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .copied()
+                            .expect("ownership event site argument");
+                        let aux = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .next()
+                            .copied()
+                            .expect("ownership event aux argument");
+                        let op = OwnershipOp::from_id(op_id as u32)
+                            .expect("known ownership op")
+                            .name();
+                        events.push(OwnershipEvent {
+                            op,
+                            site,
+                            aux: format_ownership_aux(aux),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        events
+    }
+
+    fn ownership_event_site_args(wasm: &[u8]) -> Vec<i32> {
+        ownership_event_args(wasm)
+            .into_iter()
+            .map(|event| event.site)
+            .collect()
+    }
+
+    fn format_ownership_aux(encoded: i32) -> String {
+        let Some((kind, detail)) = OwnershipAux::decode(encoded) else {
+            return format!("unknown:{encoded}");
+        };
+        match kind {
+            OwnershipAux::None => "none".to_string(),
+            OwnershipAux::ClosureCapture => format!("closure_capture:{detail}"),
+            OwnershipAux::HostArgument => format!("host_argument:{detail}"),
+            OwnershipAux::AsyncFrameSlot => format!("async_frame_slot:{detail}"),
+        }
+    }
+
+    fn checked_ownership_site_golden(src: &str) -> Vec<&'static str> {
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        compile_all(src)
+            .ownership_sites
+            .into_iter()
+            .map(|site| site.op)
+            .collect()
+    }
+
+    fn fai_dbg_json(wasm: &[u8]) -> Option<String> {
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::CustomSection(section) = payload.expect("payload") {
+                if section.name() == "fai-dbg" {
+                    return Some(String::from_utf8_lossy(section.data()).to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Compile an entry source with one synthetic user module.
@@ -21182,6 +21589,129 @@ mod tests {
     }
 
     #[test]
+    fn ownership_golden_owned_binding_return_cleanup_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  let value = 'owned'\n",
+            "  value\n",
+            "end\n",
+        ));
+
+        assert_eq!(
+            events,
+            vec!["transfer", "store", "retain", "return", "cleanup"],
+        );
+    }
+
+    #[test]
+    fn ownership_golden_owned_expression_discard_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  'discarded'\n",
+            "  1\n",
+            "end\n",
+        ));
+
+        assert_eq!(events, vec!["discard", "return"]);
+    }
+
+    #[test]
+    fn ownership_golden_local_overwrite_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  var value = 'old'\n",
+            "  value = 'new'\n",
+            "  value\n",
+            "end\n",
+        ));
+
+        assert_eq!(
+            events,
+            vec![
+                "transfer",
+                "store",
+                "transfer",
+                "release",
+                "overwrite",
+                "retain",
+                "return",
+                "cleanup",
+            ],
+        );
+    }
+
+    #[test]
+    fn checked_ownership_build_emits_resolvable_site_metadata() {
+        let src = concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  \"owned\"\n",
+            "end\n",
+        );
+
+        let default_wasm =
+            try_compile_via_production_for_target(src, None).expect("default compile");
+        let default_dbg = fai_dbg_json(&default_wasm).expect("default debug section");
+        assert!(
+            !default_dbg.contains("\"ownership_sites\""),
+            "default build should omit empty ownership site metadata: {}",
+            default_dbg,
+        );
+
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        let checked_wasm =
+            try_compile_via_production_for_target(src, None).expect("checked compile");
+        let checked_dbg = fai_dbg_json(&checked_wasm).expect("checked debug section");
+        assert!(
+            checked_dbg.contains("\"ownership_sites\":[{\"id\":1"),
+            "checked build should include dense nonzero ownership site metadata: {}",
+            checked_dbg,
+        );
+        assert!(
+            checked_dbg.contains("\"helper\":\"direct\""),
+            "checked ownership site should name helper family: {}",
+            checked_dbg,
+        );
+        assert!(
+            checked_dbg.contains("\"op\":\"return\""),
+            "checked ownership site should include operation family: {}",
+            checked_dbg,
+        );
+    }
+
+    #[test]
+    fn checked_ownership_events_use_nonzero_site_ids() {
+        let src = concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  \"owned\"\n",
+            "end\n",
+        );
+
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        let wasm = try_compile_via_production_for_target(src, None).expect("checked compile");
+        let sites = ownership_event_site_args(&wasm);
+
+        assert!(
+            !sites.is_empty(),
+            "checked build should emit ownership events"
+        );
+        assert!(
+            sites.iter().all(|site| *site > 0),
+            "ownership event sites should be nonzero: {:?}",
+            sites,
+        );
+    }
+
+    #[test]
     fn production_direct_exports_match_bytecode_path() {
         // The direct path must export the same set of symbols the
         // bytecode path does so hosts that reach into the module
@@ -21564,6 +22094,41 @@ mod tests {
             "end\n",
         )));
         assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    #[test]
+    fn direct_bare_parse_int_releases_owned_string_argument() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int?\n",
+            "do\n",
+            "  parseInt('42' + '')\n",
+            "end\n",
+        )));
+        let parse = rt_base_for_standalone() + runtime::RT_PARSE_INT;
+        let release = rt_base_for_standalone() + runtime::RT_RELEASE;
+        let mut saw_release_after_parse = false;
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let targets: Vec<u32> = body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .filter_map(|op| match op.expect("operator") {
+                    wasmparser::Operator::Call { function_index } => Some(function_index),
+                    _ => None,
+                })
+                .collect();
+            if let Some(pos) = targets.iter().position(|target| *target == parse) {
+                saw_release_after_parse = targets[pos + 1..].contains(&release);
+            }
+        }
+        assert!(
+            saw_release_after_parse,
+            "parseInt must release owned string args after RT_PARSE_INT"
+        );
     }
 
     #[test]

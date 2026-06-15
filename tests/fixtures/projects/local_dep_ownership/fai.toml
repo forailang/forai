@@ -1,0 +1,7 @@
+[project]
+name = "LocalDepOwnership"
+version = "0.1.0"
+source_root = "src"
+
+[dependencies]
+Dep = "file://./dep"
