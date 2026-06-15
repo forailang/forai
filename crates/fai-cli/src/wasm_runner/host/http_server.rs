@@ -326,13 +326,17 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         continue;
                     }
 
-                    // 4. Advance in-flight handler tasks; finish completed ones.
+                    // 4. Advance in-flight handler tasks: run ready ones, resume
+                    // any whose offloaded boundary work finished (outbound RPC,
+                    // etc.), then write responses for tasks that completed.
                     guest_poll(&mut caller);
+                    for task_id in super::boundary::pump_ready() {
+                        guest_resume_task(&mut caller, task_id);
+                    }
                     finish_completed(&mut caller, &mut pending);
 
-                    // 5. While handlers remain parked (e.g. on a sleep timer),
-                    // poll again shortly without a hot spin. Boundary-backed
-                    // waits (U6/U9) will replace this with a real wakeup.
+                    // 5. While handlers remain parked (on a sleep timer or a
+                    // boundary job), poll again shortly without a hot spin.
                     if !pending.is_empty() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -518,6 +522,17 @@ fn handler_is_async(caller: &mut Caller<'_, ()>, handler_val: i64) -> bool {
 fn guest_poll(caller: &mut Caller<'_, ()>) {
     if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
         let _ = f.call(&mut *caller, &[], &mut [Val::I32(0)]);
+    }
+}
+
+/// Mark a parked task READY (e.g. after its boundary job finished) so the next
+/// poll runs its continuation.
+fn guest_resume_task(caller: &mut Caller<'_, ()>, id: i32) {
+    if let Some(f) = caller
+        .get_export("__fai_resume_task")
+        .and_then(|e| e.into_func())
+    {
+        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut [Val::I32(0)]);
     }
 }
 

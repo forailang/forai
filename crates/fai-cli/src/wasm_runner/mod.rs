@@ -239,6 +239,11 @@ pub fn run_wasm_with_externs_opts(
         let task_result = instance
             .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
             .map_err(|e| fmt_err("missing __fai_task_result export", e))?;
+        // Resume tasks parked on a boundary job (e.g. outbound RPC) once their
+        // worker finishes; the next poll runs their continuation (plan 101).
+        let resume_task = instance
+            .get_typed_func::<i32, i32>(&mut store, "__fai_resume_task")
+            .ok();
 
         let started = std::time::Instant::now();
         let mut status = match start_async.call(&mut store, ()) {
@@ -267,6 +272,11 @@ pub fn run_wasm_with_externs_opts(
                 }
             }
             std::thread::sleep(Duration::from_millis(1));
+            for task_id in host::boundary::pump_ready() {
+                if let Some(rt) = &resume_task {
+                    let _ = rt.call(&mut store, task_id);
+                }
+            }
             status = match poll.call(&mut store, ()) {
                 Ok(s) => s,
                 Err(e) => return Err(fail("WASM async poll error", &e, &mut store)),

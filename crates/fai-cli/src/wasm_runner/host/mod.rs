@@ -4,7 +4,7 @@ use wasmtime::Linker;
 
 mod array;
 mod async_ops;
-mod boundary;
+pub(crate) mod boundary;
 mod crypto;
 mod env;
 mod events;

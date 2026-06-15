@@ -20,7 +20,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -219,6 +219,54 @@ pub(crate) fn with_boundary<R>(f: impl FnOnce(&Boundary) -> R) -> R {
         }
         f(slot.as_ref().unwrap())
     })
+}
+
+/// Like `with_boundary` but never creates the pool — returns None if no boundary
+/// has been used yet, so a driver loop can pump cheaply on every iteration
+/// without spawning worker threads for programs that never offload.
+fn try_with_boundary<R>(f: impl FnOnce(&Boundary) -> R) -> Option<R> {
+    BOUNDARY.with(|slot| slot.borrow().as_ref().map(f))
+}
+
+thread_local! {
+    /// Finished job results awaiting the guest's matching `*_result` import,
+    /// keyed by the task that parked on the job. Populated by `pump_ready`,
+    /// drained by `take_ready` (e.g. `remote_result`).
+    static READY: RefCell<HashMap<i32, JobResult>> = RefCell::new(HashMap::new());
+}
+
+/// Drain every finished job from the worker pool into the per-task ready map and
+/// return the task ids now ready to resume. The driver loop calls this each
+/// iteration, then `__fai_resume_task`s each returned id. Cheap no-op (empty
+/// vec) when no boundary exists or nothing finished.
+pub(crate) fn pump_ready() -> Vec<i32> {
+    let Some(completions) = try_with_boundary(|b| b.drain_completions()) else {
+        return Vec::new();
+    };
+    if completions.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = Vec::with_capacity(completions.len());
+    READY.with(|r| {
+        let mut map = r.borrow_mut();
+        for c in completions {
+            ids.push(c.task_id);
+            map.insert(c.task_id, c.result);
+        }
+    });
+    ids
+}
+
+/// True if any job is still running or waiting to be drained — lets a driver
+/// loop decide whether it must keep polling.
+pub(crate) fn has_inflight() -> bool {
+    try_with_boundary(|b| b.inflight() > 0).unwrap_or(false)
+}
+
+/// Take the finished result for `task_id` (surfaced by `pump_ready`). The guest
+/// calls its `*_result` import after being resumed; that import calls this.
+pub(crate) fn take_ready(task_id: i32) -> Option<JobResult> {
+    READY.with(|r| r.borrow_mut().remove(&task_id))
 }
 
 /// Tear down the main thread's boundary (joins workers). Used by test teardown

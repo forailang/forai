@@ -661,61 +661,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             .into_owned(),
                     )
                 };
-                #[cfg(feature = "http-client")]
-                let outcome: Result<i64, String> = {
-                    let rpc_url = format!("{}/fai/rpc", url.trim_end_matches('/'));
-                    let body = format!(
-                        "{{\"fn\":\"{}\",\"args\":{},\"hash\":\"{}\"}}",
-                        fn_name, args_json, hash
-                    );
-                    let agent = ureq::Agent::config_builder()
-                        .timeout_global(Some(std::time::Duration::from_secs(
-                            HTTP_CLIENT_TIMEOUT_SECS,
-                        )))
-                        .build()
-                        .new_agent();
-                    match agent
-                        .post(&rpc_url)
-                        .header("Content-Type", "application/json")
-                        .send(body.as_bytes())
-                    {
-                        Err(e) => Err(format!("network error: {}", e)),
-                        Ok(resp) => {
-                            let status = resp.status().as_u16();
-                            let resp_body = resp.into_body().read_to_string().unwrap_or_default();
-                            if !(200..300).contains(&status) {
-                                Err(format!("HTTP {}", status))
-                            } else {
-                                match serde_json::from_str::<serde_json::Value>(&resp_body) {
-                                    Ok(parsed) => {
-                                        if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                            let value =
-                                                parsed.get("value").unwrap_or(&serde_json::Value::Null);
-                                            Ok(build_value(&mut caller, &mem, value))
-                                        } else {
-                                            Err(parsed
-                                                .get("error")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("remote call failed")
-                                                .to_string())
-                                        }
-                                    }
-                                    Err(_) => Err("invalid JSON in response".to_string()),
-                                }
-                            }
-                        }
-                    }
-                };
-                #[cfg(not(feature = "http-client"))]
-                let outcome: Result<i64, String> = Ok(VAL_NULL);
-                PENDING_RPC.with(|p| p.borrow_mut().insert(task_id, outcome));
-                // Wake the parked task so the next poll runs its continuation.
-                if let Some(f) = caller
-                    .get_export("__fai_resume_task")
-                    .and_then(|e| e.into_func())
-                {
-                    let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
-                }
+                // Offload the blocking request to the boundary worker pool and
+                // leave the task parked (plan 101 U2/U6). The async lowering
+                // suspended this task right after the call; the driver loop
+                // pumps the boundary completion and resumes it via
+                // `__fai_resume_task`, then `remote_result` reads the value. The
+                // worker only touches owned data (the request strings), never
+                // the Store. (The browser implements `remote_begin` in JS with
+                // async `fetch`, so this native change doesn't affect it.)
+                super::boundary::with_boundary(|b| {
+                    b.submit(task_id, move || {
+                        Box::new(rpc_request_owned(url, fn_name, args_json, hash))
+                            as Box<dyn std::any::Any + Send>
+                    });
+                });
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -727,10 +686,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "env",
             "remote_result",
             |mut caller: Caller<'_, ()>, task_id: i32| -> i64 {
-                let outcome = PENDING_RPC.with(|p| p.borrow_mut().remove(&task_id));
-                match outcome {
-                    Some(Ok(v)) => v,
-                    Some(Err(msg)) => signal_remote_call_error(&mut caller, &msg),
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                match super::boundary::take_ready(task_id) {
+                    Some(Ok(boxed)) => {
+                        match boxed.downcast::<Result<serde_json::Value, String>>() {
+                            Ok(b) => match *b {
+                                Ok(value) => build_value(&mut caller, &mem, &value),
+                                Err(msg) => signal_remote_call_error(&mut caller, &msg),
+                            },
+                            Err(_) => {
+                                signal_remote_call_error(&mut caller, "RPC result type mismatch")
+                            }
+                        }
+                    }
+                    Some(Err(panic_msg)) => signal_remote_call_error(&mut caller, &panic_msg),
                     None => signal_remote_call_error(&mut caller, "missing RPC result"),
                 }
             },
@@ -740,10 +709,63 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     Ok(())
 }
 
-thread_local! {
-    /// Per-task RPC results bridging `remote_begin` → `remote_result` across the
-    /// task's suspension. The value is a NaN-boxed guest heap address (stable —
-    /// the bump heap never reclaims) or an error message re-signaled on read.
-    static PENDING_RPC: std::cell::RefCell<std::collections::HashMap<i32, Result<i64, String>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+/// Perform an RPC POST on a boundary worker thread, returning the parsed
+/// `value` (or an error message) as owned data. Runs off the main thread — must
+/// not touch the Store or guest memory; the caller (`remote_result`) marshals
+/// the returned `serde_json::Value` into the guest heap on the main thread.
+#[cfg(feature = "http-client")]
+fn rpc_request_owned(
+    url: String,
+    fn_name: String,
+    args_json: String,
+    hash: String,
+) -> Result<serde_json::Value, String> {
+    let rpc_url = format!("{}/fai/rpc", url.trim_end_matches('/'));
+    let body = format!(
+        "{{\"fn\":\"{}\",\"args\":{},\"hash\":\"{}\"}}",
+        fn_name, args_json, hash
+    );
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+    match agent
+        .post(&rpc_url)
+        .header("Content-Type", "application/json")
+        .send(body.as_bytes())
+    {
+        Err(e) => Err(format!("network error: {}", e)),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let resp_body = resp.into_body().read_to_string().unwrap_or_default();
+            if !(200..300).contains(&status) {
+                Err(format!("HTTP {}", status))
+            } else {
+                match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                    Ok(parsed) => {
+                        if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            Ok(parsed.get("value").cloned().unwrap_or(serde_json::Value::Null))
+                        } else {
+                            Err(parsed
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("remote call failed")
+                                .to_string())
+                        }
+                    }
+                    Err(_) => Err("invalid JSON in response".to_string()),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "http-client"))]
+fn rpc_request_owned(
+    _url: String,
+    _fn_name: String,
+    _args_json: String,
+    _hash: String,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::Value::Null)
 }
