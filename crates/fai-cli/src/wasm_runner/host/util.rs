@@ -327,6 +327,95 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.ffi_begin(task_id, ext_fn_idx, arg_count, args_ptr) -> ()
+    // The async (suspending) FFI path (plan 101 U7-U9): offload the blocking C
+    // call to a boundary worker and leave the task parked. The codegen only
+    // emits this for scalar-signature externs (Int/Float/Bool, no Ptr/String/
+    // out-params), so the worker can build its `Value`s locally and hand back
+    // just the NaN-boxed result bits — no guest memory, Store, or PtrTracker
+    // crosses the thread boundary. The driver loop pumps the completion and
+    // resumes the task; the guest then reads the value with `ffi_result`.
+    linker
+        .func_wrap(
+            "env",
+            "ffi_begin",
+            |mut caller: Caller<'_, ()>, task_id: i32, ext_fn_idx: i32, arg_count: i32, args_ptr: i32| {
+                let info = match CURRENT_EXTERNS
+                    .with(|slot| slot.borrow().get(ext_fn_idx as usize).cloned())
+                {
+                    Some(info) => info,
+                    None => return,
+                };
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return;
+                };
+                let mut raw_args: Vec<i64> = Vec::with_capacity(arg_count as usize);
+                {
+                    let data = mem.data(&caller);
+                    for i in 0..arg_count as usize {
+                        let off = args_ptr as usize + i * 8;
+                        if off + 8 > data.len() {
+                            return;
+                        }
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&data[off..off + 8]);
+                        raw_args.push(i64::from_le_bytes(buf));
+                    }
+                }
+                super::boundary::with_boundary(|b| {
+                    b.submit(task_id, move || {
+                        // Scalar args don't read guest memory, so decode against
+                        // an empty slice on this worker thread.
+                        let values: Vec<fai_core::value::Value> = raw_args
+                            .iter()
+                            .zip(info.param_types.iter().chain(std::iter::repeat(&FfiType::Int)))
+                            .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, &[]))
+                            .collect();
+                        let fixed = info.param_types.len();
+                        let supplied = values.len();
+                        let mut tracker = PtrTracker::new();
+                        let result = if supplied > fixed {
+                            fai_ffi::call_variadic(
+                                &info.library,
+                                &info.function,
+                                &values,
+                                &info.param_types,
+                                &info.return_type,
+                                &mut tracker,
+                                fixed,
+                            )
+                        } else {
+                            fai_ffi::call(
+                                &info.library,
+                                &info.function,
+                                &values,
+                                &info.param_types,
+                                &info.return_type,
+                                &mut tracker,
+                            )
+                        };
+                        let bits: i64 = match result {
+                            Ok(call_result) => call_result.return_value.to_bits() as i64,
+                            Err(_) => VAL_NULL,
+                        };
+                        Box::new(bits) as Box<dyn std::any::Any + Send>
+                    });
+                });
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.ffi_result(task_id) -> i64 — the NaN-boxed result the worker computed
+    // for the offloaded extern call (or null if it failed / went missing).
+    linker
+        .func_wrap("env", "ffi_result", |_caller: Caller<'_, ()>, task_id: i32| -> i64 {
+            match super::boundary::take_ready(task_id) {
+                Some(Ok(boxed)) => boxed.downcast::<i64>().map(|b| *b).unwrap_or(VAL_NULL),
+                _ => VAL_NULL,
+            }
+        })
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.float_to_str(value: f64, buf_ptr: i32) -> i32 (length)
     linker
         .func_wrap(

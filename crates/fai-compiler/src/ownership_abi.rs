@@ -312,6 +312,7 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
     // handling is read end to end.
     HostImportRow { canon: "", method: "", import: "remote_call", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
     HostImportRow { canon: "", method: "", import: "remote_result", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
+    HostImportRow { canon: "", method: "", import: "ffi_result", ret: RBor, doc: "async FFI offload result; scalar-only v1 returns primitives (ownership-neutral) — conservatively borrowed" },
 ];
 
 /// Look up the ownership signature of a std-module call (`canon.method`),

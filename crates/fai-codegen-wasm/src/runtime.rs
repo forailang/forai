@@ -526,7 +526,15 @@ pub const IMPORT_RC_WATCH: u32 = 110;
 /// changes. Generalizes the RC watchpoint to any address — for tracking a
 /// stray write (e.g. a clobbered count field) to the op that produced it.
 pub const IMPORT_MEM_WATCH: u32 = 111;
-pub const IMPORT_COUNT: u32 = 112;
+/// `env.ffi_begin(task_id, ext_fn_idx, arg_count, args_ptr) -> void` — offload
+/// a blocking extern call to the boundary worker pool and park the task (plan
+/// 101 U7-U9). The driver loop resumes it when the worker finishes; the guest
+/// then reads the value with `ffi_result`.
+pub const IMPORT_FFI_BEGIN: u32 = 112;
+/// `env.ffi_result(task_id) -> i64` — the NaN-boxed result of the offloaded
+/// extern call started by `ffi_begin`.
+pub const IMPORT_FFI_RESULT: u32 = 113;
+pub const IMPORT_COUNT: u32 = 114;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -714,6 +722,10 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             avail[IMPORT_CRYPTO_CONSTANT_TIME_EQUALS as usize] = false;
             avail[IMPORT_CRYPTO_BASE64_ENCODE as usize] = false;
             avail[IMPORT_CRYPTO_BASE64_DECODE as usize] = false;
+            // FFI is native-only; an extern call reached on the browser
+            // compiles to `unreachable` like the other stripped imports.
+            avail[IMPORT_FFI_BEGIN as usize] = false;
+            avail[IMPORT_FFI_RESULT as usize] = false;
         }
         _ => {}
     }
@@ -8847,6 +8859,14 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ("__fai_rc_watch", vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
         // IMPORT_MEM_WATCH: () -> void. Host reads the watched address.
         ("__fai_mem_watch", vec![], vec![]),
+        // IMPORT_FFI_BEGIN: (task_id, ext_fn_idx, arg_count, args_ptr) -> ()
+        (
+            "ffi_begin",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![],
+        ),
+        // IMPORT_FFI_RESULT: (task_id) -> i64 (NaN-boxed value)
+        ("ffi_result", vec![ValType::I32], vec![ValType::I64]),
     ]
 }
 
