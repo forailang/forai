@@ -822,6 +822,84 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f
 }
 
+/// `__fai_spawn_closure(closure_val: i64, arg: i64) -> i64`: spawn an async
+/// closure as a scheduler task and return its task id (as i64) WITHOUT driving
+/// it to completion. This is `emit_drive_closure`'s spawn prologue with the
+/// drive loop removed, so the unified host driver loop can keep many handler
+/// tasks in flight on the single scheduler thread at once: it spawns each, polls
+/// the scheduler, and reads each result via `__fai_task_result` once
+/// `__fai_task_status` reports completion. The task is marked host-driven (-2)
+/// so the scheduler won't recycle its slot — the host reads the result and frees
+/// it, exactly as for a `__fai_drive_closure` task.
+pub fn emit_spawn_closure(l: &SchedLayout) -> Function {
+    // params: closure_val = 0 (i64), arg = 1 (i64); locals: addr=2, frame=3, id=4 (i32)
+    let mut f = Function::new([(3, ValType::I32)]);
+    // addr = (closure_val & ADDR_MASK) as i32
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::LocalSet(2));
+    // frame = alloc(closure.frame_size @ addr+12)
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Load(ma(12)));
+    f.instruction(&Instruction::Call(l.alloc));
+    f.instruction(&Instruction::LocalSet(3));
+    // Zero the fresh frame (see emit_drive_closure: freed blocks are reused
+    // without clearing; an unwritten slot would hold a stale pointer that async
+    // reclamation would double-free).
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Load(ma(12)));
+    f.instruction(&Instruction::MemoryFill(0));
+    // frame[0] = env_ptr = addr + 16 (upvalues begin past the 16-byte header)
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(16));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Store(ma(0)));
+    // frame[8] = retain(arg) (param slots own +1; the task releases at completion)
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::Call(l.retain));
+    f.instruction(&Instruction::I64Store(ma(8)));
+    // id = spawn(table_idx @ addr+4, frame)
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Load(ma(4)));
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::Call(l.spawn));
+    f.instruction(&Instruction::LocalSet(4));
+    // Record the spawned frame's size (closure header @ +12) for reclaim.
+    rec_addr_local(&mut f, l, 4);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Load(ma(12)));
+    f.instruction(&Instruction::I32Store(ma(O_FRAME_SIZE)));
+    // Mark the task host-driven (-2) so its completion doesn't recycle the slot.
+    rec_addr_local(&mut f, l, 4);
+    f.instruction(&Instruction::I32Const(-2));
+    f.instruction(&Instruction::I32Store(ma(O_WAITER)));
+    // return id as i64
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I64ExtendI32S);
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// `__fai_task_status(id: i32) -> i32`: the task's status word (READY=0,
+/// RUNNING=1, WAITING=2, COMPLETE=3, FAILED=4). The host driver loop polls this
+/// to learn when a spawned handler task has finished (status >= COMPLETE) so it
+/// can write that connection's response, and whether it failed (status ==
+/// FAILED) so it can answer 500 instead of reading a non-response result.
+pub fn emit_task_status(l: &SchedLayout) -> Function {
+    // param: id = 0 (i32)
+    let mut f = Function::new([]);
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    f.instruction(&Instruction::End);
+    f
+}
+
 // ─── Resume-body building blocks (used by the direct-builder lowering) ──
 
 /// Emit `current_task.resume_state` load (an i32 on the stack).

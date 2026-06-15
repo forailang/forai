@@ -7168,6 +7168,10 @@ pub fn try_codegen_async_engine(
             funcs.function(fai_type_indices[&c.info.param_count]);
         }
     }
+    // Appended after the closures so their indices never shift: the unified
+    // host driver loop's spawn-without-drive and task-status entries (plan 101).
+    funcs.function(t_i64i64_i64); // __fai_spawn_closure (i64,i64)->i64
+    funcs.function(t_i32_i32); // __fai_task_status (i32)->i32
     module.section(&funcs);
 
     // Table = [async resume fns (0..nasync)] ++ [sync-fn closures (nasync..)].
@@ -7257,6 +7261,14 @@ pub fn try_codegen_async_engine(
     // Host-driver entry: spawn+drive an async guest closure (route/event handler)
     // to completion. await = sb+11, drive_closure = sb+12 (appended last).
     exports.export("__fai_drive_closure", ExportKind::Func, sb + 12);
+    // Host-driver loop entries (plan 101), appended after the closures so the
+    // closure table indices never shift. Scheduler block is sb..sb+13; closures
+    // occupy sb+13..sb+13+nclosures; these two sit just past them.
+    let nclosures = (async_closures.len() + sync_closures.len()) as u32;
+    let spawn_closure_idx = sb + 13 + nclosures;
+    let task_status_idx = sb + 14 + nclosures;
+    exports.export("__fai_spawn_closure", ExportKind::Func, spawn_closure_idx);
+    exports.export("__fai_task_status", ExportKind::Func, task_status_idx);
     // Host-callable refcount release: lets the host reclaim per-request guest
     // objects it owns (the request/response dicts it built) after writing the
     // response, so a long-running server plateaus instead of leaking ~1 dict
@@ -7354,6 +7366,10 @@ pub fn try_codegen_async_engine(
     for c in async_closures.iter().chain(sync_closures.iter()) {
         code.function(&c.function);
     }
+    // Appended after the closures (function-section order matches): the two
+    // host-driver-loop entries (plan 101). Indices computed at the export below.
+    code.function(&async_engine::emit_spawn_closure(&layout));
+    code.function(&async_engine::emit_task_status(&layout));
     module.section(&code);
 
     if !extended.is_empty() {
