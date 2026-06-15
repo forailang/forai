@@ -4,6 +4,7 @@ use wasmtime::Linker;
 
 mod array;
 mod async_ops;
+mod boundary;
 mod crypto;
 mod env;
 mod events;
