@@ -2,15 +2,18 @@
 //!
 //! Boots a real forai server via the `fai` binary in a subprocess, then drives
 //! it over raw TCP. This is the verification foundation for the async I/O
-//! boundary work (plan 101, U2–U4): the server's handler sleeps before
-//! responding, so concurrent requests reveal whether the runtime serves them
-//! one-at-a-time (today) or overlaps them on the single scheduler thread (after
-//! the driver-loop rewrite).
+//! boundary work (plan 101). The server exposes several routes that exercise
+//! the unified driver loop's paths:
 //!
-//! `server_responds` proves the harness and the current server work and runs in
-//! the normal suite. `concurrent_requests_overlap` is the red target for U3/U4
-//! and is `#[ignore]`d until the driver loop lands — run it with
-//! `cargo test -p fai-feature-tests --test http_concurrency -- --ignored`.
+//!   GET /       async handler, sleeps 500ms then 200 "ok"  (concurrency timing)
+//!   GET /quick  async handler, sleeps 1ms then 200 "quick" (fast task churn)
+//!   GET /sync   synchronous handler, 200 "sync"            (inline path)
+//!   GET /boom   async handler, sleeps then throws          (FAILED -> 500)
+//!   (any other path)                                       (404)
+//!
+//! The sleeping handlers occupy the runtime cooperatively, so concurrent
+//! requests reveal whether the runtime serves them one-at-a-time or overlaps
+//! them on the single scheduler thread.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -20,12 +23,8 @@ use std::time::{Duration, Instant};
 
 use fai_feature_tests::{fai_binary, workspace_root};
 
-const HANDLER_SLEEP_MS: u64 = 500;
+const SLOW_MS: u64 = 500;
 
-/// A forai server whose `/` handler sleeps `HANDLER_SLEEP_MS` then returns
-/// `200 ok`. The sleep makes the handler async (suspending), so the request
-/// occupies the runtime for the sleep duration — the signal the concurrency
-/// test measures.
 fn server_source(port: u16) -> String {
     format!(
         "use std.http.server\n\
@@ -35,12 +34,23 @@ fn server_source(port: u16) -> String {
          do\n\
          \x20 let router = server.router()\n\
          \x20 server.get(router, '/') do with req HttpRequest\n\
-         \x20   sleep({sleep})\n\
+         \x20   sleep({slow})\n\
          \x20   server.text(200, 'ok')\n\
+         \x20 end\n\
+         \x20 server.get(router, '/quick') do with req HttpRequest\n\
+         \x20   sleep(1)\n\
+         \x20   server.text(200, 'quick')\n\
+         \x20 end\n\
+         \x20 server.get(router, '/sync') do with req HttpRequest\n\
+         \x20   server.text(200, 'sync')\n\
+         \x20 end\n\
+         \x20 server.get(router, '/boom') do with req HttpRequest\n\
+         \x20   sleep(1)\n\
+         \x20   throw 7\n\
          \x20 end\n\
          \x20 server.listen(router, {port})\n\
          end\n",
-        sleep = HANDLER_SLEEP_MS,
+        slow = SLOW_MS,
         port = port,
     )
 }
@@ -61,8 +71,6 @@ impl Drop for ServerProc {
     }
 }
 
-/// Pick a port the OS just confirmed is free, then release it. Small race
-/// window before the server rebinds it; acceptable for a local test.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -93,7 +101,6 @@ fn boot_server() -> ServerProc {
 
     let mut proc = ServerProc { child, dir, port };
 
-    // Poll until the server is listening, or the process exits / times out.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -113,57 +120,134 @@ fn boot_server() -> ServerProc {
     }
 }
 
-/// Issue one `GET /`, read the full response (server closes on `Connection:
+/// Issue one `GET <path>`, read the full response (server closes on `Connection:
 /// close`), and return how long the round trip took plus the raw response.
-fn timed_get(port: u16) -> (Duration, String) {
+fn timed_get(port: u16, path: &str) -> (Duration, String) {
     let start = Instant::now();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
         .expect("write request");
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read response");
     (start.elapsed(), response)
 }
 
+/// Fire `n` concurrent `GET <path>` requests; return each response and the
+/// total wall-clock for the whole batch.
+fn concurrent_gets(port: u16, path: &str, n: usize) -> (Duration, Vec<String>) {
+    let start = Instant::now();
+    let handles: Vec<_> = (0..n)
+        .map(|_| {
+            let p = path.to_string();
+            thread::spawn(move || timed_get(port, &p).1)
+        })
+        .collect();
+    let responses: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    (start.elapsed(), responses)
+}
+
 #[test]
 fn server_responds() {
     let server = boot_server();
-    let (_elapsed, response) = timed_get(server.port);
-    assert!(
-        response.contains("200"),
-        "expected 200 status, got:\n{response}"
-    );
-    assert!(
-        response.contains("ok"),
-        "expected body 'ok', got:\n{response}"
-    );
+    let (_t, response) = timed_get(server.port, "/");
+    assert!(response.contains("200"), "expected 200, got:\n{response}");
+    assert!(response.contains("ok"), "expected body 'ok', got:\n{response}");
+}
+
+#[test]
+fn sync_handler_responds() {
+    // A handler with no suspending call resolves inline (not spawned as a task).
+    let server = boot_server();
+    let (_t, response) = timed_get(server.port, "/sync");
+    assert!(response.contains("200"), "expected 200, got:\n{response}");
+    assert!(response.contains("sync"), "expected body 'sync', got:\n{response}");
+}
+
+#[test]
+fn unmatched_path_404() {
+    let server = boot_server();
+    let (_t, response) = timed_get(server.port, "/does-not-exist");
+    assert!(response.contains("404"), "expected 404, got:\n{response}");
+}
+
+#[test]
+fn handler_error_500() {
+    // An async handler that throws becomes a FAILED task; the driver loop must
+    // answer 500 rather than writing its non-response result or hanging.
+    let server = boot_server();
+    let (_t, response) = timed_get(server.port, "/boom");
+    assert!(response.contains("500"), "expected 500, got:\n{response}");
 }
 
 #[test]
 fn concurrent_requests_overlap() {
     let server = boot_server();
-    let port = server.port;
-
-    let start = Instant::now();
-    let handles: Vec<_> = (0..2)
-        .map(|_| thread::spawn(move || timed_get(port)))
-        .collect();
-    for h in handles {
-        let (_elapsed, response) = h.join().unwrap();
-        assert!(response.contains("200"), "request failed:\n{response}");
+    let (total, responses) = concurrent_gets(server.port, "/", 2);
+    for r in &responses {
+        assert!(r.contains("200"), "request failed:\n{r}");
     }
-    let total = start.elapsed();
-
-    // Two handlers that each sleep HANDLER_SLEEP_MS. Served concurrently the
-    // pair finishes in ~one sleep; served serially it takes ~two. The midpoint
-    // (1.5x) cleanly separates the two regimes.
-    let threshold = Duration::from_millis(HANDLER_SLEEP_MS * 3 / 2);
+    // Served concurrently the pair finishes in ~one SLOW_MS; serially it takes
+    // ~two. The 1.5x midpoint cleanly separates the regimes.
+    let threshold = Duration::from_millis(SLOW_MS * 3 / 2);
     assert!(
         total < threshold,
         "expected concurrent serving (< {threshold:?}), took {total:?} — still serial?"
     );
+}
+
+#[test]
+fn many_requests_overlap() {
+    // Eight slow requests at once: concurrent serving finishes in ~one SLOW_MS,
+    // serial would be ~eight. Proves the loop multiplexes well beyond two.
+    let server = boot_server();
+    let (total, responses) = concurrent_gets(server.port, "/", 8);
+    assert_eq!(responses.len(), 8);
+    for r in &responses {
+        assert!(r.contains("200"), "request failed:\n{r}");
+    }
+    let threshold = Duration::from_millis(SLOW_MS * 5 / 2);
+    assert!(
+        total < threshold,
+        "expected 8 requests to overlap (< {threshold:?}), took {total:?}"
+    );
+}
+
+#[test]
+fn sequential_soak_reuses_task_slots() {
+    // Many sequential async requests churn spawn -> complete -> __fai_free_task.
+    // If slot recycling were wrong the task table (capacity 4096) would not
+    // exhaust at this count, but a wedge or corruption would surface as a failed
+    // or missing response well before then. Also guards against a per-request
+    // wedge in the driver loop.
+    let server = boot_server();
+    for i in 0..120 {
+        let (_t, response) = timed_get(server.port, "/quick");
+        assert!(
+            response.contains("200") && response.contains("quick"),
+            "request {i} failed:\n{response}"
+        );
+    }
+}
+
+#[test]
+fn mixed_sync_and_async_concurrent() {
+    // A sync request must be served promptly even while a slow async handler is
+    // in flight — the driver loop accepts and resolves it inline rather than
+    // waiting behind the parked task.
+    let server = boot_server();
+    let port = server.port;
+    let slow = thread::spawn(move || timed_get(port, "/").1);
+    // Give the slow request a moment to be accepted and parked.
+    thread::sleep(Duration::from_millis(50));
+    let (sync_elapsed, sync_resp) = timed_get(port, "/sync");
+    assert!(sync_resp.contains("sync"), "sync failed:\n{sync_resp}");
+    assert!(
+        sync_elapsed < Duration::from_millis(SLOW_MS),
+        "sync request waited behind the async one: {sync_elapsed:?}"
+    );
+    assert!(slow.join().unwrap().contains("200"));
 }
