@@ -732,7 +732,9 @@ fn rpc_request_owned(
         fn_name, args_json, hash
     );
     let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS)))
+        .timeout_global(Some(std::time::Duration::from_secs(
+            HTTP_CLIENT_TIMEOUT_SECS,
+        )))
         .build()
         .new_agent();
     match agent
@@ -750,7 +752,10 @@ fn rpc_request_owned(
                 match serde_json::from_str::<serde_json::Value>(&resp_body) {
                     Ok(parsed) => {
                         if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            Ok(parsed.get("value").cloned().unwrap_or(serde_json::Value::Null))
+                            Ok(parsed
+                                .get("value")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null))
                         } else {
                             Err(parsed
                                 .get("error")

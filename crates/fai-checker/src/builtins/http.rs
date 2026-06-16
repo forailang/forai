@@ -83,27 +83,6 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("status", Type::Int), p("url", Type::String)],
         &[http_response_type.clone()],
     );
-    // Kept for backward compatibility (not exported from std.http.server module anymore)
-    ins(
-        b,
-        "httpServerListen",
-        &[
-            p("port", Type::Int),
-            p(
-                "using",
-                function_type(
-                    "httpRequestHandler",
-                    vec![param(
-                        "request",
-                        named_type("HttpRequest", NamedCategory::Type),
-                    )],
-                    vec![http_response_type.clone()],
-                ),
-            ),
-        ],
-        &[Type::Void],
-    );
-
     // HTTP server — Router API
     let router_type = named_type("Router", NamedCategory::Type);
     let http_request_type = named_type("HttpRequest", NamedCategory::Type);
@@ -190,7 +169,6 @@ mod tests {
             "httpServerHtml",
             "httpServerJson",
             "httpServerRedirect",
-            "httpServerListen",
         ] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
@@ -247,18 +225,6 @@ mod tests {
                     },
                     other => panic!("expected Function handler param, got {:?}", other),
                 }
-            }
-            _ => panic!("expected Function"),
-        }
-    }
-
-    #[test]
-    fn test_http_server_listen_takes_handler_function() {
-        let b = fresh();
-        match b.get("httpServerListen").unwrap() {
-            Type::Function(sig) => {
-                assert_eq!(sig.params.len(), 2);
-                assert!(matches!(sig.params[1].ty, Type::Function(_)));
             }
             _ => panic!("expected Function"),
         }

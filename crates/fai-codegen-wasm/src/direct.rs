@@ -2903,7 +2903,11 @@ fn offloadable_extern_call_args(
         return None;
     };
     let idx = OFFLOADABLE_EXTERNS.with(|m| m.borrow().get(&id.name).copied())?;
-    Some((idx, call.args.iter().map(|a| &a.value).collect(), &call.location))
+    Some((
+        idx,
+        call.args.iter().map(|a| &a.value).collect(),
+        &call.location,
+    ))
 }
 
 /// A spy target the mock/assert calls refer to.
@@ -4082,6 +4086,16 @@ fn expr_has_user_call(expr: &Expression, fns: &AsyncResolve<'_>) -> bool {
         Expression::IndexExpression(i) => {
             expr_has_user_call(&i.object, fns) || expr_has_user_call(&i.index, fns)
         }
+        Expression::OptionalCheckExpression(o) => expr_has_user_call(&o.expression, fns),
+        Expression::ForceUnwrapExpression(f) => expr_has_user_call(&f.expression, fns),
+        Expression::ArrayExpression(a) => a.items.iter().any(|it| expr_has_user_call(it, fns)),
+        Expression::TupleExpression(t) => t.items.iter().any(|it| expr_has_user_call(it, fns)),
+        Expression::DictionaryExpression(d) => {
+            d.entries.iter().any(|entry| expr_has_user_call(&entry.value, fns))
+        }
+        Expression::RangeExpression(r) => {
+            expr_has_user_call(&r.start, fns) || expr_has_user_call(&r.end, fns)
+        }
         _ => false,
     }
 }
@@ -4191,7 +4205,9 @@ enum Incoming {
     },
     /// Resume of an `AwaitFfi`: bind `ffi_result(g_current)` to `bind`
     /// (or discard if `None`).
-    AwaitedFfi { bind: Option<String> },
+    AwaitedFfi {
+        bind: Option<String>,
+    },
 }
 
 /// A basic block in the resumable function's CFG: what to assign at entry
@@ -4203,6 +4219,11 @@ struct Block<'a> {
     incoming: Incoming,
     stmts: Vec<&'a Statement>,
     term: Term<'a>,
+    /// Enclosing async catch handler for non-suspending statements in this
+    /// block. Sync helper calls compiled inside async resume segments must
+    /// route `error_flag` through the scheduler instead of returning from the
+    /// resume function.
+    on_error: Option<(usize, String)>,
     /// Phase 3 reclamation (plans/111): frame-var names to `rt_drop` after this
     /// block's statements run, before its terminator. Set on the back-edge
     /// block of a NON-suspending `while` body to free confined fresh-literal
@@ -4637,9 +4658,21 @@ impl<'a> CfgBuilder<'a> {
             incoming: Incoming::None,
             stmts: Vec::new(),
             term: Term::Unset,
+            on_error: None,
             drops: Vec::new(),
         });
         self.blocks.len() - 1
+    }
+
+    fn push_inline_stmt(&mut self, blk: usize, stmt: &'a Statement) -> Result<(), ()> {
+        let handler = self.handler();
+        if self.blocks[blk].on_error.is_none() {
+            self.blocks[blk].on_error = handler.clone();
+        } else if self.blocks[blk].on_error != handler {
+            return Err(());
+        }
+        self.blocks[blk].stmts.push(stmt);
+        Ok(())
     }
 
     fn args_ok(&self, args: &[&Expression]) -> bool {
@@ -4719,7 +4752,7 @@ impl<'a> CfgBuilder<'a> {
             if !self.args_ok(&args) {
                 return Err(());
             }
-            self.blocks[cur].stmts.push(stmt);
+            self.push_inline_stmt(cur, stmt)?;
             return Ok(Flow::Continue(cur));
         }
         // let/var [a, b] = all(...)
@@ -4780,7 +4813,11 @@ impl<'a> CfgBuilder<'a> {
                     loc,
                     next,
                 };
-                let bind = if name == "_" { None } else { Some(name.to_string()) };
+                let bind = if name == "_" {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
                 self.blocks[next].incoming = Incoming::AwaitedFfi { bind };
                 return Ok(Flow::Continue(next));
             }
@@ -4824,7 +4861,7 @@ impl<'a> CfgBuilder<'a> {
             if expr_has_user_call(value, self.fns) {
                 return Err(());
             }
-            self.blocks[cur].stmts.push(stmt);
+            self.push_inline_stmt(cur, stmt)?;
             return Ok(Flow::Continue(cur));
         }
         // assignment `v = expr` (no awaits in the value)
@@ -4835,9 +4872,7 @@ impl<'a> CfgBuilder<'a> {
             // in a collect loop). Mirrors the let/var binding case.
             if let AssignmentTarget::Variables { names } = &asg.target {
                 if names.len() == 1 {
-                    if let Some((ext_idx, fargs, loc)) =
-                        offloadable_extern_call_args(&asg.value)
-                    {
+                    if let Some((ext_idx, fargs, loc)) = offloadable_extern_call_args(&asg.value) {
                         let next = self.new_block();
                         self.blocks[cur].term = Term::AwaitFfi {
                             ext_idx,
@@ -4855,7 +4890,7 @@ impl<'a> CfgBuilder<'a> {
             if expr_has_user_call(&asg.value, self.fns) {
                 return Err(());
             }
-            self.blocks[cur].stmts.push(stmt);
+            self.push_inline_stmt(cur, stmt)?;
             return Ok(Flow::Continue(cur));
         }
         // expression statement
@@ -4950,7 +4985,7 @@ impl<'a> CfgBuilder<'a> {
             if is_tail {
                 return Ok(self.tail_value(cur, &es.expression, mode));
             }
-            self.blocks[cur].stmts.push(stmt);
+            self.push_inline_stmt(cur, stmt)?;
             return Ok(Flow::Continue(cur));
         }
         // throw value
@@ -5124,7 +5159,7 @@ impl<'a> CfgBuilder<'a> {
             // segment compiler (`compile_stmt`) lowers it directly, exactly as a
             // sync function would. Only statements that themselves suspend need
             // CFG segment-splitting (not supported inside loops/case yet).
-            self.blocks[cur].stmts.push(stmt);
+            self.push_inline_stmt(cur, stmt)?;
             Ok(Flow::Continue(cur))
         } else {
             if std::env::var("FAI_ASYNC_DEBUG").is_ok() {
@@ -5241,6 +5276,7 @@ fn build_cfg<'a>(
             incoming: Incoming::None,
             stmts: Vec::new(),
             term: Term::Unset,
+            on_error: None,
             drops: Vec::new(),
         }],
         fns,
@@ -6009,7 +6045,22 @@ fn build_resume_fn(
                 )?;
                 continue;
             }
+            let catch = match &blk.on_error {
+                Some((catch_blk, err_var)) => {
+                    let l = *var_local
+                        .get(err_var)
+                        .ok_or(BuildError::UnsupportedExpression("async-unknown-catch"))?;
+                    Some((*catch_blk, l))
+                }
+                None => None,
+            };
+            b.async_error_ctx = Some(AsyncErrorContext {
+                layout: *layout,
+                loop_depth,
+                catch,
+            });
             compile_async_segment_stmt(&mut b, stmt, &var_local, &release_set)?;
+            b.async_error_ctx = None;
         }
 
         // (R1 clean slate, plan 113: async loop-body auto-drops removed — RC
@@ -6088,7 +6139,12 @@ fn build_resume_fn(
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Return);
             }
-            Term::AwaitFfi { ext_idx, args, loc: _, next } => {
+            Term::AwaitFfi {
+                ext_idx,
+                args,
+                loc: _,
+                next,
+            } => {
                 // Park the task (status WAITING, O_WAKE = -1) and offload the
                 // blocking extern call to the boundary; the driver loop resumes
                 // it via `__fai_resume_task` when the worker finishes.
@@ -6101,7 +6157,9 @@ fn build_resume_fn(
                 };
                 rec(&mut b);
                 b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
-                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_STATUS)));
+                b.emit(Instruction::I32Store(mem_off(
+                    crate::async_engine::O_STATUS,
+                )));
                 rec(&mut b);
                 b.emit(Instruction::F64Const(-1.0));
                 b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
@@ -8365,6 +8423,10 @@ struct Builder<'a, 'c> {
     /// the slot at exactly one owned ref instead of leaking the old
     /// value. Populated by `build_resume_fn` from the release set.
     owned_frame_locals: HashSet<u32>,
+    /// Async resume segment error route. When set, sync helper calls that set
+    /// `error_flag` fail the current scheduler task or jump to the async catch
+    /// block instead of returning from the resume function.
+    async_error_ctx: Option<AsyncErrorContext>,
 }
 
 /// Per-`try` bookkeeping for `throw` dispatch. Popped *before* the
@@ -8379,6 +8441,13 @@ struct TryFrame {
     /// Local that holds the thrown value until the `$catch` block
     /// binds it to the user-declared `catch_name`.
     err_local: u32,
+}
+
+#[derive(Clone, Copy)]
+struct AsyncErrorContext {
+    layout: crate::async_engine::SchedLayout,
+    loop_depth: u32,
+    catch: Option<(usize, u32)>,
 }
 
 /// Label bookkeeping for `break` / `continue`. Each `while` lowering
@@ -8463,6 +8532,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             upvalue_by_name: HashMap::new(),
             cell_captured_vars: collect_cell_captured_vars(&fd.body),
             owned_frame_locals: HashSet::new(),
+            async_error_ctx: None,
         }
     }
 
@@ -8471,11 +8541,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     /// Emit a `Call` to a host import using the target-aware remap.
-    /// If the import is available for the current target, the call
-    /// lands on its remapped wasm function index. If not (e.g.,
-    /// `IMPORT_HTTP_SERVER_LISTEN` on `wasm-html`), emit
-    /// `unreachable` — matches `runtime::emit_import_call`'s policy
-    /// so both codegen paths trap identically on unavailable imports.
+    /// If the import is available for the current target, the call lands on
+    /// its remapped wasm function index. If not, emit `unreachable` — matches
+    /// `runtime::emit_import_call`'s policy so both codegen paths trap
+    /// identically on unavailable imports.
     fn emit_import_call(&mut self, import_idx: u32) {
         match self
             .ctx
@@ -9694,6 +9763,29 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.release_owned_arg_stashes(owned_arg_stashes);
             self.emit_cleanup_to_depth(frame.cleanup_depth);
             self.emit(Instruction::Br(rel));
+        } else if let Some(async_ctx) = self.async_error_ctx {
+            self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
+            let err_local = self.alloc_local();
+            self.emit(Instruction::LocalSet(err_local));
+            self.emit(Instruction::I32Const(0));
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
+            self.emit(Instruction::I64Const(0));
+            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+            self.release_owned_arg_stashes(owned_arg_stashes);
+            match async_ctx.catch {
+                Some((catch_blk, catch_local)) => {
+                    self.emit(Instruction::LocalGet(err_local));
+                    self.emit(Instruction::LocalSet(catch_local));
+                    emit_store_current_rstate(self, &async_ctx.layout, catch_blk as i32);
+                    self.emit(Instruction::Br(async_ctx.loop_depth + 1));
+                }
+                None => {
+                    self.emit(Instruction::GlobalGet(async_ctx.layout.g_current));
+                    self.emit(Instruction::LocalGet(err_local));
+                    self.emit(Instruction::Call(async_ctx.layout.fail));
+                    self.emit(Instruction::Return);
+                }
+            }
         } else if self.fd.name == "<__start__>" {
             // Outermost frame — there is nowhere left to propagate.
             // A clean `Return` here would silently exit the program
@@ -16309,7 +16401,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },
@@ -19555,7 +19648,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },
@@ -20230,7 +20324,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },
@@ -21473,7 +21568,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },
@@ -21642,7 +21738,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },
@@ -21969,7 +22066,6 @@ mod tests {
             "sleep_ms",
             "run_all",
             "http_server_response",
-            "http_server_listen",
             "http_server_router",
             "http_server_router_get",
             "http_server_router_post",
@@ -23007,7 +23103,8 @@ mod tests {
                                 .get_export("__fai_resume_task")
                                 .and_then(|e| e.into_func())
                             {
-                                let _ = f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
+                                let _ =
+                                    f.call(&mut caller, &[Val::I32(task_id)], &mut [Val::I32(0)]);
                             }
                             Ok(())
                         },

@@ -88,10 +88,11 @@ impl Drop for ServerProc {
 }
 
 fn boot_server(source: &str, port: u16) -> ServerProc {
-    let dir = workspace_root()
-        .join("target")
-        .join("tmp")
-        .join(format!("rpc_offload_{}_{}", std::process::id(), port));
+    let dir = workspace_root().join("target").join("tmp").join(format!(
+        "rpc_offload_{}_{}",
+        std::process::id(),
+        port
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("server.fai");
     std::fs::write(&src, source).unwrap();
@@ -141,16 +142,25 @@ fn get(port: u16) -> String {
 fn single_rpc_handler_responds() {
     let stub = spawn_rpc_stub(Duration::from_millis(RPC_DELAY_MS));
     let port = free_port();
-    let server = boot_server(&server_source(port, &format!("http://127.0.0.1:{stub}")), port);
+    let server = boot_server(
+        &server_source(port, &format!("http://127.0.0.1:{stub}")),
+        port,
+    );
     let resp = get(server.port);
-    assert!(resp.contains("200") && resp.contains("done"), "got:\n{resp}");
+    assert!(
+        resp.contains("200") && resp.contains("done"),
+        "got:\n{resp}"
+    );
 }
 
 #[test]
 fn concurrent_outbound_rpc_overlaps() {
     let stub = spawn_rpc_stub(Duration::from_millis(RPC_DELAY_MS));
     let port = free_port();
-    let server = boot_server(&server_source(port, &format!("http://127.0.0.1:{stub}")), port);
+    let server = boot_server(
+        &server_source(port, &format!("http://127.0.0.1:{stub}")),
+        port,
+    );
     let p = server.port;
 
     let start = Instant::now();

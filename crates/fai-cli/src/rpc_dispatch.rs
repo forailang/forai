@@ -11,6 +11,7 @@ pub struct DispatchFunction {
     pub name: String,
     pub key: String,
     pub params: Vec<String>,
+    pub returns_void: bool,
 }
 
 /// Generate server-side RPC dispatch code from a shared module's source.
@@ -97,10 +98,15 @@ pub fn generate_dispatch_for_functions(
                 "{}    events.emit('rpc:beforeCall', {})\n",
                 indent, before_payload
             ));
-            out.push_str(&format!(
-                "{}    __rpcResult = json.stringify({}())\n",
-                indent, fd.name
-            ));
+            if fd.returns_void {
+                out.push_str(&format!("{}    {}()\n", indent, fd.name));
+                out.push_str(&format!("{}    __rpcResult = 'null'\n", indent));
+            } else {
+                out.push_str(&format!(
+                    "{}    __rpcResult = json.stringify({}())\n",
+                    indent, fd.name
+                ));
+            }
             out.push_str(&format!(
                 "{}    events.emit('rpc:afterCall', {})\n",
                 indent, after_payload
@@ -134,10 +140,15 @@ pub fn generate_dispatch_for_functions(
                 "{}    events.emit('rpc:beforeCall', {})\n",
                 indent, before_payload
             ));
-            out.push_str(&format!(
-                "{}    __rpcResult = json.stringify({})\n",
-                indent, call
-            ));
+            if fd.returns_void {
+                out.push_str(&format!("{}    {}\n", indent, call));
+                out.push_str(&format!("{}    __rpcResult = 'null'\n", indent));
+            } else {
+                out.push_str(&format!(
+                    "{}    __rpcResult = json.stringify({})\n",
+                    indent, call
+                ));
+            }
             out.push_str(&format!(
                 "{}    events.emit('rpc:afterCall', {})\n",
                 indent, after_payload
@@ -202,7 +213,15 @@ fn dispatch_function_from_parser(fd: &FunctionDeclaration) -> DispatchFunction {
         name: fd.name.clone(),
         key: fd.name.clone(),
         params: fd.params.iter().map(|p| p.name.clone()).collect(),
+        returns_void: returns_void_parser(fd),
     }
+}
+
+fn returns_void_parser(fd: &FunctionDeclaration) -> bool {
+    fd.return_types.len() == 1
+        && fd.return_types[0].type_node.name.as_deref() == Some("Void")
+        && !fd.return_types[0].type_node.is_array
+        && !fd.return_types[0].type_node.is_optional
 }
 
 fn ensure_unique_bare_names(remote_fns: &[DispatchFunction]) -> Result<(), String> {
@@ -439,6 +458,7 @@ mod tests {
                 name: "getTasks".to_string(),
                 key: "data.tasks.getTasks".to_string(),
                 params: vec![],
+                returns_void: false,
             }],
             "h",
         )
@@ -470,12 +490,14 @@ mod tests {
                     name: "get".to_string(),
                     key: "data.tasks.get".to_string(),
                     params: vec![],
+                    returns_void: false,
                 },
                 DispatchFunction {
                     module: Some("auth.tasks".to_string()),
                     name: "get".to_string(),
                     key: "auth.tasks.get".to_string(),
                     params: vec![],
+                    returns_void: false,
                 },
             ],
             "h",
@@ -499,6 +521,30 @@ mod tests {
             parse_result.is_ok(),
             "generated dispatch + addRpcRoutes should be valid forai. Error: {:?}\nSource:\n{}",
             parse_result.err(),
+            result
+        );
+    }
+
+    #[test]
+    fn test_void_remote_def_encodes_null_without_stringifying_void() {
+        let result = generate_dispatch(
+            "remote def sendMessage\n    @param conversationId Int\n    @param body String\n    @return Void",
+            "h",
+        )
+        .unwrap();
+        assert!(
+            result.contains("sendMessage(__parsed[0], __parsed[1])"),
+            "Void endpoint should be called as a statement. Got:\n{}",
+            result
+        );
+        assert!(
+            result.contains("__rpcResult = 'null'"),
+            "Void endpoint should encode a null JSON result. Got:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("json.stringify(sendMessage("),
+            "Void endpoint should not stringify the Void result. Got:\n{}",
             result
         );
     }

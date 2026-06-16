@@ -41,18 +41,32 @@ fn free_port() -> u16 {
 fn project_main(port: u16) -> String {
     format!(
         "use std.http.server\n\
+         use std.events\n\
          use std.string\n\
          use {{ open, query }} from Forsqlite\n\
+         \n\
+         var beforeValue = ''\n\
          \n\
          def main\n\
          \x20   @return Void\n\
          do\n\
          \x20 let shared = open(':memory:')\n\
+         \x20 let eventDb = open(':memory:')\n\
          \x20 let router = server.router()\n\
+         \x20 let _before = events.on('http:beforeRequest') do with e Event\n\
+         \x20   let req HttpRequest = from_dict(e.data)\n\
+         \x20   if req.path == '/event'\n\
+         \x20     let rows = query(eventDb, '{q}')\n\
+         \x20     beforeValue = toString(getInt(rows[0], 'n')!)\n\
+         \x20   end\n\
+         \x20 end\n\
          \x20 server.get(router, '/q') do with req HttpRequest\n\
          \x20   let db = open(':memory:')\n\
          \x20   let rows = query(db, '{q}')\n\
          \x20   server.text(200, toString(getInt(rows[0], 'n')!))\n\
+         \x20 end\n\
+         \x20 server.get(router, '/event') do with req HttpRequest\n\
+         \x20   server.text(200, beforeValue)\n\
          \x20 end\n\
          \x20 server.get(router, '/shared') do with req HttpRequest\n\
          \x20   let rows = query(shared, '{q}')\n\
@@ -81,10 +95,11 @@ impl Drop for ServerProc {
 
 fn boot_server(forsqlite: &std::path::Path) -> ServerProc {
     let port = free_port();
-    let dir = workspace_root()
-        .join("target")
-        .join("tmp")
-        .join(format!("forsqlite_{}_{}", std::process::id(), port));
+    let dir = workspace_root().join("target").join("tmp").join(format!(
+        "forsqlite_{}_{}",
+        std::process::id(),
+        port
+    ));
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("fai.toml"),
@@ -149,7 +164,25 @@ fn sqlite_query_in_handler_is_correct() {
     let (_t, resp) = timed_get(server.port);
     assert!(resp.contains("200"), "got:\n{resp}");
     // count(*) over the recursive CTE = 2_000_000.
-    assert!(resp.contains("2000000"), "expected count 2000000, got:\n{resp}");
+    assert!(
+        resp.contains("2000000"),
+        "expected count 2000000, got:\n{resp}"
+    );
+}
+
+#[test]
+fn sqlite_query_in_before_request_event_completes_before_handler() {
+    let Some(forsqlite) = forsqlite_dir() else {
+        eprintln!("skipping: forsqlite checkout not found");
+        return;
+    };
+    let server = boot_server(&forsqlite);
+    let resp = get_path(server.port, "/event");
+    assert!(resp.contains("200"), "got:\n{resp}");
+    assert!(
+        resp.contains("2000000"),
+        "expected beforeRequest SQLite query result before handler, got:\n{resp}"
+    );
 }
 
 fn get_path(port: u16, path: &str) -> String {
@@ -158,7 +191,9 @@ fn get_path(port: u16, path: &str) -> String {
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .unwrap();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).unwrap();
@@ -206,7 +241,9 @@ fn concurrent_sqlite_queries_overlap() {
     // offloads to the boundary, so they run on separate worker threads and
     // overlap rather than serialize.
     let start = Instant::now();
-    let handles: Vec<_> = (0..2).map(|_| thread::spawn(move || timed_get(p).1)).collect();
+    let handles: Vec<_> = (0..2)
+        .map(|_| thread::spawn(move || timed_get(p).1))
+        .collect();
     for h in handles {
         assert!(h.join().unwrap().contains("2000000"));
     }

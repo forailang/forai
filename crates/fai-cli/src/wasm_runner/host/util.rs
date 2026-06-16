@@ -356,7 +356,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap(
             "env",
             "ffi_begin",
-            |mut caller: Caller<'_, ()>, task_id: i32, ext_fn_idx: i32, arg_count: i32, args_ptr: i32| {
+            |mut caller: Caller<'_, ()>,
+             task_id: i32,
+             ext_fn_idx: i32,
+             arg_count: i32,
+             args_ptr: i32| {
                 let info = match CURRENT_EXTERNS
                     .with(|slot| slot.borrow().get(ext_fn_idx as usize).cloned())
                 {
@@ -408,7 +412,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         // Worker thread: run only the raw C call. On a prepare
                         // failure (e.g. missing symbol) surface the error string;
                         // ffi_result turns it into null so the task still resumes.
-                        let outcome: Result<(fai_ffi::RawReturn, FfiType), String> = match prepared {
+                        let outcome: Result<(fai_ffi::RawReturn, FfiType), String> = match prepared
+                        {
                             Ok(call) => {
                                 let rt = call.return_type();
                                 call.raw_call().map(|raw| (raw, rt)).map_err(|e| e.message)
@@ -426,30 +431,34 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // guest value on the main thread (pointer returns tracked via PTR_TRACKER,
     // string returns copied into guest memory). Null on failure / missing.
     linker
-        .func_wrap("env", "ffi_result", |mut caller: Caller<'_, ()>, task_id: i32| -> i64 {
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-                return VAL_NULL;
-            };
-            let outcome = match super::boundary::take_ready(task_id) {
-                Some(Ok(boxed)) => {
-                    match boxed.downcast::<Result<(fai_ffi::RawReturn, FfiType), String>>() {
-                        Ok(b) => *b,
-                        Err(_) => return VAL_NULL,
+        .func_wrap(
+            "env",
+            "ffi_result",
+            |mut caller: Caller<'_, ()>, task_id: i32| -> i64 {
+                let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                    return VAL_NULL;
+                };
+                let outcome = match super::boundary::take_ready(task_id) {
+                    Some(Ok(boxed)) => {
+                        match boxed.downcast::<Result<(fai_ffi::RawReturn, FfiType), String>>() {
+                            Ok(b) => *b,
+                            Err(_) => return VAL_NULL,
+                        }
                     }
+                    _ => return VAL_NULL,
+                };
+                match outcome {
+                    Ok((raw, ty)) => {
+                        let value = PTR_TRACKER.with(|t| {
+                            let mut tracker = t.borrow_mut();
+                            fai_ffi::convert_offload_return(raw, &ty, &mut tracker)
+                        });
+                        encode_return_for_guest(&value, &ty, &mut caller, &mem)
+                    }
+                    Err(_) => VAL_NULL,
                 }
-                _ => return VAL_NULL,
-            };
-            match outcome {
-                Ok((raw, ty)) => {
-                    let value = PTR_TRACKER.with(|t| {
-                        let mut tracker = t.borrow_mut();
-                        fai_ffi::convert_offload_return(raw, &ty, &mut tracker)
-                    });
-                    encode_return_for_guest(&value, &ty, &mut caller, &mem)
-                }
-                Err(_) => VAL_NULL,
-            }
-        })
+            },
+        )
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.float_to_str(value: f64, buf_ptr: i32) -> i32 (length)

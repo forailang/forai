@@ -259,10 +259,9 @@ pub const IMPORT_FLOAT_TO_STR: u32 = 15;
 /// Host-side helper that builds the `{status, body, contentType?, location?}`
 /// response dict on the guest heap and returns a NaN-boxed pointer.
 pub const IMPORT_HTTP_SERVER_RESPONSE: u32 = 16;
-/// `env.http_server_listen(port, handler_val) -> void`. Blocks forever
-/// on the host side running the HTTP accept loop; each request is
-/// dispatched back to `handler_val` (closure) via `__indirect_function_table`.
-pub const IMPORT_HTTP_SERVER_LISTEN: u32 = 17;
+/// Reserved import slot kept to preserve canonical import indices after
+/// removing the legacy single-handler HTTP listener.
+pub const IMPORT_RESERVED_17: u32 = 17;
 /// `env.get_location_path() -> i64` — returns window.location.pathname as NaN-boxed String.
 pub const IMPORT_GET_LOCATION_PATH: u32 = 18;
 /// `env.push_history_state(ptr, len) -> void` — calls history.pushState with path string.
@@ -741,6 +740,7 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     if std::env::var_os("FAI_MEM_WATCH").is_none() {
         avail[IMPORT_MEM_WATCH as usize] = false;
     }
+    avail[IMPORT_RESERVED_17 as usize] = false;
     // Ownership helper events are opt-in, matching the helper-call emission
     // gate. Default/native/browser builds keep their old import surface.
     if !ownership_check_enabled() {
@@ -754,7 +754,6 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             avail[IMPORT_SLEEP_MS as usize] = false;
             avail[IMPORT_RUN_ALL as usize] = false;
             avail[IMPORT_HTTP_SERVER_RESPONSE as usize] = false;
-            avail[IMPORT_HTTP_SERVER_LISTEN as usize] = false;
             avail[IMPORT_HTTP_SERVER_ROUTER as usize] = false;
             avail[IMPORT_HTTP_SERVER_ROUTER_GET as usize] = false;
             avail[IMPORT_HTTP_SERVER_ROUTER_POST as usize] = false;
@@ -3812,10 +3811,10 @@ fn emit_get_field(base: u32, ks: &KnownStrings) -> Function {
             emit_method_check(&mut f, base, ks.unix, 1, 2, METHOD_TIME_UNIX, 10);
             emit_method_check(&mut f, base, ks.random, 1, 2, METHOD_RANDOM, 10);
             emit_method_check(&mut f, base, ks.sleep, 1, 2, METHOD_SLEEP, 10);
-            // std.http.server methods. `listen` blocks forever via
-            // IMPORT_HTTP_SERVER_LISTEN; `text`/`html`/`json`/`ok`/`redirect`
-            // all build response dicts via IMPORT_HTTP_SERVER_RESPONSE with
-            // different `kind` discriminants (see RESPONSE_KIND_*).
+            // std.http.server methods. `listen` uses the router accept loop;
+            // `text`/`html`/`json`/`ok`/`redirect` all build response dicts
+            // via IMPORT_HTTP_SERVER_RESPONSE with different `kind`
+            // discriminants (see RESPONSE_KIND_*).
             emit_method_check(&mut f, base, ks.listen, 1, 2, METHOD_SERVER_LISTEN, 10);
             emit_method_check(&mut f, base, ks.text, 1, 2, METHOD_SERVER_TEXT, 10);
             emit_method_check(&mut f, base, ks.html, 1, 2, METHOD_SERVER_HTML, 10);
@@ -8610,12 +8609,9 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             vec![ValType::I64],
         ),
-        // IMPORT_HTTP_SERVER_LISTEN: (port, handler_val) -> void (blocks forever)
-        (
-            "http_server_listen",
-            vec![ValType::I32, ValType::I64],
-            vec![],
-        ),
+        // IMPORT_RESERVED_17: removed legacy HTTP listener slot. It is always
+        // marked unavailable, so compiled modules never declare it.
+        ("reserved_17", vec![], vec![]),
         // IMPORT_GET_LOCATION_PATH: () -> i64 (NaN-boxed String with window.location.pathname)
         ("get_location_path", vec![], vec![ValType::I64]),
         // IMPORT_PUSH_HISTORY_STATE: (path_ptr: i32, path_len: i32) -> void

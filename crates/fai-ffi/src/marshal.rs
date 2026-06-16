@@ -213,10 +213,11 @@ pub unsafe fn raw_word_call(
             5 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize, usize)>(
                 fn_ptr,
             ))(w[0], w[1], w[2], w[3], w[4]),
-            6 => (std::mem::transmute::<
-                _,
-                extern "C" fn(usize, usize, usize, usize, usize, usize),
-            >(fn_ptr))(w[0], w[1], w[2], w[3], w[4], w[5]),
+            6 => {
+                (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize, usize, usize)>(
+                    fn_ptr,
+                ))(w[0], w[1], w[2], w[3], w[4], w[5])
+            }
             7 => (std::mem::transmute::<
                 _,
                 extern "C" fn(usize, usize, usize, usize, usize, usize, usize),
@@ -236,9 +237,11 @@ pub unsafe fn raw_word_call(
         3 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize) -> usize>(fn_ptr))(
             w[0], w[1], w[2],
         ),
-        4 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize) -> usize>(
-            fn_ptr,
-        ))(w[0], w[1], w[2], w[3]),
+        4 => {
+            (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize) -> usize>(fn_ptr))(
+                w[0], w[1], w[2], w[3],
+            )
+        }
         5 => (std::mem::transmute::<_, extern "C" fn(usize, usize, usize, usize, usize) -> usize>(
             fn_ptr,
         ))(w[0], w[1], w[2], w[3], w[4]),

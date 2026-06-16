@@ -1,11 +1,10 @@
-//! HTTP server host imports: `http_server_response`, `http_server_listen`.
+//! HTTP server host imports for typed responses and the router listener.
 //!
 //! Mirrors the VM behaviour in `fai-runtime/src/vm.rs` (see
 //! `drain_pending_bindings`, `run_event_loop`, `parse_http_request`,
 //! `write_http_response`, `is_options_request`). The wasm path differs
 //! from the VM in that the accept loop runs entirely inside the host
-//! import — there's no scheduler — and the handler is called back into
-//! wasm via `__indirect_function_table`.
+//! import, while async route handlers are driven by the guest scheduler.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -17,7 +16,8 @@ use super::super::output;
 
 use super::super::heap::{decode_closure_header, host_retain_value, reserve, wasm_alloc_str};
 use super::super::nan_box::{
-    encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_INT, VAL_NULL,
+    encode_object, ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, QNAN, SIGN_BIT, TAG_BOOL, TAG_INT,
+    TAG_MASK, VAL_NULL, VAL_VOID,
 };
 
 // Must stay in sync with fai-codegen-wasm/src/runtime.rs
@@ -80,59 +80,6 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     }
                 };
                 build_response_dict(&mut caller, &mem, kind, status, &body)
-            },
-        )
-        .map_err(|e| format!("linker error: {}", e))?;
-
-    // env.http_server_listen(port, handler_val) -> void (blocks forever)
-    linker
-        .func_wrap(
-            "env",
-            "http_server_listen",
-            |mut caller: Caller<'_, ()>, port: i32, handler_val: i64| {
-                let addr = format!("127.0.0.1:{}", port as u16);
-                let listener = match TcpListener::bind(&addr) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        output::stderr_line(&format!("error: could not listen on port {}: {}", port, e));
-                        return;
-                    }
-                };
-                for conn in listener.incoming() {
-                    let stream = match conn {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    if is_options_request(&stream) {
-                        write_cors_preflight(stream);
-                        continue;
-                    }
-                    // Build the request dict on the guest heap.
-                    let request_val = {
-                        let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                        parse_http_request_into_guest(&mut caller, &mem, &stream)
-                    };
-                    // Call handler via indirect function table.
-                    match invoke_handler(&mut caller, handler_val, request_val) {
-                        Some(response_val) => {
-                            write_http_response(&mut caller, stream, response_val);
-                            // Reclaim the per-request graph (plan 116):
-                            // request + response are host-owned sole refs.
-                            host_release_value(&mut caller, response_val);
-                        }
-                        None => {
-                            let body = "Handler error";
-                            let resp = format!(
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            let _ = (&stream).write_all(resp.as_bytes());
-                        }
-                    }
-                    host_release_value(&mut caller, request_val);
-                }
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -292,6 +239,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     .ok()
                     .and_then(|v| v.parse().ok());
                 let mut accepted: u64 = 0;
+                let mut pending_connections: Vec<TcpStream> = Vec::new();
                 let mut pending: Vec<PendingRequest> = Vec::new();
                 let _ = listener.set_nonblocking(true);
                 loop {
@@ -302,7 +250,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         loop {
                             match listener.accept() {
                                 Ok((stream, _)) => {
-                                    accept_connection(&mut caller, id as u32, stream, &mut pending);
+                                    pending_connections.push(stream);
                                     accepted += 1;
                                 }
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -310,20 +258,29 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             }
                         }
                     }
+                    process_ready_connections(
+                        &mut caller,
+                        id as u32,
+                        &mut pending_connections,
+                        &mut pending,
+                    );
 
                     // 2. Request cap reached and all in-flight work drained →
                     // exit the server loop so the program can terminate.
-                    if !accepting && pending.is_empty() {
+                    if !accepting && pending_connections.is_empty() && pending.is_empty() {
                         break;
                     }
 
                     // 3. Idle but still accepting: block for the next connection
                     // rather than spinning, then loop back to the drain.
-                    if pending.is_empty() {
+                    if pending_connections.is_empty()
+                        && pending.is_empty()
+                        && guest_live_count(&mut caller) <= 1
+                    {
                         let _ = listener.set_nonblocking(false);
                         if let Ok((stream, _)) = listener.accept() {
                             let _ = listener.set_nonblocking(true);
-                            accept_connection(&mut caller, id as u32, stream, &mut pending);
+                            pending_connections.push(stream);
                             accepted += 1;
                         } else {
                             let _ = listener.set_nonblocking(true);
@@ -334,7 +291,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // 4. Advance in-flight handler tasks: run ready ones, resume
                     // any whose offloaded boundary work finished (outbound RPC,
                     // etc.), then write responses for tasks that completed.
-                    guest_poll(&mut caller);
+                    let _ = guest_poll(&mut caller);
                     for task_id in super::boundary::pump_ready() {
                         guest_resume_task(&mut caller, task_id);
                     }
@@ -344,6 +301,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // boundary job), poll again shortly without a hot spin.
                     if !pending.is_empty() {
                         std::thread::sleep(Duration::from_millis(1));
+                    } else if !pending_connections.is_empty() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    } else if guest_live_count(&mut caller) > 1 {
+                        std::thread::sleep(Duration::from_millis(25));
                     }
                 }
             },
@@ -361,9 +322,56 @@ struct PendingRequest {
     task_id: i32,
 }
 
+enum ConnectionReadiness {
+    Ready,
+    Pending,
+    Closed,
+}
+
 // Task status words — mirror fai_codegen_wasm::async_engine ST_* (stable ABI).
 const ST_COMPLETE: i32 = 3;
 const ST_FAILED: i32 = 4;
+
+/// Move accepted sockets into request handling only after the client has sent
+/// at least one byte. Browsers may open speculative/preconnect sockets and keep
+/// them idle; blocking on those sockets would stall later real requests on this
+/// single runtime thread.
+fn process_ready_connections(
+    caller: &mut Caller<'_, ()>,
+    router_id: u32,
+    pending_connections: &mut Vec<TcpStream>,
+    pending: &mut Vec<PendingRequest>,
+) {
+    let mut i = 0;
+    while i < pending_connections.len() {
+        match connection_readiness(&pending_connections[i]) {
+            ConnectionReadiness::Ready => {
+                let stream = pending_connections.swap_remove(i);
+                accept_connection(caller, router_id, stream, pending);
+            }
+            ConnectionReadiness::Pending => {
+                i += 1;
+            }
+            ConnectionReadiness::Closed => {
+                let _ = pending_connections.swap_remove(i);
+            }
+        }
+    }
+}
+
+fn connection_readiness(stream: &TcpStream) -> ConnectionReadiness {
+    let _ = stream.set_nonblocking(true);
+    let mut buf = [0u8; 1];
+    match stream.peek(&mut buf) {
+        Ok(0) => ConnectionReadiness::Closed,
+        Ok(_) => {
+            let _ = stream.set_nonblocking(false);
+            ConnectionReadiness::Ready
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => ConnectionReadiness::Pending,
+        Err(_) => ConnectionReadiness::Closed,
+    }
+}
 
 /// Accept one connection. OPTIONS preflight and static files are served inline.
 /// Otherwise the request is parsed; an async handler is spawned as a scheduler
@@ -428,7 +436,25 @@ fn finish_completed(caller: &mut Caller<'_, ()>, pending: &mut Vec<PendingReques
             let p = pending.swap_remove(i);
             let response = if status == ST_FAILED {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                build_response_dict(caller, &mem, KIND_TEXT, 500, "Handler error")
+                let error_val = guest_task_result(caller, p.task_id);
+                let error = describe_guest_error(caller, &mem, error_val);
+                let (method, path) = request_method_path(caller, &mem, p.request_val);
+                output::stderr_line(&format!(
+                    "[router] handler error for {} {}: {}",
+                    method, path, error
+                ));
+                let err_payload = build_http_error(caller, p.request_val, &error);
+                super::events::dispatch_event(caller, "http:error", err_payload);
+                host_release_value(caller, err_payload);
+                let response = build_response_dict(
+                    caller,
+                    &mem,
+                    KIND_TEXT,
+                    500,
+                    &format!("Handler error: {}", error),
+                );
+                host_release_value(caller, error_val);
+                response
             } else {
                 guest_task_result(caller, p.task_id)
             };
@@ -523,11 +549,73 @@ fn handler_is_async(caller: &mut Caller<'_, ()>, handler_val: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// Run one scheduler poll cycle (advances every READY task once).
-fn guest_poll(caller: &mut Caller<'_, ()>) {
-    if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
-        let _ = f.call(&mut *caller, &[], &mut [Val::I32(0)]);
+fn request_method_path(
+    caller: &mut Caller<'_, ()>,
+    mem: &Memory,
+    request_val: i64,
+) -> (String, String) {
+    let v = request_val as u64;
+    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return ("?".into(), "?".into());
     }
+    let addr = (v & ADDR_MASK) as usize;
+    (
+        read_dict_string(mem, caller, addr, "method").unwrap_or_else(|| "?".into()),
+        read_dict_string(mem, caller, addr, "path").unwrap_or_else(|| "?".into()),
+    )
+}
+
+fn describe_guest_error(caller: &mut Caller<'_, ()>, mem: &Memory, val: i64) -> String {
+    if let Some(message) = read_string_value(mem, caller, val) {
+        return message;
+    }
+
+    let v = val as u64;
+    if (v & (QNAN | SIGN_BIT | TAG_MASK)) == (QNAN | TAG_INT) {
+        return (v as i32).to_string();
+    }
+    if (v & (QNAN | SIGN_BIT | TAG_MASK)) == (QNAN | TAG_BOOL) {
+        return if (v & 1) == 1 { "true" } else { "false" }.into();
+    }
+    if v == VAL_NULL as u64 {
+        return "null".into();
+    }
+    if v == VAL_VOID as u64 {
+        return "void".into();
+    }
+    if (v & (QNAN | SIGN_BIT)) == (QNAN | SIGN_BIT) {
+        let addr = (v & ADDR_MASK) as usize;
+        if let Some(message) = read_dict_string(mem, caller, addr, "message") {
+            return message;
+        }
+    }
+    format!("0x{v:016x}")
+}
+
+/// Run one scheduler poll cycle (advances every READY task once).
+fn guest_poll(caller: &mut Caller<'_, ()>) -> i32 {
+    if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
+        let mut out = [Val::I32(0)];
+        if f.call(&mut *caller, &[], &mut out).is_ok() {
+            if let Val::I32(v) = out[0] {
+                return v;
+            }
+        }
+    }
+    0
+}
+
+/// Number of live guest scheduler tasks. While inside `server.listen`, the root
+/// task itself is live, so values above one mean detached/background work exists.
+fn guest_live_count(caller: &mut Caller<'_, ()>) -> i32 {
+    caller
+        .get_export("__dbg_live")
+        .and_then(|e| e.into_global())
+        .and_then(|g| match g.get(&mut *caller) {
+            Val::I32(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Mark a parked task READY (e.g. after its boundary job finished) so the next
@@ -1494,41 +1582,6 @@ fn invoke_handler_with_err(
     match results[0] {
         Val::I64(v) => Ok(v),
         _ => Err("unexpected result type".to_string()),
-    }
-}
-
-/// Invoke a handler closure with one argument (the request Dict value).
-fn invoke_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) -> Option<i64> {
-    let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-    let v = handler_val as u64;
-    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
-        return None;
-    }
-    let addr = (v & ADDR_MASK) as usize;
-    let header = {
-        let data = mem.data(&*caller);
-        decode_closure_header(data, addr)?
-    };
-
-    // Set __env_ptr so the closure can access upvalues.
-    if let Some(env_global) = caller.get_export("__env_ptr") {
-        if let Some(g) = env_global.into_global() {
-            let _ = g.set(&mut *caller, Val::I32(header.env_addr));
-        }
-    }
-
-    let table = caller
-        .get_export("__indirect_function_table")?
-        .into_table()?;
-    let func_ref = table.get(&mut *caller, header.table_idx as u64)?;
-    let func = func_ref.unwrap_func()?.clone();
-    let mut results = vec![Val::I64(0)];
-    match func.call(&mut *caller, &[Val::I64(arg)], &mut results) {
-        Ok(()) => match results[0] {
-            Val::I64(v) => Some(v),
-            _ => None,
-        },
-        Err(_) => None,
     }
 }
 

@@ -139,11 +139,7 @@ impl Boundary {
         if !q.is_empty() {
             return true;
         }
-        let (q, _timed_out) = self
-            .completions
-            .ready
-            .wait_timeout(q, timeout)
-            .unwrap();
+        let (q, _timed_out) = self.completions.ready.wait_timeout(q, timeout).unwrap();
         !q.is_empty()
     }
 
@@ -332,7 +328,10 @@ mod tests {
             });
         }
         drain_until(&b, 12, |c| c.len() == 12);
-        assert!(peak.load(Ordering::SeqCst) <= POOL, "peak exceeded pool size");
+        assert!(
+            peak.load(Ordering::SeqCst) <= POOL,
+            "peak exceeded pool size"
+        );
     }
 
     #[test]

@@ -110,10 +110,11 @@ impl Drop for ServerProc {
 /// server with that dir on `LD_LIBRARY_PATH` so `extern ffistub` resolves.
 fn boot_server() -> ServerProc {
     let port = free_port();
-    let dir = workspace_root()
-        .join("target")
-        .join("tmp")
-        .join(format!("ffi_ptr_{}_{}", std::process::id(), port));
+    let dir = workspace_root().join("target").join("tmp").join(format!(
+        "ffi_ptr_{}_{}",
+        std::process::id(),
+        port
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let c_src = dir.join("stub.c");
     std::fs::write(&c_src, STUB_C).unwrap();
@@ -168,7 +169,9 @@ fn get(port: u16, path: &str) -> String {
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .unwrap();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).unwrap();

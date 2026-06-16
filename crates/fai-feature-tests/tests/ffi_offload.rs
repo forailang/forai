@@ -64,10 +64,11 @@ impl Drop for ServerProc {
 }
 
 fn boot_server(port: u16) -> ServerProc {
-    let dir = workspace_root()
-        .join("target")
-        .join("tmp")
-        .join(format!("ffi_offload_{}_{}", std::process::id(), port));
+    let dir = workspace_root().join("target").join("tmp").join(format!(
+        "ffi_offload_{}_{}",
+        std::process::id(),
+        port
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("server.fai");
     std::fs::write(&src, server_source(port)).unwrap();
@@ -118,7 +119,10 @@ fn single_ffi_handler_responds() {
     let port = free_port();
     let server = boot_server(port);
     let resp = get(server.port);
-    assert!(resp.contains("200") && resp.contains("slept"), "got:\n{resp}");
+    assert!(
+        resp.contains("200") && resp.contains("slept"),
+        "got:\n{resp}"
+    );
 }
 
 #[test]

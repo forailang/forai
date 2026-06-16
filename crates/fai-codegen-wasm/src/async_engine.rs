@@ -399,8 +399,8 @@ fn emit_sleep(l: &SchedLayout) -> Function {
 }
 
 fn emit_notify_waiter(l: &SchedLayout) -> Function {
-    // param: id = 0; locals: w = 1, jr = 2
-    let mut f = Function::new([(2, ValType::I32)]);
+    // param: id = 0; locals: w = 1, jr = 2, waiter_status = 3
+    let mut f = Function::new([(3, ValType::I32)]);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I32Load(ma(O_WAITER)));
     f.instruction(&Instruction::LocalSet(1));
@@ -434,6 +434,9 @@ fn emit_notify_waiter(l: &SchedLayout) -> Function {
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::I32Load(ma(O_JOIN)));
     f.instruction(&Instruction::LocalSet(2));
+    rec_addr_local(&mut f, l, 1);
+    f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    f.instruction(&Instruction::LocalSet(3));
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::I32GtS);
@@ -445,15 +448,19 @@ fn emit_notify_waiter(l: &SchedLayout) -> Function {
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Store(ma(O_JOIN)));
-    f.instruction(&Instruction::End);
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Const(ST_WAITING));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::I32And);
     f.instruction(&Instruction::If(BlockType::Empty));
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::I32Const(ST_READY));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::Call(l.ready_push));
+    f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
@@ -1335,6 +1342,17 @@ mod tests {
         f
     }
 
+    fn body_child_const_then_stale_notify(l: &SchedLayout, value: i64) -> Function {
+        let mut f = Function::new([]);
+        emit_complete_current_with(&mut f, l, |f| {
+            f.instruction(&Instruction::I64Const(value));
+        });
+        f.instruction(&Instruction::GlobalGet(l.g_current));
+        f.instruction(&Instruction::Call(l.notify));
+        f.instruction(&Instruction::End);
+        f
+    }
+
     #[test]
     fn parent_awaits_child_and_reads_its_result() {
         CLOCK_MS.with(|c| c.set(0.0));
@@ -1355,6 +1373,27 @@ mod tests {
         // poll; parent resumes and completes with the child's result.
         assert_eq!(start.call(&mut store, ()).unwrap(), 2);
         assert_eq!(result.call(&mut store, 0).unwrap(), 99);
+    }
+
+    #[test]
+    fn stale_child_notification_does_not_reenqueue_ready_parent() {
+        CLOCK_MS.with(|c| c.set(0.0));
+        let (_, layout) = test_module(vec![Function::new([]), Function::new([])]);
+        let wasm = test_module(vec![
+            body_await_child(&layout),
+            body_child_const_then_stale_notify(&layout, 101),
+        ])
+        .0;
+        let (mut store, inst) = instantiate(&wasm);
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .unwrap();
+        let result = inst
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .unwrap();
+
+        assert_eq!(start.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(result.call(&mut store, 0).unwrap(), 101);
     }
 
     #[test]

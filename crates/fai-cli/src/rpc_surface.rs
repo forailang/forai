@@ -49,6 +49,7 @@ impl RpcSurface {
                     .iter()
                     .map(|p| p.name.clone())
                     .collect(),
+                returns_void: returns_void_compiler(&f.declaration),
             })
             .collect()
     }
@@ -158,6 +159,13 @@ fn should_expose_function(fd: &FunctionDeclaration) -> bool {
 
 fn should_expose_type(td: &TypeDeclaration) -> bool {
     td.is_remote && !td.is_private.unwrap_or(false)
+}
+
+fn returns_void_compiler(fd: &FunctionDeclaration) -> bool {
+    fd.return_types.len() == 1
+        && fd.return_types[0].type_node.name.as_deref() == Some("Void")
+        && !fd.return_types[0].type_node.is_array
+        && !fd.return_types[0].type_node.is_optional
 }
 
 fn rpc_key(module: Option<&str>, name: &str) -> String {
