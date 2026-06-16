@@ -47,10 +47,15 @@ fn project_main(port: u16) -> String {
          def main\n\
          \x20   @return Void\n\
          do\n\
+         \x20 let shared = open(':memory:')\n\
          \x20 let router = server.router()\n\
          \x20 server.get(router, '/q') do with req HttpRequest\n\
          \x20   let db = open(':memory:')\n\
          \x20   let rows = query(db, '{q}')\n\
+         \x20   server.text(200, toString(getInt(rows[0], 'n')!))\n\
+         \x20 end\n\
+         \x20 server.get(router, '/shared') do with req HttpRequest\n\
+         \x20   let rows = query(shared, '{q}')\n\
          \x20   server.text(200, toString(getInt(rows[0], 'n')!))\n\
          \x20 end\n\
          \x20 server.listen(router, {port})\n\
@@ -145,6 +150,43 @@ fn sqlite_query_in_handler_is_correct() {
     assert!(resp.contains("200"), "got:\n{resp}");
     // count(*) over the recursive CTE = 2_000_000.
     assert!(resp.contains("2000000"), "expected count 2000000, got:\n{resp}");
+}
+
+fn get_path(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+#[test]
+fn concurrent_queries_on_shared_connection_stay_correct() {
+    // Two concurrent requests hit ONE connection (opened in main, captured by
+    // the handler). forsqlite's per-connection lock (acquire_conn/release_conn)
+    // must serialize the offloaded steps so neither query corrupts the other —
+    // both still return the right count, and the server doesn't deadlock.
+    let Some(forsqlite) = forsqlite_dir() else {
+        eprintln!("skipping: forsqlite checkout not found");
+        return;
+    };
+    let server = boot_server(&forsqlite);
+    let p = server.port;
+    let handles: Vec<_> = (0..2)
+        .map(|_| thread::spawn(move || get_path(p, "/shared")))
+        .collect();
+    for h in handles {
+        let resp = h.join().unwrap();
+        assert!(
+            resp.contains("200") && resp.contains("2000000"),
+            "shared-connection query wrong/corrupted:\n{resp}"
+        );
+    }
 }
 
 #[test]
