@@ -19,12 +19,14 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fai_feature_tests::{fai_binary, workspace_root};
 
 const SLOW_MS: u64 = 500;
+static PORT_ALLOCATION: Mutex<()> = Mutex::new(());
 
 fn server_source(port: u16) -> String {
     format!(
@@ -316,9 +318,14 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn port_allocation_guard() -> MutexGuard<'static, ()> {
+    PORT_ALLOCATION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Write the server source to a unique temp dir, spawn `fai run`, and wait
 /// until it accepts connections. Panics with captured output on failure.
 fn boot_server() -> ServerProc {
+    let _port_guard = port_allocation_guard();
     let port = free_port();
     let dir = workspace_root().join("target").join("tmp").join(format!(
         "http_concurrency_{}_{}",
@@ -418,6 +425,7 @@ fn concurrent_gets(port: u16, path: &str, n: usize) -> (Duration, Vec<String>) {
 /// Run a finite server, issue one request, then return the response plus
 /// captured stderr after the server exits.
 fn one_request_with_stderr(path: &str) -> (String, String) {
+    let _port_guard = port_allocation_guard();
     let port = free_port();
     let dir = workspace_root().join("target").join("tmp").join(format!(
         "http_one_request_{}_{}",
@@ -689,6 +697,7 @@ fn sequential_soak_reuses_task_slots() {
 /// exactly that many at `/quick`, and return the live-object count the leak
 /// ledger reports at exit. Panics if the server doesn't exit or print a report.
 fn live_objects_after(max: usize, path: &str) -> u64 {
+    let _port_guard = port_allocation_guard();
     let port = free_port();
     let dir = workspace_root().join("target").join("tmp").join(format!(
         "http_leak_{}_{}",

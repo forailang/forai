@@ -1818,7 +1818,7 @@ mod tests {
         // ownership conventions; plan 101 adds ffi_result. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 98, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 100, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

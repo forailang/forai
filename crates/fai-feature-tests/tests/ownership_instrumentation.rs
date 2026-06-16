@@ -65,7 +65,7 @@ fn write_probe_source(name: &str, source: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn seeded_suppressed_retain_fails_ownership_check_with_site_history() {
+fn seeded_suppressed_retain_fails_ownership_check_with_grouped_site() {
     let (dir, path) = write_probe("suppressed-retain");
     let out = Command::new(fai_binary())
         .arg("test")
@@ -88,8 +88,8 @@ fn seeded_suppressed_retain_fails_ownership_check_with_site_history() {
         output
     );
     assert!(
-        output.contains("direct:cleanup:cleanup owned value") && output.contains("history:"),
-        "report should include resolved site labels and history:\n{}",
+        output.contains("direct:cleanup:cleanup owned value") && output.contains("groups:"),
+        "report should include grouped resolved site labels:\n{}",
         output
     );
 
