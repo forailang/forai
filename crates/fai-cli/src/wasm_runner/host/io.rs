@@ -504,12 +504,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "env",
             "__fai_rc_watch",
             |mut caller: Caller<'_, ()>, obj_addr: i32, rc_slot: i32, delta: i32| {
-                let want = match std::env::var("FAI_RC_WATCH")
-                    .ok()
-                    .and_then(|s| {
-                        let t = s.trim().trim_start_matches("0x");
-                        u32::from_str_radix(t, 16).ok()
-                    }) {
+                let want = match std::env::var("FAI_RC_WATCH").ok().and_then(|s| {
+                    let t = s.trim().trim_start_matches("0x");
+                    u32::from_str_radix(t, 16).ok()
+                }) {
                     Some(w) => w,
                     None => return,
                 };
@@ -622,6 +620,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "__fai_alloc_event",
             |mut caller: Caller<'_, ()>, addr: i32, size: i32| {
                 use super::super::leak_ledger;
+                super::super::ownership_balance::record_alloc(addr as u32);
                 if !leak_ledger::is_enabled() {
                     return;
                 }
@@ -653,9 +652,23 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "__fai_free_event",
             |_caller: Caller<'_, ()>, addr: i32, size: i32| {
                 use super::super::leak_ledger;
+                super::super::ownership_balance::record_free(addr as u32);
                 if leak_ledger::is_enabled() {
                     leak_ledger::record_free(addr as u32, size as u32);
                 }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // __fai_ownership_event(op, site, value, aux) — phase-4 helper event
+    // stream. Opt-in ownership-check runs record the tuple in the native
+    // ownership ledger; default builds do not import this function.
+    linker
+        .func_wrap(
+            "env",
+            "__fai_ownership_event",
+            |_caller: Caller<'_, ()>, op: i32, site: i32, value: i64, aux: i32| {
+                super::super::ownership_balance::record_event(op, site, value, aux);
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -898,7 +911,10 @@ fn describe_boxed_value(data: &[u8], v: u64) -> String {
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .unwrap_or_default();
             let ellipsis = if len > preview_len { "…" } else { "" };
-            format!("String \"{}{}\" ({} bytes{})", preview, ellipsis, len, rc_suffix)
+            format!(
+                "String \"{}{}\" ({} bytes{})",
+                preview, ellipsis, len, rc_suffix
+            )
         }
         1 => format!("Array({} items{})", count, rc_suffix),
         2 => format!("Tuple({} items{})", count, rc_suffix),
@@ -919,7 +935,11 @@ fn describe_boxed_value(data: &[u8], v: u64) -> String {
                     parts.push(format!("{}: {}", k, v));
                 }
             }
-            let ellipsis = if count.max(0) as usize > shown { ", …" } else { "" };
+            let ellipsis = if count.max(0) as usize > shown {
+                ", …"
+            } else {
+                ""
+            };
             format!(
                 "Dict({} entries{}) {{{}{}}}",
                 count,

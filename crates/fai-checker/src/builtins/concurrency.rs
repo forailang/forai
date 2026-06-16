@@ -37,7 +37,10 @@ mod tests {
         // `wait` was removed in favour of `sleep`; calls auto-await by
         // default so there is no await-like `wait` keyword.
         let b = fresh();
-        assert!(!b.contains_key("wait"), "wait should no longer be a builtin");
+        assert!(
+            !b.contains_key("wait"),
+            "wait should no longer be a builtin"
+        );
     }
 
     #[test]

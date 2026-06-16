@@ -55,7 +55,11 @@ pub(super) fn format_return_value(
                     }
                     let len = read_i32(saddr + 4).unwrap_or(0) as usize;
                     let bytes = data.get(saddr + 8..saddr + 8 + len)?;
-                    Some(std::str::from_utf8(bytes).unwrap_or("<invalid utf8>").to_string())
+                    Some(
+                        std::str::from_utf8(bytes)
+                            .unwrap_or("<invalid utf8>")
+                            .to_string(),
+                    )
                 };
                 match read_i32(addr) {
                     Some(OBJ_TAG_STRING) => {

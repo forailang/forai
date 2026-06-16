@@ -18,6 +18,12 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     );
     ins(
         b,
+        "cryptoHmacSha1Base64",
+        &[p("key", Type::String), p("message", Type::String)],
+        &[Type::String],
+    );
+    ins(
+        b,
         "cryptoSha256Hex",
         &[p("data", Type::String)],
         &[Type::String],
@@ -64,6 +70,7 @@ mod tests {
         for name in &[
             "cryptoAvailable",
             "cryptoHmacSha256Hex",
+            "cryptoHmacSha1Base64",
             "cryptoSha256Hex",
             "cryptoHexEncode",
             "cryptoConstantTimeEquals",
@@ -89,12 +96,14 @@ mod tests {
     #[test]
     fn test_hmac_takes_two_strings_returns_string() {
         let b = fresh();
-        match b.get("cryptoHmacSha256Hex").unwrap() {
-            Type::Function(sig) => {
-                assert_eq!(sig.params.len(), 2);
-                assert!(matches!(sig.returns[0], Type::String));
+        for name in &["cryptoHmacSha256Hex", "cryptoHmacSha1Base64"] {
+            match b.get(*name).unwrap() {
+                Type::Function(sig) => {
+                    assert_eq!(sig.params.len(), 2);
+                    assert!(matches!(sig.returns[0], Type::String));
+                }
+                _ => panic!("expected Function"),
             }
-            _ => panic!("expected Function"),
         }
     }
 

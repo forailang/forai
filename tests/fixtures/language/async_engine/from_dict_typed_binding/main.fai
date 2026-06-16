@@ -1,0 +1,33 @@
+# expect: ok
+# stdout:
+#   42
+#   borrowed
+# `let p Type = from_dict(d)` must lower inside an async function, not only on
+# the sync path. `sleep` colors `main` async, so the binding flows through the
+# resume-fn segment compiler — which previously dropped the LHS type annotation
+# and reported `UnknownIdentifier("from_dict")` (plan 101 dogfood: brain's
+# `http:beforeRequest` listener does `from_dict(e.data)` after FFI
+# async-coloring). Both an owned source temp and a borrowed binding are
+# exercised so the source-release path is covered.
+
+type Point
+    x Int
+    label String
+end
+
+def main
+    @return Void
+do
+    sleep(1)
+    let owned Point = from_dict({
+        x: 42
+        label: 'owned'
+    })
+    print(owned.x)
+    let d = {
+        x: 7
+        label: 'borrowed'
+    }
+    let borrowed Point = from_dict(d)
+    print(borrowed.label)
+end

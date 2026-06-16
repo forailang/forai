@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase4
+# leak: flat
 #
 # The map RESULT is handled correctly (bound, then released at scope
 # exit) — what leaks are the call's owned BOXED ARG TEMPS: the input

@@ -1,6 +1,6 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase6
+# leak: flat
 
 use std.array
 

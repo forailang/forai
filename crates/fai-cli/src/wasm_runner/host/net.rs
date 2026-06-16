@@ -651,14 +651,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let (url, fn_name, args_json, hash) = {
                     let data = mem.data(&caller);
                     (
-                        String::from_utf8_lossy(&data[url_ptr as usize..(url_ptr + url_len) as usize])
-                            .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[url_ptr as usize..(url_ptr + url_len) as usize],
+                        )
+                        .into_owned(),
                         String::from_utf8_lossy(&data[fn_ptr as usize..(fn_ptr + fn_len) as usize])
                             .into_owned(),
-                        String::from_utf8_lossy(&data[args_ptr as usize..(args_ptr + args_len) as usize])
-                            .into_owned(),
-                        String::from_utf8_lossy(&data[hash_ptr as usize..(hash_ptr + hash_len) as usize])
-                            .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[args_ptr as usize..(args_ptr + args_len) as usize],
+                        )
+                        .into_owned(),
+                        String::from_utf8_lossy(
+                            &data[hash_ptr as usize..(hash_ptr + hash_len) as usize],
+                        )
+                        .into_owned(),
                     )
                 };
                 // Offload the blocking request to the boundary worker pool and

@@ -1,10 +1,9 @@
 # expect: ok
 # stdout: ok
-# leak: expected phase6
+# leak: flat
 #
-# events.on retains the handler closure host-side; events.off removes
-# the subscription WITHOUT releasing it (host/events.rs unregister) —
-# the closure and its captures stay live forever.
+# events.on retains the handler closure host-side; events.off releases
+# that retained host credit when it removes the subscription.
 
 use std.events
 

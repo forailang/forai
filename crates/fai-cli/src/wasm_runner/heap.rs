@@ -59,10 +59,10 @@ pub(crate) fn reserve(caller: &mut Caller<'_, ()>, mem: &Memory, logical_size: u
     ensure_heap_capacity(caller, mem, real_end);
     let data = mem.data_mut(&mut *caller);
     data[base as usize..base as usize + 4].copy_from_slice(&1i32.to_le_bytes()); // rc = 1
-    // Logical alloc size in the spare prefix word (obj_addr-4), matching the
-    // guest `rt_alloc`: `rt_release` reads it to free the block at its true size
-    // (dicts over-allocate spare capacity, so a count-derived size is wrong;
-    // plan 115).
+                                                                                 // Logical alloc size in the spare prefix word (obj_addr-4), matching the
+                                                                                 // guest `rt_alloc`: `rt_release` reads it to free the block at its true size
+                                                                                 // (dicts over-allocate spare capacity, so a count-derived size is wrong;
+                                                                                 // plan 115).
     data[base as usize + 4..base as usize + 8]
         .copy_from_slice(&(logical_size as i32).to_le_bytes());
     let logical = base + 8;
@@ -82,6 +82,7 @@ pub(crate) fn reserve(caller: &mut Caller<'_, ()>, mem: &Memory, logical_size: u
             }
         }
     }
+    super::ownership_balance::record_alloc(logical);
     logical
 }
 
@@ -106,6 +107,27 @@ pub(crate) fn host_release_value(caller: &mut Caller<'_, ()>, val: i64) {
         None => crate::wasm_runner::output::stderr_line(
             "[host-release] __fai_release export missing — host-built objects will leak",
         ),
+    }
+}
+
+/// Retain a guest value the host is about to store beyond the current import.
+/// This is the native-host counterpart of an ABI `RetainedByCallee` argument.
+pub(crate) fn host_retain_value(caller: &mut Caller<'_, ()>, val: i64) {
+    match caller.get_export("memory").and_then(|e| e.into_memory()) {
+        Some(mem) => host_retain(mem.data_mut(&mut *caller), val),
+        None => crate::wasm_runner::output::stderr_line(
+            "[host-retain] memory export missing — retained host state may dangle",
+        ),
+    }
+}
+
+/// Release every guest handle retained by a host registry collection.
+pub(crate) fn host_release_values(
+    caller: &mut Caller<'_, ()>,
+    vals: impl IntoIterator<Item = i64>,
+) {
+    for val in vals {
+        host_release_value(caller, val);
     }
 }
 

@@ -1,0 +1,34 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: Events flat
+#   ownership: balanced
+# leak: flat
+#
+# Browser event registries mirror native host ownership: subscriptions
+# retain handler closures while stored, then release on off/clear/once
+# removal. Deferred queue payloads release on clearAll.
+
+use std.browser
+
+use std.events
+
+def main
+    @return Void
+do
+    let offSub = events.on('drop-one') do with e Event
+        print('never-off')
+    end
+    events.off(offSub)
+    events.on('drop-name') do with e Event
+        print('never-clear')
+    end
+    events.clear('drop-name')
+    events.once('once') do with e Event
+        print('once')
+    end
+    events.emit('once', 'payload')
+    events.emitDeferred('queued', 'payload')
+    events.clearAll()
+    browser.setHtml('<main><h1 class="message">Events flat</h1></main>')
+end

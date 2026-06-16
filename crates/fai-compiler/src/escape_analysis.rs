@@ -249,7 +249,10 @@ fn expr_escapes_var(expr: &Expression, var: &str, ctx: &Ctx) -> bool {
             // Nested escapes in the callee or args (e.g. `g(h(x))`, or a closure
             // arg that references var — closures stay conservative).
             expr_escapes_var(&call.callee, var, ctx)
-                || call.args.iter().any(|a| expr_escapes_var(&a.value, var, ctx))
+                || call
+                    .args
+                    .iter()
+                    .any(|a| expr_escapes_var(&a.value, var, ctx))
         }
         Expression::BinaryExpression(be) => {
             expr_escapes_var(&be.left, var, ctx) || expr_escapes_var(&be.right, var, ctx)
@@ -305,9 +308,10 @@ fn stmt_references_var(stmt: &Statement, var: &str) -> bool {
             target_ref || expr_references_var(&a.value, var)
         }
         Statement::ExpressionStatement(es) => expr_references_var(&es.expression, var),
-        Statement::ReturnStatement(rs) => {
-            rs.value.as_ref().map_or(false, |v| expr_references_var(v, var))
-        }
+        Statement::ReturnStatement(rs) => rs
+            .value
+            .as_ref()
+            .map_or(false, |v| expr_references_var(v, var)),
         Statement::ThrowStatement(t) => expr_references_var(&t.expression, var),
         Statement::NowaitStatement(n) => expr_references_var(&n.expression, var),
         Statement::IfStatement(is) => {
@@ -324,7 +328,8 @@ fn stmt_references_var(stmt: &Statement, var: &str) -> bool {
                 || ws.body.iter().any(|s| stmt_references_var(s, var))
         }
         Statement::ForStatement(fs) => {
-            expr_references_var(&fs.items, var) || fs.body.iter().any(|s| stmt_references_var(s, var))
+            expr_references_var(&fs.items, var)
+                || fs.body.iter().any(|s| stmt_references_var(s, var))
         }
         Statement::TryStatement(ts) => {
             ts.try_body.iter().any(|s| stmt_references_var(s, var))
@@ -368,9 +373,10 @@ fn expr_references_var(expr: &Expression, var: &str) -> bool {
         }
         Expression::ArrayExpression(ae) => ae.items.iter().any(|i| expr_references_var(i, var)),
         Expression::TupleExpression(te) => te.items.iter().any(|i| expr_references_var(i, var)),
-        Expression::DictionaryExpression(de) => {
-            de.entries.iter().any(|e| expr_references_var(&e.value, var))
-        }
+        Expression::DictionaryExpression(de) => de
+            .entries
+            .iter()
+            .any(|e| expr_references_var(&e.value, var)),
         Expression::RangeExpression(re) => {
             expr_references_var(&re.start, var) || expr_references_var(&re.end, var)
         }
@@ -393,10 +399,9 @@ fn init_kind(expr: &Expression) -> InitKind {
 /// Does `stmt` cause `var` to escape?
 fn stmt_escapes_var(stmt: &Statement, var: &str, ctx: &Ctx) -> bool {
     match stmt {
-        Statement::ReturnStatement(rs) => rs
-            .value
-            .as_ref()
-            .map_or(false, |v| aliases_var(v, var) || expr_escapes_var(v, var, ctx)),
+        Statement::ReturnStatement(rs) => rs.value.as_ref().map_or(false, |v| {
+            aliases_var(v, var) || expr_escapes_var(v, var, ctx)
+        }),
         Statement::AssignmentStatement(a) => {
             let stored = match &a.target {
                 AssignmentTarget::Field { object } | AssignmentTarget::Index { object } => {
@@ -474,7 +479,9 @@ fn body_tail_aliases(body: &[Statement], var: &str) -> bool {
                     .map_or(false, |e| body_tail_aliases(e, var))
         }
         Statement::CaseStatement(cs) => {
-            cs.when_branches.iter().any(|b| body_tail_aliases(&b.body, var))
+            cs.when_branches
+                .iter()
+                .any(|b| body_tail_aliases(&b.body, var))
                 || cs
                     .default_branch
                     .as_ref()
@@ -537,11 +544,7 @@ pub fn declared_names(body: &[Statement]) -> Vec<String> {
 /// Names (params + locals) of a function that escape, given the current
 /// interprocedural summaries.
 fn escaping_names(params: &[String], body: &[Statement], ctx: &Ctx) -> HashSet<String> {
-    let names: Vec<String> = params
-        .iter()
-        .cloned()
-        .chain(declared_names(body))
-        .collect();
+    let names: Vec<String> = params.iter().cloned().chain(declared_names(body)).collect();
     let mut esc = HashSet::new();
     for name in &names {
         if body.iter().any(|s| stmt_escapes_var(s, name, ctx)) || body_tail_aliases(body, name) {
@@ -587,7 +590,9 @@ fn collect_binding_verdicts(
                     collect_binding_verdicts(e, func, escaping, out);
                 }
             }
-            Statement::WhileStatement(ws) => collect_binding_verdicts(&ws.body, func, escaping, out),
+            Statement::WhileStatement(ws) => {
+                collect_binding_verdicts(&ws.body, func, escaping, out)
+            }
             Statement::ForStatement(fs) => collect_binding_verdicts(&fs.body, func, escaping, out),
             Statement::TryStatement(ts) => {
                 collect_binding_verdicts(&ts.try_body, func, escaping, out);
@@ -730,8 +735,7 @@ pub fn is_freeable_fresh(expr: &Expression) -> bool {
         // already a String. Any concat (≥2 parts) or a text part forces a fresh
         // buffer.
         Expression::TemplateStringExpression(ts) => {
-            !(ts.parts.len() == 1
-                && matches!(ts.parts[0], TemplateStringPart::Expression { .. }))
+            !(ts.parts.len() == 1 && matches!(ts.parts[0], TemplateStringPart::Expression { .. }))
         }
         _ => false,
     }
@@ -793,18 +797,27 @@ fn body_has_return(stmts: &[Statement]) -> bool {
         Statement::ReturnStatement(_) => true,
         Statement::IfStatement(is) => {
             is.branches.iter().any(|b| body_has_return(&b.body))
-                || is.else_branch.as_ref().map_or(false, |e| body_has_return(e))
+                || is
+                    .else_branch
+                    .as_ref()
+                    .map_or(false, |e| body_has_return(e))
         }
         Statement::WhileStatement(ws) => body_has_return(&ws.body),
         Statement::ForStatement(fs) => body_has_return(&fs.body),
         Statement::TryStatement(ts) => {
             body_has_return(&ts.try_body)
                 || body_has_return(&ts.catch_body)
-                || ts.finally_body.as_ref().map_or(false, |f| body_has_return(f))
+                || ts
+                    .finally_body
+                    .as_ref()
+                    .map_or(false, |f| body_has_return(f))
         }
         Statement::CaseStatement(cs) => {
             cs.when_branches.iter().any(|b| body_has_return(&b.body))
-                || cs.default_branch.as_ref().map_or(false, |d| body_has_return(d))
+                || cs
+                    .default_branch
+                    .as_ref()
+                    .map_or(false, |d| body_has_return(d))
         }
         _ => false,
     })
@@ -823,7 +836,6 @@ pub fn plan_async_completion_drops(fd: &FunctionDeclaration) -> Vec<String> {
     }
     plan_drops(fd)
 }
-
 
 #[cfg(test)]
 mod tests {

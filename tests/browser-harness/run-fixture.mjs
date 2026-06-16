@@ -45,6 +45,30 @@ const server = createServer(async (req, res) => {
     });
     return;
   }
+  if (url.pathname === '/fai/rpc') {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      let fn = '';
+      try {
+        fn = JSON.parse(body).fn ?? '';
+      } catch {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+        res.end('{"ok":false,"error":"invalid fixture RPC"}');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      if (fn === 'fixture.fail') {
+        res.end('{"ok":false,"error":"fixture failed"}');
+      } else {
+        res.end('{"ok":true,"value":null}');
+      }
+    });
+    return;
+  }
   const requested = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = join(root, requested.replace(/^\/+/, ''));
   try {
@@ -76,7 +100,8 @@ try {
     consoleErrors.push(err.message);
   });
 
-  await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'networkidle' });
+  const search = assertion.ownership === 'balanced' ? '?fai_ownership_check=1' : '';
+  await page.goto(`http://127.0.0.1:${port}/index.html${search}`, { waitUntil: 'networkidle' });
 
   if (assertion.selector) {
     await page.waitForSelector(assertion.selector, { timeout: assertion.timeoutMs ?? 5000 });
@@ -127,13 +152,32 @@ try {
     }
   }
 
+  if (assertion.clickSelector !== undefined) {
+    const count = assertion.clickCount ?? 1;
+    await page.waitForSelector(assertion.clickSelector, { timeout: assertion.timeoutMs ?? 5000 });
+    for (let i = 0; i < count; i++) {
+      await page.locator(assertion.clickSelector).click();
+    }
+    await page.waitForTimeout(0);
+  }
+
   if (assertion.leak !== undefined) {
     // Browser leak gate (plan 118 U4): after the root completes, read
-    // the always-exported __live_objects counter through the runtime's
-    // window accessor. Two-sided, mirroring the native gate.
+    // the generated runtime leak dump. This must be a real guest-instrumented
+    // run; the dump function exists in all browser runtimes, so reject the
+    // explicit "no guest events" hint instead of silently trusting the scalar.
     await page.waitForFunction(() => window.__FAI_ROOT_DONE === true, null, {
       timeout: assertion.timeoutMs ?? 5000,
     });
+    const dump = await page.evaluate(() =>
+      typeof window.__fai_dump_leaks === 'function' ? window.__fai_dump_leaks() : null
+    );
+    if (dump === null) {
+      throw new Error('leak gate: window.__fai_dump_leaks unavailable — runtime JS predates browser leak diagnostics');
+    }
+    if (dump.includes('no guest events')) {
+      throw new Error(`leak gate: browser guest leak hooks were not active\n${dump}`);
+    }
     const live = await page.evaluate(() =>
       typeof window.__fai_live_objects === 'function' ? window.__fai_live_objects() : null
     );
@@ -144,10 +188,28 @@ try {
       throw new Error(`leak gate: __live_objects is NEGATIVE (${live}) — host/guest free imbalance, investigate`);
     }
     if (assertion.leak === 'flat' && live > 0) {
-      throw new Error(`marked leak: flat but ${live} object(s) live after root — an unexpected leak (regression)`);
+      throw new Error(`marked leak: flat but ${live} object(s) live after root — an unexpected leak (regression)\n${dump}`);
     }
     if (assertion.leak === 'expected' && live === 0) {
       throw new Error(`marked leak: expected ${assertion.leakTag ?? ''} but ran FLAT — the leak is fixed; flip the marker to leak: flat`);
+    }
+  }
+
+  if (assertion.ownership === 'balanced') {
+    await page.waitForFunction(() => window.__FAI_ROOT_DONE === true, null, {
+      timeout: assertion.timeoutMs ?? 5000,
+    });
+    const ownership = await page.evaluate(() =>
+      typeof window.__fai_assert_ownership === 'function' ? window.__fai_assert_ownership() : null
+    );
+    if (ownership === null) {
+      throw new Error('ownership gate: window.__fai_assert_ownership unavailable — rebuild with FAI_OWNERSHIP_CHECK=1');
+    }
+    if (!ownership.ok) {
+      const dump = await page.evaluate(() =>
+        typeof window.__fai_dump_ownership === 'function' ? window.__fai_dump_ownership() : ''
+      );
+      throw new Error(`ownership gate: helper imbalance\n${dump}`);
     }
   }
 

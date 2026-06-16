@@ -100,7 +100,8 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  fmt [path] [--check]    fmt");
     eprintln!("  check [file]            fmt → check");
-    eprintln!("  test [file] [--checked] [--check-leaks] fmt → check → test");
+    eprintln!("  test [file] [--checked] [--check-leaks] [--check-ownership]");
+    eprintln!("                          fmt → check → test");
     eprintln!("  run [file]              fmt → check → test → run");
     eprintln!("  build [target]          fmt → check → test → build");
     eprintln!("  new <name>              Create a new project");
@@ -120,16 +121,20 @@ fn print_usage() {
     eprintln!("                          exit/trap, grouped by size + allocation site");
     eprintln!("  run --check-leaks=interval:<ms>  Also print a live-set summary every");
     eprintln!("                          <ms> ms (for servers that never exit)");
+    eprintln!("  run --check-ownership   Record helper ownership events and print a");
+    eprintln!("                          site/history balance report at exit/trap");
     eprintln!("  run --debug             Debug umbrella (currently: --watchdog)");
     eprintln!("  test --checked          Build tests with cheap always-on memory");
-    eprintln!("  test --check-leaks      Per-test leak assertion: a case that does not");
-    eprintln!("                          return the heap to its baseline fails with a");
-    eprintln!("                          delta report. --allow-leak=<suite[::case]>");
-    eprintln!("                          (repeatable, exact match) exempts known leaks.");
     eprintln!("                          guards: trap an out-of-bounds index store");
     eprintln!("                          (xs[i]=v) and any single alloc past 256 MB");
     eprintln!("                          at the source, with a named reason. Use this");
     eprintln!("                          first when a test suite corrupts the heap.");
+    eprintln!("  test --check-leaks      Per-test leak assertion: a case that does not");
+    eprintln!("                          return the heap to its baseline fails with a");
+    eprintln!("                          delta report. --allow-leak=<suite[::case]>");
+    eprintln!("                          (repeatable, exact match) exempts known leaks.");
+    eprintln!("  test --check-ownership  Record helper ownership events and print a");
+    eprintln!("                          site/history report; helper imbalance fails.");
     eprintln!();
     eprintln!("Debugging (set as environment variables, e.g. FAI_RC_CHECK=1 fai test):");
     eprintln!("  These instrument the generated wasm for memory-corruption hunts.");
@@ -153,6 +158,8 @@ fn print_usage() {
     eprintln!("                      a backtrace (find who clobbers a specific address).");
     eprintln!("  FAI_CHECK_LEAKS     Allocation ledger (same as 'run --check-leaks'):");
     eprintln!("                      itemized live set at exit/trap, grouped by alloc site.");
+    eprintln!("  FAI_OWNERSHIP_CHECK Helper ownership event stream (same as");
+    eprintln!("                      'run/test --check-ownership').");
     eprintln!("  FAI_TRACE_TESTS     Print each test case's name on stderr before it runs,");
     eprintln!("                      so a trap/hang is attributable to the exact case.");
     eprintln!("  FAI_ABI_CHECK       Compile-time only: log '[abi-check] DIVERGENCE' when");
@@ -202,6 +209,8 @@ fn cmd_test(args: &[String]) {
     let (args, verbose) = extract_verbose_flag(args);
     let (args, checked) = extract_checked_flag(&args);
     // `fai test --check-leaks` (plan 118 U2): per-case leak assertion.
+    // `fai test --check-ownership` (plan 117 phase 4): aggregate helper
+    // ownership event recording for the whole test wasm run.
     // `--allow-leak=<name>` (repeatable) exempts an exact `suite` or
     // `suite::case` name — for the known host leaks (events.off/clear,
     // spy reset, ...) until plan-117 phases 4-6 fix them.
@@ -210,6 +219,18 @@ fn cmd_test(args: &[String]) {
         let mut found = false;
         for a in args {
             if a == "--check-leaks" {
+                found = true;
+            } else {
+                rest.push(a);
+            }
+        }
+        (rest, found)
+    };
+    let (args, check_ownership) = {
+        let mut rest = Vec::new();
+        let mut found = false;
+        for a in args {
+            if a == "--check-ownership" {
                 found = true;
             } else {
                 rest.push(a);
@@ -231,6 +252,7 @@ fn cmd_test(args: &[String]) {
     };
     let test_opts = wasm_runner::TestRunOptions {
         check_leaks,
+        check_ownership,
         allow_leaks,
     };
     let (args, project) = extract_project_flag(&args);
@@ -253,8 +275,15 @@ fn cmd_test(args: &[String]) {
     // wasm carries no `__fai_alloc_event` hooks, so the ledger (and its
     // interval report) stays silent during `fai test` — exactly when a
     // runaway allocator needs naming.
-    if test_opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some() {
+    if test_opts.check_leaks
+        || test_opts.check_ownership
+        || std::env::var_os("FAI_CHECK_LEAKS").is_some()
+        || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some()
+    {
         fai_codegen_wasm::set_check_leaks(true);
+    }
+    if test_opts.check_ownership || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some() {
+        fai_codegen_wasm::set_ownership_check(true);
     }
     // `--checked` (plan 116): build the test wasm with the cheap,
     // always-safe corruption guards (alloc-guard past 256 MB + index-store
@@ -300,6 +329,14 @@ fn cmd_run(args: &[String]) {
             if let Some(name) = project.as_deref() {
                 build_args.retain(|a| a != name);
             }
+            // Debug instrumentation flags need their codegen half armed before
+            // project-mode `step_build`, where the wasm is produced.
+            if args.iter().any(|a| a == "--check-ownership")
+                || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some()
+            {
+                fai_codegen_wasm::set_ownership_check(true);
+                fai_codegen_wasm::set_check_leaks(true);
+            }
             // `--check-leaks` instruments codegen, and in project mode
             // the codegen happens HERE (step_build), not in step_run —
             // arm the gate before building or the artifact carries no
@@ -319,7 +356,8 @@ fn cmd_run(args: &[String]) {
                 // Users who want a self-contained build-dir runtime can
                 // still `cd build/<target>` and run the wasm directly.
                 // Forward the debug flags (--watchdog/--debug/
-                // --check-leaks) so the runner half still sees them.
+                // --check-leaks/--check-ownership) so the runner half
+                // still sees them.
                 let mut run_args: Vec<String> = vec![wasm];
                 run_args.extend(args.iter().filter(|a| a.starts_with("--")).cloned());
                 step_run(&run_args, None, &reporter);
@@ -881,7 +919,11 @@ fn step_test_with_opts(args: &[String], reporter: &Reporter, opts: &wasm_runner:
 /// `prepare_module_directory_for_tests` so there's no notion of an
 /// "entry file" — every `.fai` file in `src_path` contributes its
 /// declarations and tests to the same module.
-fn run_tests_module(src_path: &std::path::Path, reporter: &Reporter, opts: &wasm_runner::TestRunOptions) {
+fn run_tests_module(
+    src_path: &std::path::Path,
+    reporter: &Reporter,
+    opts: &wasm_runner::TestRunOptions,
+) {
     let src_path_str = src_path.to_string_lossy().to_string();
     let prepared = match fai_compiler::prepare_module_directory_for_tests(&src_path_str) {
         Ok(p) => p,
@@ -1354,9 +1396,16 @@ fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
         // Codegen gate — must be set before compile_fai_to_wasm below.
         fai_codegen_wasm::set_check_leaks(true);
     }
+    let check_ownership = args.iter().any(|a| a == "--check-ownership")
+        || wasm_runner::RunOptions::from_env().check_ownership;
+    if check_ownership {
+        fai_codegen_wasm::set_ownership_check(true);
+        fai_codegen_wasm::set_check_leaks(true);
+    }
     let run_opts = wasm_runner::RunOptions {
         watchdog_secs,
         check_leaks,
+        check_ownership,
     };
 
     // Check if the first positional arg is a target name or a file path.
@@ -1763,6 +1812,13 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
     } else {
         None
     };
+    if std::env::var_os("FAI_CHECK_LEAKS").is_some() {
+        fai_codegen_wasm::set_check_leaks(true);
+    }
+    if std::env::var_os("FAI_OWNERSHIP_CHECK").is_some() {
+        fai_codegen_wasm::set_ownership_check(true);
+        fai_codegen_wasm::set_check_leaks(true);
+    }
 
     // Find which sub-project's `main` matches this entry path so we
     // can read its `rpc_server` flag and remote-dependency URL. When
@@ -3627,6 +3683,7 @@ const env = {{
     }}
   }},
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
+  replace_location(p,l){{window.location.replace(readStr(p,l))}},
   storage_get_str(){{return 0x7FFD000000000000n}},
   file_read_str(){{return 0x7FFD000000000000n}},
   storage_set(kp,kl,vp,vl){{try{{window.localStorage.setItem(readStr(kp,kl),readStr(vp,vl))}}catch(e){{}}}},
@@ -3647,7 +3704,8 @@ const env = {{
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
-  __fai_free_event(){{}}
+  __fai_free_event(){{}},
+  __fai_ownership_event(){{}}
 }};
 let instance;
 let asyncRootDone = false;
@@ -3779,6 +3837,7 @@ const env={{
   json_stringify(v){{try{{const j=wasmToJs(v);return writeStrToWasm(JSON.stringify(j))}}catch(e){{return writeStrToWasm('null')}}}},
   remote_call(a,b,c,d,e,f,g,h){{const u=readStr(a,b),fn_name=readStr(c,d),ar=readStr(e,f),ha=readStr(g,h);const body=JSON.stringify({{fn:fn_name,args:JSON.parse(ar||'[]'),hash:ha}});console.log('FAI remote_call request', {{url:u,fn:fn_name,args:ar,hash:ha}});try{{const x=new XMLHttpRequest();x.open('POST',u.replace(/\/+$/,'')+'/fai/rpc',false);x.setRequestHeader('Content-Type','application/json');x.send(body);const resp=JSON.parse(x.responseText);console.log('FAI remote_call response', {{fn:fn_name,ok:resp.ok,value:resp.value,error:resp.error}});if(resp.ok)return jsToWasm(resp.value);console.warn('FAI remote_call returned error', resp);return NULL_VAL}}catch(e){{console.error('FAI remote_call failed', e);return NULL_VAL}}}},
   float_to_str(v,p){{const s=(v===Math.floor(v)&&isFinite(v))?String(BigInt(v)):String(v);const b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p,b.length).set(b);return b.length}},
+  replace_location(p,l){{window.location.replace(readStr(p,l))}},
   storage_get(kp,kl,bp){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return -1;const b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
   storage_get_str(kp,kl){{try{{const k=readStr(kp,kl);const v=window.localStorage.getItem(k);if(v===null)return NULL_VAL;return writeStrToWasm(v)}}catch(e){{return NULL_VAL}}}},
   file_read_str(){{return NULL_VAL}},
@@ -3800,7 +3859,8 @@ const env={{
   __fai_set_trap_msg(p,l){{console.error('FAI trap:',readStr(p,l))}},
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
-  __fai_free_event(){{}}
+  __fai_free_event(){{}},
+  __fai_ownership_event(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
@@ -3870,7 +3930,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-seri
 .fai-button:hover{background:#f5f5f7}
 .fai-button:active{opacity:0.7}
 
-.fai-textinput{
+.fai-textinput,
+.fai-textarea{
   padding:10px 14px;
   border:1px solid #d0d0d0;
   border-radius:8px;
@@ -3882,7 +3943,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-seri
   outline:none;
   transition:border-color 0.1s;
 }
-.fai-textinput:focus{border-color:#007aff}
+.fai-textarea{
+  min-height:96px;
+  resize:vertical;
+  line-height:1.4;
+}
+.fai-textinput:focus,
+.fai-textarea:focus{border-color:#007aff}
 
 /* ── Toggle (iOS-style switch) ──────────────────────────────── */
 .fai-toggle{
@@ -3986,8 +4053,8 @@ function jsToWasm(v){{
   if(typeof v==='boolean')return QNAN|TAG_BOOL|BigInt(v?1:0);
   if(typeof v==='number'){{if(Number.isInteger(v))return QNAN|TAG_INT|BigInt.asUintN(32,BigInt(v));var buf=new ArrayBuffer(8);new Float64Array(buf)[0]=v;return new BigInt64Array(buf)[0]}}
   if(typeof v==='string')return writeStrToWasm(v);
-  if(Array.isArray(v)){{var base=instance.exports.__heap_ptr.value,logsz=8+v.length*8,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,1,true);dv.setInt32(addr+4,v.length,true);faiLeakAlloc(addr,logsz,true);var items=v.map(function(i){{return jsToWasm(i)}});m=instance.exports.memory.buffer;for(var i=0;i<items.length;i++){{new BigInt64Array(m,addr+8+i*8,1)[0]=items[i]}}return OBJ_MASK|BigInt(addr)}}
-  if(typeof v==='object'){{var keys=Object.keys(v),base=instance.exports.__heap_ptr.value,cap=Math.max(keys.length,16),logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,keys.length,true);faiLeakAlloc(addr,logsz,true);for(var i=0;i<keys.length;i++){{var kv=writeStrToWasm(keys[i]),vv=jsToWasm(v[keys[i]]),ea=addr+8+i*16;m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,ea,2);bi[0]=kv;bi[1]=vv}}return OBJ_MASK|BigInt(addr)}}
+  if(Array.isArray(v)){{var base=instance.exports.__heap_ptr.value,logsz=8+v.length*8,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,1,true);dv.setInt32(addr+4,v.length,true);faiLeakAlloc(addr,logsz,true);faiOwnershipAlloc(addr);var items=v.map(function(i){{return jsToWasm(i)}});m=instance.exports.memory.buffer;for(var i=0;i<items.length;i++){{new BigInt64Array(m,addr+8+i*8,1)[0]=items[i]}}return OBJ_MASK|BigInt(addr)}}
+  if(typeof v==='object'){{var keys=Object.keys(v),base=instance.exports.__heap_ptr.value,cap=Math.max(keys.length,16),logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,keys.length,true);faiLeakAlloc(addr,logsz,true);faiOwnershipAlloc(addr);for(var i=0;i<keys.length;i++){{var kv=writeStrToWasm(keys[i]),vv=jsToWasm(v[keys[i]]),ea=addr+8+i*16;m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,ea,2);bi[0]=kv;bi[1]=vv}}return OBJ_MASK|BigInt(addr)}}
   return QNAN|TAG_NULL;
 }}
 function wasmToJs(v){{
@@ -4010,6 +4077,8 @@ function writeStr(p,s){{var b=new TextEncoder().encode(s);new Uint8Array(instanc
 function wasmGrow(needed){{var mem=instance.exports.memory;var cur=mem.buffer.byteLength;if(needed>cur){{var pages=Math.ceil((needed-cur)/65536);mem.grow(pages)}}}}
 function writeStrToWasm(s){{var b=new TextEncoder().encode(s),base=instance.exports.__heap_ptr.value,logsz=8+b.length,h=base+8;wasmGrow(base+8+logsz+8);var m=new Uint8Array(instance.exports.memory.buffer),d=new DataView(instance.exports.memory.buffer);d.setInt32(base,1,true);d.setInt32(base+4,logsz,true);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;faiLeakAlloc(h,logsz,true);return OBJ_MASK|BigInt(h)}}
 function readNanBoxedStr(v){{var n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{var a=Number(n&0x0000FFFFFFFFFFFFn),d=new DataView(instance.exports.memory.buffer);if(d.getInt32(a,true)===0){{var l=d.getInt32(a+4,true);return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,a+8,l))}}}}return''}}
+function faiHostRetain(v){{if(instance&&instance.exports.__fai_retain)instance.exports.__fai_retain(BigInt.asIntN(64,BigInt(v)));return BigInt.asIntN(64,BigInt(v))}}
+function faiHostRelease(v){{if(instance&&instance.exports.__fai_release)instance.exports.__fai_release(BigInt.asIntN(64,BigInt(v)))}}
 function invokeExport(name){{var fn=instance.exports[name];if(!fn)return;var args=Array.prototype.slice.call(arguments,1);try{{return fn.apply(null,args)}}catch(e){{console.error('FAI',name,'failed',e);throw e}}}}
 function rootResultText(result){{var v=wasmToJs(result);if(Array.isArray(v))return JSON.stringify(v);if(v===null||v===undefined)return'';return String(v)}}
 function publishRootResult(result){{window.__FAI_ROOT_RESULT_TEXT=rootResultText(result);window.__FAI_ROOT_FINISHED_AT=performance.now();window.__FAI_ROOT_DONE=true}}
@@ -4024,12 +4093,32 @@ var __faiRpcResults={{}};
 // first __fai_alloc_event from a check-leaks build (or ?fai_check_leaks=1).
 // Tier 1 only in the browser: live set grouped by size, dumped on demand
 // from DevTools/Playwright via window.__fai_dump_leaks().
-var faiLeak={{on:new URLSearchParams(location.search).get('fai_check_leaks')==='1',map:new Map(),hostAllocs:0,guestEvents:0,unknownFrees:0,bytes:0}};
-function faiLeakAlloc(addr,size,host){{if(!host&&!faiLeak.on)faiLeak.on=true;if(!faiLeak.on)return;if(host)faiLeak.hostAllocs++;else faiLeak.guestEvents++;var old=faiLeak.map.get(addr);if(old!==undefined)faiLeak.bytes-=old;faiLeak.map.set(addr,size);faiLeak.bytes+=size}}
-function faiLeakFree(addr,size){{if(!faiLeak.on)return;faiLeak.guestEvents++;var s=faiLeak.map.get(addr);if(s===undefined){{faiLeak.unknownFrees++}}else{{faiLeak.map.delete(addr);faiLeak.bytes-=s}}}}
-window.__fai_dump_leaks=function(){{var by={{}};faiLeak.map.forEach(function(size){{by[size]=(by[size]||0)+1}});var rows=Object.keys(by).map(function(s){{return{{size:+s,count:by[s]}}}}).sort(function(a,b){{return b.size*b.count-a.size*a.count}});var live=instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null;var out='[check-leaks] live heap: '+faiLeak.map.size+' objects, '+faiLeak.bytes+' bytes ('+faiLeak.hostAllocs+' host-side, '+faiLeak.unknownFrees+' unknown frees'+(live===null?'':', __live_objects='+live)+')';if(faiLeak.guestEvents===0)out+='\n  no guest events — module not built with --check-leaks';rows.slice(0,40).forEach(function(r){{out+='\n  '+r.count+' × '+r.size+'B = '+(r.count*r.size)+'B'}});console.log(out);return out}};
-function faiBuildEvent(name,dataVal){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var kn=writeStrToWasm('name'),vn=writeStrToWasm(name),kd=writeStrToWasm('data');m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=kn;bi[1]=vn;bi[2]=kd;bi[3]=BigInt.asIntN(64,BigInt(dataVal));return OBJ_MASK|BigInt(addr)}}
-function faiBuildSubscription(id,name){{var addr=instance.exports.__heap_ptr.value,cap=16,end=(addr+8+cap*16+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);var ki=writeStrToWasm('id'),kn=writeStrToWasm('name'),vn=writeStrToWasm(name),iv=INT_MASK|BigInt.asUintN(32,BigInt(id));m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=ki;bi[1]=iv;bi[2]=kn;bi[3]=vn;return OBJ_MASK|BigInt(addr)}}
+var faiLeak={{on:new URLSearchParams(location.search).get('fai_check_leaks')==='1',map:new Map(),hostAllocs:0,hostLive:0,guestEvents:0,unknownFrees:0,bytes:0}};
+function faiLeakAlloc(addr,size,host){{if(host)faiLeak.hostAllocs++;if(!host&&!faiLeak.on)faiLeak.on=true;if(!faiLeak.on)return;if(!host)faiLeak.guestEvents++;var old=faiLeak.map.get(addr);if(old!==undefined){{faiLeak.bytes-=old.size;if(old.host)faiLeak.hostLive--}}faiLeak.map.set(addr,{{size:size,host:!!host}});faiLeak.bytes+=size;if(host)faiLeak.hostLive++}}
+function faiLeakFree(addr,size){{if(!faiLeak.on)return;faiLeak.guestEvents++;var s=faiLeak.map.get(addr);if(s===undefined){{faiLeak.unknownFrees++}}else{{faiLeak.map.delete(addr);faiLeak.bytes-=s.size;if(s.host)faiLeak.hostLive--}}}}
+window.__fai_dump_leaks=function(){{var by={{}};faiLeak.map.forEach(function(item){{var size=item.size;by[size]=(by[size]||0)+1}});var rows=Object.keys(by).map(function(s){{return{{size:+s,count:by[s]}}}}).sort(function(a,b){{return b.size*b.count-a.size*a.count}});var live=instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null;var out='[check-leaks] live heap: '+faiLeak.map.size+' objects, '+faiLeak.bytes+' bytes ('+faiLeak.hostLive+' host-side, '+faiLeak.unknownFrees+' unknown frees'+(live===null?'':', __live_objects='+live)+')';if(faiLeak.guestEvents===0)out+='\n  no guest events — module not built with --check-leaks';rows.slice(0,40).forEach(function(r){{out+='\n  '+r.count+' × '+r.size+'B = '+(r.count*r.size)+'B'}});console.log(out);return out}};
+function faiLeakTagName(tag){{return tag===0?'String':tag===1?'Array':tag===2?'Tuple':tag===3?'Dict':tag===4?'Closure':tag===5?'Module':tag===6?'NativeFn':tag===7?'Instance':tag===8?'Cell':'tag'+tag}}
+function faiLeakDescribe(addr,item){{var out={{addr:addr,size:item.size,host:!!item.host}};if(!instance||!instance.exports.memory||item.host)return out;try{{var mem=instance.exports.memory.buffer,dv=new DataView(mem),u8=new Uint8Array(mem),tag=dv.getInt32(addr,true);out.tag=tag;out.kind=faiLeakTagName(tag);if(tag===0){{var len=dv.getInt32(addr+4,true);out.len=len;out.text=new TextDecoder().decode(u8.slice(addr+8,addr+8+Math.min(len,80)))}}else if(tag===1||tag===2){{out.count=dv.getInt32(addr+4,true)}}else if(tag===3||tag===7){{out.count=dv.getInt32(addr+4,true);var keys=[];for(var i=0;i<Math.min(out.count,8);i++){{var kv=new BigInt64Array(mem,addr+8+i*16,1)[0],ka=Number(BigInt.asUintN(64,kv)&0x0000FFFFFFFFFFFFn);if(ka>0&&dv.getInt32(ka,true)===0){{var kl=dv.getInt32(ka+4,true);keys.push(new TextDecoder().decode(u8.slice(ka+8,ka+8+Math.min(kl,40))))}}}}out.keys=keys}}else if(tag===4){{out.table=dv.getInt32(addr+4,true);out.upvalues=dv.getInt32(addr+8,true);out.frameSize=dv.getInt32(addr+12,true)}}else if(tag===8){{out.value='0x'+new BigInt64Array(mem,addr+8,1)[0].toString(16)}}}}catch(e){{out.error=String(e)}}return out}}
+window.__fai_leak_snapshot=function(limit){{limit=limit||200;var byKind={{}},bySize={{}},items=[];faiLeak.map.forEach(function(item,addr){{var d=faiLeakDescribe(addr,item);var kind=d.kind||(item.host?'Host':'Unknown');byKind[kind]=(byKind[kind]||0)+1;bySize[item.size]=(bySize[item.size]||0)+1;if(items.length<limit)items.push(d)}});items.sort(function(a,b){{return b.size-a.size}});return{{count:faiLeak.map.size,bytes:faiLeak.bytes,hostLive:faiLeak.hostLive,unknownFrees:faiLeak.unknownFrees,byKind:byKind,bySize:bySize,items:items}}}};
+var faiOwnership={{on:new URLSearchParams(location.search).get('fai_ownership_check')==='1',events:[],credits:new Map(),unmatched:[],freed:[],sites:Object.create(null),history:new Map(),sawLifecycle:false}};
+var faiOwnershipOps={{1:'retain',2:'release',3:'transfer',4:'borrow',5:'store',6:'overwrite',7:'cleanup',8:'return',9:'discard',10:'call_argument'}};
+function faiOwnershipReadLeb(bytes,pos){{var result=0,shift=0,b;do{{b=bytes[pos++];result|=(b&0x7f)<<shift;shift+=7}}while(b&0x80);return{{value:result,pos:pos}}}}
+function faiInstallOwnershipSitesFromWasm(buffer){{try{{var bytes=new Uint8Array(buffer),pos=8,dec=new TextDecoder();while(pos<bytes.length){{var id=bytes[pos++],len=faiOwnershipReadLeb(bytes,pos);pos=len.pos;var end=pos+len.value;if(id===0){{var n=faiOwnershipReadLeb(bytes,pos),name=dec.decode(bytes.slice(n.pos,n.pos+n.value));if(name==='fai-dbg'){{var meta=JSON.parse(dec.decode(bytes.slice(n.pos+n.value,end)));(meta.ownership_sites||[]).forEach(function(s){{faiOwnership.sites[s.id]=s}});return}}}}pos=end}}}}catch(e){{debugLog('FAI ownership site metadata unavailable',e)}}}}
+function faiOwnershipAddr(value){{var u=BigInt.asUintN(64,value);return (u&OBJ_MASK)===OBJ_MASK?Number(u&0x0000FFFFFFFFFFFFn):0}}
+function faiOwnershipDelta(op){{return op===1||op===3?1:(op===2||op===7||op===9?-1:0)}}
+function faiOwnershipAllowsUntracked(op){{return op===2||op===9}}
+function faiOwnershipAlloc(addr){{if(!faiOwnership.on)return;faiOwnership.sawLifecycle=true;faiOwnership.credits.delete(addr);faiOwnership.history.delete(addr)}}
+function faiOwnershipFree(addr){{if(!faiOwnership.on)return;faiOwnership.sawLifecycle=true;faiOwnership.credits.delete(addr);faiOwnership.history.delete(addr)}}
+function faiOwnershipSiteLabel(site){{if(site===0)return'unknown ownership site';var s=faiOwnership.sites[site];if(!s)return'ownership site '+site;var loc=s.file&&s.line?(' ('+s.file+':'+s.line+')'):(s.line?(' (line '+s.line+')'):'');return s.helper+':'+s.op+':'+s.reason+loc}}
+function faiOwnershipAuxLabel(aux){{var kind=aux>>16,detail=aux&0xffff;if(kind===0&&detail===0)return'none';if(kind===1)return'ClosureCapture:'+detail;if(kind===2)return'HostArgument:'+detail;if(kind===3)return'AsyncFrameSlot:'+detail;return String(aux)}}
+function faiOwnershipFormatEvent(e){{return(faiOwnershipOps[e.op]||('op='+e.op))+' '+e.label+' aux='+e.auxLabel+' value='+e.value}}
+function faiOwnershipGroupLabel(e){{return(faiOwnershipOps[e.op]||('op='+e.op))+' '+e.label+' aux='+e.auxLabel}}
+function faiOwnershipGroupSummary(a){{var m=new Map();function add(k,addr){{var g=m.get(k);if(!g){{g={{key:k,count:0,addr:addr}};m.set(k,g)}}g.count++}}a.imbalances.forEach(function(i){{var h=i.history||[],last=h[h.length-1],label=last?faiOwnershipGroupLabel(last):'unknown ownership site';add('live helper credits '+(i.credits>0?'+':'')+i.credits+' at '+label,i.addr)}});a.unmatched.forEach(function(e){{add('unmatched '+(faiOwnershipOps[e.op]||('op='+e.op))+' at '+faiOwnershipGroupLabel(e),e.addr)}});return Array.from(m.values()).sort(function(a,b){{return b.count-a.count||a.key.localeCompare(b.key)}})}}
+function faiOwnershipEvent(op,site,value,aux){{if(!faiOwnership.on)return;var addr=faiOwnershipAddr(value),delta=faiOwnershipDelta(op),event={{op:op,opName:faiOwnershipOps[op]||String(op),site:site,label:faiOwnershipSiteLabel(site),value:'0x'+BigInt.asUintN(64,value).toString(16),addr:addr?('0x'+addr.toString(16)):'',aux:aux,auxLabel:faiOwnershipAuxLabel(aux)}};if(addr){{var hist=faiOwnership.history.get(addr)||[];hist.push(event);if(hist.length>16)hist.shift();faiOwnership.history.set(addr,hist)}}if(addr&&delta){{var cur=faiOwnership.credits.get(addr)||0;if(delta>0){{faiOwnership.credits.set(addr,cur+delta)}}else if(cur>0){{faiOwnership.credits.set(addr,cur+delta)}}else if(!faiOwnershipAllowsUntracked(op)){{faiOwnership.unmatched.push(event)}}}}faiOwnership.events.push(event)}}
+window.__fai_assert_ownership=function(){{var bad=faiOwnership.freed.slice();if(!faiOwnership.sawLifecycle)faiOwnership.credits.forEach(function(v,k){{if(v!==0)bad.push({{addr:'0x'+k.toString(16),credits:v,history:(faiOwnership.history.get(k)||[]).slice(),freed:false}})}});return{{ok:bad.length===0&&faiOwnership.unmatched.length===0,eventCount:faiOwnership.events.length,imbalances:bad,unmatched:faiOwnership.unmatched.slice(),sites:faiOwnership.sites}}}};
+window.__fai_dump_ownership=function(){{var a=window.__fai_assert_ownership(),count=a.imbalances.length+a.unmatched.length,out='[ownership-check] '+a.eventCount+' event(s), '+count+' object(s) with helper imbalance',groups=faiOwnershipGroupSummary(a);if(groups.length){{out+='\n  groups:';groups.slice(0,8).forEach(function(g){{out+='\n    '+g.count+' x '+g.key+(g.addr?' (sample '+g.addr+')':'')}})}}a.imbalances.slice(0,8).forEach(function(i){{out+='\n  '+i.addr+': '+(i.freed?'freed with ':'')+'helper credits '+(i.credits>0?'+':'')+i.credits;i.history.forEach(function(e){{out+='\n    '+faiOwnershipFormatEvent(e)}})}});a.unmatched.slice(0,8-a.imbalances.length).forEach(function(e){{out+='\n  unmatched '+faiOwnershipFormatEvent(e)}});faiOwnership.events.slice(-40).forEach(function(e){{out+='\n  '+faiOwnershipFormatEvent(e)}});console.log(out);return out}};
+function faiBuildEvent(name,dataVal){{var base=instance.exports.__heap_ptr.value,cap=16,logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);faiLeakAlloc(addr,logsz,true);faiOwnershipAlloc(addr);var kn=writeStrToWasm('name'),vn=writeStrToWasm(name),kd=writeStrToWasm('data'),data=faiHostRetain(dataVal);m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=kn;bi[1]=vn;bi[2]=kd;bi[3]=data;return OBJ_MASK|BigInt(addr)}}
+function faiBuildSubscription(id,name){{var base=instance.exports.__heap_ptr.value,cap=16,logsz=8+cap*16,addr=base+8,end=(base+8+logsz+7)&~7;wasmGrow(end+8);instance.exports.__heap_ptr.value=end;var m=instance.exports.memory.buffer,dv=new DataView(m);dv.setInt32(base,1,true);dv.setInt32(base+4,logsz,true);dv.setInt32(addr,3,true);dv.setInt32(addr+4,2,true);faiLeakAlloc(addr,logsz,true);faiOwnershipAlloc(addr);var ki=writeStrToWasm('id'),kn=writeStrToWasm('name'),vn=writeStrToWasm(name),iv=INT_MASK|BigInt.asUintN(32,BigInt(id));m=instance.exports.memory.buffer;var bi=new BigInt64Array(m,addr+8,4);bi[0]=ki;bi[1]=iv;bi[2]=kn;bi[3]=vn;return OBJ_MASK|BigInt(addr)}}
 function faiReadSubscription(subVal){{var n=BigInt.asIntN(64,BigInt(subVal));var u=BigInt.asUintN(64,n);if((u&OBJ_MASK)!==OBJ_MASK)return null;var a=Number(u&0x0000FFFFFFFFFFFFn),dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==3)return null;var cnt=dv.getInt32(a+4,true),id=null,name=null;for(var i=0;i<cnt;i++){{var ea=a+8+i*16,bi=new BigInt64Array(instance.exports.memory.buffer,ea,2),k=readNanBoxedStr(bi[0]),v=BigInt.asUintN(64,bi[1]);if(k==='id')id=Number(BigInt.asIntN(32,v&0xFFFFFFFFn));else if(k==='name')name=readNanBoxedStr(bi[1])}}if(id===null||name===null)return null;return{{id:id,name:name}}}}
 // Single-flight scheduler turn. Every async wakeup — an event closure, an RPC
 // completion, a timer — funnels through here. A closure queued while a turn is
@@ -4039,12 +4128,13 @@ function faiReadSubscription(subVal){{var n=BigInt.asIntN(64,BigInt(subVal));var
 // `g_current` and corrupts the task table). Drives queued closures, then pumps
 // the scheduler; repeats while the pump's resumed tasks queue more closures.
 var __faiInScheduler=false,__faiClosureQueue=[];
-function faiServiceScheduler(){{if(__faiInScheduler)return;__faiInScheduler=true;try{{var guard=0;do{{while(__faiClosureQueue.length){{var q=__faiClosureQueue.shift();try{{instance.exports.__fai_drive_closure(q[0],q[1])}}catch(e){{console.error('FAI async closure failed',e)}}}}pumpAsync()}}while(__faiClosureQueue.length&&guard++<100000)}}finally{{__faiInScheduler=false}}}}
-function faiInvokeClosure(closureVal,arg){{var u=BigInt.asUintN(64,BigInt(closureVal));if((u&OBJ_MASK)!==OBJ_MASK)return NULL_VAL;var a=Number(u&0x0000FFFFFFFFFFFFn);if(a+16>instance.exports.memory.buffer.byteLength)return NULL_VAL;var dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==4)return NULL_VAL;var tidx=dv.getInt32(a+4,true),frameSize=dv.getInt32(a+12,true),envAddr=a+16;if(frameSize>0&&instance.exports.__fai_drive_closure){{__faiClosureQueue.push([BigInt.asIntN(64,BigInt(closureVal)),BigInt.asIntN(64,BigInt(arg))]);faiServiceScheduler();return NULL_VAL}}if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(!tbl)return NULL_VAL;try{{return tbl.get(tidx)(BigInt.asIntN(64,BigInt(arg)))}}catch(e){{console.error('FAI event closure failed',e);return NULL_VAL}}}}
-function faiEventEmit(name,dataVal){{var list=faiEventRegistry.byName[name];if(!list||list.length===0)return;var snap=list.slice();faiEventRegistry.byName[name]=list.filter(function(s){{return !s.once}});var ev=faiBuildEvent(name,dataVal);for(var i=0;i<snap.length;i++)faiInvokeClosure(snap[i].closureVal,ev)}}
-function handleEvent(id){{faiEventEmit('view:click',jsToWasm({{id:id}}))}}
-function handleInputEvent(id,value){{faiEventEmit('view:input',jsToWasm({{id:id,value:value}}))}}
-function handleSubmitEvent(id){{faiEventEmit('view:submit',jsToWasm({{id:id}}))}}
+function faiServiceScheduler(){{if(__faiInScheduler)return;__faiInScheduler=true;try{{var guard=0;do{{while(__faiClosureQueue.length){{var q=__faiClosureQueue.shift();try{{instance.exports.__fai_drive_closure(q[0],q[1])}}catch(e){{console.error('FAI async closure failed',e)}}finally{{faiHostRelease(q[1])}}}}pumpAsync()}}while(__faiClosureQueue.length&&guard++<100000)}}finally{{__faiInScheduler=false}}}}
+function faiInvokeClosure(closureVal,arg){{var u=BigInt.asUintN(64,BigInt(closureVal));if((u&OBJ_MASK)!==OBJ_MASK)return NULL_VAL;var a=Number(u&0x0000FFFFFFFFFFFFn);if(a+16>instance.exports.memory.buffer.byteLength)return NULL_VAL;var dv=new DataView(instance.exports.memory.buffer);if(dv.getInt32(a,true)!==4)return NULL_VAL;var tidx=dv.getInt32(a+4,true),frameSize=dv.getInt32(a+12,true),envAddr=a+16;if(frameSize>0&&instance.exports.__fai_drive_closure){{__faiClosureQueue.push([BigInt.asIntN(64,BigInt(closureVal)),faiHostRetain(arg)]);faiServiceScheduler();return NULL_VAL}}if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(!tbl)return NULL_VAL;try{{return tbl.get(tidx)(BigInt.asIntN(64,BigInt(arg)))}}catch(e){{console.error('FAI event closure failed',e);return NULL_VAL}}}}
+function faiEventEmit(name,dataVal){{var list=faiEventRegistry.byName[name];if(!list||list.length===0)return;var snap=list.slice(),kept=[],removed=[];for(var i=0;i<list.length;i++){{if(list[i].once)removed.push(list[i]);else kept.push(list[i])}}faiEventRegistry.byName[name]=kept;var ev=faiBuildEvent(name,dataVal);try{{for(var i=0;i<snap.length;i++)faiInvokeClosure(snap[i].closureVal,ev)}}finally{{faiHostRelease(ev);for(var i=0;i<removed.length;i++)faiHostRelease(removed[i].closureVal)}}}}
+function faiEmitHostEvent(name,dataVal){{try{{faiEventEmit(name,dataVal)}}finally{{faiHostRelease(dataVal)}}}}
+function handleEvent(id){{faiEmitHostEvent('view:click',jsToWasm({{id:id}}))}}
+function handleInputEvent(id,value){{faiEmitHostEvent('view:input',jsToWasm({{id:id,value:value}}))}}
+function handleSubmitEvent(id){{faiEmitHostEvent('view:submit',jsToWasm({{id:id}}))}}
 function morphDom(root,newHtml,replaceSelf){{var tmp=document.createElement('div');tmp.innerHTML=newHtml;if(replaceSelf&&root.parentNode&&tmp.childNodes.length===1){{morphNode(root,tmp.childNodes[0],root.parentNode);return}}morphChildren(root,tmp)}}
 function morphChildren(op,np){{var oc=Array.from(op.childNodes),nc=Array.from(np.childNodes);var hasKeys=false;for(var i=0;i<nc.length;i++)if(nc[i].nodeType===1&&nc[i].getAttribute('data-fai-key')){{hasKeys=true;break}}if(hasKeys){{var oldMap={{}};for(var i=0;i<oc.length;i++)if(oc[i].nodeType===1){{var k=oc[i].getAttribute('data-fai-key');if(k)oldMap[k]=oc[i]}}for(var i=0;i<nc.length;i++){{var nk=nc[i].nodeType===1?nc[i].getAttribute('data-fai-key'):null;if(nk&&oldMap[nk]){{var old=oldMap[nk];if(i<op.childNodes.length){{if(op.childNodes[i]!==old)op.insertBefore(old,op.childNodes[i])}}else{{op.appendChild(old)}}morphNode(old,nc[i],op)}}else{{var ref=i<op.childNodes.length?op.childNodes[i]:null;op.insertBefore(nc[i],ref)}}}}while(op.childNodes.length>nc.length)op.removeChild(op.lastChild)}}else{{for(var i=0;i<Math.max(oc.length,nc.length);i++){{if(i>=nc.length){{while(op.childNodes.length>nc.length)op.removeChild(op.lastChild);break}}if(i>=oc.length){{op.appendChild(nc[i]);continue}}morphNode(oc[i],nc[i],op)}}}}}}
 function morphNode(o,n,p){{if(o.nodeType!==n.nodeType){{p.replaceChild(n,o);return}}if(o.nodeType===3){{if(o.textContent!==n.textContent)o.textContent=n.textContent;return}}if(o.nodeType===1){{if(o.nodeName!==n.nodeName){{p.replaceChild(n,o);return}}patchAttrs(o,n);if(!/^(INPUT|IMG|BR|HR|META|LINK)$/.test(o.nodeName))morphChildren(o,n)}}}}
@@ -4068,6 +4158,7 @@ var env={{
   float_to_str:function(v,p){{var s=(v===Math.floor(v)&&isFinite(v))?String(BigInt(v)):String(v);var b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p,b.length).set(b);return b.length}},
   get_location_path:function(){{return writeStrToWasm(window.location.pathname)}},
   push_history_state:function(p,l){{history.pushState(null,'',readStr(p,l))}},
+  replace_location:function(p,l){{window.location.replace(readStr(p,l))}},
   storage_get:function(kp,kl,bp){{try{{var k=readStr(kp,kl);var v=window.localStorage.getItem(k);if(v===null)return -1;var b=new TextEncoder().encode(v);if(b.length>65536)return -1;new Uint8Array(instance.exports.memory.buffer,bp,b.length).set(b);return b.length}}catch(e){{return -1}}}},
   storage_get_str:function(kp,kl){{try{{var k=readStr(kp,kl);var v=window.localStorage.getItem(k);if(v===null)return NULL_VAL;return writeStrToWasm(v)}}catch(e){{return NULL_VAL}}}},
   file_read_str:function(){{return NULL_VAL}},
@@ -4076,15 +4167,15 @@ var env={{
   storage_clear:function(){{try{{window.localStorage.clear()}}catch(e){{}}}},
   env_get:function(){{return NULL_VAL}},
   env_load:function(){{return 0}},
-  event_on:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:BigInt.asIntN(64,BigInt(cv)),once:false}});return faiBuildSubscription(id,name)}},
-  event_once:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:BigInt.asIntN(64,BigInt(cv)),once:true}});return faiBuildSubscription(id,name)}},
-  event_off:function(sv){{var sub=faiReadSubscription(sv);if(!sub)return 0;var list=faiEventRegistry.byName[sub.name];if(!list)return 0;var before=list.length;faiEventRegistry.byName[sub.name]=list.filter(function(s){{return s.id!==sub.id}});return before!==faiEventRegistry.byName[sub.name].length?1:0}},
+  event_on:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:faiHostRetain(cv),once:false}});return faiBuildSubscription(id,name)}},
+  event_once:function(np,nl,cv){{var name=readStr(np,nl);var id=++faiEventRegistry.nextId;if(!faiEventRegistry.byName[name])faiEventRegistry.byName[name]=[];faiEventRegistry.byName[name].push({{id:id,closureVal:faiHostRetain(cv),once:true}});return faiBuildSubscription(id,name)}},
+  event_off:function(sv){{var sub=faiReadSubscription(sv);if(!sub)return 0;var list=faiEventRegistry.byName[sub.name];if(!list)return 0;var kept=[],removed=0;for(var i=0;i<list.length;i++){{if(list[i].id===sub.id){{faiHostRelease(list[i].closureVal);removed++}}else kept.push(list[i])}}faiEventRegistry.byName[sub.name]=kept;return removed?1:0}},
   event_emit:function(np,nl,dv){{faiEventEmit(readStr(np,nl),dv)}},
   event_subscribers:function(np,nl){{var list=faiEventRegistry.byName[readStr(np,nl)];return list?list.length:0}},
-  event_clear:function(np,nl){{delete faiEventRegistry.byName[readStr(np,nl)]}},
-  event_clear_all:function(){{faiEventRegistry.byName=Object.create(null);faiEventRegistry.nextId=0;faiEventRegistry.queue=[];faiEventRegistry.draining=false}},
-  event_emit_deferred:function(np,nl,dv){{faiEventRegistry.queue.push({{name:readStr(np,nl),dataVal:BigInt.asIntN(64,BigInt(dv))}})}},
-  event_drain:function(){{if(faiEventRegistry.draining)return;faiEventRegistry.draining=true;while(faiEventRegistry.queue.length>0){{var ev=faiEventRegistry.queue.shift();faiEventEmit(ev.name,ev.dataVal)}}faiEventRegistry.draining=false}},
+  event_clear:function(np,nl){{var name=readStr(np,nl),list=faiEventRegistry.byName[name]||[];for(var i=0;i<list.length;i++)faiHostRelease(list[i].closureVal);delete faiEventRegistry.byName[name]}},
+  event_clear_all:function(){{Object.keys(faiEventRegistry.byName).forEach(function(k){{var list=faiEventRegistry.byName[k]||[];for(var i=0;i<list.length;i++)faiHostRelease(list[i].closureVal)}});for(var i=0;i<faiEventRegistry.queue.length;i++)faiHostRelease(faiEventRegistry.queue[i].dataVal);faiEventRegistry.byName=Object.create(null);faiEventRegistry.nextId=0;faiEventRegistry.queue=[];faiEventRegistry.draining=false}},
+  event_emit_deferred:function(np,nl,dv){{faiEventRegistry.queue.push({{name:readStr(np,nl),dataVal:faiHostRetain(dv)}})}},
+  event_drain:function(){{if(faiEventRegistry.draining)return;faiEventRegistry.draining=true;try{{while(faiEventRegistry.queue.length>0){{var ev=faiEventRegistry.queue.shift();try{{faiEventEmit(ev.name,ev.dataVal)}}finally{{faiHostRelease(ev.dataVal)}}}}}}finally{{faiEventRegistry.draining=false}}}},
   event_queue_len:function(){{return faiEventRegistry.queue.length}},
   file_exists:function(){{return 0}},
   http_request_get:function(p,l){{return httpRequest('GET',readStr(p,l))}},
@@ -4126,8 +4217,9 @@ var env={{
   cli_write_line:function(p,l){{output.style.display='block';output.textContent+=readStr(p,l)+'\n'}},
   cli_clear:function(){{output.textContent=''}},
   cli_move_to:function(){{}},
-  __fai_alloc_event:function(addr,size){{faiLeakAlloc(addr>>>0,size>>>0,false)}},
-  __fai_free_event:function(addr,size){{faiLeakFree(addr>>>0,size>>>0)}},
+  __fai_alloc_event:function(addr,size){{faiLeakAlloc(addr>>>0,size>>>0,false);faiOwnershipAlloc(addr>>>0)}},
+  __fai_free_event:function(addr,size){{faiLeakFree(addr>>>0,size>>>0);faiOwnershipFree(addr>>>0)}},
+  __fai_ownership_event:function(op,site,value,aux){{faiOwnershipEvent(op|0,site|0,BigInt.asIntN(64,BigInt(value)),aux|0)}},
   __fai_set_trap_msg:function(p,l){{var m=readStr(p,l);window.__FAI_TRAP_MSG=m;console.error('FAI trap:',m)}},
   __fai_trap_report:function(code,a,b){{
     // Plan 116: structured trap reason, mirrored from the native host
@@ -4156,8 +4248,8 @@ var env={{
     window.__FAI_TRAP_MSG=msg;console.error('FAI trap:',msg);
   }}
 }};
-fetch('/{}').then(function(r){{return r.arrayBuffer()}}).then(function(b){{return WebAssembly.instantiate(b,{{env:env}})}}).then(function(r){{
-  instance=r.instance;window.__fai_dbg=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};startFai();
+fetch('/{}').then(function(r){{return r.arrayBuffer()}}).then(function(b){{faiInstallOwnershipSitesFromWasm(b);return WebAssembly.instantiate(b,{{env:env}})}}).then(function(r){{
+  instance=r.instance;window.__fai_dbg=r.instance;window.__fai_live_objects=function(){{if(!instance||!instance.exports.__live_objects)return null;return instance.exports.__live_objects.value+faiLeak.hostAllocs}};startFai();
   window.addEventListener('popstate',function(){{if(instance&&instance.exports.setPathFromPlatform)instance.exports.setPathFromPlatform(writeStrToWasm(window.location.pathname))}});
 }}).catch(function(e){{app.innerHTML='<p style="color:red;padding:20px">Error: '+e.message+'</p>'}});
 "#,
@@ -6285,6 +6377,10 @@ mod tests {
         dir
     }
 
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     // ── Plan 116 phase 2: watchdog + post-mortem dump ──
 
     /// Compile a source string written to `<temp>/main.fai`.
@@ -6500,10 +6596,7 @@ mod tests {
                 "end\n",
             ),
         );
-        assert!(
-            stderr.contains("live heap: 0 objects, 0 bytes"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("live heap: 0 objects, 0 bytes"), "{stderr}",);
         assert!(stderr.contains("consistent"), "{stderr}");
     }
 
@@ -6613,8 +6706,14 @@ mod tests {
         let path = dir.join("src/main.fai");
         std::fs::write(&path, main_src).unwrap();
         let _cg = fai_codegen_wasm::CheckLeaksGuard::new();
-        let wasm =
-            compile_fai_to_wasm(main_src, path.to_str().unwrap(), false, Vec::new(), None, None);
+        let wasm = compile_fai_to_wasm(
+            main_src,
+            path.to_str().unwrap(),
+            false,
+            Vec::new(),
+            None,
+            None,
+        );
         let guard = wasm_runner::output::CaptureGuard::new();
         wasm_runner::run_wasm_with_externs_opts(
             &wasm,
@@ -6666,10 +6765,7 @@ mod tests {
                 "end\n",
             ),
         );
-        assert!(
-            stderr.contains("live heap: 0 objects, 0 bytes"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("live heap: 0 objects, 0 bytes"), "{stderr}",);
         assert!(stderr.contains("consistent"), "{stderr}");
     }
 
@@ -6912,10 +7008,7 @@ mod tests {
         .expect("program should run");
         let stderr = guard.stderr();
         drop(guard);
-        assert!(
-            stderr.contains("not built with --check-leaks"),
-            "{stderr}",
-        );
+        assert!(stderr.contains("not built with --check-leaks"), "{stderr}",);
     }
 
     /// Shared mutex for tests that call `set_current_dir` — CWD is
@@ -7605,6 +7698,23 @@ mod tests {
             "handleSubmitEvent should emit on view:submit:\n{}",
             js
         );
+        assert!(
+            js.contains("function faiEmitHostEvent")
+                && js.contains("finally{faiHostRelease(dataVal)}")
+                && js.contains("handleEvent(id){faiEmitHostEvent('view:click',jsToWasm({id:id}))}")
+                && js.contains("handleInputEvent(id,value){faiEmitHostEvent('view:input',jsToWasm({id:id,value:value}))}")
+                && js.contains("handleSubmitEvent(id){faiEmitHostEvent('view:submit',jsToWasm({id:id}))}"),
+            "browser host-created event payloads must be released after dispatch:\n{}",
+            js
+        );
+        assert!(
+            js.contains("hostLive")
+                && js.contains("if(s.host)faiLeak.hostLive--")
+                && js.contains("return instance.exports.__live_objects.value+faiLeak.hostAllocs")
+                && js.contains("window.__fai_leak_snapshot"),
+            "browser leak diagnostics must report live host allocations while normalizing __live_objects for host-created allocations:\n{}",
+            js
+        );
         // The event_* env imports must be live, not stubs — std.events
         // is implemented host-side, including in the browser.
         assert!(js.contains("faiEventRegistry"));
@@ -7615,6 +7725,51 @@ mod tests {
         assert!(js.contains("__fai_resume_task"));
         assert!(js.contains("pumpAsync()"));
         assert!(js.contains("startFai()"));
+    }
+
+    #[test]
+    fn test_generate_runtime_js_exposes_ownership_diagnostics() {
+        let js = generate_runtime_js("prog.wasm");
+
+        assert!(js.contains("function faiInstallOwnershipSitesFromWasm"));
+        assert!(js.contains("meta.ownership_sites"));
+        assert!(js.contains("faiOwnership.sites"));
+        assert!(js.contains("faiOwnership.history"));
+        assert!(js.contains("function faiOwnershipSiteLabel"));
+        assert!(js.contains("function faiOwnershipAuxLabel"));
+        assert!(js.contains("function faiOwnershipGroupSummary"));
+        assert!(js.contains("groups=faiOwnershipGroupSummary(a)"));
+        assert!(js.contains("out+='\\n  groups:'"));
+        assert!(js.contains("faiInstallOwnershipSitesFromWasm(b);return WebAssembly.instantiate"));
+        assert!(
+            !js.contains("pos=end}catch"),
+            "ownership site parser must close the try block before catch:\n{}",
+            js
+        );
+        assert!(js.contains("window.__fai_assert_ownership"));
+        assert!(js.contains("window.__fai_dump_ownership"));
+    }
+
+    #[test]
+    fn test_generate_runtime_js_is_valid_javascript() {
+        let js = generate_runtime_js("prog.wasm");
+        let dir = temp_dir("runtime_js_syntax");
+        let path = dir.join("fai-runtime.js");
+        std::fs::write(&path, js).unwrap();
+
+        let out = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("node is required to syntax-check generated fai-runtime.js");
+        assert!(
+            out.status.success(),
+            "node --check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -7663,6 +7818,47 @@ mod tests {
         assert!(public.join("index.html").exists());
         assert!(public.join("fai-runtime.js").exists());
         assert!(public.join("forui.css").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_generate_forui_css_includes_textarea_defaults() {
+        let css = generate_forui_css();
+        assert!(css.contains(".fai-textarea"));
+        assert!(css.contains("resize:vertical"));
+    }
+
+    #[test]
+    fn test_multi_target_browser_build_honors_instrumentation_env() {
+        let dir = temp_dir("multi_target_browser_instrumented");
+        std::fs::write(
+            dir.join("fai.toml"),
+            "[project]\nname = \"InstrumentedApp\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
+             [project.web]\ntarget = \"wasm-html\"\nsource = \"src/web\"\nmain = \"src/web/main.fai\"\nbuild_dir = \"build/web\"\n\n\
+             [project.server]\ntarget = \"wasm\"\nsource = \"src/server\"\nmain = \"src/server/main.fai\"\nbuild_dir = \"build/server\"\nrequired_targets = [\"web\"]\n",
+        )
+        .unwrap();
+        let web_src = dir.join("src/web");
+        let server_src = dir.join("src/server");
+        std::fs::create_dir_all(&web_src).unwrap();
+        std::fs::create_dir_all(&server_src).unwrap();
+        std::fs::write(web_src.join("main.fai"), SIMPLE_FAI).unwrap();
+        std::fs::write(server_src.join("main.fai"), SIMPLE_FAI).unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        std::env::set_var("FAI_CHECK_LEAKS", "1");
+        std::env::set_var("FAI_OWNERSHIP_CHECK", "1");
+        cmd_build(&["server".to_string()]);
+        std::env::remove_var("FAI_OWNERSHIP_CHECK");
+        std::env::remove_var("FAI_CHECK_LEAKS");
+        std::env::set_current_dir(&prev).unwrap();
+
+        let wasm = std::fs::read(dir.join("build/web/web.wasm")).unwrap();
+        assert!(bytes_contain(&wasm, b"__fai_alloc_event"));
+        assert!(bytes_contain(&wasm, b"__fai_free_event"));
+        assert!(bytes_contain(&wasm, b"__fai_ownership_event"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

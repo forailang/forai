@@ -11,8 +11,8 @@
 
 pub mod async_analysis;
 mod async_codegen;
-pub mod async_engine;
 mod async_emit_spec;
+pub mod async_engine;
 pub mod async_runtime;
 mod async_wait_codegen;
 pub mod debug_info;
@@ -24,14 +24,14 @@ mod runtime;
 // renders them into readable trap reasons.
 pub use runtime::{
     TRAP_ALLOC_TOO_BIG, TRAP_DICT_CAP_INSANE, TRAP_DOUBLE_FREE, TRAP_FORCE_UNWRAP_NULL,
-    TRAP_FREED_DIRTY,
-    TRAP_FREELIST_CORRUPT, TRAP_INDEX_OOB, TRAP_OOM, TRAP_RC_OVER_RELEASE,
+    TRAP_FREED_DIRTY, TRAP_FREELIST_CORRUPT, TRAP_INDEX_OOB, TRAP_OOM, TRAP_RC_OVER_RELEASE,
     TRAP_RC_RELEASE_POISON, TRAP_RC_RETAIN_POISON, TRAP_SCHED_STALL, TRAP_TASK_OVERFLOW,
     TRAP_UNCAUGHT_ERROR,
 };
 // Check-leaks codegen gate (plan 116 phase 5): the CLI flips this
 // before compiling a `--check-leaks` run; tests use the guard.
 pub use runtime::{check_leaks_enabled, set_check_leaks, CheckLeaksGuard};
+pub use runtime::{ownership_check_enabled, set_ownership_check, OwnershipCheckGuard};
 // Checked-mode codegen gate (plan 116): `fai test --checked` flips this
 // before compiling to enable the cheap alloc-guard + index-store guards.
 pub use runtime::{checked_enabled, set_checked};

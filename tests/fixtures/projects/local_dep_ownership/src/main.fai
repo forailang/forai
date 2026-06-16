@@ -1,0 +1,12 @@
+# expect: ok
+# stdout:
+#   owned
+# ownership: balanced
+
+use { echo } from Dep
+
+def main
+    @return String
+do
+    echo('owned')
+end

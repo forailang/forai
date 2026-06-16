@@ -7,7 +7,12 @@ use fai_parser::ast as n;
 pub fn convert_program(p: &n::Program) -> s::Program {
     s::Program {
         kind: "Program".into(),
-        statements: p.statements.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+        statements: p
+            .statements
+            .iter()
+            .filter(|s| !matches!(s, n::Statement::Comment(_)))
+            .map(convert_statement)
+            .collect(),
     }
 }
 
@@ -96,32 +101,50 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
         }),
         n::Statement::Test(t) => s::Statement::TestDeclaration(s::TestDeclaration {
             name: t.name.clone(),
-            setup: t.setup.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
-            before_all: t
-                .before_all
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
-            before_each: t
-                .before_each
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
+            setup: t
+                .setup
+                .iter()
+                .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                .map(convert_statement)
+                .collect(),
+            before_all: t.before_all.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
+            before_each: t.before_each.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
             cases: t
                 .cases
                 .iter()
                 .map(|c| s::TestCase {
                     description: c.description.clone(),
-                    body: c.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+                    body: c
+                        .body
+                        .iter()
+                        .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                        .map(convert_statement)
+                        .collect(),
                     location: loc(&c.location),
                 })
                 .collect(),
-            after_each: t
-                .after_each
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
-            after_all: t
-                .after_all
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
+            after_each: t.after_each.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
+            after_all: t.after_all.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
             location: loc(&t.location),
         }),
         n::Statement::If(i) => s::Statement::IfStatement(s::IfStatement {
@@ -130,14 +153,21 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
                 .iter()
                 .map(|b| s::IfBranch {
                     condition: convert_expr(&b.condition),
-                    body: b.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+                    body: b
+                        .body
+                        .iter()
+                        .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                        .map(convert_statement)
+                        .collect(),
                     location: loc(&b.location),
                 })
                 .collect(),
-            else_branch: i
-                .else_branch
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
+            else_branch: i.else_branch.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
             location: loc(&i.location),
         }),
         n::Statement::Case(c) => s::Statement::CaseStatement(s::CaseStatement {
@@ -147,24 +177,43 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
                 .iter()
                 .map(|b| s::CaseBranch {
                     match_expr: convert_expr(&b.match_expr),
-                    body: b.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+                    body: b
+                        .body
+                        .iter()
+                        .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                        .map(convert_statement)
+                        .collect(),
                     location: loc(&b.location),
                 })
                 .collect(),
-            default_branch: c
-                .default_branch
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
+            default_branch: c.default_branch.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
             location: loc(&c.location),
         }),
         n::Statement::Try(t) => s::Statement::TryStatement(s::TryStatement {
-            try_body: t.try_body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+            try_body: t
+                .try_body
+                .iter()
+                .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                .map(convert_statement)
+                .collect(),
             catch_name: t.catch_name.clone(),
-            catch_body: t.catch_body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
-            finally_body: t
-                .finally_body
-                .as_ref()
-                .map(|v| v.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect()),
+            catch_body: t
+                .catch_body
+                .iter()
+                .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                .map(convert_statement)
+                .collect(),
+            finally_body: t.finally_body.as_ref().map(|v| {
+                v.iter()
+                    .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                    .map(convert_statement)
+                    .collect()
+            }),
             location: loc(&t.location),
         }),
         n::Statement::Throw(t) => s::Statement::ThrowStatement(s::ThrowStatement {
@@ -178,12 +227,22 @@ fn convert_statement(stmt: &n::Statement) -> s::Statement {
         n::Statement::For(f) => s::Statement::ForStatement(s::ForStatement {
             item_name: f.item_name.clone(),
             items: convert_expr(&f.items),
-            body: f.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+            body: f
+                .body
+                .iter()
+                .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                .map(convert_statement)
+                .collect(),
             location: loc(&f.location),
         }),
         n::Statement::While(w) => s::Statement::WhileStatement(s::WhileStatement {
             condition: convert_expr(&w.condition),
-            body: w.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+            body: w
+                .body
+                .iter()
+                .filter(|s| !matches!(s, n::Statement::Comment(_)))
+                .map(convert_statement)
+                .collect(),
             location: loc(&w.location),
         }),
         n::Statement::Break(l) => {
@@ -321,7 +380,12 @@ fn convert_fn_decl(f: &n::FunctionDeclaration) -> s::FunctionDeclaration {
                 location: loc(&r.location),
             })
             .collect(),
-        body: f.body.iter().filter(|s| !matches!(s, n::Statement::Comment(_))).map(convert_statement).collect(),
+        body: f
+            .body
+            .iter()
+            .filter(|s| !matches!(s, n::Statement::Comment(_)))
+            .map(convert_statement)
+            .collect(),
         doc: None,
         is_private: Some(f.is_private),
         is_abstract: f.is_abstract,

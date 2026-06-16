@@ -1,0 +1,22 @@
+# expect: ok
+# leak: flat
+#
+# `parseInt` only reads its string argument. An owned temporary passed to it
+# must be released after parsing.
+
+use std.convert
+
+def main
+    @return Void
+do
+    var total = 0
+    var i = 0
+    while i < 20
+        let maybeId String? = '29'
+        let n = unwrap(parseInt(unwrap(maybeId, '0')), 0)
+        let m = unwrap(convert.parseInt(unwrap(maybeId, '0')), 0)
+        total = total + n + m
+        i = i + 1
+    end
+    print(total)
+end

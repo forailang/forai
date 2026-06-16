@@ -1,6 +1,7 @@
 # expect: ok
 # stdout: ok
 # leak: flat
+# ownership: balanced
 # Builds a fresh array.
 def makeArr
     @return Int[]

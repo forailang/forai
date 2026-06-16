@@ -526,15 +526,26 @@ pub const IMPORT_RC_WATCH: u32 = 110;
 /// changes. Generalizes the RC watchpoint to any address — for tracking a
 /// stray write (e.g. a clobbered count field) to the op that produced it.
 pub const IMPORT_MEM_WATCH: u32 = 111;
+/// `env.__fai_ownership_event(op, site, value, aux) -> void` — phase-4
+/// ownership-helper event stream. `op` is
+/// [`fai_compiler::ownership_abi::OwnershipOp::id`], `site` is a compact
+/// codegen site id, `value` carries the boxed value/address when relevant,
+/// and `aux` carries the slot/convention discriminator for the operation.
+pub const IMPORT_OWNERSHIP_EVENT: u32 = 112;
+/// `env.replace_location(ptr, len) -> void` — replaces the current
+/// browser location with a document navigation.
+pub const IMPORT_REPLACE_LOCATION: u32 = 113;
+/// `env.crypto_hmac_sha1_base64(key_ptr, key_len, msg_ptr, msg_len) -> i64`.
+pub const IMPORT_CRYPTO_HMAC_SHA1_BASE64: u32 = 114;
 /// `env.ffi_begin(task_id, ext_fn_idx, arg_count, args_ptr) -> void` — offload
 /// a blocking extern call to the boundary worker pool and park the task (plan
 /// 101 U7-U9). The driver loop resumes it when the worker finishes; the guest
 /// then reads the value with `ffi_result`.
-pub const IMPORT_FFI_BEGIN: u32 = 112;
+pub const IMPORT_FFI_BEGIN: u32 = 115;
 /// `env.ffi_result(task_id) -> i64` — the NaN-boxed result of the offloaded
 /// extern call started by `ffi_begin`.
-pub const IMPORT_FFI_RESULT: u32 = 113;
-pub const IMPORT_COUNT: u32 = 114;
+pub const IMPORT_FFI_RESULT: u32 = 116;
+pub const IMPORT_COUNT: u32 = 117;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -637,6 +648,42 @@ impl Drop for CheckLeaksGuard {
     }
 }
 
+// ── Ownership-check codegen gate (plan 117 phase 4) ─────────────────
+//
+// When enabled, storage/call helpers can emit `__fai_ownership_event`.
+// The import is declared only for checked ownership builds so default
+// modules instantiate against older/minimal hosts unchanged.
+thread_local! {
+    static OWNERSHIP_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable ownership-helper event codegen for this thread.
+pub fn set_ownership_check(on: bool) {
+    OWNERSHIP_CHECK.with(|c| c.set(on));
+}
+
+/// Whether this build should declare and emit ownership-helper events.
+pub fn ownership_check_enabled() -> bool {
+    OWNERSHIP_CHECK.with(|c| c.get()) || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some()
+}
+
+/// RAII guard enabling ownership-helper event codegen for this thread.
+pub struct OwnershipCheckGuard;
+
+impl OwnershipCheckGuard {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        set_ownership_check(true);
+        OwnershipCheckGuard
+    }
+}
+
+impl Drop for OwnershipCheckGuard {
+    fn drop(&mut self) {
+        set_ownership_check(false);
+    }
+}
+
 // --- Checked mode (plan 116) -------------------------------------------
 //
 // `--checked` bundles the cheap, always-safe corruption guards that have
@@ -694,6 +741,11 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     if std::env::var_os("FAI_MEM_WATCH").is_none() {
         avail[IMPORT_MEM_WATCH as usize] = false;
     }
+    // Ownership helper events are opt-in, matching the helper-call emission
+    // gate. Default/native/browser builds keep their old import surface.
+    if !ownership_check_enabled() {
+        avail[IMPORT_OWNERSHIP_EVENT as usize] = false;
+    }
     match target {
         Some("wasm-html") | Some("wasm") => {
             // Browser async lowering owns wait/all through host_set_timer.
@@ -717,6 +769,7 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             // the availability probe can report false in the browser; the
             // compute functions are stripped (calling one traps).
             avail[IMPORT_CRYPTO_HMAC_SHA256_HEX as usize] = false;
+            avail[IMPORT_CRYPTO_HMAC_SHA1_BASE64 as usize] = false;
             avail[IMPORT_CRYPTO_SHA256_HEX as usize] = false;
             avail[IMPORT_CRYPTO_HEX_ENCODE as usize] = false;
             avail[IMPORT_CRYPTO_CONSTANT_TIME_EQUALS as usize] = false;
@@ -903,7 +956,12 @@ pub fn emit_all(
         emit_cmp(base, CmpOp::Ge),              // rt_ge
         emit_print_val(base, import_remap),     // rt_print_val (legacy, primitives only)
         emit_itoa(),                            // rt_itoa
-        emit_alloc(freelist_global, live_count_global, bucket_base, import_remap), // rt_alloc
+        emit_alloc(
+            freelist_global,
+            live_count_global,
+            bucket_base,
+            import_remap,
+        ), // rt_alloc
         emit_make_obj(),                        // rt_make_obj
         emit_obj_addr(),                        // rt_obj_addr
         emit_is_obj(),                          // rt_is_obj
@@ -921,7 +979,12 @@ pub fn emit_all(
         emit_call_native(base, import_remap),      // rt_call_native
         emit_parse_int(base),                      // rt_parse_int
         emit_parse_float(base),                    // rt_parse_float
-        emit_free(freelist_global, live_count_global, bucket_base, import_remap), // rt_free
+        emit_free(
+            freelist_global,
+            live_count_global,
+            bucket_base,
+            import_remap,
+        ), // rt_free
         emit_copy_deep(base),                      // rt_copy_deep
         emit_retain(base, bucket_base, import_remap), // rt_retain
         emit_release(base, bucket_base, import_remap), // rt_release
@@ -1868,7 +1931,11 @@ fn emit_heads_scan(
     idx_local: u32,
     node_local: u32,
 ) {
-    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    let off8 = MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    };
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(idx_local));
     f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -1877,7 +1944,7 @@ fn emit_heads_scan(
     f.instruction(&Instruction::I32Const(NUM_FREE_BUCKETS as i32));
     f.instruction(&Instruction::I32GeU);
     f.instruction(&Instruction::BrIf(1)); // idx >= buckets → done
-    // node = mem[bucket_base + idx*4]
+                                          // node = mem[bucket_base + idx*4]
     f.instruction(&Instruction::I32Const(bucket_base as i32));
     f.instruction(&Instruction::LocalGet(idx_local));
     f.instruction(&Instruction::I32Const(4));
@@ -1971,8 +2038,16 @@ fn emit_alloc(
     let heap_verify = std::env::var_os("FAI_HEAP_VERIFY").is_some();
     let mem_watch = std::env::var_os("FAI_MEM_WATCH").is_some();
     let mut f = Function::new([(9, ValType::I32)]);
-    let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
-    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
+    let off8 = MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    };
     // Checked-mode free-list validation (plan 116): a node in local 5 is
     // about to be reused. Trap with a named reason if its address is
     // implausible (link word overwritten → TRAP_FREELIST_CORRUPT) or if
@@ -2171,7 +2246,7 @@ fn emit_alloc(
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End); // head != 0
-    // else: empty bucket → fall through to bump.
+                                      // else: empty bucket → fall through to bump.
     f.instruction(&Instruction::Else);
     // ── large: linear exact-fit scan of the fallback list ──
     f.instruction(&Instruction::I32Const(0));
@@ -2226,7 +2301,7 @@ fn emit_alloc(
     f.instruction(&Instruction::End); // loop
     f.instruction(&Instruction::End); // block
     f.instruction(&Instruction::End); // idx < NUM_FREE_BUCKETS
-    // addr = heap_ptr (global 0)
+                                      // addr = heap_ptr (global 0)
     f.instruction(&Instruction::GlobalGet(0));
     f.instruction(&Instruction::LocalSet(1));
     // new_ptr = (heap_ptr + size + 7) & ~7  (align to 8)
@@ -2398,7 +2473,11 @@ fn emit_free(
         );
         f.instruction(&Instruction::End);
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
@@ -2421,51 +2500,55 @@ fn emit_free(
     // bucketed range go on the single linear fallback list. Mirrors emit_alloc.
     // Skipped entirely under FAI_NO_REUSE (the block is orphaned).
     if !no_reuse {
-    // bucket_idx = block_size / 8
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I32Const(3));
-    f.instruction(&Instruction::I32ShrU);
-    f.instruction(&Instruction::LocalSet(2));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Const(NUM_FREE_BUCKETS as i32));
-    f.instruction(&Instruction::I32LtU);
-    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    // ── small: push to bucket[idx] ──
-    // bucket_addr = bucket_base + idx*4  (local 3)
-    f.instruction(&Instruction::I32Const(bucket_base as i32));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Const(4));
-    f.instruction(&Instruction::I32Mul);
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::LocalSet(3));
-    // block.next (base+4) = mem[bucket_addr]
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::I32Load(mem0()));
-    f.instruction(&Instruction::I32Store(MemArg { offset: 4, align: 0, memory_index: 0 }));
-    // mem[bucket_addr] = base
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I32Store(mem0()));
-    f.instruction(&Instruction::Else);
-    // ── large: [size@0, next@4] on the linear fallback list ──
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I32Store(mem0()));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::GlobalGet(freelist_global));
-    f.instruction(&Instruction::I32Store(MemArg {
-        offset: 4,
-        align: 0,
-        memory_index: 0,
-    }));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::GlobalSet(freelist_global));
-    f.instruction(&Instruction::End);
+        // bucket_idx = block_size / 8
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32ShrU);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(NUM_FREE_BUCKETS as i32));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        // ── small: push to bucket[idx] ──
+        // bucket_addr = bucket_base + idx*4  (local 3)
+        f.instruction(&Instruction::I32Const(bucket_base as i32));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(3));
+        // block.next (base+4) = mem[bucket_addr]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        // mem[bucket_addr] = base
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::Else);
+        // ── large: [size@0, next@4] on the linear fallback list ──
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::GlobalGet(freelist_global));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::GlobalSet(freelist_global));
+        f.instruction(&Instruction::End);
     } // !no_reuse
-    // Checked-mode: poison the object tag slot (base+8 = the logical obj_addr,
-    // untouched by the free-list node at base/base+4) so a stale reference that
-    // reaches an RC op before the block is reused traps. (plan 113 R2)
+      // Checked-mode: poison the object tag slot (base+8 = the logical obj_addr,
+      // untouched by the free-list node at base/base+4) so a stale reference that
+      // reaches an RC op before the block is reused traps. (plan 113 R2)
     if rc_check {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
@@ -2490,8 +2573,16 @@ fn emit_free(
 fn emit_copy_deep(base: u32) -> Function {
     // param 0: v. locals 1=src,2=tag,3=count,4=i,5=size,6=dst,7=srcE,8=dstE.
     let mut f = Function::new([(8, ValType::I32)]);
-    let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
-    let b8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
+    let b8 = MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    };
     let empty = wasm_encoder::BlockType::Empty;
 
     // if !is_obj(v) { return v }
@@ -2635,7 +2726,11 @@ fn emit_copy_deep(base: u32) -> Function {
             f.instruction(&Instruction::I32Add);
             f.instruction(&Instruction::LocalSet(8));
             for &co in child_offsets {
-                let ma = MemArg { offset: co, align: 0, memory_index: 0 };
+                let ma = MemArg {
+                    offset: co,
+                    align: 0,
+                    memory_index: 0,
+                };
                 // mem[dstE+co] = copy_deep(mem[srcE+co])
                 f.instruction(&Instruction::LocalGet(8));
                 f.instruction(&Instruction::LocalGet(7));
@@ -3036,7 +3131,11 @@ fn emit_retain(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fun
     // Checked-mode: trap on retaining a freed object (tag at rc_slot+8 poisoned).
     if rc_check {
         f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::I32Const(OBJ_TAG_POISON));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(empty));
@@ -3081,7 +3180,11 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     let mem_watch = std::env::var_os("FAI_MEM_WATCH").is_some();
     let rc_watch = std::env::var_os("FAI_RC_WATCH").is_some();
     let mut f = Function::new([(9, ValType::I32)]);
-    let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
     let empty = wasm_encoder::BlockType::Empty;
     if heap_verify {
         emit_heads_scan(&mut f, bucket_base, import_remap, 8, 9);
@@ -3260,7 +3363,11 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     f.instruction(&Instruction::LocalGet(1));
     f.instruction(&Instruction::I32Const(4));
     f.instruction(&Instruction::I32Sub);
-    f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 0, memory_index: 0 }));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(5));
     f.instruction(&Instruction::End);
     // INSTANCE → (key,val) @ +16, stride 16; size = 16 + count*16
@@ -3288,7 +3395,11 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::If(empty));
     f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I32Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::LocalSet(3));
     emit_entry_loop(&mut f, 16, 8, &[0]);
     f.instruction(&Instruction::I32Const(16));
@@ -3306,7 +3417,11 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::If(empty));
     f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I64Load(MemArg { offset: 8, align: 0, memory_index: 0 }));
+    f.instruction(&Instruction::I64Load(MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    }));
     f.instruction(&Instruction::Call(base + RT_RELEASE));
     f.instruction(&Instruction::I32Const(16));
     f.instruction(&Instruction::LocalSet(5));
@@ -3865,8 +3980,16 @@ fn emit_set_field(base: u32, import_remap: &[Option<u32>]) -> Function {
     //         14=gi(i32 grow-copy index), 15=src_entry(i32),
     //         16=dst_entry(i32). Returns i64 (the dict pointer).
     let mut f = Function::new([(13, ValType::I32)]);
-    let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
-    let off8 = MemArg { offset: 8, align: 0, memory_index: 0 };
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
+    let off8 = MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    };
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
     f.instruction(&Instruction::LocalSet(4));
@@ -4112,12 +4235,12 @@ fn emit_set_field(base: u32, import_remap: &[Option<u32>]) -> Function {
         }
         f.instruction(&Instruction::End); // loop
         f.instruction(&Instruction::End); // block
-        // addr = new_addr (subsequent append + return use the grown block)
+                                          // addr = new_addr (subsequent append + return use the grown block)
         f.instruction(&Instruction::LocalGet(13));
         f.instruction(&Instruction::LocalSet(4));
     }
     f.instruction(&Instruction::End); // grow
-    // Append new entry at addr + 8 + count*16.
+                                      // Append new entry at addr + 8 + count*16.
     f.instruction(&Instruction::LocalGet(4)); // addr
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::I32Add);
@@ -4295,10 +4418,44 @@ fn emit_value_to_str(base: u32, ks: &KnownStrings, import_remap: &[Option<u32>])
 
 // ── $rt_print_val_new(val: i64) -> void ──
 fn emit_print_val_new(base: u32, import_remap: &[Option<u32>]) -> Function {
-    let mut f = Function::new([(1, ValType::I32)]); // local 1: addr
-                                                    // Convert to string, extract data, call env.print
+    let mut f = Function::new([(1, ValType::I32), (1, ValType::I64)]);
+
+    // Existing String values are borrowed by print; do not release them.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: 4,
+                align: 0,
+                memory_index: 0,
+            }));
+            emit_import_call(&mut f, IMPORT_PRINT, import_remap);
+            f.instruction(&Instruction::Return);
+        }
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::End);
+
+    // Non-string values stringify to a fresh String owned by this helper.
+    // Release it after env.print copies the bytes.
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
+    f.instruction(&Instruction::LocalTee(2));
     f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
     f.instruction(&Instruction::LocalSet(1));
     // ptr = addr + 8
@@ -4314,6 +4471,8 @@ fn emit_print_val_new(base: u32, import_remap: &[Option<u32>]) -> Function {
     }));
     // call env.print(ptr, len)  — import index 0
     emit_import_call(&mut f, IMPORT_PRINT, import_remap);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::Call(base + RT_RELEASE));
     f.instruction(&Instruction::End);
     f
 }
@@ -4327,7 +4486,13 @@ fn emit_print_val_new(base: u32, import_remap: &[Option<u32>]) -> Function {
 /// payload base (tag@0), `count_local` the element count, `idx_local` is a
 /// scratch i32 the caller guarantees is free at this point. RT_RETAIN's is_obj
 /// guard makes this a no-op for primitive elements.
-fn emit_retain_array_elems(f: &mut Function, base: u32, dst_local: u32, count_local: u32, idx_local: u32) {
+fn emit_retain_array_elems(
+    f: &mut Function,
+    base: u32,
+    dst_local: u32,
+    count_local: u32,
+    idx_local: u32,
+) {
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(idx_local));
     f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -4357,7 +4522,8 @@ fn emit_retain_array_elems(f: &mut Function, base: u32, dst_local: u32, count_lo
 
 fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
     // locals: 3=addr(i32), 4=method_id(i32), 5=arg0(i64), 6=arg1(i64),
-    // 7..14=i32 temps, 15..16=i64 temps, 17..18=extra i32 temps
+    // 7..14=i32 temps, 15..16=i64 temps, 17..18=extra i32 temps,
+    // 19=extra i64 temp.
     //
     // The last two i32 temps (17, 18) were added for METHOD_REPLACE
     // which needs more persistent state than 7..14 provide (6 arg-field
@@ -4372,6 +4538,7 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         (8, ValType::I32),
         (2, ValType::I64),
         (2, ValType::I32),
+        (1, ValType::I64),
     ]);
     // addr = obj_addr(callee)
     f.instruction(&Instruction::LocalGet(0));
@@ -5456,8 +5623,10 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
 
-        // Start with first element as result
+        // Start with first element as result. It is borrowed from the array
+        // until the first concat creates a fresh accumulator.
         // local 15 = accumulator (i64 NaN-boxed string)
+        // local 17 = accumulator-owned flag (i32)
         f.instruction(&Instruction::LocalGet(7));
         f.instruction(&Instruction::I64Load(MemArg {
             offset: 8,
@@ -5466,6 +5635,8 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         })); // arr[0]
         f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
         f.instruction(&Instruction::LocalSet(15)); // result = toString(arr[0])
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(17));
 
         // local 11 = i (loop from 1)
         f.instruction(&Instruction::I32Const(1));
@@ -5480,14 +5651,26 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
             f.instruction(&Instruction::I32GeU);
             f.instruction(&Instruction::BrIf(1));
 
-            // result = concat(result, sep_string)
+            // temp = concat(result, sep_string). The separator copy and any
+            // previously owned accumulator are internal temps and can be
+            // released once temp supersedes them.
             f.instruction(&Instruction::LocalGet(15));
             f.instruction(&Instruction::LocalGet(9)); // sep_ptr
             f.instruction(&Instruction::LocalGet(10)); // sep_len
             f.instruction(&Instruction::Call(base + RT_ALLOC_STRING)); // NaN-boxed sep
+            f.instruction(&Instruction::LocalTee(16));
             f.instruction(&Instruction::Call(base + RT_CONCAT));
+            f.instruction(&Instruction::LocalSet(19));
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::LocalGet(17));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::End);
 
             // result = concat(result, toString(arr[i]))
+            f.instruction(&Instruction::LocalGet(19));
             f.instruction(&Instruction::LocalGet(7)); // arr_addr
             f.instruction(&Instruction::I32Const(8));
             f.instruction(&Instruction::I32Add);
@@ -5499,6 +5682,10 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
             f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
             f.instruction(&Instruction::Call(base + RT_CONCAT));
             f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(19));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(17));
 
             // i++
             f.instruction(&Instruction::LocalGet(11));
@@ -5509,6 +5696,17 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         }
         f.instruction(&Instruction::End); // end loop
         f.instruction(&Instruction::End); // end block
+
+        // One-element arrays never enter the loop, so the accumulator is still
+        // borrowed from arr[0]. Retain it here to keep join's Owned result
+        // contract uniform.
+        f.instruction(&Instruction::LocalGet(17));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::End);
 
         f.instruction(&Instruction::LocalGet(15));
         f.instruction(&Instruction::Return);
@@ -5631,17 +5829,23 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
                 // content — which silently broke filename-ordered migration
                 // runners and any string sort. locals: 14/17 = a/b obj addr,
                 // 15/16 = a/b boxed value (i64 scratch, free in sort).
-                let off4 = MemArg { offset: 4, align: 0, memory_index: 0 };
+                let off4 = MemArg {
+                    offset: 4,
+                    align: 0,
+                    memory_index: 0,
+                };
                 f.instruction(&Instruction::LocalGet(12));
                 f.instruction(&Instruction::I64Load(mem0()));
                 f.instruction(&Instruction::LocalSet(15)); // a
                 f.instruction(&Instruction::LocalGet(13));
                 f.instruction(&Instruction::I64Load(mem0()));
                 f.instruction(&Instruction::LocalSet(16)); // b
-                // both_str = is_str(a) && is_str(b)
+                                                           // both_str = is_str(a) && is_str(b)
                 f.instruction(&Instruction::LocalGet(15));
                 f.instruction(&Instruction::Call(base + RT_IS_OBJ));
-                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
                 f.instruction(&Instruction::LocalGet(15));
                 f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
                 f.instruction(&Instruction::I32Load(mem0()));
@@ -5652,7 +5856,9 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
                 f.instruction(&Instruction::End);
                 f.instruction(&Instruction::LocalGet(16));
                 f.instruction(&Instruction::Call(base + RT_IS_OBJ));
-                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
                 f.instruction(&Instruction::LocalGet(16));
                 f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
                 f.instruction(&Instruction::I32Load(mem0()));
@@ -5662,7 +5868,9 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
                 f.instruction(&Instruction::I32Const(0));
                 f.instruction(&Instruction::End);
                 f.instruction(&Instruction::I32And);
-                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
                 {
                     // RT_STR_CMP(a_ptr, a_len, b_ptr, b_len) > 0
                     f.instruction(&Instruction::LocalGet(15));
@@ -5727,9 +5935,6 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         }
         f.instruction(&Instruction::End); // end outer loop
         f.instruction(&Instruction::End); // end outer block
-
-        // RC: the sorted array co-owns the element refs copied from the source.
-        emit_retain_array_elems(f, base, 9, 8, 14);
 
         // Return NaN-boxed array
         f.instruction(&Instruction::LocalGet(9));
@@ -8835,7 +9040,11 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         // IMPORT_ALLOC_EVENT / IMPORT_FREE_EVENT: (addr, size) -> void —
         // heap allocation ledger (`--check-leaks`); only declared when
         // check-leaks codegen is enabled.
-        ("__fai_alloc_event", vec![ValType::I32, ValType::I32], vec![]),
+        (
+            "__fai_alloc_event",
+            vec![ValType::I32, ValType::I32],
+            vec![],
+        ),
         ("__fai_free_event", vec![ValType::I32, ValType::I32], vec![]),
         // IMPORT_PROCESS_AVAILABLE: () -> i32 — stays linked on every
         // target so the availability probe can report false in the
@@ -8856,9 +9065,27 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I64],
         ),
         // IMPORT_RC_WATCH: (obj_addr, rc_slot_addr, delta) -> void.
-        ("__fai_rc_watch", vec![ValType::I32, ValType::I32, ValType::I32], vec![]),
+        (
+            "__fai_rc_watch",
+            vec![ValType::I32, ValType::I32, ValType::I32],
+            vec![],
+        ),
         // IMPORT_MEM_WATCH: () -> void. Host reads the watched address.
         ("__fai_mem_watch", vec![], vec![]),
+        // IMPORT_OWNERSHIP_EVENT: (op, site, value, aux) -> void.
+        (
+            "__fai_ownership_event",
+            vec![ValType::I32, ValType::I32, ValType::I64, ValType::I32],
+            vec![],
+        ),
+        // IMPORT_REPLACE_LOCATION: (path_ptr, path_len) -> void.
+        ("replace_location", vec![ValType::I32, ValType::I32], vec![]),
+        // IMPORT_CRYPTO_HMAC_SHA1_BASE64: (key_ptr, key_len, msg_ptr, msg_len) -> i64.
+        (
+            "crypto_hmac_sha1_base64",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
         // IMPORT_FFI_BEGIN: (task_id, ext_fn_idx, arg_count, args_ptr) -> ()
         (
             "ffi_begin",
@@ -9001,7 +9228,11 @@ mod alloc_free_tests {
         // heap starts past the bucket region (1024 + FREE_BUCKET_REGION_BYTES);
         // the logical pointer is base+8 (rc prefix, plan 113)
         let heap_init = 1024 + super::FREE_BUCKET_REGION_BYTES as i32;
-        assert_eq!(a, heap_init + 8, "first alloc is heap start + 8-byte rc prefix");
+        assert_eq!(
+            a,
+            heap_init + 8,
+            "first alloc is heap start + 8-byte rc prefix"
+        );
         assert!(b > a, "second alloc bumps past the first (no free yet)");
     }
 
@@ -9020,7 +9251,10 @@ mod alloc_free_tests {
         assert_eq!(b, a, "freed block is reused by the next same-size alloc");
         // free list is now empty again → next alloc bumps a fresh block
         let c = alloc.call(&mut store, 16).unwrap();
-        assert!(c > a, "after the freelist drains, alloc bumps a fresh block");
+        assert!(
+            c > a,
+            "after the freelist drains, alloc bumps a fresh block"
+        );
     }
 
     #[test]
@@ -9061,7 +9295,10 @@ mod alloc_free_tests {
         let b = alloc.call(&mut store, 32).unwrap();
         free.call(&mut store, (b, 32)).unwrap();
         let small = alloc.call(&mut store, 8).unwrap();
-        assert!(small > b, "smaller request bumps rather than grabbing a larger freed block");
+        assert!(
+            small > b,
+            "smaller request bumps rather than grabbing a larger freed block"
+        );
     }
 }
 
@@ -9088,8 +9325,7 @@ mod ownership_roundtrip_tests {
         )];
 
         let sigs = import_signatures();
-        let names: std::collections::HashSet<&str> =
-            sigs.iter().map(|(n, _, _)| *n).collect();
+        let names: std::collections::HashSet<&str> = sigs.iter().map(|(n, _, _)| *n).collect();
 
         // Direction 2: no dead table rows.
         for row in fai_compiler::ownership_abi::HOST_IMPORTS {

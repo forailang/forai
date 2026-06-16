@@ -1,6 +1,8 @@
 use std.string
 
 # expect: ok
+# leak: flat
+# ownership: balanced
 # stdout:
 #   3
 #   a-b-c

@@ -86,17 +86,18 @@ fn register(name: &str, closure_val: i64, once: bool) -> i64 {
     })
 }
 
-fn unregister(name: &str, id: i64) -> bool {
+fn take_subscription(name: &str, id: i64) -> Option<Subscription> {
     REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
-        if let Some(list) = reg.by_name.get_mut(name) {
-            let before = list.len();
-            list.retain(|s| s.id != id);
-            before != list.len()
-        } else {
-            false
-        }
+        let list = reg.by_name.get_mut(name)?;
+        let pos = list.iter().position(|s| s.id == id)?;
+        Some(list.remove(pos))
     })
+}
+
+#[cfg(test)]
+fn unregister(name: &str, id: i64) -> bool {
+    take_subscription(name, id).is_some()
 }
 
 /// Snapshot the live subscriber list for `name`, then drop every
@@ -104,14 +105,29 @@ fn unregister(name: &str, id: i64) -> bool {
 /// still includes the `once` entries — they fire one last time on
 /// this dispatch — but a recursive emit during this dispatch sees
 /// them already gone.
+#[cfg(test)]
 fn snapshot_and_drop_once(name: &str) -> Vec<Subscription> {
+    let (snap, _removed_once) = snapshot_and_take_once(name);
+    snap
+}
+
+fn snapshot_and_take_once(name: &str) -> (Vec<Subscription>, Vec<Subscription>) {
     REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
         let snap = reg.by_name.get(name).cloned().unwrap_or_default();
+        let mut removed_once = Vec::new();
         if let Some(list) = reg.by_name.get_mut(name) {
-            list.retain(|s| !s.once);
+            let mut kept = Vec::with_capacity(list.len());
+            for sub in list.drain(..) {
+                if sub.once {
+                    removed_once.push(sub);
+                } else {
+                    kept.push(sub);
+                }
+            }
+            *list = kept;
         }
-        snap
+        (snap, removed_once)
     })
 }
 
@@ -125,23 +141,68 @@ fn count(name: &str) -> i32 {
     })
 }
 
+#[cfg(test)]
 fn clear_name(name: &str) {
-    REGISTRY.with(|r| {
-        r.borrow_mut().by_name.remove(name);
-    });
+    let _ = take_name_subscriptions(name);
 }
 
+fn take_name_subscriptions(name: &str) -> Vec<Subscription> {
+    REGISTRY.with(|r| r.borrow_mut().by_name.remove(name).unwrap_or_default())
+}
+
+#[cfg(test)]
 fn clear_all() {
-    REGISTRY.with(|r| {
+    let _ = take_all_state();
+}
+
+fn take_all_state() -> (Vec<Subscription>, Vec<DeferredEvent>) {
+    let subscriptions = REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
-        reg.by_name.clear();
+        let subscriptions = reg
+            .by_name
+            .drain()
+            .flat_map(|(_, subscriptions)| subscriptions)
+            .collect();
         reg.next_id = 0;
+        subscriptions
     });
-    QUEUE.with(|q| {
+    let deferred = QUEUE.with(|q| {
         let mut queue = q.borrow_mut();
-        queue.events.clear();
+        let deferred = std::mem::take(&mut queue.events);
         queue.draining = false;
+        deferred
     });
+    (subscriptions, deferred)
+}
+
+fn release_subscriptions(caller: &mut Caller<'_, ()>, subscriptions: Vec<Subscription>) {
+    super::super::heap::host_release_values(
+        caller,
+        subscriptions.into_iter().map(|s| s.closure_val),
+    );
+}
+
+fn release_deferred_events(caller: &mut Caller<'_, ()>, events: Vec<DeferredEvent>) {
+    super::super::heap::host_release_values(caller, events.into_iter().map(|e| e.data_val));
+}
+
+fn clear_name_retained(caller: &mut Caller<'_, ()>, name: &str) {
+    release_subscriptions(caller, take_name_subscriptions(name));
+}
+
+fn clear_all_retained(caller: &mut Caller<'_, ()>) {
+    let (subscriptions, deferred) = take_all_state();
+    release_subscriptions(caller, subscriptions);
+    release_deferred_events(caller, deferred);
+}
+
+fn unregister_retained(caller: &mut Caller<'_, ()>, name: &str, id: i64) -> bool {
+    if let Some(sub) = take_subscription(name, id) {
+        super::super::heap::host_release_value(caller, sub.closure_val);
+        true
+    } else {
+        false
+    }
 }
 
 // ── Deferred queue ─────────────────────────────────────────────────
@@ -193,8 +254,9 @@ fn is_draining() -> bool {
 /// dispatch stops and the caller's post-call propagation delivers
 /// the error.
 pub(super) fn dispatch_event(caller: &mut Caller<'_, ()>, name: &str, data_val: i64) {
-    let snapshot = snapshot_and_drop_once(name);
+    let (snapshot, removed_once) = snapshot_and_take_once(name);
     if snapshot.is_empty() {
+        release_subscriptions(caller, removed_once);
         return;
     }
     // The Event dict is HOST-owned for the duration of the dispatch:
@@ -213,6 +275,7 @@ pub(super) fn dispatch_event(caller: &mut Caller<'_, ()>, name: &str, data_val: 
         }
     }
     super::super::heap::host_release_value(caller, event_val);
+    release_subscriptions(caller, removed_once);
 }
 
 /// Drain every queued deferred event in FIFO order. Subscribers can
@@ -317,8 +380,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // The subscription keeps the listener closure, so co-own it:
                 // retain on register, or the guest releasing its owned handler-arg
                 // temp after `events.on` frees the closure (RC, plan 113/115).
-                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                super::super::heap::host_retain(mem.data_mut(&mut caller), closure_val);
+                super::super::heap::host_retain_value(&mut caller, closure_val);
                 let id = register(&name, closure_val, false);
                 build_subscription(&mut caller, id, &name)
             },
@@ -332,8 +394,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "event_once",
             |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32, closure_val: i64| -> i64 {
                 let name = read_name(&mut caller, name_ptr, name_len);
-                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                super::super::heap::host_retain(mem.data_mut(&mut caller), closure_val);
+                super::super::heap::host_retain_value(&mut caller, closure_val);
                 let id = register(&name, closure_val, true);
                 build_subscription(&mut caller, id, &name)
             },
@@ -350,7 +411,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let Some((id, name)) = read_subscription(&mem, &mut caller, sub_val) else {
                     return 0;
                 };
-                if unregister(&name, id) {
+                if unregister_retained(&mut caller, &name, id) {
                     1
                 } else {
                     0
@@ -390,15 +451,15 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "event_clear",
             |mut caller: Caller<'_, ()>, name_ptr: i32, name_len: i32| {
                 let name = read_name(&mut caller, name_ptr, name_len);
-                clear_name(&name);
+                clear_name_retained(&mut caller, &name);
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
     // event_clear_all() -> void
     linker
-        .func_wrap("env", "event_clear_all", |_caller: Caller<'_, ()>| {
-            clear_all();
+        .func_wrap("env", "event_clear_all", |mut caller: Caller<'_, ()>| {
+            clear_all_retained(&mut caller);
         })
         .map_err(|e| format!("linker error: {}", e))?;
 
@@ -413,9 +474,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // own ref can be released before `drain` runs (its scope
                 // ends), so an un-retained queue entry would dangle.
                 // `drain_queue` releases this ref after dispatch.
-                if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                    super::super::heap::host_retain(mem.data_mut(&mut caller), data_val);
-                }
+                super::super::heap::host_retain_value(&mut caller, data_val);
                 enqueue_deferred(&name, data_val);
             },
         )

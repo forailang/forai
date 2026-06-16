@@ -564,12 +564,14 @@ use std.browser
 
 let path = browser.getLocationPath()
 browser.pushHistoryState('/settings')
+browser.replaceLocation('/chat')
 browser.setHtmlAt('#app', '<p>Updated</p>')
 ```
 
 `setHtml` and `setHtmlAt` replace DOM content. `getLocationPath` and
-`pushHistoryState` back router integration. `remoteCall` is the low-level RPC
-transport used by generated remote stubs.
+`pushHistoryState` back router integration. `replaceLocation` performs a full
+document navigation. `remoteCall` is the low-level RPC transport used by
+generated remote stubs.
 "#,
         },
         StdlibModuleOverview {

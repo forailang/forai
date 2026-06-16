@@ -1,0 +1,7 @@
+# Return the same string through an external package boundary.
+def echo
+    @param value String
+    @return String
+do
+    value
+end

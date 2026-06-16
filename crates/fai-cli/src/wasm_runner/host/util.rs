@@ -176,7 +176,9 @@ fn freelist_scan(caller: &mut Caller<'_, ()>, mem: &Memory) -> Option<String> {
         .map(|g| g.get(&mut *caller).unwrap_i32() as u32)?;
     let data = mem.data(&caller);
     let read = |addr: usize| -> Option<i32> {
-        Some(i32::from_le_bytes(data.get(addr..addr + 4)?.try_into().ok()?))
+        Some(i32::from_le_bytes(
+            data.get(addr..addr + 4)?.try_into().ok()?,
+        ))
     };
     for idx in 0..NUM_BUCKETS {
         let node = read(bucket_base + idx * 4)? as u32;

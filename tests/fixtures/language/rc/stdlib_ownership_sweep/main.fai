@@ -1,0 +1,120 @@
+# expect: ok
+# leak: flat
+# ownership: balanced
+#
+# Broad ownership sweep for safe stdlib and bare builtins. This intentionally
+# avoids external network/process calls; those are covered by ABI inventory
+# tests until they have deterministic host fixtures.
+
+use std.array
+
+use std.convert
+
+use std.crypto
+
+use std.env
+
+use std.html
+
+use std.json
+
+use std.math
+
+use std.path
+
+use std.string
+
+def main
+    @return Void
+do
+    var total = 0
+    var i = 0
+    while i < 20
+        let raw = ' alpha-' + toString(i) + ' '
+        let trimmed = string.trim(raw)
+        let lower = string.toLower(string.toUpper(trimmed))
+        let replaced = string.replace(lower, 'alpha', 'beta')
+        let parts = string.split(replaced, '-')
+        let joined = string.join(parts, '/')
+        let repeated = string.repeat(string.substring(joined, 0, 4), 2)
+        total = total + string.length(repeated)
+        if string.contains(repeated, 'beta')
+            total = total + 1
+        end
+        if string.startsWith(repeated, 'beta')
+            total = total + 1
+        end
+        if !string.endsWith(repeated, 'missing')
+            total = total + 1
+        end
+        total = total + string.indexOf(repeated, 'ta')
+        let nums = [3 1 2 i]
+        let appended = array.append(nums, i + 1)
+        let sliced = array.slice(appended, 0, 3)
+        let sorted = array.sort(sliced)
+        let reversed = array.reverse(sorted)
+        let mapped = array.map(reversed) do with n Int
+            n + 1
+        end
+        let filtered = array.filter(mapped) do with n Int
+            n > 1
+        end
+        let found = array.find(filtered) do with n Int
+            n > 2
+        end
+        if found?
+            total = total + found!
+        end
+        if array.isAny(filtered) do with n Int
+            n == 3
+        end
+            total = total + 1
+        end
+        if array.isAll(filtered) do with n Int
+            n > 0
+        end
+            total = total + 1
+        end
+        total = total + array.length(filtered)
+        total = total + array.indexOf(filtered, 3)
+        if array.contains(filtered, 2)
+            total = total + 1
+        end
+        total = total + length(getKeys(set({}, 'k', 'v')))
+        let parsed = json.parse('{"name":"fai","n":29}')
+        let name = unwrap(json.requireString(parsed, 'name'), '')
+        let encoded = json.stringify(set({}, 'name', name))
+        total = total + length(encoded)
+        total = total + unwrap(convert.parseInt(unwrap(json.requireString(json.parse('{"id":"29"}'), 'id'), '0')), 0)
+        total = total + toInt(convert.toFloat(3))
+        total = total + length(convert.toString(total))
+        if convert.toBool(name)
+            total = total + 1
+        end
+        total = total + length(path.join('root', 'file.txt'))
+        total = total + length(path.basename('/tmp/file.txt'))
+        total = total + length(path.dirname('/tmp/file.txt'))
+        total = total + length(path.extname('/tmp/file.txt'))
+        total = total + length(html.escape('<tag>&</tag>'))
+        if crypto.available()
+            total = total + length(crypto.sha256Hex('payload'))
+            total = total + length(crypto.hexEncode('payload'))
+            total = total + length(crypto.base64Encode('payload'))
+            total = total + length(crypto.base64Decode(crypto.base64Encode('payload')))
+            if crypto.constantTimeEquals('same', 'same')
+                total = total + 1
+            end
+        end
+        if env.get('__FORAI_OWNERSHIP_SWEEP_MISSING__')? == false
+            total = total + 1
+        end
+        total = total + math.floor(math.sqrt(16.0))
+        total = total + math.ceil(1.1)
+        total = total + math.round(1.6)
+        total = total + toInt(math.min(3.0, 4.0))
+        total = total + toInt(math.max(3.0, 4.0))
+        total = total + toInt(math.pow(2.0, 3.0))
+        i = i + 1
+    end
+    print(total > 0)
+end

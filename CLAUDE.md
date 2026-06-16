@@ -60,6 +60,47 @@ The CLI binary is available as `fai` / `forai`. `forai <file.fai>` is shorthand 
 - Add or update language fixtures for user-visible language behavior.
 - Run `cargo test --workspace` before handing off broad changes.
 
+## Ownership, Leaks, and Memory Debugging
+
+For ownership, leak, RC, host-registry, and generated-runtime memory bugs, use
+the Plan 117 three-layer proof loop:
+
+1. Reproduce the symptom with the relevant checker: `fai run --check-ownership`,
+   `fai test --check-ownership`, `fai run --check-leaks`, `fai test --check-leaks`,
+   browser `window.__fai_assert_ownership()`, or the documented debug env vars.
+2. Read the report by source site and operation family. Do not assume the first
+   noisy aggregate is product code; checker semantics can be the bug.
+3. Reduce the app case into the smallest Rust unit test, language fixture,
+   browser fixture, or tracked project repro that exercises the same helper path.
+4. Fix the root cause in the owning layer: ownership ABI/table in
+   `fai-compiler`, helper emission in `fai-codegen-wasm`, native/browser
+   reporting in `fai-cli`, or app/framework code only when that layer owns the
+   bad lifetime.
+5. Keep the mechanical ratchet with `ownership: balanced`, `leak: flat`, a
+   seeded instrumentation test, or a focused unit test.
+
+Useful targeted commands:
+
+```bash
+cargo test -p fai-cli ownership_balance --lib -- --nocapture
+cargo test -p fai-cli generate_runtime_js --lib -- --nocapture
+cargo test -p fai-feature-tests --test ownership_instrumentation -- --nocapture
+cargo test -p fai-codegen-wasm ownership --lib
+```
+
+Fixture directives and reduced project repros are documented in
+`tests/fixtures/language/README.md`. Use `tests/fixtures/projects/` when an app
+bug needs `fai.toml`, source-root behavior, or local `file://` dependencies.
+Use `ownership: balanced` for native ownership gates, `browser:` with
+`ownership: balanced` for browser ownership gates, and `leak: flat` for
+per-test/per-run live-object gates. Seeded failures belong in Rust integration
+tests or explicit invalid fixtures, not in normal balanced fixtures.
+
+Generated browser runtime changes must be checked for syntax and behavior.
+At minimum, keep `generate_runtime_js` tests current; for app-facing browser
+fixes, build the web target and run `node --check build/web/fai-runtime.js`
+or the equivalent fixture/browser assertion.
+
 ## Repository Notes
 
 - `plans/` contains local planning notes and is intentionally gitignored.

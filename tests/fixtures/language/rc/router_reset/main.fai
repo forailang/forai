@@ -1,0 +1,36 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+
+use std.http.server
+
+def main
+    @return Void
+do
+    let r = server.router()
+    server.get(r, '/') do with req HttpRequest
+        server.text(200, 'ok')
+    end
+    print('ok')
+end
+
+# Router reset test target.
+def routerReset
+    @return Void
+do
+
+end
+
+test routerReset
+    it 'releases retained route handlers at teardown'
+        let r = server.router()
+        server.get(r, '/hello') do with req HttpRequest
+            server.text(200, 'hello')
+        end
+        server.post(r, '/submit') do with req HttpRequest
+            server.text(201, 'posted')
+        end
+        server.serveFiles(r, './public')
+        assert.isTrue(true)
+    end
+end

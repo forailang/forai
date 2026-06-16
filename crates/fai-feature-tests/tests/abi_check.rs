@@ -46,8 +46,7 @@ fn run_probe(name: &str, seed: Option<&str>, abi_check: bool) -> (String, bool) 
     };
     let out = cmd.output().expect("spawn fai");
     (
-        String::from_utf8_lossy(&out.stderr).into_owned()
-            + &String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout),
         out.status.success(),
     )
 }
@@ -66,7 +65,11 @@ fn full_surface_has_no_missing_signatures() {
 #[test]
 fn seeded_absent_entry_is_a_checked_build_error() {
     let (output, ok) = run_probe("seeded_checked", Some("json_parse"), true);
-    assert!(!ok, "checked build must FAIL on a missing signature:\n{}", output);
+    assert!(
+        !ok,
+        "checked build must FAIL on a missing signature:\n{}",
+        output
+    );
     assert!(
         output.contains("MissingOwnershipSignature") && output.contains("json_parse"),
         "error must name the unsigned import:\n{}",
@@ -94,5 +97,9 @@ fn seed_naming_unknown_import_warns_and_stays_inactive() {
         "unknown seed should warn:\n{}",
         output
     );
-    assert!(!output.contains(SENTINEL), "unknown seed must be a no-op:\n{}", output);
+    assert!(
+        !output.contains(SENTINEL),
+        "unknown seed must be a no-op:\n{}",
+        output
+    );
 }

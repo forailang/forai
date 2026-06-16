@@ -21,6 +21,12 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("path", Type::String)],
         &[Type::Void],
     );
+    ins(
+        b,
+        "replaceLocation",
+        &[p("path", Type::String)],
+        &[Type::Void],
+    );
 
     // HTML
     ins(b, "htmlEscape", &[p("text", Type::String)], &[Type::String]);
@@ -52,7 +58,13 @@ mod tests {
     #[test]
     fn test_browser_builtins() {
         let b = fresh();
-        for name in &["setHtml", "setHtmlAt", "htmlEscape", "remoteCall"] {
+        for name in &[
+            "setHtml",
+            "setHtmlAt",
+            "htmlEscape",
+            "remoteCall",
+            "replaceLocation",
+        ] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
     }

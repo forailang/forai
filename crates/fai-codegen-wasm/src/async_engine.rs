@@ -37,7 +37,10 @@ pub const O_ERROR: u64 = 24;
 /// can park a task on a host op (e.g. a `remoteCall` fetch) with no timer.
 pub const O_WAKE: u64 = 32;
 pub const O_NEXT: u64 = 40; // i32: ready-queue link / free-list link (-1 = none)
-const O_WAITER: u64 = 44; // i32: single parent waiter (-1 = none)
+/// i32: single parent waiter (-1 = none, -2 = host/root consumer). Public so
+/// sync-to-async closure dispatch can prevent detached auto-recycle while it is
+/// about to read the task result.
+pub const O_WAITER: u64 = 44;
 /// i32: resume-state label for the state machine. Public so the
 /// direct-builder resume lowering can read/write it on the current task.
 pub const O_RSTATE: u64 = 48;
@@ -82,6 +85,8 @@ pub struct SchedLayout {
     /// `drive_closure` retains the host-passed arg into the param slot
     /// (param slots own +1; the task releases them at completion, plan 114).
     pub retain: u32,
+    /// `rt_release` `(v:i64) -> ()`: refcount decrement.
+    pub release: u32,
     pub ready_push: u32,
     pub ready_pop: u32,
     pub spawn: u32,
@@ -343,6 +348,11 @@ fn emit_complete_or_fail(l: &SchedLayout, status: i32, value_off: u64) -> Functi
     f.instruction(&Instruction::I32Const(-1));
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::If(BlockType::Empty));
+    // Detached tasks have no result consumer. Release the stored completion
+    // value before recycling the scheduler slot.
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I64Load(ma(O_RESULT)));
+    f.instruction(&Instruction::Call(l.release));
     // task[id].next = g_free_head; g_free_head = id
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::GlobalGet(l.g_free_head));
@@ -640,6 +650,9 @@ fn emit_task_result(l: &SchedLayout) -> Function {
     let mut f = Function::new([]);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I64Load(ma(O_RESULT)));
+    // Transfer a +1 to the caller. The scheduler record keeps its own stored
+    // result until the record is recycled, where that stored ref is released.
+    f.instruction(&Instruction::Call(l.retain));
     f.instruction(&Instruction::End);
     f
 }
@@ -710,8 +723,8 @@ pub fn emit_scheduler_functions(l: &SchedLayout) -> Vec<Function> {
 /// `server.listen`, and must remain the current task afterward.
 fn emit_drive_closure(l: &SchedLayout) -> Function {
     // params: closure_val = 0 (i64), arg = 1 (i64)
-    // locals: addr = 2, frame = 3, id = 4, saved = 5 (all i32)
-    let mut f = Function::new([(4, ValType::I32)]);
+    // locals: addr = 2, frame = 3, id = 4, saved = 5 (i32), result = 6 (i64)
+    let mut f = Function::new([(4, ValType::I32), (1, ValType::I64)]);
     // saved = g_current
     f.instruction(&Instruction::GlobalGet(l.g_current));
     f.instruction(&Instruction::LocalSet(5));
@@ -805,6 +818,13 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::Call(l.task_result)); // result on stack
+    let result = 6;
+    f.instruction(&Instruction::LocalSet(result));
+    // Release the scheduler record's stored result; `task_result` retained the
+    // value for the caller above.
+    rec_addr_local(&mut f, l, 4);
+    f.instruction(&Instruction::I64Load(ma(O_RESULT)));
+    f.instruction(&Instruction::Call(l.release));
     // free id: task[id].next = g_free_head; g_free_head = id
     f.instruction(&Instruction::GlobalGet(l.g_table_base));
     f.instruction(&Instruction::LocalGet(4));
@@ -815,6 +835,7 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Store(ma(O_NEXT)));
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::GlobalSet(l.g_free_head));
+    f.instruction(&Instruction::LocalGet(result));
     f.instruction(&Instruction::Else);
     f.instruction(&Instruction::I64Const(crate::runtime::VAL_VOID));
     f.instruction(&Instruction::End);
@@ -908,6 +929,18 @@ pub fn emit_task_status(l: &SchedLayout) -> Function {
 pub fn emit_free_task(l: &SchedLayout) -> Function {
     // param: id = 0 (i32)
     let mut f = Function::new([]);
+    // Release the scheduler record's stored result before recycling the slot.
+    // `emit_task_result` transfers a +1 to the host caller and the record keeps
+    // its own +1 on O_RESULT (the ownership +1-transfer convention); the host
+    // driver is the record's recycler (sentinel -2), so without this release the
+    // record's copy of every handler response leaks one graph per request —
+    // mirrors the same release in `emit_drive_closure` and detached completion.
+    // For a FAILED task the host answers 500 without reading the result, so this
+    // is the only release of its stored value; O_RESULT is 0 / non-heap when
+    // unset, making `rt_release` a safe no-op.
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I64Load(ma(O_RESULT)));
+    f.instruction(&Instruction::Call(l.release));
     // task[id].O_NEXT = g_free_head
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::GlobalGet(l.g_free_head));
@@ -997,6 +1030,8 @@ mod tests {
             // 16 = identity retain (test harness has no RC; present only so
             // `drive_closure`'s `Call(retain)` validates).
             retain: 16,
+            // 17 = no-op release (test harness has no RC).
+            release: 17,
             resume_type: 1, // () -> ()
             g_count: 0,
             g_head: 1,
@@ -1038,6 +1073,7 @@ mod tests {
             .ty()
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]); // 10 drive_closure
         types.ty().function(vec![ValType::I64], vec![ValType::I64]); // 11 retain
+        types.ty().function(vec![ValType::I64], vec![]); // 12 release
         module.section(&types);
 
         let mut imports = ImportSection::new();
@@ -1061,6 +1097,7 @@ mod tests {
         funcs.function(7); // alloc (i32)->i32
         funcs.function(9); // free (i32,i32)->() — no-op stub (type 9)
         funcs.function(11); // retain (i64)->i64 — identity stub (type 11)
+        funcs.function(12); // release (i64)->() — no-op stub (type 12)
         for _ in &resume_bodies {
             funcs.function(1); // resume body ()->()
         }
@@ -1112,7 +1149,7 @@ mod tests {
 
         if n > 0 {
             let mut elements = ElementSection::new();
-            let idxs: Vec<u32> = (0..n).map(|i| 17 + i).collect();
+            let idxs: Vec<u32> = (0..n).map(|i| 18 + i).collect();
             elements.active(
                 Some(0),
                 &ConstExpr::i32_const(0),
@@ -1141,6 +1178,10 @@ mod tests {
         retain.instruction(&Instruction::LocalGet(0));
         retain.instruction(&Instruction::End);
         code.function(&retain);
+        // release: no-op stub (i64)->().
+        let mut release = Function::new([]);
+        release.instruction(&Instruction::End);
+        code.function(&release);
         for body in &resume_bodies {
             code.function(body);
         }
@@ -1157,7 +1198,9 @@ mod tests {
         linker
             .func_wrap("env", "now_ms", || -> f64 { CLOCK_MS.with(|c| c.get()) })
             .unwrap();
-        let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate");
         (store, instance)
     }
 
@@ -1220,7 +1263,10 @@ mod tests {
             .unwrap();
         assert_eq!(start.call(&mut store, ()).unwrap(), 1);
         // Not yet completed: result slot still holds VAL_VOID.
-        assert_eq!(result.call(&mut store, 0).unwrap(), crate::runtime::VAL_VOID);
+        assert_eq!(
+            result.call(&mut store, 0).unwrap(),
+            crate::runtime::VAL_VOID
+        );
         CLOCK_MS.with(|c| c.set(20.0));
         assert_eq!(poll.call(&mut store, ()).unwrap(), 1);
         CLOCK_MS.with(|c| c.set(50.0));
@@ -1293,7 +1339,11 @@ mod tests {
     fn parent_awaits_child_and_reads_its_result() {
         CLOCK_MS.with(|c| c.set(0.0));
         let (_, layout) = test_module(vec![Function::new([]), Function::new([])]);
-        let wasm = test_module(vec![body_await_child(&layout), body_child_const(&layout, 99)]).0;
+        let wasm = test_module(vec![
+            body_await_child(&layout),
+            body_child_const(&layout, 99),
+        ])
+        .0;
         let (mut store, inst) = instantiate(&wasm);
         let start = inst
             .get_typed_func::<(), i32>(&mut store, "_start_async")

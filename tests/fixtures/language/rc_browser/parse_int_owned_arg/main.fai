@@ -1,0 +1,24 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: parse flat
+# leak: flat
+#
+# Browser builds use the same parse lowering. This catches the route-param
+# shape from apps: unwrap(...) returns an owned string which parseInt only reads.
+
+use std.browser
+
+def main
+    @return Void
+do
+    var total = 0
+    var i = 0
+    while i < 20
+        let maybeId String? = '29'
+        let n = unwrap(parseInt(unwrap(maybeId, '0')), 0)
+        total = total + n
+        i = i + 1
+    end
+    browser.setHtml('<main><h1 class="message">parse flat</h1></main>')
+end

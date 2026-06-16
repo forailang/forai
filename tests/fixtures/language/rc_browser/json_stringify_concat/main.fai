@@ -1,0 +1,21 @@
+# expect: ok
+# browser:
+#   selector: #app .message
+#   text: JSON flat
+# leak: flat
+
+use std.browser
+
+use std.json
+
+def main
+    @return Void
+do
+    var i = 0
+    while i < 20
+        let out = '[' + json.stringify(29) + ']'
+        assert.equals(out, '[29]')
+        i = i + 1
+    end
+    browser.setHtml('<main><h1 class="message">JSON flat</h1></main>')
+end

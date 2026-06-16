@@ -16,6 +16,7 @@
 
 use wasmtime::*;
 
+use super::super::heap::{host_release_value, host_release_values, host_retain_value};
 use super::super::nan_box::{ADDR_MASK, OBJ_TAG_STRING, QNAN, SIGN_BIT};
 use super::io::set_trap_msg;
 
@@ -60,6 +61,8 @@ fn extract_string(val: i64, data: &[u8]) -> Option<&[u8]> {
 struct SpyEntry {
     mock_value: Option<i64>,
     once_value: Option<i64>,
+    // Call records are borrowed snapshots for same-test assertions. They do not
+    // own guest retain credits; only mock_value/once_value are host-retained.
     calls: Vec<Vec<i64>>,
 }
 
@@ -95,28 +98,51 @@ fn read_args(data: &[u8], args_ptr: i32, arg_count: i32) -> Vec<i64> {
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     linker
-        .func_wrap("env", "spy_set_mock", |fn_id: i32, value: i64| {
-            with_entry(fn_id, |e| {
-                e.mock_value = Some(value);
-                e.once_value = None;
-            });
-        })
+        .func_wrap(
+            "env",
+            "spy_set_mock",
+            |mut caller: Caller<'_, ()>, fn_id: i32, value: i64| {
+                host_retain_value(&mut caller, value);
+                let old = with_entry(fn_id, |e| {
+                    let old = [e.mock_value.take(), e.once_value.take()];
+                    e.mock_value = Some(value);
+                    e.once_value = None;
+                    old
+                });
+                host_release_values(&mut caller, old.into_iter().flatten());
+            },
+        )
         .map_err(|e| format!("linker error: {}", e))?;
 
     linker
-        .func_wrap("env", "spy_set_mock_once", |fn_id: i32, value: i64| {
-            with_entry(fn_id, |e| {
-                e.once_value = Some(value);
-            });
-        })
+        .func_wrap(
+            "env",
+            "spy_set_mock_once",
+            |mut caller: Caller<'_, ()>, fn_id: i32, value: i64| {
+                host_retain_value(&mut caller, value);
+                let old = with_entry(fn_id, |e| {
+                    let old = e.once_value.take();
+                    e.once_value = Some(value);
+                    old
+                });
+                host_release_values(&mut caller, old);
+            },
+        )
         .map_err(|e| format!("linker error: {}", e))?;
 
     linker
-        .func_wrap("env", "spy_reset", |fn_id: i32| {
-            with_entry(fn_id, |e| {
-                *e = SpyEntry::default();
-            });
-        })
+        .func_wrap(
+            "env",
+            "spy_reset",
+            |mut caller: Caller<'_, ()>, fn_id: i32| {
+                let old = with_entry(fn_id, |e| {
+                    let old = retained_values(e);
+                    *e = SpyEntry::default();
+                    old
+                });
+                host_release_values(&mut caller, old);
+            },
+        )
         .map_err(|e| format!("linker error: {}", e))?;
 
     // Every tracked function calls this first thing in its body:
@@ -141,12 +167,19 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mocked = with_entry(fn_id, |e| {
                     e.calls.push(args);
                     if let Some(v) = e.once_value.take() {
-                        Some(v)
+                        Some((v, true))
                     } else {
-                        e.mock_value
+                        e.mock_value.map(|v| (v, false))
                     }
                 });
-                if let Some(v) = mocked {
+                if let Some((v, release_stored_credit)) = mocked {
+                    // The spy registry owns the stored mock credit. Each mocked
+                    // return gives the guest a fresh result credit before a
+                    // once-mock drops the registry's credit.
+                    host_retain_value(&mut caller, v);
+                    if release_stored_credit {
+                        host_release_value(&mut caller, v);
+                    }
                     let data = mem.data_mut(&mut caller);
                     let off = out_value_ptr as usize;
                     if off + 8 <= data.len() {
@@ -246,8 +279,49 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     Ok(())
 }
 
-/// Reset host-side spy state between test runs. The CLI test
-/// runner calls this between cases so call history doesn't bleed.
-pub(crate) fn reset_all() {
-    SPY_STATE.with(|s| s.borrow_mut().clear());
+fn retained_values(entry: &mut SpyEntry) -> Vec<i64> {
+    [entry.mock_value.take(), entry.once_value.take()]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Drain host-retained spy/mock values between test runs. The CLI test runner
+/// releases the returned handles through the active instance's `__fai_release`
+/// export, then the cleared state prevents call history from bleeding.
+pub(crate) fn drain_retained_values() -> Vec<i64> {
+    SPY_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let mut retained = Vec::new();
+        for entry in state.iter_mut() {
+            retained.extend(retained_values(entry));
+        }
+        state.clear();
+        retained
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clear_state() {
+        SPY_STATE.with(|s| s.borrow_mut().clear());
+    }
+
+    #[test]
+    fn drain_retained_values_returns_mock_slots_and_clears_state() {
+        clear_state();
+        with_entry(2, |e| {
+            e.mock_value = Some(11);
+            e.once_value = Some(22);
+            e.calls.push(vec![33]);
+        });
+
+        let retained = drain_retained_values();
+        assert_eq!(retained, vec![11, 22]);
+
+        let retained_again = drain_retained_values();
+        assert!(retained_again.is_empty());
+    }
 }

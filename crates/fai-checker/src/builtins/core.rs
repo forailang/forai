@@ -35,14 +35,24 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // current count (or -1 for a primitive). `__retain`/`__release` drive the
     // RC primitives directly — test scaffolding for validating the count
     // transitions before the codegen emits them at every reference site (P3).
-    ins(b, "__refcount", &[p("value", type_parameter("T"))], &[Type::Int]);
+    ins(
+        b,
+        "__refcount",
+        &[p("value", type_parameter("T"))],
+        &[Type::Int],
+    );
     ins(
         b,
         "__retain",
         &[p("value", type_parameter("T"))],
         &[type_parameter("T")],
     );
-    ins(b, "__release", &[p("value", type_parameter("T"))], &[Type::Void]);
+    ins(
+        b,
+        "__release",
+        &[p("value", type_parameter("T"))],
+        &[Type::Void],
+    );
 
     // Collection
     ins(b, "length", &[p("value", Type::Unknown)], &[Type::Int]);
@@ -64,7 +74,12 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     ins(b, "toBool", &[p("value", Type::Unknown)], &[Type::Bool]);
     // parseInt/parseFloat return null at runtime for unparseable input,
     // so their type is optional — callers must `unwrap`/`?`-check.
-    ins(b, "parseInt", &[p("text", Type::String)], &[optional_of(Type::Int)]);
+    ins(
+        b,
+        "parseInt",
+        &[p("text", Type::String)],
+        &[optional_of(Type::Int)],
+    );
     ins(
         b,
         "parseFloat",

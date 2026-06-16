@@ -1,0 +1,18 @@
+# expect: ok
+# browser:
+#   selector: #click-target
+#   text: Click me
+#   click: #click-target 25
+# leak: flat
+#
+# Browser view events build JS-side payloads before entering std.events.
+# With no subscribers, the event bus returns immediately; the bridge must
+# still release the payload it created for handleEvent.
+
+use std.browser
+
+def main
+    @return Void
+do
+    browser.setHtml('<main><button id="click-target" onclick="handleEvent(7)">Click me</button></main>')
+end

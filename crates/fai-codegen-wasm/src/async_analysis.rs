@@ -350,8 +350,12 @@ fn collect_named_imports(
                 }
             } else if let Some(names) = &use_stmt.imported_names {
                 for name in names {
-                    let resolved =
-                        resolve_import_module(module, &use_stmt.module_path, name, module_function_exports);
+                    let resolved = resolve_import_module(
+                        module,
+                        &use_stmt.module_path,
+                        name,
+                        module_function_exports,
+                    );
                     imports.insert(name.clone(), format!("{}.{}", resolved, name));
                 }
             }

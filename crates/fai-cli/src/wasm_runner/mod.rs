@@ -19,6 +19,7 @@ mod host;
 mod leak_ledger;
 mod nan_box;
 pub mod output;
+mod ownership_balance;
 mod post_mortem;
 mod print;
 
@@ -58,6 +59,10 @@ pub struct RunOptions {
     /// build is recorded, and an itemized live-set report (grouped by
     /// size + allocation site) prints at exit and after a trap.
     pub check_leaks: Option<CheckLeaksOptions>,
+    /// Helper-level ownership event consumer (plan 117 phase 4). The
+    /// codegen half declares `__fai_ownership_event`; the runner half
+    /// records the event stream and prints a compact helper-balance summary.
+    pub check_ownership: bool,
 }
 
 /// Options for the `--check-leaks` heap ledger.
@@ -84,6 +89,7 @@ impl RunOptions {
                 .map(|v| CheckLeaksOptions {
                     interval_ms: v.strip_prefix("interval:").and_then(|n| n.parse().ok()),
                 }),
+            check_ownership: std::env::var_os("FAI_OWNERSHIP_CHECK").is_some(),
         }
     }
 }
@@ -187,6 +193,10 @@ pub fn run_wasm_with_externs_opts(
         opts.check_leaks.and_then(|c| c.interval_ms),
         opts.check_leaks.is_some().then(|| dbg.clone()),
     );
+    ownership_balance::reset(
+        opts.check_ownership,
+        opts.check_ownership.then(|| dbg.clone()),
+    );
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
 
@@ -206,10 +216,7 @@ pub fn run_wasm_with_externs_opts(
 
     // Failure rendering: decorated backtrace + trap reason, then the
     // post-mortem state dump (task table + heap stats).
-    let fail = |context: &str,
-                e: &wasmtime::Error,
-                store: &mut Store<()>|
-     -> String {
+    let fail = |context: &str, e: &wasmtime::Error, store: &mut Store<()>| -> String {
         let mut trap_msg = host::take_trap_msg();
         if trap_msg.is_none() && matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt)) {
             trap_msg = Some(format!(
@@ -225,6 +232,10 @@ pub fn run_wasm_with_externs_opts(
         if let Some(leaks) = leak_ledger::render_report(&instance, store, &dbg) {
             msg.push('\n');
             msg.push_str(&leaks);
+        }
+        if let Some(ownership) = ownership_balance::render_report() {
+            msg.push('\n');
+            msg.push_str(&ownership);
         }
         msg
     };
@@ -268,6 +279,10 @@ pub fn run_wasm_with_externs_opts(
                         msg.push('\n');
                         msg.push_str(&leaks);
                     }
+                    if let Some(ownership) = ownership_balance::render_report() {
+                        msg.push('\n');
+                        msg.push_str(&ownership);
+                    }
                     return Err(msg);
                 }
             }
@@ -287,6 +302,7 @@ pub fn run_wasm_with_externs_opts(
                 .call(&mut store, 1)
                 .map_err(|e| fmt_err("WASM async result error", e))?;
             report_check_leaks(&instance, &mut store, &dbg);
+            report_ownership_check();
             return Err(format!(
                 "WASM async task failed: {}",
                 print::format_return_value(result, &instance, &mut store)
@@ -297,7 +313,9 @@ pub fn run_wasm_with_externs_opts(
             .call(&mut store, 1)
             .map_err(|e| fmt_err("WASM async result error", e))?;
         print::print_return_value(result, &instance, &mut store);
+        reset_retained_host_state(&instance, &mut store)?;
         report_check_leaks(&instance, &mut store, &dbg);
+        report_ownership_check();
         return Ok(());
     }
 
@@ -312,10 +330,18 @@ pub fn run_wasm_with_externs_opts(
 
     print::print_return_value(result, &instance, &mut store);
 
+    reset_retained_host_state(&instance, &mut store)?;
     report_leak_check(&instance, &mut store);
     report_check_leaks(&instance, &mut store, &dbg);
+    report_ownership_check();
 
     Ok(())
+}
+
+fn report_ownership_check() {
+    if let Some(report) = ownership_balance::render_report() {
+        output::stderr_line(&report);
+    }
 }
 
 /// Print the `--check-leaks` live-set report (when the ledger is
@@ -352,6 +378,26 @@ fn report_leak_check(instance: &wasmtime::Instance, store: &mut wasmtime::Store<
         }
         None => eprintln!("[leak-check] module has no __live_objects export"),
     }
+}
+
+fn reset_retained_host_state(
+    instance: &wasmtime::Instance,
+    store: &mut wasmtime::Store<()>,
+) -> Result<(), String> {
+    let mut retained = host::drain_spy_retained_values();
+    retained.extend(host::drain_router_retained_values());
+    if retained.is_empty() {
+        return Ok(());
+    }
+    let release = instance
+        .get_typed_func::<i64, ()>(&mut *store, "__fai_release")
+        .map_err(|e| fmt_err("missing __fai_release export for spy reset", e))?;
+    for value in retained {
+        release
+            .call(&mut *store, value)
+            .map_err(|e| fmt_err("spy reset release failed", e))?;
+    }
+    Ok(())
 }
 
 /// Output captured from a single [`run_wasm_capturing`] invocation.
@@ -400,6 +446,8 @@ pub struct TestRunOptions {
     /// must also be BUILT with the check-leaks codegen flag or the
     /// ledger sees no events (the caller arms that before codegen).
     pub check_leaks: bool,
+    /// Arm helper ownership event recording for the whole test run.
+    pub check_ownership: bool,
     /// Leak allowances: exact `suite` or `suite::case` names (equality,
     /// not substring). An allowed case with a delta reports as leaked-
     /// allowed and still passes.
@@ -457,7 +505,13 @@ pub fn run_wasm_tests(
     tests: &[crate::test_meta::TestSuiteMeta],
     on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
-    run_wasm_tests_with_externs(wasm_bytes, tests, Vec::new(), &TestRunOptions::default(), on_case)
+    run_wasm_tests_with_externs(
+        wasm_bytes,
+        tests,
+        Vec::new(),
+        &TestRunOptions::default(),
+        on_case,
+    )
 }
 
 /// Same as [`run_wasm_tests`] but populates the extern-function table
@@ -475,9 +529,16 @@ pub fn run_wasm_tests_with_externs(
     // free-list scan its bucket base; the ledger arms for FAI_CHECK_LEAKS
     // (observability) or opts.check_leaks (per-case assertion, plan 118).
     let leaks = opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some();
-    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks;
-    if debug_env {
-        let dbg = std::rc::Rc::new(debug_table::DbgTable::from_wasm(wasm_bytes));
+    let ownership = opts.check_ownership || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some();
+    let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks || ownership;
+    let dbg = if debug_env {
+        Some(std::rc::Rc::new(debug_table::DbgTable::from_wasm(
+            wasm_bytes,
+        )))
+    } else {
+        None
+    };
+    if let Some(dbg) = &dbg {
         host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
         // FAI_CHECK_LEAKS_INTERVAL_MS streams a periodic live-set report
         // (top groups WITH allocation sites) during a test run — the way
@@ -488,6 +549,7 @@ pub fn run_wasm_tests_with_externs(
             .and_then(|s| s.parse::<u64>().ok());
         leak_ledger::reset(leaks, interval_ms, leaks.then(|| dbg.clone()));
     }
+    ownership_balance::reset(ownership, if ownership { dbg.clone() } else { None });
     let engine = shared_engine();
     let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
     let mut store = Store::new(engine, ());
@@ -512,6 +574,7 @@ pub fn run_wasm_tests_with_externs(
     // coverage failures for the file.
     let mut summary = TestSummary::default();
     if tests.is_empty() {
+        report_ownership_check();
         return Ok(summary);
     }
 
@@ -547,7 +610,7 @@ pub fn run_wasm_tests_with_externs(
             None
         };
         if test.has_before_all {
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             run_test
                 .call(&mut store, (suite_i as i32, TEST_HOOK_BEFORE_ALL_CASE_IDX))
                 .map_err(|e| fmt_err(&format!("beforeAll failed in '{}'", test.suite_name), e))?;
@@ -555,7 +618,7 @@ pub fn run_wasm_tests_with_externs(
         for (case_i, desc) in test.case_descriptions.iter().enumerate() {
             // Clear spy/mock state between cases so call counts and
             // mocked values don't bleed across `it(...)` blocks.
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             // FAI_TRACE_TESTS: name each case on the real stderr before it
             // runs (bypassing the per-test output capture), so a hang or
             // runaway is pinned to the test that never returns.
@@ -569,7 +632,12 @@ pub fn run_wasm_tests_with_externs(
             } else {
                 None
             };
-            let res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            let mut res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            if let Err(e) = reset_retained_host_state(&instance, &mut store) {
+                if res.is_ok() {
+                    res = Err(wasmtime::Error::msg(e));
+                }
+            }
             // Leak verdict for the case window. Only evaluated on a
             // clean return — a trapped case left guest state
             // indeterminate, and the trap is the failure that matters.
@@ -642,10 +710,11 @@ pub fn run_wasm_tests_with_externs(
             on_case(&outcome);
         }
         if test.has_after_all {
-            host::reset_spy_state();
+            reset_retained_host_state(&instance, &mut store)?;
             run_test
                 .call(&mut store, (suite_i as i32, TEST_HOOK_AFTER_ALL_CASE_IDX))
                 .map_err(|e| fmt_err(&format!("afterAll failed in '{}'", test.suite_name), e))?;
+            reset_retained_host_state(&instance, &mut store)?;
         }
         // Suite-level report (informational, never a failure): growth
         // since the pre-suite snapshot that per-case windows can't see —
@@ -665,6 +734,11 @@ pub fn run_wasm_tests_with_externs(
             }
         }
         summary.suites.push(suite_report);
+    }
+    let ownership_failed = ownership_balance::has_imbalance();
+    report_ownership_check();
+    if ownership_failed {
+        summary.failed += 1;
     }
     Ok(summary)
 }
@@ -697,7 +771,6 @@ mod tests {
         .expect("direct codegen refused")
     }
 
-
     /// Regression (plans/111): a function whose TAIL is a user-call await
     /// lowers to `Term::CompletePending`, which recycles the awaited child slot
     /// (`free_pending`) by reading this task's frame. Phase 4 frame reclaim made
@@ -714,9 +787,15 @@ mod tests {
                    def main\n    @return Int\ndo\n  var total Int = 0\n  var i Int = 0\n  while i < 200\n    total = total + step()\n    i = i + 1\n  end\n  total\nend\n";
         let wasm = compile_to_wasm(src);
         let (mut store, instance) = instantiate_for_async_test(&wasm);
-        let start = instance.get_typed_func::<(), i32>(&mut store, "_start_async").expect("_start_async");
-        let poll = instance.get_typed_func::<(), i32>(&mut store, "__fai_poll").expect("__fai_poll");
-        let result = instance.get_typed_func::<i32, i64>(&mut store, "__fai_task_result").expect("task_result");
+        let start = instance
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .expect("_start_async");
+        let poll = instance
+            .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+            .expect("__fai_poll");
+        let result = instance
+            .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+            .expect("task_result");
         let mut status = start.call(&mut store, ()).expect("start");
         let mut guard = 0u64;
         while status != 2 && status != 3 {
@@ -728,7 +807,11 @@ mod tests {
         // total = 200 * 42. Decode the NaN-boxed Int result.
         let boxed = result.call(&mut store, 1).expect("result") as u64;
         let int_val = (boxed & 0xFFFF_FFFF) as u32 as i32;
-        assert_eq!(int_val, 200 * 42, "correct result → no slot-freelist corruption");
+        assert_eq!(
+            int_val,
+            200 * 42,
+            "correct result → no slot-freelist corruption"
+        );
     }
 
     fn instantiate_for_async_test(wasm: &[u8]) -> (Store<()>, Instance) {

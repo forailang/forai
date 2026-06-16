@@ -13,6 +13,7 @@ use fai_compiler::ast::{
     ForStatement, FunctionDeclaration, IfStatement, LetStatement, Statement, ThrowStatement,
     TryStatement, TypeNode, UnaryExpression, VarStatement, WhileStatement,
 };
+use fai_compiler::ownership_abi::{ArgConvention, ExprOwnership, OwnershipAux, OwnershipOp};
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use crate::program::FunctionInfo;
@@ -21,39 +22,38 @@ use crate::runtime::{
     IMPORT_ARRAY_MAP, IMPORT_CALL_FFI, IMPORT_CLI_CLEAR, IMPORT_CLI_MOVE_TO, IMPORT_CLI_READ_LINE,
     IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_CRYPTO_AVAILABLE, IMPORT_CRYPTO_BASE64_DECODE,
     IMPORT_CRYPTO_BASE64_ENCODE, IMPORT_CRYPTO_CONSTANT_TIME_EQUALS, IMPORT_CRYPTO_HEX_ENCODE,
-    IMPORT_CRYPTO_HMAC_SHA256_HEX, IMPORT_CRYPTO_SHA256_HEX, IMPORT_ENV_GET, IMPORT_ENV_LOAD,
-    IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT,
-    IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE,
-    IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS, IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS,
-    IMPORT_FILE_LIST, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
+    IMPORT_CRYPTO_HMAC_SHA1_BASE64, IMPORT_CRYPTO_HMAC_SHA256_HEX, IMPORT_CRYPTO_SHA256_HEX,
+    IMPORT_ENV_GET, IMPORT_ENV_LOAD, IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL,
+    IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT, IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF,
+    IMPORT_EVENT_ON, IMPORT_EVENT_ONCE, IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS,
+    IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS, IMPORT_FILE_LIST, IMPORT_FILE_READ_STR,
+    IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
     IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH, IMPORT_HTTP_REQUEST_POST,
     IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY,
     IMPORT_LOG_ERROR, IMPORT_LOG_INFO, IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS,
-    IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
-    IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
-    IMPORT_PROCESS_STOP,
-    IMPORT_FILE_READ_STR, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM,
-    IMPORT_REMOTE_CALL, IMPORT_SET_HTML, IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN,
-    IMPORT_TRAP_REPORT,
-    IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET,
-    IMPORT_TCP_ACCEPT, IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN,
-    IMPORT_TCP_READ, IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_UDP_BIND, IMPORT_UDP_BROADCAST,
-    IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK, METHOD_APPEND,
-    METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS, METHOD_INDEX_OF,
-    METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT, METHOD_REPLACE,
-    METHOD_REVERSE, METHOD_SERVER_GET, METHOD_SERVER_HTML, METHOD_SERVER_JSON,
+    IMPORT_OWNERSHIP_EVENT, IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME,
+    IMPORT_PATH_JOIN, IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN,
+    IMPORT_PROCESS_START, IMPORT_PROCESS_STOP, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE,
+    IMPORT_RANDOM, IMPORT_REMOTE_CALL, IMPORT_REPLACE_LOCATION, IMPORT_SET_HTML,
+    IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN, IMPORT_STORAGE_CLEAR,
+    IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET, IMPORT_TCP_ACCEPT,
+    IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN, IMPORT_TCP_READ,
+    IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND,
+    IMPORT_UDP_BROADCAST, IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK,
+    METHOD_APPEND, METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS,
+    METHOD_INDEX_OF, METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT,
+    METHOD_REPLACE, METHOD_REVERSE, METHOD_SERVER_GET, METHOD_SERVER_HTML, METHOD_SERVER_JSON,
     METHOD_SERVER_LISTEN, METHOD_SERVER_OK, METHOD_SERVER_POST, METHOD_SERVER_REDIRECT,
     METHOD_SERVER_ROUTER, METHOD_SERVER_SERVE_FILES, METHOD_SERVER_TEXT, METHOD_SLICE, METHOD_SORT,
     METHOD_SPLIT, METHOD_STARTS_WITH, METHOD_SUBSTRING, METHOD_TO_LOWER, METHOD_TO_UPPER,
     METHOD_TRIM, METHOD_TRIM_END, METHOD_TRIM_START, OBJ_TAG_ARRAY, OBJ_TAG_CELL, OBJ_TAG_CLOSURE,
-    OBJ_TAG_DICT,
-    OBJ_TAG_NATIVE_FN, OBJ_TAG_STRING, OBJ_TAG_TUPLE, QNAN, RT_ADD, RT_ALLOC, RT_ALLOC_STRING,
-    RT_AS_NUMBER, RT_CALL_NATIVE, RT_CONCAT, RT_COUNT, RT_DIV, RT_EQ, RT_GE, RT_GET_FIELD,
-    RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE, RT_LT, RT_MAKE_BOOL,
-    RT_LIVE_OBJECTS, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL, RT_NE, RT_NEG,
-    RT_OBJ_ADDR, RT_RELEASE, RT_RETAIN,
-    RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_SET_FIELD, RT_STR_EQ, RT_SUB,
-    RT_VALUE_TO_STR, TAG_BOOL, TAG_INT, VAL_FALSE, VAL_NULL, VAL_VOID,
+    OBJ_TAG_DICT, OBJ_TAG_NATIVE_FN, OBJ_TAG_STRING, OBJ_TAG_TUPLE, QNAN, RT_ADD, RT_ALLOC,
+    RT_ALLOC_STRING, RT_AS_NUMBER, RT_CALL_NATIVE, RT_CONCAT, RT_COUNT, RT_DIV, RT_EQ, RT_GE,
+    RT_GET_FIELD, RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE,
+    RT_LIVE_OBJECTS, RT_LT, RT_MAKE_BOOL, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL,
+    RT_NE, RT_NEG, RT_OBJ_ADDR, RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_RELEASE,
+    RT_RETAIN, RT_SET_FIELD, RT_STR_EQ, RT_SUB, RT_VALUE_TO_STR, TAG_BOOL, TAG_INT, VAL_FALSE,
+    VAL_NULL, VAL_VOID,
 };
 
 /// Global index for `__env_ptr`. Matches the bytecode translator's
@@ -72,6 +72,7 @@ const GLOBAL_ERROR_FLAG: u32 = 2;
 /// `error_flag` is set. Cleared at the same time as `error_flag`.
 /// Initialized to 0 in the global section.
 const GLOBAL_ERROR_VALUE: u32 = 3;
+const OWNERSHIP_SITE_UNKNOWN: u32 = 0;
 
 fn mem0() -> MemArg {
     MemArg {
@@ -374,6 +375,11 @@ enum ModuleCall {
     /// `std.convert.parseFloat(s) -> Float?`. Same shape via
     /// `RT_PARSE_FLOAT`.
     ConvertParseFloat,
+    /// `std.json.requireString(dict, key) -> String?`. The raw host import
+    /// returns an alias to a string inside `dict`; this wrapper retains the
+    /// result before releasing an owned inline dict temp, so the std call has
+    /// an Owned result contract.
+    JsonRequireString,
     /// `assert.calledWith(target, ...args)` — target must resolve
     /// at compile time; `args` are serialised into a scratch buffer
     /// and compared against recorded calls via the host spy table.
@@ -544,6 +550,9 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
             _ => {}
         }
     }
+    if (module, method) == ("std.json", "requireString") {
+        return Some(ModuleCall::JsonRequireString);
+    }
     // std.string — every method dispatches through `RT_CALL_NATIVE`
     // with a method-id + arity. The runtime's string ops read args
     // 0 and 1 into pre-loaded locals and args 2+ from `args_ptr`
@@ -701,6 +710,11 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ("std.crypto", "available") => (IMPORT_CRYPTO_AVAILABLE, &[], RS::MakeBool),
         ("std.crypto", "hmacSha256Hex") => (
             IMPORT_CRYPTO_HMAC_SHA256_HEX,
+            &[AS::String, AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "hmacSha1Base64") => (
+            IMPORT_CRYPTO_HMAC_SHA1_BASE64,
             &[AS::String, AS::String],
             RS::Boxed,
         ),
@@ -1059,6 +1073,39 @@ enum ValueShape {
     RawFloat,
     /// Raw wasm i32 carrying a Bool as 0/1.
     RawBool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotOwnership {
+    NonOwning,
+    Owning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExprResult {
+    shape: ValueShape,
+    ownership: ExprOwnership,
+}
+
+impl ExprResult {
+    fn primitive(shape: ValueShape) -> Self {
+        Self {
+            shape,
+            ownership: ExprOwnership::Primitive,
+        }
+    }
+
+    fn boxed(owned: bool) -> Self {
+        Self {
+            shape: ValueShape::Boxed,
+            ownership: if owned {
+                ExprOwnership::Owned
+            } else {
+                ExprOwnership::Borrowed
+            },
+        }
+    }
 }
 
 /// Build the `param_defaults` vector for a `FunctionInfo`. Type
@@ -1675,6 +1722,7 @@ pub fn build_function_with_spy(
     std_method_fn_ids: &HashMap<(String, String), u32>,
     module_context: Option<&str>,
 ) -> Result<BuildResult, BuildError> {
+    let ownership_sites = RefCell::new(Vec::new());
     build_function_with_spy_and_offset(
         fd,
         rt,
@@ -1695,6 +1743,7 @@ pub fn build_function_with_spy(
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &ownership_sites,
         None,
         None,
     )
@@ -1727,6 +1776,7 @@ pub fn build_function_with_spy_and_offset(
     module_constants: &HashMap<String, fai_compiler::ast::Expression>,
     extern_out_params: &HashMap<String, Vec<bool>>,
     module_vars: &HashMap<String, u32>,
+    ownership_sites: &RefCell<Vec<crate::debug_info::OwnershipSiteDebugEntry>>,
     file_path: Option<&str>,
     async_ctx: Option<AsyncClosureCtx<'_>>,
 ) -> Result<BuildResult, BuildError> {
@@ -1750,6 +1800,8 @@ pub fn build_function_with_spy_and_offset(
         module_constants,
         extern_out_params,
         module_vars,
+        ownership_sites,
+        file_path,
         async_ctx,
     };
     let main = {
@@ -1811,6 +1863,9 @@ pub struct BuiltProgram {
     /// to emit the right number of extra global slots, all
     /// initialised to `VAL_NULL`.
     pub module_var_count: u32,
+    /// Helper-level ownership instrumentation sites emitted by the
+    /// compiled functions.
+    pub ownership_sites: Vec<crate::debug_info::OwnershipSiteDebugEntry>,
 }
 
 /// Routing entry for one test case — the dispatcher uses the
@@ -2445,6 +2500,7 @@ pub fn build_program_full(
     let std_method_fn_ids = spy_targets.std_method_fn_ids;
 
     let strings = RefCell::new(StringInterner::default());
+    let ownership_sites = RefCell::new(Vec::new());
     let mut functions: Vec<(FunctionInfo, Function)> = Vec::with_capacity(decls.len());
     let mut closures: Vec<BuiltClosure> = Vec::new();
     for ((fd, ctx_mod, ctx_file), info) in decls.iter().zip(infos.iter().cloned()) {
@@ -2468,6 +2524,7 @@ pub fn build_program_full(
             &module_constants,
             &extern_out_params,
             &module_vars,
+            &ownership_sites,
             ctx_file.as_deref(),
             None,
         )?;
@@ -2550,6 +2607,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2618,6 +2676,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2677,6 +2736,7 @@ pub fn build_program_full(
                     &module_constants,
                     &extern_out_params,
                     &module_vars,
+                    &ownership_sites,
                     ctx_file.as_deref(),
                     None,
                 )?;
@@ -2699,6 +2759,7 @@ pub fn build_program_full(
         string_data: strings.into_inner().bytes,
         test_cases,
         module_var_count,
+        ownership_sites: ownership_sites.into_inner(),
     })
 }
 
@@ -3467,11 +3528,16 @@ pub fn assemble_wasm_module_with_test_flag(
     if closure_count > 0 {
         exports.export("__indirect_function_table", ExportKind::Table, 0);
     }
-    // Host-callable refcount release: the HTTP host reclaims per-request
-    // guest object graphs (request/response/event dicts it built) through
-    // this after writing the response. The async assembler exports it too;
-    // without it `host_release_value` silently no-ops and a sync-built
-    // server leaks the full request graph per request (plan 116).
+    // Host-callable refcount helpers: host registries retain guest handles
+    // they store and release them on unregister/reset/drop. The async
+    // assembler exports these too; without release, sync-built servers leak
+    // request graphs, and without retain, browser host registries cannot mirror
+    // native ownership safely (plans 116/117).
+    exports.export(
+        "__fai_retain",
+        ExportKind::Func,
+        actual_import_count + RT_RETAIN,
+    );
     exports.export(
         "__fai_release",
         ExportKind::Func,
@@ -3626,6 +3692,7 @@ pub fn assemble_wasm_module_with_test_flag(
         &crate::debug_info::DbgMeta {
             bucket_base: Some(bucket_base),
             bucket_count: crate::runtime::NUM_FREE_BUCKETS,
+            ownership_sites: program.ownership_sites.clone(),
         },
     );
 
@@ -3668,7 +3735,9 @@ fn async_sleep_ms_of(stmt: &Statement) -> Option<f64> {
 /// return its 4 argument expressions and call-site location. Lowered as a
 /// suspending host op (`Term::AwaitRemote`) so the task yields while the
 /// request is in flight.
-fn remote_call_args(expr: &Expression) -> Option<(Vec<&Expression>, &fai_compiler::ast::SourceLocation)> {
+fn remote_call_args(
+    expr: &Expression,
+) -> Option<(Vec<&Expression>, &fai_compiler::ast::SourceLocation)> {
     let Expression::CallExpression(call) = expr else {
         return None;
     };
@@ -3780,7 +3849,11 @@ impl<'a> AsyncResolve<'a> {
 fn user_callee<'a>(
     expr: &'a Expression,
     fns: &AsyncResolve<'_>,
-) -> Option<(String, Vec<&'a Expression>, &'a fai_compiler::ast::SourceLocation)> {
+) -> Option<(
+    String,
+    Vec<&'a Expression>,
+    &'a fai_compiler::ast::SourceLocation,
+)> {
     let Expression::CallExpression(call) = expr else {
         return None;
     };
@@ -3796,11 +3869,7 @@ fn user_callee<'a>(
         }
     }
     args.extend(call.args.iter().map(|a| &a.value));
-    Some((
-        resolved,
-        args,
-        &call.location,
-    ))
+    Some((resolved, args, &call.location))
 }
 
 /// Async-closure compilation context, threaded into `BuildContext` so a
@@ -3900,7 +3969,9 @@ fn stmts_have_user_call(stmts: &[Statement], fns: &AsyncResolve<'_>) -> bool {
 /// Used to gate a value-`try`'s `finally`: the try-result is held in a wasm
 /// local that wouldn't survive a suspension inside `finally`.
 fn stmts_have_suspension(stmts: &[Statement], fns: &AsyncResolve<'_>) -> bool {
-    stmts.iter().any(|s| async_sleep_ms_of(s).is_some() || stmt_has_user_call(s, fns))
+    stmts
+        .iter()
+        .any(|s| async_sleep_ms_of(s).is_some() || stmt_has_user_call(s, fns))
 }
 
 /// Whether `stmts` contain a `break`/`continue` that targets the *enclosing*
@@ -3912,12 +3983,18 @@ fn stmts_have_loop_control(stmts: &[Statement]) -> bool {
         Statement::BreakStatement(_) | Statement::ContinueStatement(_) => true,
         Statement::IfStatement(is) => {
             is.branches.iter().any(|b| stmts_have_loop_control(&b.body))
-                || is.else_branch.as_ref().is_some_and(|e| stmts_have_loop_control(e))
+                || is
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|e| stmts_have_loop_control(e))
         }
         Statement::TryStatement(ts) => {
             stmts_have_loop_control(&ts.try_body)
                 || stmts_have_loop_control(&ts.catch_body)
-                || ts.finally_body.as_ref().is_some_and(|f| stmts_have_loop_control(f))
+                || ts
+                    .finally_body
+                    .as_ref()
+                    .is_some_and(|f| stmts_have_loop_control(f))
         }
         // A nested for/while owns its own break/continue; don't descend.
         _ => false,
@@ -4022,10 +4099,51 @@ fn single_binding<'a>(stmt: &'a Statement) -> Option<(&'a str, &'a Expression)> 
     }
 }
 
+/// Detect the `let name Type = from_dict(dict)` form (single binding, typed
+/// LHS, one-arg `from_dict(...)` RHS), returning `(name, type_name, dict_expr)`.
+///
+/// `from_dict` has no expression-level lowering — it is expanded at the
+/// statement level using the LHS type annotation, which `single_binding`
+/// discards. The sync `compile_let_statement` does this directly; the async
+/// resume-fn segment compiler needs the same recognition so an async function
+/// containing `from_dict` (common once a body is async-colored, e.g. an
+/// `http:beforeRequest` listener doing `from_dict(e.data)`) doesn't fall
+/// through to `UnknownIdentifier("from_dict")`.
+fn from_dict_binding<'a>(stmt: &'a Statement) -> Option<(&'a str, &'a str, &'a Expression)> {
+    let (name, type_annotation, value) = match stmt {
+        Statement::LetStatement(ls) if ls.bindings.len() == 1 => (
+            ls.bindings[0].name.as_str(),
+            ls.bindings[0].type_name.as_ref(),
+            &ls.value,
+        ),
+        Statement::VarStatement(vs) if vs.bindings.len() == 1 => (
+            vs.bindings[0].name.as_str(),
+            vs.bindings[0].type_name.as_ref(),
+            &vs.value,
+        ),
+        _ => return None,
+    };
+    let type_name = type_annotation?.name.as_deref()?;
+    let Expression::CallExpression(ce) = value else {
+        return None;
+    };
+    let Expression::IdentifierExpression(id) = &*ce.callee else {
+        return None;
+    };
+    if id.name != "from_dict" || ce.args.len() != 1 {
+        return None;
+    }
+    Some((name, type_name, &ce.args[0].value))
+}
+
 /// If `expr` is `all(c1(), c2(), ...)` where every argument is a user-call,
 /// return the list of `(callee, args)` children. `all` is a builtin keyword,
 /// not a user function.
-type AllChild<'a> = (String, Vec<&'a Expression>, &'a fai_compiler::ast::SourceLocation);
+type AllChild<'a> = (
+    String,
+    Vec<&'a Expression>,
+    &'a fai_compiler::ast::SourceLocation,
+);
 
 fn all_call<'a>(expr: &'a Expression, fns: &AsyncResolve<'_>) -> Option<Vec<AllChild<'a>>> {
     let Expression::CallExpression(call) = expr else {
@@ -4064,8 +4182,13 @@ enum Incoming {
         on_error: Option<(usize, String)>,
     },
     /// Resume of an `AwaitRemote`: bind `remote_result(g_current)` to `bind`
-    /// (or discard if `None`).
-    AwaitedRemote { bind: Option<String> },
+    /// (or discard if `None`). `on_error` is the enclosing catch handler if
+    /// the remote call was inside a `try`; a failed RPC jumps there instead of
+    /// failing the task.
+    AwaitedRemote {
+        bind: Option<String>,
+        on_error: Option<(usize, String)>,
+    },
     /// Resume of an `AwaitFfi`: bind `ffi_result(g_current)` to `bind`
     /// (or discard if `None`).
     AwaitedFfi { bind: Option<String> },
@@ -4153,7 +4276,7 @@ enum Term<'a> {
     CompletePending,
     /// Complete the task with `remote_result(g_current)` — a `remoteCall(...)`
     /// in tail/return position (the generated RPC client stubs return it).
-    CompleteRemote,
+    CompleteRemote { on_error: Option<(usize, String)> },
     /// `throw value` inside a `try`: bind the value to the catch handler's
     /// name and jump to the catch block.
     ThrowTo {
@@ -4336,14 +4459,22 @@ fn collect_spawn_targets(
     r: &AsyncResolve<'_>,
     out: &mut std::collections::HashSet<String>,
 ) {
-    fn from_call(expr: &Expression, r: &AsyncResolve<'_>, out: &mut std::collections::HashSet<String>) {
+    fn from_call(
+        expr: &Expression,
+        r: &AsyncResolve<'_>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
         if let Expression::CallExpression(c) = expr {
             if let Some(n) = r.resolve_call(c) {
                 out.insert(n);
             }
         }
     }
-    fn from_all(expr: &Expression, r: &AsyncResolve<'_>, out: &mut std::collections::HashSet<String>) {
+    fn from_all(
+        expr: &Expression,
+        r: &AsyncResolve<'_>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
         if let Expression::CallExpression(c) = expr {
             if let Expression::IdentifierExpression(id) = &*c.callee {
                 if id.name == "all" {
@@ -4438,7 +4569,11 @@ fn stmt_pending_count(
 /// name (recursively, including nested control flow and multi-binding
 /// `let a, b = all(...)`), plus a pending region sized to the widest
 /// suspension.
-fn async_frame_layout(fd: &FunctionDeclaration, fns: &AsyncResolve<'_>, has_env: bool) -> AsyncFrame {
+fn async_frame_layout(
+    fd: &FunctionDeclaration,
+    fns: &AsyncResolve<'_>,
+    has_env: bool,
+) -> AsyncFrame {
     let mut vars: Vec<String> = Vec::new();
     // Hidden `@type` params lead the frame (matching the sync ABI's leading
     // type-arg slots) so a generic callee's params land at the right offsets.
@@ -4588,14 +4723,19 @@ impl<'a> CfgBuilder<'a> {
             return Ok(Flow::Continue(cur));
         }
         // let/var [a, b] = all(...)
-        if matches!(stmt, Statement::LetStatement(_) | Statement::VarStatement(_)) {
+        if matches!(
+            stmt,
+            Statement::LetStatement(_) | Statement::VarStatement(_)
+        ) {
             let (value, binds): (&Expression, Vec<String>) = match stmt {
-                Statement::LetStatement(ls) => {
-                    (&ls.value, ls.bindings.iter().map(|b| b.name.clone()).collect())
-                }
-                Statement::VarStatement(vs) => {
-                    (&vs.value, vs.bindings.iter().map(|b| b.name.clone()).collect())
-                }
+                Statement::LetStatement(ls) => (
+                    &ls.value,
+                    ls.bindings.iter().map(|b| b.name.clone()).collect(),
+                ),
+                Statement::VarStatement(vs) => (
+                    &vs.value,
+                    vs.bindings.iter().map(|b| b.name.clone()).collect(),
+                ),
                 _ => unreachable!(),
             };
             if let Some(children) = all_call(value, self.fns) {
@@ -4616,10 +4756,16 @@ impl<'a> CfgBuilder<'a> {
         if let Some((name, value)) = single_binding(stmt) {
             // `let x = remoteCall(...)` — suspend on the RPC, bind the result.
             if let Some((rargs, loc)) = remote_call_args(value) {
+                let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::AwaitRemote { args: rargs, loc, next };
+                self.blocks[cur].term = Term::AwaitRemote {
+                    args: rargs,
+                    loc,
+                    next,
+                };
                 self.blocks[next].incoming = Incoming::AwaitedRemote {
                     bind: Some(name.to_string()),
+                    on_error,
                 };
                 return Ok(Flow::Continue(next));
             }
@@ -4644,7 +4790,12 @@ impl<'a> CfgBuilder<'a> {
                 }
                 let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::Await { callee, args, loc, next };
+                self.blocks[cur].term = Term::Await {
+                    callee,
+                    args,
+                    loc,
+                    next,
+                };
                 self.blocks[next].incoming = Incoming::Awaited {
                     binds: vec![Some(name.to_string())],
                     on_error,
@@ -4659,7 +4810,11 @@ impl<'a> CfgBuilder<'a> {
                 }
                 let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::AwaitClosure { closure, args, next };
+                self.blocks[cur].term = Term::AwaitClosure {
+                    closure,
+                    args,
+                    next,
+                };
                 self.blocks[next].incoming = Incoming::Awaited {
                     binds: vec![Some(name.to_string())],
                     on_error,
@@ -4709,16 +4864,24 @@ impl<'a> CfgBuilder<'a> {
             // is the function's value (the generated stubs do exactly this);
             // otherwise it's run for effect and the result discarded.
             if let Some((rargs, loc)) = remote_call_args(&es.expression) {
+                let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::AwaitRemote { args: rargs, loc, next };
+                self.blocks[cur].term = Term::AwaitRemote {
+                    args: rargs,
+                    loc,
+                    next,
+                };
                 match mode {
                     TailMode::Complete => {
-                        self.blocks[next].term = Term::CompleteRemote;
+                        self.blocks[next].term = Term::CompleteRemote { on_error };
                         return Ok(Flow::Diverged);
                     }
                     TailMode::StoreResult(_) => return Err(()),
                     TailMode::None => {
-                        self.blocks[next].incoming = Incoming::AwaitedRemote { bind: None };
+                        self.blocks[next].incoming = Incoming::AwaitedRemote {
+                            bind: None,
+                            on_error,
+                        };
                         return Ok(Flow::Continue(next));
                     }
                 }
@@ -4729,7 +4892,12 @@ impl<'a> CfgBuilder<'a> {
                 }
                 let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::Await { callee, args, loc, next };
+                self.blocks[cur].term = Term::Await {
+                    callee,
+                    args,
+                    loc,
+                    next,
+                };
                 match mode {
                     TailMode::Complete => {
                         self.blocks[next].term = Term::CompletePending;
@@ -4756,7 +4924,11 @@ impl<'a> CfgBuilder<'a> {
                 }
                 let on_error = self.handler();
                 let next = self.new_block();
-                self.blocks[cur].term = Term::AwaitClosure { closure, args, next };
+                self.blocks[cur].term = Term::AwaitClosure {
+                    closure,
+                    args,
+                    next,
+                };
                 match mode {
                     TailMode::Complete => {
                         self.blocks[next].term = Term::CompletePending;
@@ -4805,15 +4977,25 @@ impl<'a> CfgBuilder<'a> {
             match &rs.value {
                 Some(v) => {
                     if let Some((rargs, loc)) = remote_call_args(v) {
+                        let on_error = self.handler();
                         let next = self.new_block();
-                        self.blocks[cur].term = Term::AwaitRemote { args: rargs, loc, next };
-                        self.blocks[next].term = Term::CompleteRemote;
+                        self.blocks[cur].term = Term::AwaitRemote {
+                            args: rargs,
+                            loc,
+                            next,
+                        };
+                        self.blocks[next].term = Term::CompleteRemote { on_error };
                     } else if let Some((callee, args, loc)) = user_callee(v, self.fns) {
                         if !self.args_ok(&args) {
                             return Err(());
                         }
                         let next = self.new_block();
-                        self.blocks[cur].term = Term::Await { callee, args, loc, next };
+                        self.blocks[cur].term = Term::Await {
+                            callee,
+                            args,
+                            loc,
+                            next,
+                        };
                         self.blocks[next].term = Term::CompletePending;
                     } else if let Some((closure, args)) = async_closure_call(v, self.fns)
                         .or_else(|| indirect_closure_call(v, self.params, self.fns))
@@ -4822,7 +5004,11 @@ impl<'a> CfgBuilder<'a> {
                             return Err(());
                         }
                         let next = self.new_block();
-                        self.blocks[cur].term = Term::AwaitClosure { closure, args, next };
+                        self.blocks[cur].term = Term::AwaitClosure {
+                            closure,
+                            args,
+                            next,
+                        };
                         self.blocks[next].term = Term::CompletePending;
                     } else {
                         if expr_has_user_call(v, self.fns) {
@@ -4923,8 +5109,10 @@ impl<'a> CfgBuilder<'a> {
                 // so skip it (sound leak). Inner non-suspending if/case/for are
                 // compiled inline and drop via their own scope exits.
                 if !stmts_have_suspension(&ws.body, self.fns) {
-                    self.blocks[be].drops =
-                        fai_compiler::escape_analysis::confined_freeable_names(&ws.body, self.escaping);
+                    self.blocks[be].drops = fai_compiler::escape_analysis::confined_freeable_names(
+                        &ws.body,
+                        self.escaping,
+                    );
                 }
                 self.blocks[be].term = Term::Goto(header);
             }
@@ -4989,7 +5177,8 @@ impl<'a> CfgBuilder<'a> {
                 if let Flow::Continue(te) = try_exit {
                     self.blocks[te].term = Term::Goto(finally_blk);
                 }
-                if let Flow::Continue(ce) = self.lower_seq(&ts.catch_body, catch_blk, TailMode::None)?
+                if let Flow::Continue(ce) =
+                    self.lower_seq(&ts.catch_body, catch_blk, TailMode::None)?
                 {
                     self.blocks[ce].term = Term::Goto(finally_blk);
                 }
@@ -5017,7 +5206,11 @@ impl<'a> CfgBuilder<'a> {
                 self.handlers.push((catch_blk, ts.catch_name.clone()));
                 self.lower_seq(&ts.try_body, cur, TailMode::StoreResult(finally_blk))?;
                 self.handlers.pop();
-                self.lower_seq(&ts.catch_body, catch_blk, TailMode::StoreResult(finally_blk))?;
+                self.lower_seq(
+                    &ts.catch_body,
+                    catch_blk,
+                    TailMode::StoreResult(finally_blk),
+                )?;
                 // finally runs for effect, then completes with the result.
                 if let Flow::Continue(fe) = self.lower_seq(fb, finally_blk, TailMode::None)? {
                     self.blocks[fe].term = Term::CompleteResult;
@@ -5077,14 +5270,20 @@ fn emit_load_current_rstate(b: &mut Builder, layout: &crate::async_engine::Sched
 }
 
 /// Emit `current_task.resume_state = state`.
-fn emit_store_current_rstate(b: &mut Builder, layout: &crate::async_engine::SchedLayout, state: i32) {
+fn emit_store_current_rstate(
+    b: &mut Builder,
+    layout: &crate::async_engine::SchedLayout,
+    state: i32,
+) {
     b.emit(Instruction::GlobalGet(layout.g_table_base));
     b.emit(Instruction::GlobalGet(layout.g_current));
     b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
     b.emit(Instruction::I32Mul);
     b.emit(Instruction::I32Add);
     b.emit(Instruction::I32Const(state));
-    b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_RSTATE)));
+    b.emit(Instruction::I32Store(mem_off(
+        crate::async_engine::O_RSTATE,
+    )));
 }
 
 /// Emit `frame_ptr_local = current_task.frame`.
@@ -5111,6 +5310,30 @@ fn compile_async_segment_stmt(
     var_local: &std::collections::HashMap<String, u32>,
     release_set: &std::collections::HashSet<String>,
 ) -> Result<(), BuildError> {
+    // `let name Type = from_dict(dict)` — expand using the LHS type annotation
+    // (which `single_binding` drops) exactly as the sync `compile_let_statement`
+    // does, then store the materialized record into the async frame slot. Guard
+    // on a known type so an unknown annotation falls through to the generic path
+    // and reports the same diagnostic the sync path would.
+    if let Some((name, type_name, dict_expr)) = from_dict_binding(stmt) {
+        if b.ctx.type_fields.contains_key(type_name) {
+            let local = *var_local
+                .get(name)
+                .ok_or(BuildError::UnsupportedExpression("async-unknown-binding"))?;
+            b.compile_from_dict_value(type_name, dict_expr)?;
+            let is_cell = b.lookup(name).map(|bnd| bnd.is_cell).unwrap_or(false);
+            if is_cell {
+                b.emit_cell_store(local, ExprResult::boxed(true));
+            } else {
+                b.assign_to_async_frame_slot(
+                    local,
+                    ExprResult::boxed(true),
+                    release_set.contains(name),
+                );
+            }
+            return Ok(());
+        }
+    }
     if let Some((name, value)) = single_binding(stmt) {
         let local = *var_local
             .get(name)
@@ -5122,35 +5345,13 @@ fn compile_async_segment_stmt(
         // expects an i32.
         let is_cell = b.lookup(name).map(|bnd| bnd.is_cell).unwrap_or(false);
         if is_cell {
-            let transfers = b.expr_transfers_ownership(value);
-            b.compile_expr_as(value, ValueShape::Boxed)?;
-            b.emit_cell_store(local, transfers);
+            let result = b.compile_expr_result_as(value, ValueShape::Boxed)?;
+            b.emit_cell_store(local, result);
         } else {
-            b.compile_expr_as(value, ValueShape::Boxed)?;
-            if release_set.contains(name) {
-                // RC bind (plan 115, mirrors sync `compile_bindings`): a binding
-                // that the completion path will RELEASE must own exactly `+1`. A
-                // borrowed source (identifier / field / non-owning call) is
-                // co-owned, so retain it; a fresh value or owned call result
-                // already transfers its single ref.
-                if !b.expr_transfers_ownership(value) {
-                    b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
-                }
-                // Release the value the slot held from a PREVIOUS loop iteration
-                // (plan 116 follow-up — the async-frame loop leak): a binding
-                // statement in a suspending loop body re-executes per iteration,
-                // and completion releases only the final value, leaking N−1.
-                // Runs after the initializer is evaluated (so a read of a
-                // same-named outer binding still sees the old value); the new
-                // value rides the stack across the stack-neutral RT_RELEASE.
-                // First execution reads 0 — frames are zeroed at spawn — a safe
-                // no-op.
-                b.emit(Instruction::LocalGet(local));
-                b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
-            }
+            let result = b.compile_expr_result_as(value, ValueShape::Boxed)?;
             // Vars NOT in the release set (multi-assign targets, catch vars)
             // keep the no-retain/no-release behaviour — they leak, soundly.
-            b.emit(Instruction::LocalSet(local));
+            b.assign_to_async_frame_slot(local, result, release_set.contains(name));
         }
         return Ok(());
     }
@@ -5226,7 +5427,10 @@ fn emit_spawn_child(
     let (real_param_count, defaults) = match b.function_by_name.get(callee).copied() {
         Some(p) => {
             let fi = &b.functions()[p as usize];
-            ((fi.param_count as usize).saturating_sub(tpc), fi.param_defaults.clone())
+            (
+                (fi.param_count as usize).saturating_sub(tpc),
+                fi.param_defaults.clone(),
+            )
         }
         None => (args.len(), Vec::new()),
     };
@@ -5239,19 +5443,15 @@ fn emit_spawn_child(
         // passed to an async fn) had no release point and leaked one ref
         // per call: forui's per-render view-builder closures, exactly.
         if let Some(arg) = args.get(i) {
-            let transfers = b.expr_transfers_ownership(arg);
-            b.compile_expr_as(arg, ValueShape::Boxed)?;
-            if !transfers {
-                b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
-            }
+            let result = b.compile_expr_result_as(arg, ValueShape::Boxed)?;
+            b.prepare_stack_for_owning_store(result);
         } else if let Some(Some(default_expr)) = defaults.get(i + tpc) {
-            let transfers = b.expr_transfers_ownership(default_expr);
-            b.compile_expr_as(default_expr, ValueShape::Boxed)?;
-            if !transfers {
-                b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
-            }
+            let result = b.compile_expr_result_as(default_expr, ValueShape::Boxed)?;
+            b.prepare_stack_for_owning_store(result);
         } else {
-            return Err(BuildError::UnsupportedExpression("async-spawn-arg-count-mismatch"));
+            return Err(BuildError::UnsupportedExpression(
+                "async-spawn-arg-count-mismatch",
+            ));
         }
         b.emit(Instruction::I64Store(mem_off(((tpc + i) as u64) * 8)));
     }
@@ -5266,7 +5466,9 @@ fn emit_spawn_child(
     b.emit(Instruction::I32Mul);
     b.emit(Instruction::I32Add);
     b.emit(Instruction::I32Const(size));
-    b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_FRAME_SIZE)));
+    b.emit(Instruction::I32Store(mem_off(
+        crate::async_engine::O_FRAME_SIZE,
+    )));
     Ok(())
 }
 
@@ -5288,11 +5490,9 @@ fn emit_async_drops(
     if names.is_empty() && cell_offsets.is_empty() {
         return;
     }
-    let release_fn = b.rt().base + RT_RELEASE;
     for name in names {
         if let Some(&local) = var_local.get(name) {
-            b.emit(Instruction::LocalGet(local));
-            b.emit(Instruction::Call(release_fn));
+            b.release_owned_local(local, OwnershipOp::Cleanup);
         }
     }
     // Plan 114: release the frame's co-ownership of each heap CELL (the
@@ -5304,7 +5504,8 @@ fn emit_async_drops(
     for &off in cell_offsets {
         b.emit(Instruction::LocalGet(frame_ptr_l));
         b.emit(Instruction::I64Load(mem_off(off)));
-        b.emit(Instruction::Call(release_fn));
+        b.emit_ownership_event_for_stack(OwnershipOp::Cleanup, OWNERSHIP_SITE_UNKNOWN, 0);
+        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
     }
 }
 
@@ -5445,8 +5646,7 @@ fn build_resume_fn(
         .filter(|v| !excluded.contains(*v) && var_local.contains_key(*v))
         .cloned()
         .collect();
-    let release_set: std::collections::HashSet<String> =
-        release_names.iter().cloned().collect();
+    let release_set: std::collections::HashSet<String> = release_names.iter().cloned().collect();
     // Reassignment of a release-set var must keep the slot at one owned ref:
     // mark the local so `compile_assignment` retains-new/releases-old exactly
     // like a sync owned local (these are completion-released, never
@@ -5544,7 +5744,7 @@ fn build_resume_fn(
 
     for (k, blk) in blocks.iter().enumerate() {
         b.emit(Instruction::End); // block k region lands here
-        // br index to reach the enclosing loop from this region.
+                                  // br index to reach the enclosing loop from this region.
         let loop_depth = (b_count - 1 - k) as u32;
 
         // If a child failed, the scheduler recorded the first-completed
@@ -5593,6 +5793,37 @@ fn build_resume_fn(
                 b.emit(Instruction::End);
                 Ok(())
             };
+        let check_global_error =
+            |b: &mut Builder, on_error: Option<&(usize, String)>| -> Result<(), BuildError> {
+                b.emit(Instruction::GlobalGet(GLOBAL_ERROR_FLAG));
+                b.emit(Instruction::If(wasm_encoder::BlockType::Empty));
+                b.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
+                b.emit(Instruction::LocalSet(child_err_l));
+                b.emit(Instruction::I32Const(0));
+                b.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
+                b.emit(Instruction::I64Const(0));
+                b.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+                match on_error {
+                    Some((catch_blk, err_var)) => {
+                        let l = *var_local
+                            .get(err_var)
+                            .ok_or(BuildError::UnsupportedExpression("async-unknown-catch"))?;
+                        b.emit(Instruction::LocalGet(child_err_l));
+                        b.emit(Instruction::LocalSet(l));
+                        emit_store_current_rstate(b, layout, *catch_blk as i32);
+                        // +1: this `br` is inside the error-check `If` block.
+                        b.emit(Instruction::Br(loop_depth + 1));
+                    }
+                    None => {
+                        b.emit(Instruction::GlobalGet(layout.g_current));
+                        b.emit(Instruction::LocalGet(child_err_l));
+                        b.emit(Instruction::Call(layout.fail));
+                        b.emit(Instruction::Return);
+                    }
+                }
+                b.emit(Instruction::End);
+                Ok(())
+            };
         let assign_pending = |b: &mut Builder, slot: u64, name: &str| -> Result<(), BuildError> {
             let l = *var_local
                 .get(name)
@@ -5603,22 +5834,16 @@ fn build_resume_fn(
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off + slot * 4)));
                 b.emit(Instruction::Call(layout.task_result));
-                b.emit_cell_store(l, true);
+                b.emit_cell_store(l, ExprResult::boxed(true));
             } else {
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off + slot * 4)));
                 b.emit(Instruction::Call(layout.task_result));
-                // Release the previous iteration's value before overwriting
-                // (plan 116 follow-up): an awaited binding in a suspending loop
-                // re-receives a `+1` child result per iteration; without this
-                // only the final one is released at completion. First pass
-                // reads 0 (zeroed frame) — a safe no-op. The incoming result
-                // rides the stack across the stack-neutral RT_RELEASE.
-                if release_set.contains(name) {
-                    b.emit(Instruction::LocalGet(l));
-                    b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
-                }
-                b.emit(Instruction::LocalSet(l));
+                b.assign_to_async_frame_slot(
+                    l,
+                    ExprResult::boxed(true),
+                    release_set.contains(name),
+                );
             }
             Ok(())
         };
@@ -5654,6 +5879,15 @@ fn build_resume_fn(
             b.emit(Instruction::I32LeS);
             b.emit(Instruction::I32And);
             b.emit(Instruction::If(wasm_encoder::BlockType::Empty));
+            // Drop the scheduler record's stored result. Any consumer already
+            // received its own retained +1 through `task_result`.
+            b.emit(Instruction::GlobalGet(layout.g_table_base));
+            b.emit(Instruction::LocalGet(pend));
+            b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            b.emit(Instruction::I32Mul);
+            b.emit(Instruction::I32Add);
+            b.emit(Instruction::I64Load(mem_off(crate::async_engine::O_RESULT)));
+            b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
             // task[pend].next = g_free_head; g_free_head = pend
             b.emit(Instruction::GlobalGet(layout.g_table_base));
             b.emit(Instruction::LocalGet(pend));
@@ -5671,7 +5905,9 @@ fn build_resume_fn(
             b.emit(Instruction::I32Mul);
             b.emit(Instruction::I32Add);
             b.emit(Instruction::I32Const(crate::async_engine::ST_FREED));
-            b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_STATUS)));
+            b.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_STATUS,
+            )));
             b.emit(Instruction::End);
         };
         if let Incoming::Awaited { binds, on_error } = &blk.incoming {
@@ -5689,40 +5925,44 @@ fn build_resume_fn(
                     // ownership it would leak, so release it here. RT_RELEASE
                     // no-ops on a primitive / void result.
                     b.emit(Instruction::LocalGet(frame_ptr_l));
-                    b.emit(Instruction::I32Load(mem_off(frame.pending_off + (slot as u64) * 4)));
+                    b.emit(Instruction::I32Load(mem_off(
+                        frame.pending_off + (slot as u64) * 4,
+                    )));
                     b.emit(Instruction::Call(layout.task_result));
                     b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
                 }
                 free_pending(&mut b, slot as u64);
             }
         }
-        if let Incoming::AwaitedRemote { bind } = &blk.incoming {
+        if let Incoming::AwaitedRemote { bind, on_error } = &blk.incoming {
             // The `remoteCall` finished; read its result for the current task.
+            b.emit(Instruction::GlobalGet(layout.g_current));
+            b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
+            let remote_result_l = b.alloc_local();
+            b.emit(Instruction::LocalSet(remote_result_l));
+            check_global_error(&mut b, on_error.as_ref())?;
             if let Some(name) = bind {
                 let l = *var_local
                     .get(name)
-                    .ok_or(BuildError::UnsupportedExpression("async-unknown-remote-bind"))?;
+                    .ok_or(BuildError::UnsupportedExpression(
+                        "async-unknown-remote-bind",
+                    ))?;
                 if cell_vars.contains(name) {
                     // Value-RC store through the heap cell (plan 114); the
                     // host-built RPC result transfers.
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
-                    b.emit_cell_store(l, true);
+                    b.emit(Instruction::LocalGet(remote_result_l));
+                    b.emit_cell_store(l, ExprResult::boxed(true));
                 } else {
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
-                    // Release the previous iteration's value (plan 116
-                    // follow-up) — same rationale as `assign_pending`.
-                    if release_set.contains(name) {
-                        b.emit(Instruction::LocalGet(l));
-                        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
-                    }
-                    b.emit(Instruction::LocalSet(l));
+                    b.emit(Instruction::LocalGet(remote_result_l));
+                    b.assign_to_async_frame_slot(
+                        l,
+                        ExprResult::boxed(true),
+                        release_set.contains(name),
+                    );
                 }
             } else {
                 // Result discarded — still consume it to free the host's slot.
-                b.emit(Instruction::GlobalGet(layout.g_current));
-                b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
+                b.emit(Instruction::LocalGet(remote_result_l));
                 b.emit(Instruction::Drop);
             }
         }
@@ -5735,15 +5975,15 @@ fn build_resume_fn(
                 if cell_vars.contains(name) {
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
-                    b.emit_cell_store(l, true);
+                    b.emit_cell_store(l, ExprResult::boxed(true));
                 } else {
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
-                    if release_set.contains(name) {
-                        b.emit(Instruction::LocalGet(l));
-                        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
-                    }
-                    b.emit(Instruction::LocalSet(l));
+                    b.assign_to_async_frame_slot(
+                        l,
+                        ExprResult::boxed(true),
+                        release_set.contains(name),
+                    );
                 }
             } else {
                 b.emit(Instruction::GlobalGet(layout.g_current));
@@ -5793,12 +6033,16 @@ fn build_resume_fn(
                 b.emit(Instruction::I32Mul);
                 b.emit(Instruction::I32Add);
                 b.compile_expr_as(cond, ValueShape::RawBool)?;
-                b.emit(Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                b.emit(Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
                 b.emit(Instruction::I32Const(*then_blk as i32));
                 b.emit(Instruction::Else);
                 b.emit(Instruction::I32Const(*else_blk as i32));
                 b.emit(Instruction::End);
-                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_RSTATE)));
+                b.emit(Instruction::I32Store(mem_off(
+                    crate::async_engine::O_RSTATE,
+                )));
                 b.emit(Instruction::Br(loop_depth));
             }
             Term::Sleep { ms, next } => {
@@ -5822,16 +6066,24 @@ fn build_resume_fn(
                 };
                 rec(&mut b);
                 b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
-                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_STATUS)));
+                b.emit(Instruction::I32Store(mem_off(
+                    crate::async_engine::O_STATUS,
+                )));
                 rec(&mut b);
                 b.emit(Instruction::F64Const(-1.0));
                 b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
                 // remote_begin(g_current, url*,len, fn*,len, args*,len, hash*,len)
                 b.emit(Instruction::GlobalGet(layout.g_current));
+                let mut stashes: Vec<u32> = Vec::new();
                 for a in args {
-                    b.emit_string_arg_from_expr(a)?;
+                    if let Some(t) = b.emit_string_arg_stashing(a)? {
+                        stashes.push(t);
+                    }
                 }
                 b.emit_import_call(crate::runtime::IMPORT_REMOTE_BEGIN);
+                for t in stashes {
+                    b.release_stash(Some(t));
+                }
                 store_vars(&mut b);
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Return);
@@ -5886,15 +6138,25 @@ fn build_resume_fn(
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Return);
             }
-            Term::CompleteRemote => {
+            Term::CompleteRemote { on_error } => {
                 // complete(g_current, remote_result(g_current)) — the RPC result
                 // is this (stub) task's return value. The result is host-provided
                 // (not a frame slot), so releasing the body bindings first can't
                 // touch it.
-                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
-                b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit_import_call(crate::runtime::IMPORT_REMOTE_RESULT);
+                let remote_result_l = b.alloc_local();
+                b.emit(Instruction::LocalSet(remote_result_l));
+                check_global_error(&mut b, on_error.as_ref())?;
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit(Instruction::LocalGet(remote_result_l));
                 b.emit(Instruction::Call(layout.complete));
                 b.emit(Instruction::Return);
             }
@@ -6003,10 +6265,14 @@ fn build_resume_fn(
                 b.emit(Instruction::LocalSet(synth_addr_l));
                 b.emit(Instruction::LocalGet(synth_addr_l));
                 b.emit(Instruction::I32Const(crate::async_engine::ST_COMPLETE));
-                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_STATUS)));
+                b.emit(Instruction::I32Store(mem_off(
+                    crate::async_engine::O_STATUS,
+                )));
                 b.emit(Instruction::LocalGet(synth_addr_l));
                 b.emit(Instruction::LocalGet(sync_result_l));
-                b.emit(Instruction::I64Store(mem_off(crate::async_engine::O_RESULT)));
+                b.emit(Instruction::I64Store(mem_off(
+                    crate::async_engine::O_RESULT,
+                )));
                 b.emit(Instruction::LocalGet(synth_addr_l));
                 b.emit(Instruction::I64Const(VAL_VOID));
                 b.emit(Instruction::I64Store(mem_off(crate::async_engine::O_ERROR)));
@@ -6040,11 +6306,8 @@ fn build_resume_fn(
                     // Param slots own +1 (see `emit_spawn_child`) — retain
                     // a borrowed arg; the closure task releases its param
                     // slots at completion.
-                    let transfers = b.expr_transfers_ownership(arg);
-                    b.compile_expr_as(arg, ValueShape::Boxed)?;
-                    if !transfers {
-                        b.emit(Instruction::Call(b.rt().base + RT_RETAIN));
-                    }
+                    let result = b.compile_expr_result_as(arg, ValueShape::Boxed)?;
+                    b.prepare_stack_for_owning_store(result);
                     b.emit(Instruction::I64Store(mem_off(8 + (j as u64) * 8)));
                 }
                 b.emit(Instruction::LocalGet(closure_addr_l));
@@ -6061,7 +6324,9 @@ fn build_resume_fn(
                 b.emit(Instruction::I32Add);
                 b.emit(Instruction::LocalGet(closure_addr_l));
                 b.emit(Instruction::I32Load(mem_off(12)));
-                b.emit(Instruction::I32Store(mem_off(crate::async_engine::O_FRAME_SIZE)));
+                b.emit(Instruction::I32Store(mem_off(
+                    crate::async_engine::O_FRAME_SIZE,
+                )));
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::LocalGet(childid_l));
                 b.emit(Instruction::I32Store(mem_off(frame.pending_off)));
@@ -6090,7 +6355,9 @@ fn build_resume_fn(
                     )?;
                     b.emit(Instruction::LocalGet(frame_ptr_l));
                     b.emit(Instruction::LocalGet(childid_l));
-                    b.emit(Instruction::I32Store(mem_off(frame.pending_off + (j as u64) * 4)));
+                    b.emit(Instruction::I32Store(mem_off(
+                        frame.pending_off + (j as u64) * 4,
+                    )));
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit(Instruction::LocalGet(childid_l));
                     b.emit(Instruction::Call(layout.await_fn));
@@ -6114,7 +6381,13 @@ fn build_resume_fn(
                 }
                 let saved = b.alloc_local();
                 b.emit(Instruction::LocalSet(saved));
-                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(saved));
                 b.emit(Instruction::Call(layout.complete));
@@ -6122,7 +6395,13 @@ fn build_resume_fn(
             }
             Term::CompleteVoid => {
                 // Void is a primitive — no result to retain.
-                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::I64Const(VAL_VOID));
                 b.emit(Instruction::Call(layout.complete));
@@ -6134,7 +6413,13 @@ fn build_resume_fn(
                 // child's (read below from its task record, not a frame slot),
                 // so releasing the body bindings first can't touch it.
                 check_child_error(&mut b, None)?;
-                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::I32Load(mem_off(frame.pending_off)));
@@ -6180,7 +6465,13 @@ fn build_resume_fn(
                     }
                     let saved = b.alloc_local();
                     b.emit(Instruction::LocalSet(saved));
-                    emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
+                    emit_async_drops(
+                        &mut b,
+                        &release_names,
+                        &var_local,
+                        &cell_offsets,
+                        frame_ptr_l,
+                    );
                     b.emit(Instruction::GlobalGet(layout.g_current));
                     b.emit(Instruction::LocalGet(saved));
                     b.emit(Instruction::Call(layout.fail));
@@ -6205,7 +6496,13 @@ fn build_resume_fn(
             Term::CompleteResult => {
                 // try_result_l already holds a `+1` ref (retained at
                 // StoreResultGoto when there are bindings to release).
-                emit_async_drops(&mut b, &release_names, &var_local, &cell_offsets, frame_ptr_l);
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(try_result_l));
                 b.emit(Instruction::Call(layout.complete));
@@ -6230,11 +6527,7 @@ fn build_resume_fn(
 /// would change evaluation semantics — `&&`/`||` right operands, `while`
 /// conditions, `elsif` chains — are deliberately not rewritten; an async call
 /// there stays in place and the CFG falls back exactly as before.
-fn anf_async_body(
-    body: &[Statement],
-    r: &AsyncResolve<'_>,
-    counter: &mut usize,
-) -> Vec<Statement> {
+fn anf_async_body(body: &[Statement], r: &AsyncResolve<'_>, counter: &mut usize) -> Vec<Statement> {
     let mut out = Vec::with_capacity(body.len());
     for stmt in body {
         anf_async_stmt(stmt, r, counter, &mut out);
@@ -6308,7 +6601,14 @@ fn anf_async_stmt(
             // evaluated: branch 0's into `out` (before the if), branch k>0's
             // into the preceding `else` body (only reached if earlier
             // conditions were false), preserving short-circuit semantics.
-            anf_if_chain(&is.branches, is.else_branch.as_deref(), &is.location, r, counter, out);
+            anf_if_chain(
+                &is.branches,
+                is.else_branch.as_deref(),
+                &is.location,
+                r,
+                counter,
+                out,
+            );
         }
         Statement::WhileStatement(ws) => {
             // Condition is re-evaluated each iteration — must NOT hoist it.
@@ -6703,15 +7003,19 @@ pub fn try_codegen_async_engine(
                     if module_vars.contains_key(name) {
                         continue;
                     }
-                    module_vars.insert(name.clone(), MODULE_VAR_BASE + module_var_inits.len() as u32);
+                    module_vars.insert(
+                        name.clone(),
+                        MODULE_VAR_BASE + module_var_inits.len() as u32,
+                    );
                     let target = fai_compiler::ast::AssignmentTarget::Variables {
                         names: vec![name.clone()],
                     };
-                    let assign = Statement::AssignmentStatement(fai_compiler::ast::AssignmentStatement {
-                        target,
-                        value: vs.value.clone(),
-                        location: vs.location.clone(),
-                    });
+                    let assign =
+                        Statement::AssignmentStatement(fai_compiler::ast::AssignmentStatement {
+                            target,
+                            value: vs.value.clone(),
+                            location: vs.location.clone(),
+                        });
                     module_var_inits.push((ctx_mod.map(|s| s.to_string()), assign));
                 }
             }
@@ -6770,7 +7074,11 @@ pub fn try_codegen_async_engine(
             master_body.push(mk_call(&fn_name));
             decls.push((synth(fn_name, body), ctx_mod, None));
         }
-        decls.push((synth("<__module_init__>".to_string(), master_body), None, None));
+        decls.push((
+            synth("<__module_init__>".to_string(), master_body),
+            None,
+            None,
+        ));
         master_init_name = Some("<__module_init__>".to_string());
     }
 
@@ -6825,32 +7133,47 @@ pub fn try_codegen_async_engine(
     {
         let mut record = |stmts: &[Statement], current: Option<&str>, entry_wins: bool| {
             for s in stmts {
-                let Statement::UseStatement(u) = s else { continue };
-                let qualified = qualify_module_path_for_codegen(current, &u.module_path);
-                let mut put = |out: &mut std::collections::HashMap<String, String>, k: String, v: String| {
-                    if entry_wins {
-                        out.insert(k, v);
-                    } else {
-                        out.entry(k).or_insert(v);
-                    }
+                let Statement::UseStatement(u) = s else {
+                    continue;
                 };
+                let qualified = qualify_module_path_for_codegen(current, &u.module_path);
+                let mut put =
+                    |out: &mut std::collections::HashMap<String, String>, k: String, v: String| {
+                        if entry_wins {
+                            out.insert(k, v);
+                        } else {
+                            out.entry(k).or_insert(v);
+                        }
+                    };
                 if u.import_all {
                     if fai_checker::std_modules::is_std_module(&u.module_path) {
                         if let Some(exports) =
                             fai_checker::std_modules::std_module_exports().get(&qualified)
                         {
                             for (n, _) in exports {
-                                put(&mut named_imports, n.clone(), format!("{}.{}", qualified, n));
+                                put(
+                                    &mut named_imports,
+                                    n.clone(),
+                                    format!("{}.{}", qualified, n),
+                                );
                             }
                         }
                     } else if let Some(names) = module_fn_exports.get(&qualified) {
                         for n in names {
-                            put(&mut named_imports, n.clone(), format!("{}.{}", qualified, n));
+                            put(
+                                &mut named_imports,
+                                n.clone(),
+                                format!("{}.{}", qualified, n),
+                            );
                         }
                     }
                 } else if let Some(names) = &u.imported_names {
                     for n in names {
-                        put(&mut named_imports, n.clone(), format!("{}.{}", qualified, n));
+                        put(
+                            &mut named_imports,
+                            n.clone(),
+                            format!("{}.{}", qualified, n),
+                        );
                     }
                 }
             }
@@ -6943,9 +7266,7 @@ pub fn try_codegen_async_engine(
     for fd in &all_fns {
         let is_async = async_set.contains(&fd.name);
         // A sync fn becomes a `FaiFunc(arity)` in the table-type space.
-        if !is_async
-            && (fd.params.len() + fd.type_params.len()) > MAX_DIRECT_ARITY as usize
-        {
+        if !is_async && (fd.params.len() + fd.type_params.len()) > MAX_DIRECT_ARITY as usize {
             return None;
         }
     }
@@ -6953,8 +7274,11 @@ pub fn try_codegen_async_engine(
     // Proto order = wasm function order: each user fn sits at
     // `import_count + RT_COUNT + proto`. `main` is first.
     let mut ordered: Vec<&FunctionDeclaration> = vec![main];
-    let mut rest: Vec<&FunctionDeclaration> =
-        all_fns.iter().copied().filter(|fd| fd.name != "main").collect();
+    let mut rest: Vec<&FunctionDeclaration> = all_fns
+        .iter()
+        .copied()
+        .filter(|fd| fd.name != "main")
+        .collect();
     rest.sort_by(|a, b| a.name.cmp(&b.name));
     ordered.extend(rest);
 
@@ -6963,7 +7287,8 @@ pub fn try_codegen_async_engine(
     // for async fns.
     let mut fn_table_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut frame_sizes: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    let mut frames: std::collections::HashMap<String, AsyncFrame> = std::collections::HashMap::new();
+    let mut frames: std::collections::HashMap<String, AsyncFrame> =
+        std::collections::HashMap::new();
     let mut tpos = 0u32;
     for fd in &ordered {
         if async_set.contains(&fd.name) {
@@ -6994,7 +7319,10 @@ pub fn try_codegen_async_engine(
     // ── module-level index layout ──
     let import_available = runtime::available_imports_with_test_flag(target, false);
     let (import_remap, actual_import_count) = runtime::build_import_remap(&import_available);
-    let now_ms_idx = import_remap.get(IMPORT_NOW_MS as usize).copied().flatten()?;
+    let now_ms_idx = import_remap
+        .get(IMPORT_NOW_MS as usize)
+        .copied()
+        .flatten()?;
     let import_sigs = runtime::import_signatures();
     let rt_sigs = runtime::type_signatures();
 
@@ -7017,7 +7345,7 @@ pub fn try_codegen_async_engine(
     // calls resolve to `rt.base + RT_COUNT + proto`. The scheduler sits after.
     let user_fn_base = actual_import_count + RT_COUNT;
     let sb = user_fn_base + nuser; // first scheduler fn index
-    // Wasm index of the synthesized module-init fn (if any), for start_async.
+                                   // Wasm index of the synthesized module-init fn (if any), for start_async.
     let module_init = master_init_name.as_ref().and_then(|name| {
         ordered
             .iter()
@@ -7029,6 +7357,7 @@ pub fn try_codegen_async_engine(
         alloc: actual_import_count + RT_ALLOC,
         free: actual_import_count + RT_FREE,
         retain: actual_import_count + RT_RETAIN,
+        release: actual_import_count + RT_RELEASE,
         ready_push: sb,
         ready_pop: sb + 1,
         spawn: sb + 2,
@@ -7139,7 +7468,11 @@ pub fn try_codegen_async_engine(
         collect_decls(&m.statements);
     }
     // Externs from modules get fresh indices after the entry's.
-    let mut next_ext = extern_fn_indices.values().max().map(|m| *m + 1).unwrap_or(0);
+    let mut next_ext = extern_fn_indices
+        .values()
+        .max()
+        .map(|m| *m + 1)
+        .unwrap_or(0);
     for m in modules {
         for s in &m.statements {
             if let Statement::ExternBlockDeclaration(ext) = s {
@@ -7174,6 +7507,7 @@ pub fn try_codegen_async_engine(
             source_line: fd.location.line,
         })
         .collect();
+    let ownership_sites = RefCell::new(Vec::new());
     let ctx = BuildContext {
         rt,
         functions: &infos,
@@ -7195,6 +7529,8 @@ pub fn try_codegen_async_engine(
         module_constants: &module_constants,
         extern_out_params: &extern_out_params,
         module_vars: &module_vars,
+        ownership_sites: &ownership_sites,
+        file_path: None,
         async_ctx: Some(AsyncClosureCtx {
             async_set: &async_set,
             all_fns: &all_user_fns,
@@ -7226,7 +7562,16 @@ pub fn try_codegen_async_engine(
                 module_key: fctx.or(mctx).unwrap_or(""),
             };
             let (f, _upvalues) = match build_resume_fn(
-                &ctx, fd, frame, &fn_table_idx, &frame_sizes, &layout, &r, mctx, fctx, None,
+                &ctx,
+                fd,
+                frame,
+                &fn_table_idx,
+                &frame_sizes,
+                &layout,
+                &r,
+                mctx,
+                fctx,
+                None,
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -7269,6 +7614,7 @@ pub fn try_codegen_async_engine(
             &module_constants,
             &extern_out_params,
             &module_vars,
+            &ownership_sites,
             fctx,
             ctx.async_ctx,
         );
@@ -7378,9 +7724,9 @@ pub fn try_codegen_async_engine(
     funcs.function(t_i32_i64); // task_result
     funcs.function(t_i32i32_void); // await
     funcs.function(t_i64i64_i64); // drive_closure
-    // Closures, after the scheduler: async closures are resume fns (`t_resume`),
-    // sync closures are `FaiFunc(arity)`. async-fn closures first, then sync-fn,
-    // matching the table-slot order.
+                                  // Closures, after the scheduler: async closures are resume fns (`t_resume`),
+                                  // sync closures are `FaiFunc(arity)`. async-fn closures first, then sync-fn,
+                                  // matching the table-slot order.
     for c in async_closures.iter().chain(sync_closures.iter()) {
         if c.is_async {
             funcs.function(t_resume);
@@ -7440,9 +7786,9 @@ pub fn try_codegen_async_engine(
         },
         &ConstExpr::i64_const(0),
     ); // error_value
-    // Task ids start at 1: the host runner reads the root result via
-    // `__fai_task_result(1)`, so `main` (the first spawn) must be id 1.
-    // Slot 0 is left unused.
+       // Task ids start at 1: the host runner reads the root result via
+       // `__fai_task_result(1)`, so `main` (the first spawn) must be id 1.
+       // Slot 0 is left unused.
     globals.global(i32mut, &ConstExpr::i32_const(1)); // g_count
     globals.global(i32mut, &ConstExpr::i32_const(-1)); // g_head
     globals.global(i32mut, &ConstExpr::i32_const(-1)); // g_tail
@@ -7451,8 +7797,8 @@ pub fn try_codegen_async_engine(
     globals.global(i32mut, &ConstExpr::i32_const(0)); // g_table_base
     globals.global(i32mut, &ConstExpr::i32_const(0)); // g_live
     globals.global(i32mut, &ConstExpr::i32_const(-1)); // g_free_head (empty)
-    // Module-level `var` globals (i64), indices 12.. — initialized to Void;
-    // their real values are written by `<__module_init__>` before `main` runs.
+                                                       // Module-level `var` globals (i64), indices 12.. — initialized to Void;
+                                                       // their real values are written by `<__module_init__>` before `main` runs.
     let i64mut = GlobalType {
         val_type: ValType::I64,
         mutable: true,
@@ -7492,10 +7838,15 @@ pub fn try_codegen_async_engine(
     exports.export("__fai_spawn_closure", ExportKind::Func, spawn_closure_idx);
     exports.export("__fai_task_status", ExportKind::Func, task_status_idx);
     exports.export("__fai_free_task", ExportKind::Func, free_task_idx);
-    // Host-callable refcount release: lets the host reclaim per-request guest
-    // objects it owns (the request/response dicts it built) after writing the
-    // response, so a long-running server plateaus instead of leaking ~1 dict
-    // graph per request (plan 115). Points straight at the RT_RELEASE runtime fn.
+    // Host-callable refcount helpers: lets the host retain guest handles it
+    // stores and reclaim per-request guest objects it owns (the request/response
+    // dicts it built) after writing the response, so a long-running server
+    // plateaus instead of leaking retained route/event graphs (plans 115/117).
+    exports.export(
+        "__fai_retain",
+        ExportKind::Func,
+        actual_import_count + runtime::RT_RETAIN,
+    );
     exports.export(
         "__fai_release",
         ExportKind::Func,
@@ -7512,11 +7863,7 @@ pub fn try_codegen_async_engine(
     // table is table 0.
     exports.export("__heap_ptr", ExportKind::Global, 0);
     // Live-object counter (plan 113); index = free-list (12 + module vars) + 1.
-    exports.export(
-        "__live_objects",
-        ExportKind::Global,
-        13 + module_var_count,
-    );
+    exports.export("__live_objects", ExportKind::Global, 13 + module_var_count);
     exports.export("__env_ptr", ExportKind::Global, GLOBAL_ENV_PTR);
     // The browser runtime signals a failed `remoteCall` by setting these from JS
     // (`instance.exports.__error_flag.value = 1`), so the awaiting guest task
@@ -7648,9 +7995,16 @@ pub fn try_codegen_async_engine(
     .iter()
     .enumerate()
     {
-        dbg.push(crate::debug_info::FnDebugEntry::unlocated(sb + k as u32, *n));
+        dbg.push(crate::debug_info::FnDebugEntry::unlocated(
+            sb + k as u32,
+            *n,
+        ));
     }
-    for (i, c) in async_closures.iter().chain(sync_closures.iter()).enumerate() {
+    for (i, c) in async_closures
+        .iter()
+        .chain(sync_closures.iter())
+        .enumerate()
+    {
         let name = if c.is_async {
             format!("{}#resume", c.info.name)
         } else {
@@ -7669,6 +8023,7 @@ pub fn try_codegen_async_engine(
         &crate::debug_info::DbgMeta {
             bucket_base: Some(bucket_base),
             bucket_count: runtime::NUM_FREE_BUCKETS,
+            ownership_sites: ownership_sites.into_inner(),
         },
     );
 
@@ -7799,6 +8154,12 @@ struct BuildContext<'a> {
     /// writes to `GlobalSet`; initialisers are compiled into a
     /// synthesised module-init function.
     module_vars: &'a HashMap<String, u32>,
+    /// Shared ownership instrumentation site table. Each helper-level
+    /// ownership event allocates a dense nonzero id here and emits it
+    /// in `__fai_ownership_event`.
+    ownership_sites: &'a RefCell<Vec<crate::debug_info::OwnershipSiteDebugEntry>>,
+    /// Best known source file for the function currently being compiled.
+    file_path: Option<&'a str>,
     /// Async-engine context for compiling closures that await/fork as resume
     /// fns (A3.0). `None` on the pure-sync build path.
     async_ctx: Option<AsyncClosureCtx<'a>>,
@@ -7864,6 +8225,55 @@ impl<'o> OuterScopeView<'o> {
     }
 }
 
+fn ownership_reason(op: OwnershipOp) -> &'static str {
+    match op {
+        OwnershipOp::Retain => "retain borrowed value",
+        OwnershipOp::Release => "release owned value",
+        OwnershipOp::Transfer => "transfer owned value",
+        OwnershipOp::Borrow => "borrow value",
+        OwnershipOp::Store => "store owned value",
+        OwnershipOp::Overwrite => "overwrite owned slot",
+        OwnershipOp::Cleanup => "cleanup owned value",
+        OwnershipOp::Return => "return owned value",
+        OwnershipOp::Discard => "discard owned value",
+        OwnershipOp::CallArgument => "prepare call argument",
+    }
+}
+
+fn ownership_seed_suppresses(op: OwnershipOp) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static SEED: OnceLock<Option<OwnershipOp>> = OnceLock::new();
+        let seed = SEED.get_or_init(|| {
+            let value = std::env::var("FAI_OWNERSHIP_SEED").ok()?;
+            let Some(name) = value.strip_prefix("suppress-") else {
+                eprintln!(
+                    "[ownership-check] FAI_OWNERSHIP_SEED='{}' is not a known seed — seed inactive",
+                    value
+                );
+                return None;
+            };
+            for op in OwnershipOp::ALL {
+                if op.name() == name {
+                    return Some(op);
+                }
+            }
+            eprintln!(
+                "[ownership-check] FAI_OWNERSHIP_SEED='{}' names no ownership op — seed inactive",
+                value
+            );
+            None
+        });
+        return *seed == Some(op);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = op;
+        false
+    }
+}
+
 /// How an identifier resolves in the current builder's scope stack.
 /// `Local` is the ordinary case; `Upvalue` means the binding came from
 /// the outer scope (only possible when the builder is compiling a
@@ -7892,8 +8302,8 @@ struct Builder<'a, 'c> {
     /// Phase 3 reclamation (plans/111): per-scope list of wasm locals holding
     /// confined fresh-literal (Array/Dict/Tuple) bindings — `rt_drop`'d when the
     /// scope exits. Parallel to `scopes`. `pop_scope` drops the top list on
-    /// fall-through; a `return`/tail drops every active list (it jumps past the
-    /// pop_scopes). `break`/`continue`/`throw` skip the drops (leak, sound).
+    /// fall-through; non-trap early exits use targeted cleanup depths so they
+    /// release the scopes they skip before branching.
     scope_drops: Vec<Vec<u32>>,
     /// Names that escape this function under a conservative intraprocedural
     /// analysis (every call assumed to retain). A binding is a drop candidate
@@ -7960,9 +8370,12 @@ struct Builder<'a, 'c> {
 /// Per-`try` bookkeeping for `throw` dispatch. Popped *before* the
 /// catch body compiles so a throw inside `catch` propagates to the
 /// next-outer try.
+#[derive(Clone, Copy)]
 struct TryFrame {
     /// Absolute `block_depth` of the inner `$catch` block.
     catch_abs: u32,
+    /// `scope_drops` depth that remains live at the catch handler.
+    cleanup_depth: usize,
     /// Local that holds the thrown value until the `$catch` block
     /// binds it to the user-declared `catch_name`.
     err_local: u32,
@@ -7972,6 +8385,7 @@ struct TryFrame {
 /// pushes one of these before emitting the outer `block` + inner
 /// `loop`; relative `br` depth at a use site is
 /// `current_block_depth - target_abs`.
+#[derive(Clone, Copy)]
 struct LoopFrame {
     /// Absolute `block_depth` after the outer `block` was opened —
     /// the `break` target.
@@ -7979,6 +8393,8 @@ struct LoopFrame {
     /// Absolute `block_depth` after the inner `loop` was opened —
     /// the `continue` target.
     continue_abs: u32,
+    /// `scope_drops` depth that remains live after `break`/`continue`.
+    cleanup_depth: usize,
 }
 
 impl<'a, 'c> Builder<'a, 'c> {
@@ -8077,6 +8493,100 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
     }
 
+    fn ownership_events_enabled(&self) -> bool {
+        self.ctx
+            .import_remap
+            .get(IMPORT_OWNERSHIP_EVENT as usize)
+            .copied()
+            .flatten()
+            .is_some()
+    }
+
+    fn current_source_file(&self) -> Option<String> {
+        if let Some(file) = self.ctx.file_path {
+            return Some(file.to_string());
+        }
+        if !self.module_key.is_empty() && self.module_key.contains('/') {
+            return Some(self.module_key.clone());
+        }
+        self.ctx
+            .functions
+            .iter()
+            .find(|info| info.name == self.fd.name)
+            .and_then(|info| info.source_file.clone())
+    }
+
+    fn ownership_site(&mut self, op: OwnershipOp, site_id: u32) -> u32 {
+        if site_id != OWNERSHIP_SITE_UNKNOWN {
+            return site_id;
+        }
+        let mut sites = self.ctx.ownership_sites.borrow_mut();
+        let id = sites.len() as u32 + 1;
+        sites.push(crate::debug_info::OwnershipSiteDebugEntry {
+            id,
+            op: op.name(),
+            helper: "direct",
+            reason: ownership_reason(op),
+            file: self.current_source_file(),
+            line: self.fd.location.line,
+        });
+        id
+    }
+
+    #[allow(dead_code)]
+    fn emit_ownership_event_const(&mut self, op: OwnershipOp, site_id: u32, value: i64, aux: i32) {
+        if !self.ownership_events_enabled() {
+            return;
+        }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
+        self.emit(Instruction::I32Const(op.id() as i32));
+        self.emit(Instruction::I32Const(site_id as i32));
+        self.emit(Instruction::I64Const(value));
+        self.emit(Instruction::I32Const(aux));
+        self.emit_import_call(IMPORT_OWNERSHIP_EVENT);
+    }
+
+    fn emit_ownership_event_for_stack(&mut self, op: OwnershipOp, site_id: u32, aux: i32) {
+        if !self.ownership_events_enabled() {
+            return;
+        }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
+        let value = self.alloc_local();
+        self.emit(Instruction::LocalTee(value));
+        self.emit(Instruction::I32Const(op.id() as i32));
+        self.emit(Instruction::I32Const(site_id as i32));
+        self.emit(Instruction::LocalGet(value));
+        self.emit(Instruction::I32Const(aux));
+        self.emit_import_call(IMPORT_OWNERSHIP_EVENT);
+    }
+
+    fn emit_ownership_event_for_local(
+        &mut self,
+        op: OwnershipOp,
+        site_id: u32,
+        value_local: u32,
+        aux: i32,
+    ) {
+        if !self.ownership_events_enabled() {
+            return;
+        }
+        if ownership_seed_suppresses(op) {
+            return;
+        }
+        let site_id = self.ownership_site(op, site_id);
+        self.emit(Instruction::I32Const(op.id() as i32));
+        self.emit(Instruction::I32Const(site_id as i32));
+        self.emit(Instruction::LocalGet(value_local));
+        self.emit(Instruction::I32Const(aux));
+        self.emit_import_call(IMPORT_OWNERSHIP_EVENT);
+    }
+
     fn functions(&self) -> &'a [FunctionInfo] {
         self.ctx.functions
     }
@@ -8160,6 +8670,27 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let got = self.compile_expr(expr)?;
         self.emit_convert(got, want)
+    }
+
+    fn expr_result_for_compiled(&mut self, expr: &Expression, shape: ValueShape) -> ExprResult {
+        match shape {
+            ValueShape::Boxed => ExprResult::boxed(self.expr_transfers_ownership(expr)),
+            _ => ExprResult::primitive(shape),
+        }
+    }
+
+    fn compile_expr_result(&mut self, expr: &Expression) -> Result<ExprResult, BuildError> {
+        let shape = self.compile_expr(expr)?;
+        Ok(self.expr_result_for_compiled(expr, shape))
+    }
+
+    fn compile_expr_result_as(
+        &mut self,
+        expr: &Expression,
+        want: ValueShape,
+    ) -> Result<ExprResult, BuildError> {
+        self.compile_expr_as(expr, want)?;
+        Ok(self.expr_result_for_compiled(expr, want))
     }
 
     fn compile_numeric_expr_as_float(&mut self, expr: &Expression) -> Result<(), BuildError> {
@@ -8334,24 +8865,44 @@ impl<'a, 'c> Builder<'a, 'c> {
         );
     }
 
+    fn prepare_stack_for_owning_store(&mut self, result: ExprResult) {
+        if result.shape != ValueShape::Boxed {
+            return;
+        }
+        match result.ownership {
+            ExprOwnership::Borrowed => {
+                self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
+            ExprOwnership::Owned => {
+                self.emit_ownership_event_for_stack(
+                    OwnershipOp::Transfer,
+                    OWNERSHIP_SITE_UNKNOWN,
+                    0,
+                );
+            }
+            ExprOwnership::Primitive => {}
+        }
+    }
+
     /// Store the Boxed value currently on the stack into the cell whose
     /// address is in `addr_local`, with value-RC (plan 114): the cell OWNS
     /// its value, so retain a borrowed source, release the previous value,
     /// then write the slot at offset 8. The previous value is released
     /// AFTER the new one is computed, so a self-referencing write
     /// (`s = s + x`) reads the old value safely.
-    fn emit_cell_store(&mut self, addr_local: u32, transfers: bool) {
-        if !transfers {
-            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-        }
+    fn emit_cell_store(&mut self, addr_local: u32, result: ExprResult) {
+        self.prepare_stack_for_owning_store(result);
         let tmp = self.alloc_local();
         self.emit(Instruction::LocalSet(tmp));
         self.emit(Instruction::LocalGet(addr_local));
         self.emit(Instruction::I64Load(mem_off(8)));
+        self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
         self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         self.emit(Instruction::LocalGet(addr_local));
         self.emit(Instruction::LocalGet(tmp));
         self.emit(Instruction::I64Store(mem_off(8)));
+        self.emit_ownership_event_for_local(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, tmp, 0);
     }
 
     /// Allocate a fresh tagged cell (`OBJ_TAG_CELL`, 16 bytes, rc=1 from
@@ -8371,6 +8922,194 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I64Const(0));
         self.emit(Instruction::I64Store(mem_off(8)));
         addr_local
+    }
+
+    fn store_field_value(&mut self, result: ExprResult) {
+        self.prepare_stack_for_owning_store(result);
+        self.emit_ownership_event_for_stack(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, 0);
+        self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
+    }
+
+    fn store_index_slot(&mut self, slot: u32, result: ExprResult) {
+        self.prepare_stack_for_owning_store(result);
+        let newv = self.alloc_local();
+        self.emit(Instruction::LocalSet(newv));
+        self.emit(Instruction::LocalGet(slot));
+        self.emit(Instruction::I64Load(mem0()));
+        self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        self.emit(Instruction::LocalGet(slot));
+        self.emit(Instruction::LocalGet(newv));
+        self.emit(Instruction::I64Store(mem0()));
+        self.emit_ownership_event_for_local(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, newv, 0);
+    }
+
+    fn assign_to_async_frame_slot(&mut self, local: u32, result: ExprResult, owns_slot: bool) {
+        let aux = OwnershipAux::AsyncFrameSlot.encode(local as u16);
+        if owns_slot {
+            self.prepare_stack_for_owning_store(result);
+            self.emit(Instruction::LocalGet(local));
+            self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, aux);
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::LocalSet(local));
+            self.emit_ownership_event_for_local(
+                OwnershipOp::Overwrite,
+                OWNERSHIP_SITE_UNKNOWN,
+                local,
+                aux,
+            );
+        } else {
+            self.emit(Instruction::LocalSet(local));
+        }
+    }
+
+    fn capture_into_closure(&mut self, upvalue_index: usize) {
+        let aux = OwnershipAux::ClosureCapture.encode(upvalue_index as u16);
+        self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, aux);
+        self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+        self.emit_ownership_event_for_stack(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, aux);
+    }
+
+    fn bind_to_local(
+        &mut self,
+        name: &str,
+        result: ExprResult,
+        release_at_scope_exit: bool,
+    ) -> u32 {
+        if result.shape == ValueShape::Boxed {
+            match result.ownership {
+                ExprOwnership::Borrowed => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Retain,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        0,
+                    );
+                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+                }
+                ExprOwnership::Owned => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Transfer,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        0,
+                    );
+                }
+                ExprOwnership::Primitive => {}
+            }
+        }
+        let local = self.alloc_typed_local(result.shape);
+        self.emit(Instruction::LocalSet(local));
+        self.bind_shape(name, local, result.shape);
+        if release_at_scope_exit && result.shape == ValueShape::Boxed {
+            self.note_droppable(local);
+            self.emit_ownership_event_for_local(
+                OwnershipOp::Store,
+                OWNERSHIP_SITE_UNKNOWN,
+                local,
+                0,
+            );
+        }
+        local
+    }
+
+    fn assign_to_local_slot(&mut self, binding: LocalBinding, result: ExprResult) {
+        if binding.shape == ValueShape::Boxed && self.is_owned_local(binding.local) {
+            match result.ownership {
+                ExprOwnership::Borrowed => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Retain,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        0,
+                    );
+                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+                }
+                ExprOwnership::Owned => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Transfer,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        0,
+                    );
+                }
+                ExprOwnership::Primitive => {}
+            }
+            self.emit(Instruction::LocalGet(binding.local));
+            self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::LocalSet(binding.local));
+            self.emit_ownership_event_for_local(
+                OwnershipOp::Overwrite,
+                OWNERSHIP_SITE_UNKNOWN,
+                binding.local,
+                0,
+            );
+        } else {
+            self.emit(Instruction::LocalSet(binding.local));
+        }
+    }
+
+    fn assign_to_global_slot(&mut self, global_idx: u32, result: ExprResult) {
+        debug_assert_eq!(result.shape, ValueShape::Boxed);
+        match result.ownership {
+            ExprOwnership::Borrowed => {
+                self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
+            ExprOwnership::Owned => {
+                self.emit_ownership_event_for_stack(
+                    OwnershipOp::Transfer,
+                    OWNERSHIP_SITE_UNKNOWN,
+                    0,
+                );
+            }
+            ExprOwnership::Primitive => {}
+        }
+        self.emit(Instruction::GlobalGet(global_idx));
+        self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        self.emit(Instruction::GlobalSet(global_idx));
+    }
+
+    fn discard_value(&mut self, result: ExprResult) {
+        if result.shape == ValueShape::Boxed && result.ownership == ExprOwnership::Owned {
+            self.emit_ownership_event_for_stack(OwnershipOp::Discard, OWNERSHIP_SITE_UNKNOWN, 0);
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        } else {
+            self.emit(Instruction::Drop);
+        }
+    }
+
+    fn release_owned_local(&mut self, local: u32, op: OwnershipOp) {
+        self.emit(Instruction::LocalGet(local));
+        self.emit_ownership_event_for_stack(op, OWNERSHIP_SITE_UNKNOWN, 0);
+        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+    }
+
+    fn return_value(&mut self, value: Option<&Expression>) -> Result<(), BuildError> {
+        match value {
+            Some(expr) => {
+                let result = self.compile_expr_result_as(expr, ValueShape::Boxed)?;
+                if result.ownership == ExprOwnership::Borrowed {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Retain,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        0,
+                    );
+                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+                }
+                self.emit_ownership_event_for_stack(OwnershipOp::Return, OWNERSHIP_SITE_UNKNOWN, 0);
+                if self.has_active_drops() {
+                    let saved = self.alloc_local();
+                    self.emit(Instruction::LocalSet(saved));
+                    self.emit_all_active_drops();
+                    self.emit(Instruction::LocalGet(saved));
+                }
+            }
+            None => {
+                self.emit_all_active_drops();
+                self.emit(Instruction::I64Const(VAL_VOID));
+            }
+        }
+        self.emit(Instruction::Return);
+        Ok(())
     }
 
     fn emit_typed_param_prelude(&mut self) -> Result<(), BuildError> {
@@ -8480,6 +9219,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(args_ptr));
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for i in 0..arity {
             self.emit(Instruction::LocalGet(args_ptr));
             self.emit(Instruction::LocalGet(i));
@@ -8491,6 +9233,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(out_ptr));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
 
         // spy_check_call(fn_id, args_ptr, arity, out_ptr) -> i32
         self.emit(Instruction::I32Const(fn_id as i32));
@@ -8500,11 +9245,29 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit_import_call(crate::runtime::IMPORT_SPY_CHECK_CALL);
 
         // If the import returned 1, load *out_ptr and return it.
+        let mocked = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(mocked));
+        self.emit(Instruction::LocalGet(mocked));
         self.emit_open(Instruction::If(BlockType::Empty));
+        let mocked_value = self.alloc_local();
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit(Instruction::I64Load(mem0()));
+        self.emit(Instruction::LocalSet(mocked_value));
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(mocked_value));
         self.emit(Instruction::Return);
         self.emit_close();
+        self.emit(Instruction::LocalGet(args_ptr));
+        self.emit(Instruction::I32Const((arity as i32).max(1) * 8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
         Ok(())
     }
 
@@ -8524,18 +9287,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             Statement::ForStatement(s) => self.compile_for(s),
             Statement::NowaitStatement(n) => self.compile_nowait(n),
             Statement::ExpressionStatement(es) => {
-                let shape = self.compile_expr(&es.expression)?;
-                // Discard the result — the statement runs for its side effects.
-                // Under the +1 return convention (RC, plan 113 R2) a call now
-                // hands back an owned reference; if we just dropped it the ref
-                // would leak. Release an owned/fresh Boxed result instead of
-                // dropping it. A borrowed read (identifier/field) isn't owned
-                // here, and primitives carry no count, so those just drop.
-                if shape == ValueShape::Boxed && self.expr_transfers_ownership(&es.expression) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-                } else {
-                    self.emit(Instruction::Drop);
-                }
+                let result = self.compile_expr_result(&es.expression)?;
+                self.discard_value(result);
                 Ok(())
             }
             Statement::UseStatement(_) => {
@@ -8713,6 +9466,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// )
     /// ```
     fn compile_while(&mut self, s: &WhileStatement) -> Result<(), BuildError> {
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty));
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty));
@@ -8720,6 +9474,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // Evaluate condition + branch out on falsy.
@@ -8746,21 +9501,23 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     fn compile_break(&mut self) -> Result<(), BuildError> {
-        let frame = self
+        let frame = *self
             .loops
             .last()
             .ok_or(BuildError::UnsupportedStatement("break outside loop"))?;
         let rel = self.block_depth - frame.break_abs;
+        self.emit_cleanup_to_depth(frame.cleanup_depth);
         self.emit(Instruction::Br(rel));
         Ok(())
     }
 
     fn compile_continue(&mut self) -> Result<(), BuildError> {
-        let frame = self
+        let frame = *self
             .loops
             .last()
             .ok_or(BuildError::UnsupportedStatement("continue outside loop"))?;
         let rel = self.block_depth - frame.continue_abs;
+        self.emit_cleanup_to_depth(frame.cleanup_depth);
         self.emit(Instruction::Br(rel));
         Ok(())
     }
@@ -8770,37 +9527,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// have a single i64 result (boxed forai Value) regardless of the
     /// declared fai return type, so this always emits an i64.
     fn compile_return(&mut self, s: &fai_compiler::ast::ReturnStatement) -> Result<(), BuildError> {
-        // An explicit `return` jumps past the `pop_scope` of every enclosing
-        // scope, so free their confined bindings here. Compute the value first
-        // (it may read a binding), stash it, drop, then return it.
-        match &s.value {
-            Some(expr) => {
-                self.compile_expr_as(expr, ValueShape::Boxed)?;
-                // +1 return convention (RC, plan 113 R2): every function hands
-                // the caller an OWNED reference, so call sites can transfer
-                // (not retain) the result — that is what removes the pervasive
-                // call-result leak. A borrowed return value (identifier, field/
-                // index read, borrowed-builtin result) is retained to make it
-                // +1; a fresh value or an owned call result already is. This
-                // also keeps the value alive across the active-drop releases
-                // below (which would otherwise free a returned owned local).
-                if !self.expr_transfers_ownership(expr) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                }
-                if self.has_active_drops() {
-                    let saved = self.alloc_local();
-                    self.emit(Instruction::LocalSet(saved));
-                    self.emit_all_active_drops();
-                    self.emit(Instruction::LocalGet(saved));
-                }
-            }
-            None => {
-                self.emit_all_active_drops();
-                self.emit(Instruction::I64Const(VAL_VOID));
-            }
-        }
-        self.emit(Instruction::Return);
-        Ok(())
+        self.return_value(s.value.as_ref())
     }
 
     /// Lower `try ... catch e ... end` to two nested wasm blocks:
@@ -8825,11 +9552,13 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// current error-handling contract.
     fn compile_try(&mut self, s: &TryStatement) -> Result<(), BuildError> {
         let err_local = self.alloc_local();
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty));
         self.emit_open(Instruction::Block(BlockType::Empty));
         let catch_abs = self.block_depth;
         self.tries.push(TryFrame {
             catch_abs,
+            cleanup_depth,
             err_local,
         });
 
@@ -8855,6 +9584,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // under the user-declared catch_name for the catch body.
         self.push_scope();
         self.bind(&s.catch_name, err_local);
+        self.note_droppable(err_local);
         for st in &s.catch_body {
             self.compile_stmt(st)?;
         }
@@ -8889,15 +9619,35 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// further up. This is the unwind path that makes
     /// cross-function throw + catch work.
     fn compile_throw(&mut self, s: &ThrowStatement) -> Result<(), BuildError> {
-        self.compile_expr(&s.expression)?;
-        if let Some(frame) = self.tries.last() {
+        let result = self.compile_expr_result_as(&s.expression, ValueShape::Boxed)?;
+        match result.ownership {
+            ExprOwnership::Borrowed => {
+                self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
+            ExprOwnership::Owned => {
+                self.emit_ownership_event_for_stack(
+                    OwnershipOp::Transfer,
+                    OWNERSHIP_SITE_UNKNOWN,
+                    0,
+                );
+            }
+            ExprOwnership::Primitive => {}
+        }
+        let thrown_local = self.alloc_local();
+        self.emit(Instruction::LocalSet(thrown_local));
+        if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
+            self.emit_cleanup_to_depth(frame.cleanup_depth);
             let err_local = frame.err_local;
+            self.emit(Instruction::LocalGet(thrown_local));
             self.emit(Instruction::LocalSet(err_local));
             self.emit(Instruction::Br(rel));
         } else {
+            self.emit_cleanup_to_depth(0);
             // Stash the value into the error globals; the caller
             // will pick it up via the post-call propagation check.
+            self.emit(Instruction::LocalGet(thrown_local));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
             self.emit(Instruction::I32Const(1));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
@@ -8919,12 +9669,20 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// return value. If the flag isn't set, the saved result is
     /// pushed back so the caller's expression context sees an i64
     /// exactly as if no check had run.
-    fn emit_post_call_propagation(&mut self) {
+    fn release_owned_arg_stashes(&mut self, owned_arg_stashes: &[u32]) {
+        for &t in owned_arg_stashes {
+            self.emit_ownership_event_for_local(OwnershipOp::Discard, OWNERSHIP_SITE_UNKNOWN, t, 0);
+            self.emit(Instruction::LocalGet(t));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
+    }
+
+    fn emit_post_call_propagation(&mut self, owned_arg_stashes: &[u32]) {
         let result_local = self.alloc_local();
         self.emit(Instruction::LocalSet(result_local));
         self.emit(Instruction::GlobalGet(GLOBAL_ERROR_FLAG));
         self.emit_open(Instruction::If(BlockType::Empty));
-        if let Some(frame) = self.tries.last() {
+        if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
             let err_local = frame.err_local;
             self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
@@ -8933,6 +9691,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
             self.emit(Instruction::I64Const(0));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
+            self.release_owned_arg_stashes(owned_arg_stashes);
+            self.emit_cleanup_to_depth(frame.cleanup_depth);
             self.emit(Instruction::Br(rel));
         } else if self.fd.name == "<__start__>" {
             // Outermost frame — there is nowhere left to propagate.
@@ -8950,6 +9710,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         } else {
             // Push the saved result and return — it's a placeholder
             // the caller throws away once it sees the flag set.
+            self.release_owned_arg_stashes(owned_arg_stashes);
+            self.emit_cleanup_to_depth(0);
             self.emit(Instruction::LocalGet(result_local));
             self.emit(Instruction::Return);
         }
@@ -9065,6 +9827,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // item slot (NaN-boxed i64) — rebound each iteration.
         let item_local = self.alloc_local();
 
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty)); // $break
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty)); // $repeat
@@ -9074,6 +9837,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // if index >= length: break
@@ -9140,6 +9904,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // item slot (NaN-boxed) for the user's loop variable.
         let item_local = self.alloc_local();
 
+        let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty)); // $break
         let break_abs = self.block_depth;
         self.emit_open(Instruction::Loop(BlockType::Empty)); // $repeat
@@ -9149,6 +9914,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.loops.push(LoopFrame {
             break_abs,
             continue_abs,
+            cleanup_depth,
         });
 
         // `..` is exclusive (exit when counter >= end); `...` is
@@ -9217,9 +9983,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // borrowed, release-old, store at offset 8. A
                             // sibling closure that kept the old value has its
                             // own retain, so the release can't free under it.
-                            let transfers = self.expr_transfers_ownership(&a.value);
-                            self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                            self.emit_cell_store(binding.local, transfers);
+                            let result =
+                                self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                            self.emit_cell_store(binding.local, result);
                         } else if binding.shape == ValueShape::Boxed
                             && self.is_owned_local(binding.local)
                         {
@@ -9227,19 +9993,15 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // retain a borrowed new value (co-ownership), release
                             // the old value this slot owned, then store. The slot
                             // keeps owning exactly one ref.
-                            self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                            if !self.expr_transfers_ownership(&a.value) {
-                                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                            }
-                            self.emit(Instruction::LocalGet(binding.local));
-                            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-                            self.emit(Instruction::LocalSet(binding.local));
+                            let result =
+                                self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                            self.assign_to_local_slot(binding, result);
                         } else {
                             // Borrowed slot (param) or primitive: plain overwrite.
                             // The scope owns no ref here, so there is nothing to
                             // release and nothing to retain.
-                            self.compile_expr_as(&a.value, binding.shape)?;
-                            self.emit(Instruction::LocalSet(binding.local));
+                            let result = self.compile_expr_result_as(&a.value, binding.shape)?;
+                            self.assign_to_local_slot(binding, result);
                         }
                         Ok(())
                     }
@@ -9257,9 +10019,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                         self.emit(Instruction::I64Load(mem_off(uv_idx as u64 * 8)));
                         self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
                         self.emit(Instruction::LocalSet(cell_addr));
-                        let transfers = self.expr_transfers_ownership(&a.value);
-                        self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                        self.emit_cell_store(cell_addr, transfers);
+                        let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                        self.emit_cell_store(cell_addr, result);
                         Ok(())
                     }
                     Some(Resolve::ModuleVar(global_idx)) => {
@@ -9268,13 +10029,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                         // value, release the previous one (reclaiming it mid-run),
                         // then store. The initial global value is 0/VAL_VOID, on
                         // which RT_RELEASE's is_obj guard is a safe no-op.
-                        self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                        if !self.expr_transfers_ownership(&a.value) {
-                            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                        }
-                        self.emit(Instruction::GlobalGet(global_idx));
-                        self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-                        self.emit(Instruction::GlobalSet(global_idx));
+                        let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                        self.assign_to_global_slot(global_idx, result);
                         Ok(())
                     }
                     None => Err(BuildError::UnknownIdentifier(names[0].clone())),
@@ -9285,6 +10041,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // destructure the RHS tuple into each existing
                 // local. Each name must already be bound;
                 // reassignment doesn't allocate new locals.
+                let tuple_owned = self.expr_transfers_ownership(&a.value);
                 self.compile_expr(&a.value)?;
                 let tuple_local = self.alloc_local();
                 self.emit(Instruction::LocalSet(tuple_local));
@@ -9297,7 +10054,17 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
                     self.emit(Instruction::Call(self.rt().base + RT_GET_INDEX));
                     self.emit_convert(ValueShape::Boxed, binding.shape)?;
-                    self.emit(Instruction::LocalSet(binding.local));
+                    let result = match binding.shape {
+                        ValueShape::Boxed => ExprResult {
+                            shape: ValueShape::Boxed,
+                            ownership: ExprOwnership::Borrowed,
+                        },
+                        shape => ExprResult::primitive(shape),
+                    };
+                    self.assign_to_local_slot(binding, result);
+                }
+                if tuple_owned {
+                    self.release_owned_local(tuple_local, OwnershipOp::Discard);
                 }
                 Ok(())
             }
@@ -9339,14 +10106,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // RawInt/RawFloat from an arithmetic fast-path (e.g.
                 // `s.val = s.val + 1`) stored unconverted would read back as
                 // garbage, exactly as the Index path below guards against.
-                self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                // The object co-owns the new field value (RC, plan 113 R1):
-                // retain if borrowed. RT_SET_FIELD releases the value it
-                // overwrites (or just appends, with no old value to release).
-                if !self.expr_transfers_ownership(&a.value) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                }
-                self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.store_field_value(result);
                 // RT_SET_FIELD now returns the (possibly reallocated) dict
                 // pointer. This `obj.field = v` statement path is used for
                 // records/instances (fixed shape — never grow, pointer
@@ -9427,21 +10188,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // old value must stay alive until after we've taken our ref.
                 // Must be Boxed — array slots hold NaN-boxed values; a
                 // RawInt/RawFloat stored unconverted would read back as garbage.
-                self.compile_expr_as(&a.value, ValueShape::Boxed)?;
-                if !self.expr_transfers_ownership(&a.value) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                }
-                let newv = self.alloc_local();
-                self.emit(Instruction::LocalSet(newv));
-                // Now release the value the slot currently holds — the array
-                // owned it (RT_RELEASE's is_obj guard skips a leftover int).
-                self.emit(Instruction::LocalGet(slot));
-                self.emit(Instruction::I64Load(mem0()));
-                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-                // Store the new value through the slot.
-                self.emit(Instruction::LocalGet(slot));
-                self.emit(Instruction::LocalGet(newv));
-                self.emit(Instruction::I64Store(mem0()));
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.store_index_slot(slot, result);
                 Ok(())
             }
         }
@@ -9450,6 +10198,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.scope_drops.push(Vec::new());
+    }
+
+    fn cleanup_depth(&self) -> usize {
+        self.scope_drops.len()
     }
 
     fn pop_scope(&mut self) {
@@ -9462,11 +10214,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // deep-free at zero. Refcounting makes this order-independent and
                 // safe even when a value is co-owned (e.g. stored in a container) —
                 // whoever releases last frees it.
-                let drop_fn = self.rt().base + RT_RELEASE;
                 let locals = drops.clone();
                 for l in locals {
-                    self.emit(Instruction::LocalGet(l));
-                    self.emit(Instruction::Call(drop_fn));
+                    self.release_owned_local(l, OwnershipOp::Cleanup);
                 }
             }
         }
@@ -9487,23 +10237,35 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
     }
 
-    /// Emit `rt_drop` for every confined binding in every active scope
-    /// (innermost → outermost). Used before a `return`/tail, which jumps past
-    /// the `pop_scope` of each enclosing scope.
-    fn emit_all_active_drops(&mut self) {
-        let locals: Vec<u32> = self.scope_drops.iter().rev().flatten().copied().collect();
+    /// Emit `rt_drop` for every confined binding in scopes deeper than
+    /// `target_depth` (innermost -> outermost). Used before any non-trap early
+    /// exit that jumps past lexical `pop_scope` cleanup.
+    fn emit_cleanup_to_depth(&mut self, target_depth: usize) {
+        let locals: Vec<u32> = self
+            .scope_drops
+            .iter()
+            .skip(target_depth)
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         if locals.is_empty() {
             return;
         }
+        for l in locals {
+            self.release_owned_local(l, OwnershipOp::Cleanup);
+        }
+    }
+
+    /// Emit `rt_drop` for every confined binding in every active scope
+    /// (innermost -> outermost). Used before a `return`/tail, which jumps past
+    /// the `pop_scope` of each enclosing scope.
+    fn emit_all_active_drops(&mut self) {
         // RC release before a return/tail (which jumps past each pop_scope).
         // `compile_return`/`compile_tail_stmt` already retained a borrowed return
         // value before calling this, so releasing its owning local here leaves it
         // alive at +1 for the caller to take ownership of.
-        let drop_fn = self.rt().base + RT_RELEASE;
-        for l in locals {
-            self.emit(Instruction::LocalGet(l));
-            self.emit(Instruction::Call(drop_fn));
-        }
+        self.emit_cleanup_to_depth(0);
     }
 
     fn has_active_drops(&self) -> bool {
@@ -9527,26 +10289,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// emits its own `Return` (no wasm `if` result-type needed).
     fn compile_tail_stmt(&mut self, stmt: &Statement) -> Result<(), BuildError> {
         match stmt {
-            Statement::ExpressionStatement(es) => {
-                self.compile_expr_as(&es.expression, ValueShape::Boxed)?;
-                // +1 return convention (RC, plan 113 R2) — mirrors
-                // `compile_return`: retain a borrowed tail value so the function
-                // returns an owned ref the caller transfers, and so it survives
-                // the active-drop releases below.
-                if !self.expr_transfers_ownership(&es.expression) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                }
-                if self.has_active_drops() {
-                    // Stash the return value (it may read a binding), free the
-                    // dead bindings in every active scope, then return it.
-                    let saved = self.alloc_local();
-                    self.emit(Instruction::LocalSet(saved));
-                    self.emit_all_active_drops();
-                    self.emit(Instruction::LocalGet(saved));
-                }
-                self.emit(Instruction::Return);
-                Ok(())
-            }
+            Statement::ExpressionStatement(es) => self.return_value(Some(&es.expression)),
             Statement::IfStatement(s) => {
                 self.compile_if_branches_tail(&s.branches, s.else_branch.as_deref())?;
                 // Fall-through safety: if no branch matched and
@@ -9713,9 +10456,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                     if let Some(existing) = self.lookup(name) {
                         if existing.is_cell {
                             let addr_local = existing.local;
-                            let transfers = self.expr_transfers_ownership(value);
-                            self.compile_expr_as(value, ValueShape::Boxed)?;
-                            self.emit_cell_store(addr_local, transfers);
+                            let result = self.compile_expr_result_as(value, ValueShape::Boxed)?;
+                            self.emit_cell_store(addr_local, result);
                             return Ok(());
                         }
                     }
@@ -9724,9 +10466,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                     // a cell binding. Reads and writes on either side deref
                     // the value slot at offset 8.
                     let addr_local = self.emit_cell_alloc();
-                    let transfers = self.expr_transfers_ownership(value);
-                    self.compile_expr_as(value, ValueShape::Boxed)?;
-                    self.emit_cell_store(addr_local, transfers);
+                    let result = self.compile_expr_result_as(value, ValueShape::Boxed)?;
+                    self.emit_cell_store(addr_local, result);
                     self.bind_cell(name, addr_local);
                     // The scope owns the cell's +1 from the allocator:
                     // release it at scope exit like any owned binding (the
@@ -9752,27 +10493,17 @@ impl<'a, 'c> Builder<'a, 'c> {
                     .as_ref()
                     .map(shape_for_type_node)
                     .unwrap_or_else(|| self.shape_for_expr(value));
-                self.compile_expr_as(value, shape)?;
-                // RC bind (plan 113 R1): a borrowed source (identifier/field/
-                // call/…) is co-owned by this new local → retain; a fresh value
-                // transfers its single ref. The local is released at scope exit.
-                // (`shared` no longer has any runtime effect.)
-                let _ = is_shared;
-                if shape == ValueShape::Boxed && !self.expr_transfers_ownership(value) {
-                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
-                }
-                let local = self.alloc_typed_local(shape);
-                self.emit(Instruction::LocalSet(local));
-                self.bind_shape(name, local, shape);
-                // Release this owned object local at scope exit (RC, plan 113 R1).
-                if !is_shared && shape == ValueShape::Boxed {
-                    self.note_droppable(local);
-                }
+                let result = self.compile_expr_result_as(value, shape)?;
+                // RC bind (plan 113 R1): `bind_to_local` retains borrowed boxed
+                // values, transfers owned boxed values, and registers owning
+                // boxed locals for scope-exit release.
+                self.bind_to_local(name, result, !is_shared);
                 Ok(())
             }
             _ => {
                 // Evaluate the RHS (expected Tuple) into a scratch
                 // local so we can index into it repeatedly.
+                let tuple_owned = self.expr_transfers_ownership(value);
                 self.compile_expr_as(value, ValueShape::Boxed)?;
                 let tuple_local = self.alloc_local();
                 self.emit(Instruction::LocalSet(tuple_local));
@@ -9786,9 +10517,17 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit(Instruction::I32Const(i as i32));
                     self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
                     self.emit(Instruction::Call(self.rt().base + RT_GET_INDEX));
-                    let local = self.alloc_local();
-                    self.emit(Instruction::LocalSet(local));
-                    self.bind(&binding.name, local);
+                    self.bind_to_local(
+                        &binding.name,
+                        ExprResult {
+                            shape: ValueShape::Boxed,
+                            ownership: ExprOwnership::Borrowed,
+                        },
+                        true,
+                    );
+                }
+                if tuple_owned {
+                    self.release_owned_local(tuple_local, OwnershipOp::Discard);
                 }
                 Ok(())
             }
@@ -10264,7 +11003,6 @@ impl<'a, 'c> Builder<'a, 'c> {
         let type_param_count = self.functions()[proto_idx as usize].type_param_count as usize;
         let real_param_count = expected - type_param_count;
         let defaults = self.functions()[proto_idx as usize].param_defaults.clone();
-
         // Named-param reorder: if the checker recorded a reorder map
         // for this call site, use it to pull caller args into
         // declaration order. Missing slots are filled from default
@@ -10276,8 +11014,12 @@ impl<'a, 'c> Builder<'a, 'c> {
                     "CallExpression/reorder-shape-mismatch",
                 ));
             }
-            // Owned argument temporaries to release after the call (RC, plan 113
-            // R2) — mirrors the positional path below.
+            // Owned argument temporaries to release after the call (RC, plan
+            // 113 R2) — mirrors the positional path below. User calls borrow
+            // their params; if a result aliases an arg, returning a borrowed
+            // arg retains it and storing a borrowed arg in a field/array retains
+            // it. That gives the result its own credit, so the caller must still
+            // release the fresh source argument credit after the call.
             let mut owned_arg_stashes: Vec<u32> = Vec::new();
             if type_param_count > 0 {
                 let type_args = self
@@ -10325,7 +11067,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
             self.emit(Instruction::Call(wasm_idx));
-            self.emit_post_call_propagation();
+            self.emit_post_call_propagation(&owned_arg_stashes);
             for t in owned_arg_stashes {
                 self.emit(Instruction::LocalGet(t));
                 self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
@@ -10358,9 +11100,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         // unless freed once the call returns. `LocalTee` keeps each on the stack
         // for the call while saving a copy to release. A borrowed arg
         // (identifier / field — incl. `mutable` bindings) is owned by the
-        // caller's binding, so it is left alone. If the callee returns one of
-        // these args it retained it first (the +1 return convention), so the
-        // result survives our release.
+        // caller's binding, so it is left alone. Aliasing heap results are safe:
+        // user-function returns retain borrowed return values, and any store of
+        // a borrowed param into an owning field/array retains before returning.
         let mut owned_arg_stashes: Vec<u32> = Vec::new();
         if type_param_count > 0 {
             let type_args = self
@@ -10403,10 +11145,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&owned_arg_stashes);
         // Result is on the stack (propagation re-pushed it); release the owned
-        // argument temporaries beneath it. On a throw, propagation branched away
-        // and this is skipped — the temps leak on the error path (sound).
+        // argument temporaries beneath it. On a throw, propagation releases the
+        // stashes before branching away.
         for t in owned_arg_stashes {
             self.emit(Instruction::LocalGet(t));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
@@ -10442,9 +11184,51 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// already on the stack (e.g. the call's result) is preserved.
     fn release_stash(&mut self, stash: Option<u32>) {
         if let Some(t) = stash {
+            self.emit_ownership_event_for_local(OwnershipOp::Discard, OWNERSHIP_SITE_UNKNOWN, t, 0);
             self.emit(Instruction::LocalGet(t));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         }
+    }
+
+    fn pass_argument(
+        &mut self,
+        e: &Expression,
+        convention: ArgConvention,
+    ) -> Result<Option<u32>, BuildError> {
+        let result = self.compile_expr_result_as(e, ValueShape::Boxed)?;
+        let mut release_after_call = None;
+        let aux = OwnershipAux::HostArgument.encode(convention.id() as u16);
+        match convention {
+            ArgConvention::Borrowed
+            | ArgConvention::RetainedByCallee
+            | ArgConvention::CopiedByHost => {
+                if result.ownership == ExprOwnership::Owned {
+                    let t = self.alloc_local();
+                    self.emit(Instruction::LocalTee(t));
+                    release_after_call = Some(t);
+                }
+            }
+            ArgConvention::Consumed => match result.ownership {
+                ExprOwnership::Borrowed => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Retain,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        aux,
+                    );
+                    self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+                }
+                ExprOwnership::Owned => {
+                    self.emit_ownership_event_for_stack(
+                        OwnershipOp::Transfer,
+                        OWNERSHIP_SITE_UNKNOWN,
+                        aux,
+                    );
+                }
+                ExprOwnership::Primitive => {}
+            },
+        }
+        self.emit_ownership_event_for_stack(OwnershipOp::CallArgument, OWNERSHIP_SITE_UNKNOWN, aux);
+        Ok(release_after_call)
     }
 
     /// Like `emit_string_arg_from_expr`, but when the arg is an OWNED temp
@@ -10505,11 +11289,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         // Stash each arg in a local so the subsequent buffer
         // allocation doesn't clobber String pointers mid-build.
         let mut arg_locals: Vec<u32> = Vec::with_capacity(call_args.len());
+        let mut arg_owned: Vec<bool> = Vec::with_capacity(call_args.len());
         for a in call_args {
-            self.compile_expr(&a.value)?;
+            let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
             let local = self.alloc_local();
             self.emit(Instruction::LocalSet(local));
             arg_locals.push(local);
+            arg_owned.push(result.ownership == ExprOwnership::Owned);
         }
 
         let arity = call_args.len() as u32;
@@ -10517,6 +11303,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(buf));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for (i, &local) in arg_locals.iter().enumerate() {
             self.emit(Instruction::LocalGet(buf));
             self.emit(Instruction::LocalGet(local));
@@ -10527,18 +11316,45 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(8));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(out_ptr));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
 
         self.emit(Instruction::I32Const(fn_id as i32));
         self.emit(Instruction::LocalGet(buf));
         self.emit(Instruction::I32Const(arity as i32));
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit_import_call(crate::runtime::IMPORT_SPY_CHECK_CALL);
+        let mocked = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(mocked));
+        for (&local, owned) in arg_locals.iter().zip(arg_owned.iter()) {
+            if *owned {
+                self.emit(Instruction::LocalGet(local));
+                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            }
+        }
 
         // i32 on stack: 1 = mocked (use *out_ptr), 0 = run real call.
+        self.emit(Instruction::LocalGet(mocked));
         self.emit_open(Instruction::If(BlockType::Result(ValType::I64)));
+        let mocked_value = self.alloc_local();
         self.emit(Instruction::LocalGet(out_ptr));
         self.emit(Instruction::I64Load(mem0()));
+        self.emit(Instruction::LocalSet(mocked_value));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(mocked_value));
         self.emit(Instruction::Else);
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((arity.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(out_ptr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
         // Real path — compile_module_call re-evaluates args.
         self.compile_module_call(call, call_args)?;
         self.emit_close();
@@ -10579,6 +11395,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             ModuleCall::ConvertToString => self.compile_convert_to_string(call_args),
             ModuleCall::ConvertParseInt => self.compile_convert_parse(RT_PARSE_INT, call_args),
             ModuleCall::ConvertParseFloat => self.compile_convert_parse(RT_PARSE_FLOAT, call_args),
+            ModuleCall::JsonRequireString => self.compile_json_require_string(call_args),
             ModuleCall::ConvertToBool => self.compile_convert_to_bool(call_args),
             ModuleCall::SpyAssertCalledWith => self.compile_spy_assert_called_with(call_args),
             ModuleCall::SpyAssertCallCount => self.compile_spy_assert_call_count(call_args),
@@ -10713,6 +11530,44 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
+    fn compile_json_require_string(
+        &mut self,
+        call_args: &[fai_compiler::ast::CallArgument],
+    ) -> Result<(), BuildError> {
+        if call_args.len() != 2 {
+            return Err(BuildError::UnsupportedExpression(
+                "ModuleCall/json-require-string-arg-count",
+            ));
+        }
+
+        let dict_result = self.compile_expr_result_as(&call_args[0].value, ValueShape::Boxed)?;
+        let dict = self.alloc_local();
+        self.emit(Instruction::LocalSet(dict));
+
+        self.emit(Instruction::LocalGet(dict));
+        let key_stash = self.emit_string_arg_stashing(&call_args[1].value)?;
+        self.emit_import_call(IMPORT_JSON_REQUIRE_STRING);
+
+        let result = self.alloc_local();
+        self.emit(Instruction::LocalSet(result));
+        self.release_stash(key_stash);
+
+        // json_require_string returns an alias into the dict. Retain that alias
+        // before releasing an owned inline dict temp so callers can treat this
+        // std call as returning an owned optional string.
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+        self.emit(Instruction::Drop);
+
+        if dict_result.ownership == ExprOwnership::Owned {
+            self.emit(Instruction::LocalGet(dict));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
+
+        self.emit(Instruction::LocalGet(result));
+        Ok(())
+    }
+
     /// Lower an assertion: `test.assert`, `test.equal`,
     /// `assert.equals`, `assert.isTrue`, `assert.isFalse`. Each
     /// evaluates a condition and produces an i32 `ok` flag (1 = pass,
@@ -10765,9 +11620,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             AssertionKind::StringEq => {
                 // stringify both, pass (ptr, len) pairs to RT_STR_EQ.
-                self.emit_string_arg_from_expr(&call_args[0].value)?;
-                self.emit_string_arg_from_expr(&call_args[1].value)?;
+                let left_stash = self.emit_string_arg_stashing(&call_args[0].value)?;
+                let right_stash = self.emit_string_arg_stashing(&call_args[1].value)?;
                 self.emit(Instruction::Call(self.rt().base + RT_STR_EQ));
+                let ok = self.alloc_i32_local();
+                self.emit(Instruction::LocalSet(ok));
+                self.release_stash(left_stash);
+                self.release_stash(right_stash);
+                self.emit(Instruction::LocalGet(ok));
             }
         }
 
@@ -10895,25 +11755,12 @@ impl<'a, 'c> Builder<'a, 'c> {
         // literal or fresh-call argument is created here and only borrowed by the
         // callee, so it leaks unless freed after the call.
         //
-        // Arg 0 (the RECEIVER) is released ONLY for methods that return a
-        // PRIMITIVE (length/isEmpty/contains/indexOf/startsWith/endsWith): an
-        // Int/Bool result provably can't reference the receiver, so freeing a
-        // fresh receiver is safe. Heap-returning methods (split/replace/slice/
-        // sort/append/join/…) are NOT released at arg 0 — their result can share
-        // structure with the receiver (e.g. a builder that copies element refs),
-        // and freeing the receiver could free something the result still points
-        // at (a use-after-free — observed as a closure-arity trap when a freed
-        // node is later `call_indirect`'d). Those receiver temps leak, soundly.
-        // Args 1..n never alias any result, so owned ones are always released.
-        // Arg 0 (receiver) is safe to release when the result CANNOT share a heap
-        // pointer with it: a primitive result (length/isEmpty/contains/indexOf/
-        // startsWith/endsWith), or a CROSS-TYPE transform — `join` (array → fresh
-        // string) and `split` (string → fresh array of fresh substrings) build a
-        // result of a different type with copied bytes, so nothing in the result
-        // points into the receiver. Still skipped: same-type string→string
-        // transforms (may alias the receiver on a fast path) and array-rebuilders
-        // (append/sort/reverse/slice — result shares element pointers) and
-        // element accessors (first/last — result IS a receiver element).
+        // Arg 0 (receiver) is safe to release when the result either cannot
+        // share a heap pointer with it, or the builder retains every shared
+        // child before returning. This includes primitive readers, fresh string
+        // transforms, and array/dict rebuilders like slice/getKeys that retain
+        // copied elements. Still skipped: element accessors (first/last), where
+        // the result is the receiver's child alias.
         let result_cannot_alias_receiver = matches!(
             method_id,
             METHOD_LENGTH
@@ -10922,8 +11769,21 @@ impl<'a, 'c> Builder<'a, 'c> {
                 | METHOD_INDEX_OF
                 | METHOD_STARTS_WITH
                 | METHOD_ENDS_WITH
+                | METHOD_GET_KEYS
+                | METHOD_REPLACE
                 | METHOD_JOIN
                 | METHOD_SPLIT
+                | METHOD_TRIM
+                | METHOD_TRIM_START
+                | METHOD_TRIM_END
+                | METHOD_TO_UPPER
+                | METHOD_TO_LOWER
+                | METHOD_SUBSTRING
+                | METHOD_REPEAT
+                | METHOD_APPEND
+                | METHOD_SORT
+                | METHOD_SLICE
+                | METHOD_REVERSE
         );
         for (i, a) in call_args.iter().enumerate() {
             if i == 0 && !result_cannot_alias_receiver {
@@ -10964,9 +11824,11 @@ impl<'a, 'c> Builder<'a, 'c> {
         // once-per-import stderr sentinel otherwise. Classification reads
         // the same table, so an unsigned import would otherwise silently
         // fall through as borrowed and over-retain forever.
+        let import_ownership =
+            fai_compiler::ownership_abi::lookup_host_import(import_name(import_idx));
         if matches!(result, ResultShape::Boxed) {
             let name = import_name(import_idx);
-            if fai_compiler::ownership_abi::lookup_host_import(name).is_none() {
+            if import_ownership.is_none() {
                 if crate::runtime::checked_enabled() || abi_check_enabled() {
                     return Err(BuildError::MissingOwnershipSignature(name.to_string()));
                 }
@@ -10982,26 +11844,33 @@ impl<'a, 'c> Builder<'a, 'c> {
         // handler, storage retains values), so freeing one would be a UAF.
         // Reclaiming owned Boxed arg temps needs per-import "does it retain?"
         // metadata — left as a follow-up; those leak (soundly) for now.
-        let mut string_stashes: Vec<u32> = Vec::new();
-        for (shape, arg) in arg_shapes.iter().zip(call_args.iter()) {
+        let arg_conventions = import_ownership.as_ref().and_then(|sig| sig.args.as_ref());
+        let mut stashes: Vec<u32> = Vec::new();
+        for (i, (shape, arg)) in arg_shapes.iter().zip(call_args.iter()).enumerate() {
             match shape {
                 ArgShape::String => {
                     if let Some(t) = self.emit_string_arg_stashing(&arg.value)? {
-                        string_stashes.push(t);
+                        stashes.push(t);
                     }
                 }
                 ArgShape::Int => self.emit_int_arg_from_expr(&arg.value)?,
                 ArgShape::Boxed => {
-                    self.compile_expr(&arg.value)?;
+                    if let Some(convention) = arg_conventions.and_then(|args| args.get(i)).copied()
+                    {
+                        if let Some(t) = self.pass_argument(&arg.value, convention)? {
+                            stashes.push(t);
+                        }
+                    } else {
+                        self.compile_expr(&arg.value)?;
+                    }
                 }
             }
         }
         self.emit_import_call(import_idx);
         // Release owned string-arg temps. The result/return is produced by the
         // import (independent of the guest string bytes), so this can't free it.
-        for t in &string_stashes {
-            self.emit(Instruction::LocalGet(*t));
-            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        for t in &stashes {
+            self.release_stash(Some(*t));
         }
         match result {
             ResultShape::Boxed => {}
@@ -11375,24 +12244,39 @@ impl<'a, 'c> Builder<'a, 'c> {
     ///     through untouched.
     ///
     /// The dict read path is `RT_GET_FIELD`.
-    fn compile_from_dict_binding(
+    /// Materialize `from_dict(dict_expr)` for `type_name`, leaving the boxed
+    /// owned record (+1) on the stack. Releases the source dict when it was an
+    /// owned temp. Shared by the sync let-binding path and the async resume-fn
+    /// segment compiler — they differ only in where the value is stored (a
+    /// scope-bound local vs. an async frame slot), not in how it is built.
+    fn compile_from_dict_value(
         &mut self,
-        binding_name: &str,
         type_name: &str,
-        dict_expr: Expression,
+        dict_expr: &Expression,
     ) -> Result<(), BuildError> {
-        self.compile_expr_as(&dict_expr, ValueShape::Boxed)?;
+        self.compile_expr_as(dict_expr, ValueShape::Boxed)?;
         let dict_local = self.alloc_local();
         self.emit(Instruction::LocalSet(dict_local));
         self.compile_from_dict_local_value(type_name, dict_local)?;
         // An OWNED source temp (e.g. `from_dict(json.parse(s))`) is consumed
         // by the materialization — the record retained every field it kept,
         // so the source's ref can go. A borrowed source (`from_dict(e.data)`)
-        // stays the caller's.
-        if self.expr_transfers_ownership(&dict_expr) {
+        // stays the caller's. Releasing `dict_local` leaves the record on the
+        // stack untouched.
+        if self.expr_transfers_ownership(dict_expr) {
             self.emit(Instruction::LocalGet(dict_local));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         }
+        Ok(())
+    }
+
+    fn compile_from_dict_binding(
+        &mut self,
+        binding_name: &str,
+        type_name: &str,
+        dict_expr: Expression,
+    ) -> Result<(), BuildError> {
+        self.compile_from_dict_value(type_name, &dict_expr)?;
         let local = self.alloc_local();
         self.emit(Instruction::LocalSet(local));
         self.bind(binding_name, local);
@@ -11591,7 +12475,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let wasm_idx = self.rt().base + RT_COUNT + proto_idx;
         self.emit(Instruction::Call(wasm_idx));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&[]);
         let rows_local = self.alloc_local();
         self.emit(Instruction::LocalSet(rows_local));
 
@@ -11933,9 +12817,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     ) -> Result<(), BuildError> {
         use fai_compiler::ast::TemplateStringPart;
 
-        // Helper: emit one part as a boxed String on the stack.
-        // Text parts intern + RT_ALLOC_STRING; expressions stringify
-        // via RT_VALUE_TO_STR.
+        // Helper: emit one owned (+1) boxed String on the stack.
+        // Text parts are fresh allocations; expression parts go through
+        // `emit_to_string_owned` so string aliases are retained and owned
+        // expression temps are released.
         let emit_part = |this: &mut Self, part: &TemplateStringPart| -> Result<(), BuildError> {
             match part {
                 TemplateStringPart::Text { value } => {
@@ -11945,8 +12830,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                     this.emit(Instruction::Call(this.rt().base + RT_ALLOC_STRING));
                 }
                 TemplateStringPart::Expression { expression } => {
-                    this.compile_expr_as(expression, ValueShape::Boxed)?;
-                    this.emit(Instruction::Call(this.rt().base + RT_VALUE_TO_STR));
+                    this.emit_to_string_owned(expression)?;
                 }
             }
             Ok(())
@@ -11962,9 +12846,19 @@ impl<'a, 'c> Builder<'a, 'c> {
 
         emit_part(self, &parts[0])?;
         for p in &parts[1..] {
+            let left = self.alloc_local();
+            self.emit(Instruction::LocalTee(left));
             emit_part(self, p)?;
+            let right = self.alloc_local();
+            self.emit(Instruction::LocalTee(right));
             // Two strings on the stack — concatenate into one.
             self.emit(Instruction::Call(self.rt().base + RT_CONCAT));
+            // RT_CONCAT reads its operands and returns a fresh string; it does
+            // not consume either operand's ownership.
+            self.emit(Instruction::LocalGet(left));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::LocalGet(right));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         }
         Ok(())
     }
@@ -11992,7 +12886,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I64Const(VAL_NULL));
         self.emit(Instruction::I64Eq);
         self.emit_open(Instruction::If(BlockType::Empty));
-        self.emit(Instruction::I32Const(crate::runtime::TRAP_FORCE_UNWRAP_NULL));
+        self.emit(Instruction::I32Const(
+            crate::runtime::TRAP_FORCE_UNWRAP_NULL,
+        ));
         self.emit(Instruction::I64Const(0));
         self.emit(Instruction::I64Const(0));
         self.emit_import_call(IMPORT_TRAP_REPORT);
@@ -12016,7 +12912,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             ));
         }
         self.compile_expr(&call_args[0].value)?;
+        let stash = self.stash_if_owned(&call_args[0].value);
         self.emit(Instruction::Call(self.rt().base + helper));
+        self.release_stash(stash);
         Ok(())
     }
 
@@ -12031,10 +12929,16 @@ impl<'a, 'c> Builder<'a, 'c> {
         if args.len() != 4 {
             return Err(BuildError::UnsupportedExpression("remoteCall-arg-count"));
         }
+        let mut stashes: Vec<u32> = Vec::new();
         for a in args {
-            self.emit_string_arg_from_expr(a)?;
+            if let Some(t) = self.emit_string_arg_stashing(a)? {
+                stashes.push(t);
+            }
         }
         self.emit_import_call(IMPORT_REMOTE_CALL);
+        for t in stashes {
+            self.release_stash(Some(t));
+        }
         Ok(())
     }
 
@@ -12059,7 +12963,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                     return Err(BuildError::UnsupportedExpression("copy-arg-count"));
                 }
                 self.compile_expr_as(args[0], ValueShape::Boxed)?;
-                self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_COPY_DEEP));
+                self.emit(Instruction::Call(
+                    self.rt().base + crate::runtime::RT_COPY_DEEP,
+                ));
                 Ok(Some(()))
             }
             // ── debug: current heap bump pointer (__heap_ptr, global 0) ──
@@ -12185,6 +13091,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             "setHtmlAt" => self.compile_bare_set_html_at(args).map(Some),
             "getLocationPath" => self.compile_bare_get_location_path(args).map(Some),
             "pushHistoryState" => self.compile_bare_push_history_state(args).map(Some),
+            "replaceLocation" => self.compile_bare_replace_location(args).map(Some),
 
             // ── dict helpers ──────────────────────────────────
             "getString" | "getInt" | "getBool" | "get" => {
@@ -12272,8 +13179,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         // through as a no-op (matches `mock` with the same target).
         let Some(fn_id) = fn_id else {
             for a in call_args {
-                self.compile_expr(&a.value)?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.discard_value(result);
             }
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
@@ -12283,17 +13190,22 @@ impl<'a, 'c> Builder<'a, 'c> {
         // Stash each expected value in a local so the buffer
         // allocation doesn't clobber it during its own RT_ALLOC.
         let mut expected_locals = Vec::with_capacity(expected_count);
+        let mut expected_owned = Vec::with_capacity(expected_count);
         for a in &call_args[1..] {
-            self.compile_expr(&a.value)?;
+            let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
             let local = self.alloc_local();
             self.emit(Instruction::LocalSet(local));
             expected_locals.push(local);
+            expected_owned.push(result.ownership == ExprOwnership::Owned);
         }
 
         let buf = self.alloc_i32_local();
         self.emit(Instruction::I32Const((expected_count.max(1) * 8) as i32));
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(buf));
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I64Const(0));
+        self.emit(Instruction::I64Store(mem0()));
         for (i, &local) in expected_locals.iter().enumerate() {
             self.emit(Instruction::LocalGet(buf));
             self.emit(Instruction::LocalGet(local));
@@ -12304,6 +13216,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::LocalGet(buf));
         self.emit(Instruction::I32Const(expected_count as i32));
         self.emit_import_call(crate::runtime::IMPORT_SPY_ASSERT_CALLED_WITH);
+        let assertion_failed = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(assertion_failed));
+        for (&local, owned) in expected_locals.iter().zip(expected_owned.iter()) {
+            if *owned {
+                self.emit(Instruction::LocalGet(local));
+                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            }
+        }
+        self.emit(Instruction::LocalGet(buf));
+        self.emit(Instruction::I32Const((expected_count.max(1) * 8) as i32));
+        self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
+        self.emit(Instruction::LocalGet(assertion_failed));
         // i32 result on stack: 0 pass, 1 fail.
         self.emit_open(Instruction::If(BlockType::Empty));
         self.emit(Instruction::Unreachable);
@@ -12332,8 +13256,8 @@ impl<'a, 'c> Builder<'a, 'c> {
         );
         let Some(fn_id) = fn_id else {
             for a in call_args {
-                self.compile_expr(&a.value)?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                self.discard_value(result);
             }
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
@@ -12369,8 +13293,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.ctx.std_method_fn_ids,
         );
         let Some(fn_id) = fn_id else {
-            self.compile_expr(&call_args[0].value)?;
-            self.emit(Instruction::Drop);
+            let result = self.compile_expr_result_as(&call_args[0].value, ValueShape::Boxed)?;
+            self.discard_value(result);
             self.emit(Instruction::I64Const(VAL_VOID));
             return Ok(());
         };
@@ -12408,23 +13332,31 @@ impl<'a, 'c> Builder<'a, 'c> {
         ) {
             Some(fn_id) => {
                 self.emit(Instruction::I32Const(fn_id as i32));
-                self.compile_expr(args[1])?;
+                let value = self.compile_expr_result_as(args[1], ValueShape::Boxed)?;
+                let release_after_call = if value.ownership == ExprOwnership::Owned {
+                    let local = self.alloc_local();
+                    self.emit(Instruction::LocalTee(local));
+                    Some(local)
+                } else {
+                    None
+                };
                 let import = if once {
                     crate::runtime::IMPORT_SPY_SET_MOCK_ONCE
                 } else {
                     crate::runtime::IMPORT_SPY_SET_MOCK
                 };
                 self.emit_import_call(import);
+                self.release_stash(release_after_call);
             }
             None => {
                 // Unresolvable target — preserve side effects and
                 // emit no host call. The corresponding call sites
                 // won't be instrumented either (they weren't in
                 // the mocked set), so this is consistent.
-                self.compile_expr(args[0])?;
-                self.emit(Instruction::Drop);
-                self.compile_expr(args[1])?;
-                self.emit(Instruction::Drop);
+                let target = self.compile_expr_result_as(args[0], ValueShape::Boxed)?;
+                self.discard_value(target);
+                let value = self.compile_expr_result_as(args[1], ValueShape::Boxed)?;
+                self.discard_value(value);
             }
         }
         self.emit(Instruction::I64Const(VAL_VOID));
@@ -12451,8 +13383,8 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.emit_import_call(crate::runtime::IMPORT_SPY_RESET);
             }
             None => {
-                self.compile_expr(args[0])?;
-                self.emit(Instruction::Drop);
+                let result = self.compile_expr_result_as(args[0], ValueShape::Boxed)?;
+                self.discard_value(result);
             }
         }
         self.emit(Instruction::I64Const(VAL_VOID));
@@ -12682,7 +13614,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             return Err(BuildError::UnsupportedExpression("parse-arg-count"));
         }
         self.compile_expr(args[0])?;
+        let stash = self.stash_if_owned(args[0]);
         self.emit(Instruction::Call(self.rt().base + rt_fn));
+        self.release_stash(stash);
         Ok(())
     }
 
@@ -12748,8 +13682,9 @@ impl<'a, 'c> Builder<'a, 'c> {
         if args.len() != 1 {
             return Err(BuildError::UnsupportedExpression("setHtml-arg-count"));
         }
-        self.emit_string_arg_from_expr(args[0])?;
+        let stash = self.emit_string_arg_stashing(args[0])?;
         self.emit_import_call(IMPORT_SET_HTML);
+        self.release_stash(stash);
         self.emit(Instruction::I64Const(VAL_VOID));
         Ok(())
     }
@@ -12758,9 +13693,11 @@ impl<'a, 'c> Builder<'a, 'c> {
         if args.len() != 2 {
             return Err(BuildError::UnsupportedExpression("setHtmlAt-arg-count"));
         }
-        self.emit_string_arg_from_expr(args[0])?;
-        self.emit_string_arg_from_expr(args[1])?;
+        let selector_stash = self.emit_string_arg_stashing(args[0])?;
+        let html_stash = self.emit_string_arg_stashing(args[1])?;
         self.emit_import_call(IMPORT_SET_HTML_AT);
+        self.release_stash(selector_stash);
+        self.release_stash(html_stash);
         self.emit(Instruction::I64Const(VAL_VOID));
         Ok(())
     }
@@ -12783,6 +13720,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         self.emit_string_arg_from_expr(args[0])?;
         self.emit_import_call(IMPORT_PUSH_HISTORY_STATE);
+        self.emit(Instruction::I64Const(VAL_VOID));
+        Ok(())
+    }
+
+    fn compile_bare_replace_location(&mut self, args: &[&Expression]) -> Result<(), BuildError> {
+        if args.len() != 1 {
+            return Err(BuildError::UnsupportedExpression(
+                "replaceLocation-arg-count",
+            ));
+        }
+        self.emit_string_arg_from_expr(args[0])?;
+        self.emit_import_call(IMPORT_REPLACE_LOCATION);
         self.emit(Instruction::I64Const(VAL_VOID));
         Ok(())
     }
@@ -12880,9 +13829,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.compile_expr_as(args[2], ValueShape::Boxed)?;
         // The dict co-owns the stored value (RC, plan 113 R1): retain if
         // borrowed. RT_SET_FIELD releases any value it overwrites.
-        if !self.expr_transfers_ownership(args[2]) {
+        if self.expr_transfers_ownership(args[2]) {
+            self.emit_ownership_event_for_stack(OwnershipOp::Transfer, OWNERSHIP_SITE_UNKNOWN, 0);
+        } else {
+            self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
             self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
         }
+        self.emit_ownership_event_for_stack(OwnershipOp::Store, OWNERSHIP_SITE_UNKNOWN, 0);
         self.emit(Instruction::Call(self.rt().base + RT_SET_FIELD));
         // RT_SET_FIELD returns the dict pointer — identical to the input
         // unless an at-capacity dict was reallocated to fit the new key.
@@ -13058,7 +14011,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                         // Write through the heap cell (value-RC store @8;
                         // the host-written out value is a fresh handle —
                         // transfer).
-                        self.emit_cell_store(binding.local, true);
+                        self.emit_cell_store(binding.local, ExprResult::boxed(true));
                     } else {
                         self.emit_convert(ValueShape::Boxed, binding.shape)?;
                         self.emit(Instruction::LocalSet(binding.local));
@@ -13152,7 +14105,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             let layout = *actx.layout;
             self.emit(Instruction::LocalGet(addr_local));
             self.emit(Instruction::I32Load(mem_off(12)));
-            self.emit(Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+            self.emit(Instruction::If(wasm_encoder::BlockType::Result(
+                ValType::I64,
+            )));
             // ── async: spawn the closure as a task, drive `poll`, read result ──
             // Args (evaluated in the caller's env) → the new frame's param slots.
             let mut arg_locals = Vec::with_capacity(args.len());
@@ -13170,6 +14125,14 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::I32Load(mem_off(12)));
             self.emit(Instruction::Call(layout.alloc));
             self.emit(Instruction::LocalSet(frame_l));
+            // Fresh async frames must not inherit stale pending/local slots from
+            // a recycled heap block. The awaited-closure CFG reads pending slots
+            // after resume; stale ids there become invalid `task_result` reads.
+            self.emit(Instruction::LocalGet(frame_l));
+            self.emit(Instruction::I32Const(0));
+            self.emit(Instruction::LocalGet(addr_local));
+            self.emit(Instruction::I32Load(mem_off(12)));
+            self.emit(Instruction::MemoryFill(0));
             // frame[0] = env_ptr = addr + 16
             self.emit(Instruction::LocalGet(frame_l));
             self.emit(Instruction::LocalGet(addr_local));
@@ -13177,9 +14140,18 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::I32Add);
             self.emit(Instruction::I32Store(mem0()));
             // frame[8 + 8*i] = arg_i (params sit past the env slot)
-            for (i, l) in arg_locals.iter().enumerate() {
+            for (i, (arg, l)) in args.iter().zip(arg_locals.iter()).enumerate() {
                 self.emit(Instruction::LocalGet(frame_l));
+                let owned = self.expr_transfers_ownership(arg);
                 self.emit(Instruction::LocalGet(*l));
+                self.prepare_stack_for_owning_store(ExprResult {
+                    shape: ValueShape::Boxed,
+                    ownership: if owned {
+                        ExprOwnership::Owned
+                    } else {
+                        ExprOwnership::Borrowed
+                    },
+                });
                 self.emit(Instruction::I64Store(mem_off(8 + 8 * i as u64)));
             }
             // id = spawn(table_idx @ addr+4, frame)
@@ -13188,6 +14160,29 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::LocalGet(frame_l));
             self.emit(Instruction::Call(layout.spawn));
             self.emit(Instruction::LocalSet(id_l));
+            // Record frame size so completion can reclaim the closure frame.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalGet(addr_local));
+            self.emit(Instruction::I32Load(mem_off(12)));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_FRAME_SIZE,
+            )));
+            // This caller is the result consumer while the drive loop runs. If
+            // left detached (-1), a quickly completed child recycles itself and
+            // releases O_RESULT before the caller reaches `task_result`.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(-2));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_WAITER,
+            )));
             // saved_cur = g_current (re-entrant: an outer task may be live)
             self.emit(Instruction::GlobalGet(layout.g_current));
             self.emit(Instruction::LocalSet(saved_cur));
@@ -13227,9 +14222,63 @@ impl<'a, 'c> Builder<'a, 'c> {
             // g_current = saved_cur
             self.emit(Instruction::LocalGet(saved_cur));
             self.emit(Instruction::GlobalSet(layout.g_current));
-            // result = task_result(id)
+            // If the task finished, read and recycle its result. If browser
+            // polling yielded because the child is parked on host I/O, detach
+            // it again and return Void; the host wakeup will let it finish for
+            // side effects, but this sync caller cannot suspend to await it.
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Load(mem_off(crate::async_engine::O_STATUS)));
+            self.emit(Instruction::I32Const(crate::async_engine::ST_COMPLETE));
+            self.emit(Instruction::I32GeS);
+            self.emit(Instruction::If(wasm_encoder::BlockType::Result(
+                ValType::I64,
+            )));
             self.emit(Instruction::LocalGet(id_l));
             self.emit(Instruction::Call(layout.task_result));
+            let async_result_l = self.alloc_local();
+            self.emit(Instruction::LocalSet(async_result_l));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I64Load(mem_off(crate::async_engine::O_RESULT)));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::GlobalGet(layout.g_free_head));
+            self.emit(Instruction::I32Store(mem_off(crate::async_engine::O_NEXT)));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::GlobalSet(layout.g_free_head));
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(crate::async_engine::ST_FREED));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_STATUS,
+            )));
+            self.emit(Instruction::LocalGet(async_result_l));
+            self.emit(Instruction::Else);
+            self.emit(Instruction::GlobalGet(layout.g_table_base));
+            self.emit(Instruction::LocalGet(id_l));
+            self.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+            self.emit(Instruction::I32Mul);
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::I32Const(-1));
+            self.emit(Instruction::I32Store(mem_off(
+                crate::async_engine::O_WAITER,
+            )));
+            self.emit(Instruction::I64Const(VAL_VOID));
+            self.emit(Instruction::End);
             self.emit(Instruction::Else);
             // ── sync: the original `call_indirect` (env-set + args inline) ──
             let saved_env = self.alloc_i32_local();
@@ -13258,12 +14307,12 @@ impl<'a, 'c> Builder<'a, 'c> {
             });
             self.emit(Instruction::LocalGet(saved_env));
             self.emit(Instruction::GlobalSet(GLOBAL_ENV_PTR));
+            // This vector is only initialized on the sync branch of the emitted
+            // wasm `if`; release it before closing that branch so the async
+            // branch never sees unassigned stash locals during propagation.
+            self.release_owned_arg_stashes(&owned_arg_stashes);
             self.emit(Instruction::End); // end if
-            self.emit_post_call_propagation();
-            for t in owned_arg_stashes {
-                self.emit(Instruction::LocalGet(t));
-                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-            }
+            self.emit_post_call_propagation(&[]);
             return Ok(());
         }
 
@@ -13302,7 +14351,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         // doesn't leak a closure's upvalue frame into outer scope.
         self.emit(Instruction::LocalGet(saved_env));
         self.emit(Instruction::GlobalSet(GLOBAL_ENV_PTR));
-        self.emit_post_call_propagation();
+        self.emit_post_call_propagation(&owned_arg_stashes);
         for t in owned_arg_stashes {
             self.emit(Instruction::LocalGet(t));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
@@ -13512,6 +14561,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 type_param_count: fd.type_params.len() as u16,
                 include_in_coverage: false,
                 param_defaults: param_defaults_for(fd),
+                source_file: self.current_source_file(),
                 source_line: fd.location.line,
                 ..Default::default()
             },
@@ -13578,7 +14628,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             // ref is what keeps a shared cell alive after the enclosing
             // scope (or async frame) lets go. RT_RELEASE's closure-teardown
             // branch releases every upvalue, balancing these.
-            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            self.capture_into_closure(i);
             self.emit(Instruction::I64Store(mem_off(16 + i as u64 * 8)));
         }
 
@@ -13617,10 +14667,9 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// sole-owned value — a literal, or a `+` (concat String / numeric). Storing
     /// or binding such a value TRANSFERS its single owning reference (no retain).
     /// Everything else (identifier / field / index / call / unwrap reads, and
-    /// `and`/`or` which return a borrowed OPERAND, and interpolation which can be
-    /// the degenerate `"{x}"` returning `x`) is BORROWED — co-owning it requires a
-    /// retain. Conservative: not-provably-fresh → retain (over-retain leaks; the
-    /// opposite would be a use-after-free).
+    /// `and`/`or` which return a borrowed OPERAND) is BORROWED — co-owning it
+    /// requires a retain. Conservative: not-provably-fresh → retain (over-retain
+    /// leaks; the opposite would be a use-after-free).
     fn is_fresh_value(expr: &Expression) -> bool {
         match expr {
             Expression::StringExpression(_)
@@ -13630,6 +14679,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             | Expression::ArrayExpression(_)
             | Expression::DictionaryExpression(_)
             | Expression::TupleExpression(_)
+            | Expression::TemplateStringExpression(_)
             // A `do...end` / function expression allocates a fresh closure
             // object (RT_MAKE_OBJ) — sole-owned, so binding/storing it transfers
             // the single ref. Without this it would be treated as borrowed and
@@ -13650,7 +14700,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// (`unwrap`, the `get*` dict accessors, `set`, the `message`/`kind` error
     /// field reads). Fresh-returning bare-globals are intentionally absent —
     /// transferring their (genuinely fresh) result is correct.
-    
+
     /// Builtins that ALWAYS return a freshly `RT_ALLOC`-d (rc-prefixed) object
     /// distinct from their arguments (plan 113 R2). A call to one of these is
     /// ownership-transferring just like a user function: the result is a
@@ -13667,7 +14717,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// host-allocated results (json/env/file/path — unverified rc prefix), where
     /// transferring an aliasing result would be a use-after-free; the bar is
     /// "provably +1".
-    
+
     /// Ownership inference (plan 113 R2). True if `ce` resolves to a call that
     /// yields an OWNED (+1) value the caller must take ownership of — a
     /// user-defined function or a closure value, both of which return +1 via
@@ -13718,16 +14768,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         use fai_compiler::ownership_abi::{
             lookup_bare_call, lookup_member_call, lookup_std_module_call, ReturnConvention,
         };
-        let ufcs_key = (self.module_key.clone(), ce.location.line, ce.location.column);
+        let ufcs_key = (
+            self.module_key.clone(),
+            ce.location.line,
+            ce.location.column,
+        );
         let is_ufcs = self.checker().ufcs_calls.contains(&ufcs_key);
         let sig = match &*ce.callee {
             Expression::IdentifierExpression(id) => lookup_bare_call(id.name.as_str()),
             // UFCS `recv.method(...)`: member dispatch checks the borrowed
             // list first (the bare/member set/unwrap asymmetry, preserved
             // by decision — see plans/119 KTD).
-            Expression::MemberExpression(me) if is_ufcs => {
-                lookup_member_call(me.property.as_str())
-            }
+            Expression::MemberExpression(me) if is_ufcs => lookup_member_call(me.property.as_str()),
             Expression::MemberExpression(me) => {
                 let m = me.property.as_str();
                 // Module-alias path first, only when the object is an
@@ -13809,7 +14861,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// `resolve` — an early upvalue capture from the logging path would
     /// reorder env-slot indices and make FAI_ABI_CHECK builds emit different
     /// wasm than unchecked builds, breaking the "logging only" contract.
-    
+
     /// Log a divergence between the signature table and the heuristic for the
     /// statically-classified callables the table covers. Mirrors the
     /// heuristic's three dispatch arms exactly (bare identifier, UFCS member,
@@ -13819,8 +14871,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// there, unlike their bare forms). Dynamic callables (user fns, closures,
     /// type constructors, externs) are intentionally not in the static table;
     /// a table miss on those is expected and silent.
-    
-    
+
     /// Std-module host calls verified to return a FRESH owned (+1) object
     /// graph (each call allocates anew on the guest heap — host `reserve`
     /// or guest `RT_ALLOC_STRING`; a null result is a primitive no-op for
@@ -13830,7 +14881,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Curated: only entries whose host/lowering code was checked. Methods
     /// returning borrowed views (array element reads, dict gets) must stay
     /// out.
-    
+
     /// RC transfer test (plan 113 R2): does compiling `expr` leave an OWNED (+1)
     /// value on the stack that the consuming context should TRANSFER (take
     /// without retaining)? True for fresh allocations (`is_fresh_value`) and for
@@ -14204,6 +15255,7 @@ mod tests {
         let std_method_fn_ids = HashMap::new();
         let strings = RefCell::new(StringInterner::default());
         let closures = RefCell::new(Vec::new());
+        let ownership_sites = RefCell::new(Vec::new());
         let module_constants = HashMap::new();
         let extern_out_params: HashMap<String, Vec<bool>> = HashMap::new();
         let module_vars: HashMap<String, u32> = HashMap::new();
@@ -14228,6 +15280,8 @@ mod tests {
             module_constants: &module_constants,
             extern_out_params: &extern_out_params,
             module_vars: &module_vars,
+            ownership_sites: &ownership_sites,
+            file_path: None,
             async_ctx: None,
         };
         let mut builder = Builder::new(main, &ctx, None);
@@ -14754,6 +15808,7 @@ mod tests {
         top_level: Vec<(FunctionInfo, Function)>,
         closures: Vec<BuiltClosure>,
         string_data: Vec<u8>,
+        ownership_sites: Vec<crate::debug_info::OwnershipSiteDebugEntry>,
     }
 
     /// Compile every top-level function in `src` directly to wasm.
@@ -14832,6 +15887,7 @@ mod tests {
         }
         let named_imports: HashMap<String, String> = HashMap::new();
         let strings = RefCell::new(StringInterner::default());
+        let ownership_sites = RefCell::new(Vec::new());
         let remap = identity_import_remap();
         let mut top_level = Vec::with_capacity(decls.len());
         let mut all_closures = Vec::new();
@@ -14858,6 +15914,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
+                &ownership_sites,
                 None,
                 None,
             )
@@ -14869,6 +15926,7 @@ mod tests {
             top_level,
             closures: all_closures,
             string_data: strings.into_inner().bytes,
+            ownership_sites: ownership_sites.into_inner(),
         }
     }
 
@@ -15174,6 +16232,7 @@ mod tests {
             &crate::debug_info::DbgMeta {
                 bucket_base: Some(bucket_base),
                 bucket_count: runtime::NUM_FREE_BUCKETS,
+                ownership_sites: program.ownership_sites.clone(),
             },
         );
 
@@ -15198,6 +16257,7 @@ mod tests {
             )],
             closures: Vec::new(),
             string_data: Vec::new(),
+            ownership_sites: Vec::new(),
         })
     }
 
@@ -19665,6 +20725,61 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test]
+    fn direct_remote_call_releases_owned_string_arguments() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let _ = remoteCall('http://localhost:3040', 'data.chat.listMessages', '[29]', '')\n",
+            "  42\n",
+            "end\n",
+        )));
+        let mut body_targets: Vec<Vec<u32>> = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let mut targets = Vec::new();
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                if let wasmparser::Operator::Call { function_index } = op {
+                    targets.push(function_index);
+                }
+            }
+            body_targets.push(targets);
+        }
+        let remote_import = if body_targets
+            .iter()
+            .any(|targets| targets.contains(&runtime::IMPORT_REMOTE_BEGIN))
+        {
+            runtime::IMPORT_REMOTE_BEGIN
+        } else {
+            runtime::IMPORT_REMOTE_CALL
+        };
+        let targets = body_targets
+            .iter()
+            .find(|targets| targets.contains(&remote_import))
+            .expect("a lowered body should call remote_call/remote_begin");
+        let remote_pos = targets
+            .iter()
+            .position(|target| *target == remote_import)
+            .expect("body should call remote_call/remote_begin");
+        let release = rt_base_for_standalone() + runtime::RT_RELEASE;
+        let releases_after_remote = targets[remote_pos + 1..]
+            .iter()
+            .filter(|target| **target == release)
+            .count();
+        assert!(
+            releases_after_remote >= 4,
+            "remoteCall must release url/fn/args/hash string temps after host import"
+        );
+    }
+
     // ── extern FFI ──────────────────────────────────────────────
     //
     // `extern { ... }` blocks declare C-ABI functions. Callers
@@ -19936,6 +21051,10 @@ mod tests {
     /// failure; returns `None` if any function refuses the direct
     /// path.
     fn try_compile_via_production(src: &str) -> Option<Vec<u8>> {
+        try_compile_via_production_for_target(src, None)
+    }
+
+    fn try_compile_via_production_for_target(src: &str, target: Option<&str>) -> Option<Vec<u8>> {
         let prepared = fai_compiler::prepare_source(src, None).expect("prepare");
         let mut checker = fai_checker::Checker::new();
         checker
@@ -19947,7 +21066,152 @@ mod tests {
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
         };
-        crate::try_codegen_direct(&prepared.serde_ast, &info, None)
+        crate::try_codegen_direct(&prepared.serde_ast, &info, target)
+    }
+
+    fn wasm_import_names(wasm: &[u8]) -> Vec<String> {
+        let parser = wasmparser::Parser::new(0);
+        let mut import_names: Vec<String> = Vec::new();
+        for payload in parser.parse_all(wasm) {
+            if let wasmparser::Payload::ImportSection(section) = payload.expect("payload") {
+                for imp in section {
+                    let imp = imp.expect("import entry");
+                    import_names.push(imp.name.to_string());
+                }
+                break;
+            }
+        }
+        import_names
+    }
+
+    fn wasm_import_index(wasm: &[u8], name: &str) -> Option<u32> {
+        let mut index = 0u32;
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::ImportSection(section) = payload.expect("payload") {
+                for imp in section {
+                    let imp = imp.expect("import entry");
+                    match imp.ty {
+                        wasmparser::TypeRef::Func(_) => {
+                            if imp.name == name {
+                                return Some(index);
+                            }
+                            index += 1;
+                        }
+                        wasmparser::TypeRef::Table(_)
+                        | wasmparser::TypeRef::Memory(_)
+                        | wasmparser::TypeRef::Global(_)
+                        | wasmparser::TypeRef::Tag(_) => {}
+                    }
+                }
+                break;
+            }
+        }
+        None
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnershipEvent {
+        op: &'static str,
+        site: i32,
+        aux: String,
+    }
+
+    fn ownership_event_args(wasm: &[u8]) -> Vec<OwnershipEvent> {
+        let event_index =
+            wasm_import_index(wasm, "__fai_ownership_event").expect("ownership event import");
+        let mut events = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let mut recent_i32_consts = Vec::new();
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                match op {
+                    wasmparser::Operator::I32Const { value } => {
+                        recent_i32_consts.push(value);
+                        if recent_i32_consts.len() > 8 {
+                            recent_i32_consts.remove(0);
+                        }
+                    }
+                    wasmparser::Operator::Call { function_index }
+                        if function_index == event_index =>
+                    {
+                        let op_id = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .nth(2)
+                            .copied()
+                            .expect("ownership event op argument");
+                        let site = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .copied()
+                            .expect("ownership event site argument");
+                        let aux = recent_i32_consts
+                            .iter()
+                            .rev()
+                            .next()
+                            .copied()
+                            .expect("ownership event aux argument");
+                        let op = OwnershipOp::from_id(op_id as u32)
+                            .expect("known ownership op")
+                            .name();
+                        events.push(OwnershipEvent {
+                            op,
+                            site,
+                            aux: format_ownership_aux(aux),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        events
+    }
+
+    fn ownership_event_site_args(wasm: &[u8]) -> Vec<i32> {
+        ownership_event_args(wasm)
+            .into_iter()
+            .map(|event| event.site)
+            .collect()
+    }
+
+    fn format_ownership_aux(encoded: i32) -> String {
+        let Some((kind, detail)) = OwnershipAux::decode(encoded) else {
+            return format!("unknown:{encoded}");
+        };
+        match kind {
+            OwnershipAux::None => "none".to_string(),
+            OwnershipAux::ClosureCapture => format!("closure_capture:{detail}"),
+            OwnershipAux::HostArgument => format!("host_argument:{detail}"),
+            OwnershipAux::AsyncFrameSlot => format!("async_frame_slot:{detail}"),
+        }
+    }
+
+    fn checked_ownership_site_golden(src: &str) -> Vec<&'static str> {
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        compile_all(src)
+            .ownership_sites
+            .into_iter()
+            .map(|site| site.op)
+            .collect()
+    }
+
+    fn fai_dbg_json(wasm: &[u8]) -> Option<String> {
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let wasmparser::Payload::CustomSection(section) = payload.expect("payload") {
+                if section.name() == "fai-dbg" {
+                    return Some(String::from_utf8_lossy(section.data()).to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Compile an entry source with one synthetic user module.
@@ -20046,6 +21310,34 @@ mod tests {
         .expect("dict + field access should compile via direct");
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 30;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_user_call_heap_result_can_embed_owned_arg() {
+        let wasm = try_compile_via_production(concat!(
+            "type Box\n",
+            "  items String[]\n",
+            "end\n",
+            "\n",
+            "# Wrap items in a box.\n",
+            "def wrap\n",
+            "    @param items String[]\n",
+            "    @return Box\n",
+            "do\n",
+            "  Box(items: items)\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  let box = wrap(['a', 'b'])\n",
+            "  length(box.items)\n",
+            "end\n",
+        ))
+        .expect("heap-returning user call should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 2;
         assert_eq!(result, expected);
     }
 
@@ -20672,19 +21964,7 @@ mod tests {
         let wasm = crate::try_codegen_direct(&prepared.serde_ast, &info, Some("wasm-html"))
             .expect("wasm-html build should succeed");
 
-        // Scan the emitted wasm for import names. The simple way:
-        // check each expected-excluded server import is absent.
-        let parser = wasmparser::Parser::new(0);
-        let mut import_names: Vec<String> = Vec::new();
-        for payload in parser.parse_all(&wasm) {
-            if let wasmparser::Payload::ImportSection(section) = payload.expect("payload") {
-                for imp in section {
-                    let imp = imp.expect("import entry");
-                    import_names.push(imp.name.to_string());
-                }
-                break;
-            }
-        }
+        let import_names = wasm_import_names(&wasm);
         for excluded_import in &[
             "sleep_ms",
             "run_all",
@@ -20714,6 +21994,171 @@ mod tests {
             "expected many non-server imports, got {}: {:?}",
             import_names.len(),
             import_names,
+        );
+    }
+
+    #[test]
+    fn ownership_event_import_is_gated_on_native_and_browser() {
+        let src = concat!("def main\n", "    @return Int\n", "do\n", "  42\n", "end\n",);
+
+        let native_default =
+            try_compile_via_production_for_target(src, None).expect("native compile");
+        assert!(
+            !wasm_import_names(&native_default)
+                .iter()
+                .any(|n| n == "__fai_ownership_event"),
+            "default native build must not require ownership event import",
+        );
+
+        let browser_default =
+            try_compile_via_production_for_target(src, Some("wasm-html")).expect("browser compile");
+        assert!(
+            !wasm_import_names(&browser_default)
+                .iter()
+                .any(|n| n == "__fai_ownership_event"),
+            "default browser build must not require ownership event import",
+        );
+
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        let native_checked =
+            try_compile_via_production_for_target(src, None).expect("checked native compile");
+        assert!(
+            wasm_import_names(&native_checked)
+                .iter()
+                .any(|n| n == "__fai_ownership_event"),
+            "checked native build should declare ownership event import",
+        );
+
+        let browser_checked = try_compile_via_production_for_target(src, Some("wasm-html"))
+            .expect("checked browser compile");
+        assert!(
+            wasm_import_names(&browser_checked)
+                .iter()
+                .any(|n| n == "__fai_ownership_event"),
+            "checked browser build should declare ownership event import",
+        );
+    }
+
+    #[test]
+    fn ownership_golden_owned_binding_return_cleanup_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  let value = 'owned'\n",
+            "  value\n",
+            "end\n",
+        ));
+
+        assert_eq!(
+            events,
+            vec!["transfer", "store", "retain", "return", "cleanup"],
+        );
+    }
+
+    #[test]
+    fn ownership_golden_owned_expression_discard_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  'discarded'\n",
+            "  1\n",
+            "end\n",
+        ));
+
+        assert_eq!(events, vec!["discard", "return"]);
+    }
+
+    #[test]
+    fn ownership_golden_local_overwrite_sequence() {
+        let events = checked_ownership_site_golden(concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  var value = 'old'\n",
+            "  value = 'new'\n",
+            "  value\n",
+            "end\n",
+        ));
+
+        assert_eq!(
+            events,
+            vec![
+                "transfer",
+                "store",
+                "transfer",
+                "release",
+                "overwrite",
+                "retain",
+                "return",
+                "cleanup",
+            ],
+        );
+    }
+
+    #[test]
+    fn checked_ownership_build_emits_resolvable_site_metadata() {
+        let src = concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  \"owned\"\n",
+            "end\n",
+        );
+
+        let default_wasm =
+            try_compile_via_production_for_target(src, None).expect("default compile");
+        let default_dbg = fai_dbg_json(&default_wasm).expect("default debug section");
+        assert!(
+            !default_dbg.contains("\"ownership_sites\""),
+            "default build should omit empty ownership site metadata: {}",
+            default_dbg,
+        );
+
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        let checked_wasm =
+            try_compile_via_production_for_target(src, None).expect("checked compile");
+        let checked_dbg = fai_dbg_json(&checked_wasm).expect("checked debug section");
+        assert!(
+            checked_dbg.contains("\"ownership_sites\":[{\"id\":1"),
+            "checked build should include dense nonzero ownership site metadata: {}",
+            checked_dbg,
+        );
+        assert!(
+            checked_dbg.contains("\"helper\":\"direct\""),
+            "checked ownership site should name helper family: {}",
+            checked_dbg,
+        );
+        assert!(
+            checked_dbg.contains("\"op\":\"return\""),
+            "checked ownership site should include operation family: {}",
+            checked_dbg,
+        );
+    }
+
+    #[test]
+    fn checked_ownership_events_use_nonzero_site_ids() {
+        let src = concat!(
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "  \"owned\"\n",
+            "end\n",
+        );
+
+        let _guard = crate::runtime::OwnershipCheckGuard::new();
+        let wasm = try_compile_via_production_for_target(src, None).expect("checked compile");
+        let sites = ownership_event_site_args(&wasm);
+
+        assert!(
+            !sites.is_empty(),
+            "checked build should emit ownership events"
+        );
+        assert!(
+            sites.iter().all(|site| *site > 0),
+            "ownership event sites should be nonzero: {:?}",
+            sites,
         );
     }
 
@@ -21100,6 +22545,41 @@ mod tests {
             "end\n",
         )));
         assert_eq!(run_module(&wasm) as u64, int_val(42));
+    }
+
+    #[test]
+    fn direct_bare_parse_int_releases_owned_string_argument() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int?\n",
+            "do\n",
+            "  parseInt('42' + '')\n",
+            "end\n",
+        )));
+        let parse = rt_base_for_standalone() + runtime::RT_PARSE_INT;
+        let release = rt_base_for_standalone() + runtime::RT_RELEASE;
+        let mut saw_release_after_parse = false;
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("payload") else {
+                continue;
+            };
+            let targets: Vec<u32> = body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .filter_map(|op| match op.expect("operator") {
+                    wasmparser::Operator::Call { function_index } => Some(function_index),
+                    _ => None,
+                })
+                .collect();
+            if let Some(pos) = targets.iter().position(|target| *target == parse) {
+                saw_release_after_parse = targets[pos + 1..].contains(&release);
+            }
+        }
+        assert!(
+            saw_release_after_parse,
+            "parseInt must release owned string args after RT_PARSE_INT"
+        );
     }
 
     #[test]
@@ -21578,4 +23058,3 @@ mod tests {
         );
     }
 }
-

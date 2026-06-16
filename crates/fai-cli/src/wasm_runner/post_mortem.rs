@@ -32,24 +32,27 @@ fn status_name(s: i32) -> &'static str {
 }
 
 fn global_i32(instance: &Instance, store: &mut Store<()>, name: &str) -> Option<i32> {
-    instance.get_global(&mut *store, name)?.get(&mut *store).i32()
+    instance
+        .get_global(&mut *store, name)?
+        .get(&mut *store)
+        .i32()
 }
 
 fn read_i32(data: &[u8], addr: usize) -> Option<i32> {
-    Some(i32::from_le_bytes(data.get(addr..addr + 4)?.try_into().ok()?))
+    Some(i32::from_le_bytes(
+        data.get(addr..addr + 4)?.try_into().ok()?,
+    ))
 }
 
 fn read_f64(data: &[u8], addr: usize) -> Option<f64> {
-    Some(f64::from_le_bytes(data.get(addr..addr + 8)?.try_into().ok()?))
+    Some(f64::from_le_bytes(
+        data.get(addr..addr + 8)?.try_into().ok()?,
+    ))
 }
 
 /// Render the dump, or `None` when the module exposes nothing useful
 /// (e.g. a hand-built fixture without the standard exports).
-pub(crate) fn render(
-    instance: &Instance,
-    store: &mut Store<()>,
-    dbg: &DbgTable,
-) -> Option<String> {
+pub(crate) fn render(instance: &Instance, store: &mut Store<()>, dbg: &DbgTable) -> Option<String> {
     let heap_ptr = global_i32(instance, store, "__heap_ptr");
     let live_objects = global_i32(instance, store, "__live_objects");
     let free_list = global_i32(instance, store, "__free_list");

@@ -53,6 +53,25 @@ types/              — type def, fields, generics
 arrays/  dicts/  ufcs/  stdlib/  ffi/  testing_syntax/  browser/
 ```
 
+Project/package repros that need `fai.toml` and local dependencies live in a
+parallel tree:
+
+```
+fixtures/projects/
+  local_dep_ownership/
+    fai.toml
+    src/main.fai
+    dep/fai.toml
+    dep/src/helper.fai
+```
+
+For project fixtures, directives still live in the leading comments of
+`src/main.fai`, but the harness runs CLI commands from the project root instead
+of passing a single file path. Use this lane when an app bug only reproduces
+through project/package resolution, `file://` dependencies, or source-root
+behavior. Keep the repro minimal and self-contained inside `fai/` unless the
+bug specifically requires an external workspace project.
+
 Fixture names are lowercase snake_case describing the concept. Invalid-
 by-design fixtures end in `.invalid`:
 
@@ -66,6 +85,7 @@ Display names in `cargo test` output use `::` separators:
 ```
 test variables::let_inferred ... ok
 test operators::ampamp.invalid ... ok
+test projects::local_dep_ownership ... ok
 ```
 
 ## Directive block
@@ -99,15 +119,26 @@ end
 | `stdout:` | Expected stdout. Each following `#` line (indented under the directive) is one output line. Trailing newline tolerated. |
 | `error:` | Pattern the diagnostic must contain. Plain substring, or `/regex/` for a regex. |
 | `skip: <reason>` | Temporarily skip. Must reference a tracking issue. |
-| `browser:` | Browser assertion. Use `selector:` plus `text:`/`html:` for DOM assertions, `rootResult:` for the root return value, and optional duration bounds for async parity. |
+| `browser:` | Browser assertion. Use `selector:` plus `text:`/`html:` for DOM assertions, `rootResult:` for the root return value, optional duration bounds for async parity, and optional `click:` actions for browser event coverage. |
 | `leak: flat` | Leak gate (plan 118): re-run under `--check-leaks`; the program must end with zero live heap objects. Locals release at scope exit, so a flat fixture avoids module-level `var`s (they stay live by design). |
 | `leak: expected <phase-tag>` | The fixture leaks today; `<phase-tag>` names the plan-117 phase that fixes it. Two-sided: when the leak is fixed, the gate FAILS with "flip the marker" — the fixing change must flip this to `leak: flat`. Fixtures without a `leak:` directive are ungated. |
+| `ownership: balanced` | Native ownership gate (plan 123): re-run under `--check-ownership`; the helper ownership report must say zero object imbalances. This is independent from `leak:`. |
 
 A fixture carrying both `browser:` and `leak:` runs the leak gate inside the
 browser instead of natively: after the root completes, the harness reads the
 always-exported `__live_objects` counter via `window.__fai_live_objects()`
 with the same two-sided semantics. Categories that cannot run in the browser
 simply never carry `browser:`.
+
+A browser fixture can also include `#   ownership: balanced` inside its
+`browser:` block. The harness builds with ownership instrumentation and calls
+`window.__fai_assert_ownership()` after root completion. Native fixtures use the
+top-level `ownership: balanced` directive instead.
+
+Browser fixtures can include `#   click: <selector> <count>` to exercise DOM
+event bridges before the browser leak or ownership gate runs. Use this for
+reduced browser-only leaks, especially when host-created event payloads cross
+into wasm.
 
 ### Leak baseline suite (`rc/`, `rc_browser/`)
 
@@ -120,23 +151,44 @@ project's test lane, not here.
 
 | # | Category | Fixtures | State |
 |---|----------|----------|-------|
-| 1 | binding + discard | `rc/binding_discard`, `rc/binding_scope_exit`, `rc/print_int_scratch` | flat; print(Int) scratch → expected phase4 |
+| 1 | binding + discard | `rc/binding_discard`, `rc/binding_scope_exit`, `rc/print_int_scratch`, `rc/template_interpolation_loop` | flat; `binding_discard` also ownership-balanced; interpolation temporaries release after concat |
 | 2 | assignment/overwrite | `rc/assign_overwrite` | flat |
-| 3 | destructuring | `rc/destructure_tuple` | tuple leaks → expected phase4 |
-| 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort` | append flat; map/filter boxed arg temps → phase4; fresh receiver → phase6 |
+| 3 | destructuring | `rc/destructure_tuple` | flat |
+| 4 | arrays + helpers | `rc/array_helpers`, `rc/array_map_bind`, `rc/array_filter_discard`, `rc/receiver_alias_sort`, `rc/receiver_alias_array_rebuilders` | flat, including audited fresh receiver array rebuilders |
 | 5 | dict/field stores | `rc/dict_field_store` | flat |
 | 6 | std host imports | `rc/std_json_roundtrip`, `rc/std_path_join`, `rc/json_parse_array`, `rc/json_require_string` | flat — incl. the Owned string/graph classes and the verified-Borrowed alias class (plan 119; requireString returns the dict entry's own pointer) |
 | 7 | FFI externs | `rc/ffi_libc_abs` | flat (primitive returns) |
-| 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | handler closures retained, never released → expected phase6 |
+| 8 | events | `rc/events_off`, `rc/events_clear`, `rc/events_once` | flat — host-retained handlers release on off/clear/once removal |
 | 9 | async frames | `rc/async_frame_complete` | frames released; scheduler buffer → expected async-runtime-root |
-| 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | skipped scope drops → expected phase5; fallthrough flat |
-| 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try` | skipped drops on throw/break → expected phase5 |
+| 10 | break/continue | `rc/break_scope`, `rc/continue_scope`, `rc/loop_fallthrough` | flat |
+| 11 | throw/catch | `rc/throw_caught`, `rc/try_in_loop`, `rc/loop_in_try`, `rc/throw_through_two_frames` | flat, including in-function catch and cross-function propagation cleanup |
 | 12 | closures | `rc/closure_capture` | balances; typedef callbacks pull async scheduler → expected async-runtime-root |
 | 13 | spy/mock | `rc/spy_mock_reset` | run-path flat; host retention is the `fai test --check-leaks` lane's oracle (phase 6 audit) |
-| 14 | brain request loop | brain project inline suite | see plans/118 U8 |
+| 14 | router handlers | `rc/router_reset` | flat — retained route handlers release on finite run/test teardown |
+| 15 | brain request loop | brain project inline suite | see plans/118 U8 |
 
 Browser-host leak surface: `rc_browser/flat_baseline` (flat),
-`rc_browser/sethtml_literal_arg` (literal arg temp → expected phase4).
+`rc_browser/sethtml_literal_arg` (literal arg temp flat),
+`rc_browser/events_registry` (event registry flat).
+
+### Ownership reduction workflow
+
+Use `fai run <fixture-or-repro> --check-ownership` or
+`fai test <fixture-or-repro> --check-ownership` when a memory bug smells like a
+missing retain/transfer, duplicate cleanup, skipped return/discard cleanup, or
+host-call argument convention bug. The report names grouped operation clusters
+first, then source line when available, aux detail, and recent per-object
+history. Reduce the app case into the matching `rc/`, `rc_browser/`, or
+`fixtures/projects/` category, then add `ownership: balanced` once the reduced
+fixture is clean.
+
+Instrumentation itself has a seeded validation lane:
+`FAI_OWNERSHIP_SEED=suppress-retain fai test <fixture> --check-ownership`
+suppresses one helper event family and should fail with a resolved site history.
+The meaningful seeded failure families today are `suppress-retain`,
+`suppress-transfer`, and `suppress-cleanup`; unknown seed names warn and remain
+inactive. Keep seeded cases in Rust integration tests or explicit `.invalid`
+fixtures; do not mark seeded fixtures as normal `ownership: balanced`.
 
 ## Gates
 
@@ -191,6 +243,17 @@ WASM instance starts:
 #   rootResult: 3
 #   durationAtLeastMs: 80
 #   durationLessThanMs: 170
+```
+
+Browser event fixtures can click a target before asserting leaks or ownership:
+
+```fai
+# expect: ok
+# browser:
+#   selector: #click-target
+#   text: Click me
+#   click: #click-target 25
+# leak: flat
 ```
 
 ## Conventions
