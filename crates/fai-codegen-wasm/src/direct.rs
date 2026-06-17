@@ -48,7 +48,7 @@ use crate::runtime::{
     METHOD_SPLIT, METHOD_STARTS_WITH, METHOD_SUBSTRING, METHOD_TO_LOWER, METHOD_TO_UPPER,
     METHOD_TRIM, METHOD_TRIM_END, METHOD_TRIM_START, OBJ_TAG_ARRAY, OBJ_TAG_CELL, OBJ_TAG_CLOSURE,
     OBJ_TAG_DICT, OBJ_TAG_NATIVE_FN, OBJ_TAG_STRING, OBJ_TAG_TUPLE, QNAN, RT_ADD, RT_ALLOC,
-    RT_ALLOC_STRING, RT_AS_NUMBER, RT_CALL_NATIVE, RT_CONCAT, RT_COUNT, RT_DIV, RT_EQ, RT_GE,
+    RT_ALLOC_STRING, RT_AS_NUMBER, RT_CALL_NATIVE, RT_COUNT, RT_DIV, RT_EQ, RT_GE,
     RT_GET_FIELD, RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE,
     RT_LIVE_OBJECTS, RT_LT, RT_MAKE_BOOL, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL,
     RT_NE, RT_NEG, RT_OBJ_ADDR, RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_RELEASE,
@@ -1052,6 +1052,17 @@ pub struct CheckerInfo {
     /// Concrete type constructor names inferred for generic `@type`
     /// call sites, keyed like UFCS/reorder maps.
     pub generic_type_args: std::collections::HashMap<(String, u32, u32), Vec<String>>,
+    /// `arr[i]` sites proven to have an `Array` receiver and `Int`
+    /// index (keyed by the IndexExpression's `(module, line, column)`).
+    /// Lets the builder inline the element read instead of calling the
+    /// polymorphic `rt_get_index`.
+    pub array_int_index_sites: std::collections::HashSet<(String, u32, u32)>,
+    /// `obj.field` reads proven to target a user record type, mapping
+    /// the MemberExpression's `(module, line, column)` to the receiver's
+    /// type name. Lets the builder read the field's fixed dict slot
+    /// directly instead of the string-keyed `rt_get_field` scan.
+    pub record_field_read_sites:
+        std::collections::HashMap<(String, u32, u32, u32), String>,
 }
 
 impl CheckerInfo {
@@ -3712,8 +3723,8 @@ pub fn assemble_wasm_module_with_test_flag(
 // `sleep_ordering` acceptance fixture. Returns `None` (fall back to the
 // facade / sync path) for anything outside that shape.
 
-/// `sleep(<number>)` as a statement → the millisecond delay, else `None`.
-fn async_sleep_ms_of(stmt: &Statement) -> Option<f64> {
+/// `sleep(expr)` as a statement → the millisecond expression, else `None`.
+fn async_sleep_arg_of(stmt: &Statement) -> Option<&Expression> {
     let Statement::ExpressionStatement(es) = stmt else {
         return None;
     };
@@ -3729,10 +3740,7 @@ fn async_sleep_ms_of(stmt: &Statement) -> Option<f64> {
     let [arg] = call.args.as_slice() else {
         return None;
     };
-    let Expression::NumberExpression(n) = &arg.value else {
-        return None;
-    };
-    Some(n.value.max(0.0))
+    Some(&arg.value)
 }
 
 /// If `expr` is `remoteCall(url, fn, args, hash)` (the RPC client transport),
@@ -3975,7 +3983,7 @@ fn stmts_have_user_call(stmts: &[Statement], fns: &AsyncResolve<'_>) -> bool {
 fn stmts_have_suspension(stmts: &[Statement], fns: &AsyncResolve<'_>) -> bool {
     stmts
         .iter()
-        .any(|s| async_sleep_ms_of(s).is_some() || stmt_has_user_call(s, fns))
+        .any(|s| async_sleep_arg_of(s).is_some() || stmt_has_user_call(s, fns))
 }
 
 /// Whether `stmts` contain a `break`/`continue` that targets the *enclosing*
@@ -4003,6 +4011,43 @@ fn stmts_have_loop_control(stmts: &[Statement]) -> bool {
         // A nested for/while owns its own break/continue; don't descend.
         _ => false,
     })
+}
+
+fn stmts_have_return(stmts: &[Statement]) -> bool {
+    stmts.iter().any(stmt_has_return)
+}
+
+fn stmt_has_return(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::ReturnStatement(_) => true,
+        Statement::IfStatement(is) => {
+            is.branches.iter().any(|b| stmts_have_return(&b.body))
+                || is
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|e| stmts_have_return(e))
+        }
+        Statement::WhileStatement(ws) => stmts_have_return(&ws.body),
+        Statement::ForStatement(fs) => stmts_have_return(&fs.body),
+        Statement::CaseStatement(cs) => {
+            cs.when_branches
+                .iter()
+                .any(|b| stmts_have_return(&b.body))
+                || cs
+                    .default_branch
+                    .as_ref()
+                    .is_some_and(|d| stmts_have_return(d))
+        }
+        Statement::TryStatement(ts) => {
+            stmts_have_return(&ts.try_body)
+                || stmts_have_return(&ts.catch_body)
+                || ts
+                    .finally_body
+                    .as_ref()
+                    .is_some_and(|f| stmts_have_return(f))
+        }
+        _ => false,
+    }
 }
 
 fn stmt_has_user_call(stmt: &Statement, fns: &AsyncResolve<'_>) -> bool {
@@ -4244,7 +4289,7 @@ enum Term<'a> {
         else_blk: usize,
     },
     /// `sleep(ms)` then resume at `next`.
-    Sleep { ms: f64, next: usize },
+    Sleep { ms: &'a Expression, next: usize },
     /// `remoteCall(url, fn, args, hash)` — the RPC client transport. Lowered as
     /// a suspending host op: `remote_begin(g_current, …)` starts the request and
     /// parks the task; on resume the next block binds the response via
@@ -4739,7 +4784,7 @@ impl<'a> CfgBuilder<'a> {
     fn lower_stmt(&mut self, stmt: &'a Statement, cur: usize, mode: TailMode) -> Result<Flow, ()> {
         let is_tail = !matches!(mode, TailMode::None);
         // sleep(ms)
-        if let Some(ms) = async_sleep_ms_of(stmt) {
+        if let Some(ms) = async_sleep_arg_of(stmt) {
             let next = self.new_block();
             self.blocks[cur].term = Term::Sleep { ms, next };
             return Ok(Flow::Continue(next));
@@ -5153,12 +5198,18 @@ impl<'a> CfgBuilder<'a> {
             }
             // A `while` yields no value, so in tail position it completes Void.
             self.finish_void(exit, mode)
-        } else if !is_tail && !stmts_have_suspension(std::slice::from_ref(stmt), self.fns) {
+        } else if !is_tail
+            && !stmts_have_suspension(std::slice::from_ref(stmt), self.fns)
+            && !stmt_has_return(stmt)
+        {
             // Any other statement (e.g. a `for` loop, `case`) that contains no
             // suspension point runs as a plain inline segment statement — the
             // segment compiler (`compile_stmt`) lowers it directly, exactly as a
-            // sync function would. Only statements that themselves suspend need
-            // CFG segment-splitting (not supported inside loops/case yet).
+            // sync function would. Source-level `return` is also excluded here:
+            // in a resume function it must go through scheduler completion, not a
+            // raw wasm return. Only statements that themselves suspend or return
+            // need CFG segment-splitting (not supported inside all statement
+            // shapes yet).
             self.push_inline_stmt(cur, stmt)?;
             Ok(Flow::Continue(cur))
         } else {
@@ -6100,7 +6151,8 @@ fn build_resume_fn(
                 store_vars(&mut b);
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::GlobalGet(layout.g_current));
-                b.emit(Instruction::F64Const(*ms));
+                b.compile_expr(ms)?;
+                b.emit(Instruction::Call(b.rt().base + RT_AS_NUMBER));
                 b.emit(Instruction::Call(layout.sleep));
                 b.emit(Instruction::Return);
             }
@@ -6678,11 +6730,14 @@ fn anf_async_stmt(
             }));
         }
         Statement::ForStatement(fs)
-            if stmts_have_suspension(&fs.body, r) && !stmts_have_loop_control(&fs.body) =>
+            if (stmts_have_suspension(&fs.body, r) || stmts_have_return(&fs.body))
+                && !stmts_have_loop_control(&fs.body) =>
         {
-            // A `for` loop whose body suspends can't be compiled inline (the body
-            // would have to yield mid-iteration). Desugar it into an index-driven
-            // `while` loop, which the engine already lowers across suspension:
+            // A `for` loop whose body suspends or returns can't be compiled inline:
+            // a suspension must yield mid-iteration, and a source-level `return`
+            // must lower to scheduler `complete()` rather than a raw wasm return
+            // from the resume function. Desugar it into an index-driven `while`
+            // loop, which the engine already lowers through the async CFG:
             //
             //   let  __for_coll = <items>
             //   var  __for_idx  = 0
@@ -6693,8 +6748,8 @@ fn anf_async_stmt(
             //   end
             //
             // The loop index and collection live in the frame, so they survive a
-            // suspension inside the body. (Plain non-suspending `for` loops keep
-            // the fast inline path below.)
+            // suspension inside the body. (Plain fall-through `for` loops keep the
+            // fast inline path below.)
             let loc = fs.location.clone();
             let coll = atomize(&fs.items, counter, out);
             let coll_name = format!("__for_coll_{}", *counter);
@@ -8684,10 +8739,27 @@ impl<'a, 'c> Builder<'a, 'c> {
                     Some(ValueShape::RawFloat)
                 }
             }
-            Expression::IdentifierExpression(id) => self
-                .lookup(&id.name)
-                .map(|binding| binding.shape)
-                .filter(|shape| matches!(shape, ValueShape::RawInt | ValueShape::RawFloat)),
+            Expression::IdentifierExpression(id) => {
+                // A binding physically stored in a raw numeric local is
+                // trivially that shape.
+                if let Some(binding) = self.lookup(&id.name) {
+                    if matches!(binding.shape, ValueShape::RawInt | ValueShape::RawFloat) {
+                        return Some(binding.shape);
+                    }
+                }
+                // Otherwise fall back to the checker's static type: a
+                // Boxed binding the checker proved Int/Float still holds a
+                // scalar payload, and unboxing it (`compile_expr_as(_,
+                // RawInt)` = `wrap; extend_s`) is sound. This lets native
+                // arithmetic apply to boxed-but-scalar bindings — e.g. a
+                // `for x in ints` loop variable, whose `total + x` would
+                // otherwise pay a `rt_add` call every iteration instead of
+                // a native `i64.add`.
+                match self.shape_for_expr(expr) {
+                    shape @ (ValueShape::RawInt | ValueShape::RawFloat) => Some(shape),
+                    _ => None,
+                }
+            }
             _ => match self.shape_for_expr(expr) {
                 shape @ (ValueShape::RawInt | ValueShape::RawFloat) => Some(shape),
                 _ => None,
@@ -8695,7 +8767,41 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
     }
 
+    /// True when `ce` is the bare builtin `length(x)` — callee is the
+    /// identifier `length`, one argument, and `length` is neither a
+    /// local binding nor a user function (the same conditions under
+    /// which `compile_call` routes it to `try_compile_bare_global`).
+    fn is_bare_length_call(&self, ce: &CallExpression) -> bool {
+        matches!(&*ce.callee, Expression::IdentifierExpression(id) if id.name == "length")
+            && ce.args.len() == 1
+            && self.lookup("length").is_none()
+            && !self.resolves_to_user_fn("length")
+    }
+
     fn compile_expr_as(&mut self, expr: &Expression, want: ValueShape) -> Result<(), BuildError> {
+        // Fast path: `length(borrowed)` wanted as a raw Int. The header
+        // count lives at obj+4; reading it inline avoids the two calls
+        // (`rt_obj_addr` + `rt_make_int`) and the box-then-unbox the
+        // generic path pays — hot in `while i < length(arr)` conditions.
+        // Restricted to a borrowed arg so we don't skip the owned-arg
+        // temp release the boxed `compile_bare_length` path performs.
+        if want == ValueShape::RawInt {
+            if let Expression::CallExpression(ce) = expr {
+                if self.is_bare_length_call(ce) {
+                    let arg = &ce.args[0].value;
+                    if !self.expr_transfers_ownership(arg) {
+                        self.compile_expr_as(arg, ValueShape::Boxed)?;
+                        // inline rt_obj_addr: mask NaN-box tag bits, wrap to i32
+                        self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+                        self.emit(Instruction::I64And);
+                        self.emit(Instruction::I32WrapI64);
+                        self.emit(Instruction::I32Load(mem_off(4)));
+                        self.emit(Instruction::I64ExtendI32S);
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // Fast paths: when a caller wants a raw shape, skip the
         // box-then-unbox round-trip compile_expr would do. compile_expr
         // defaults to Boxed (so the many call sites that discard the
@@ -8743,9 +8849,65 @@ impl<'a, 'c> Builder<'a, 'c> {
 
     fn expr_result_for_compiled(&mut self, expr: &Expression, shape: ValueShape) -> ExprResult {
         match shape {
-            ValueShape::Boxed => ExprResult::boxed(self.expr_transfers_ownership(expr)),
+            ValueShape::Boxed => {
+                // Scalar fast path: a value the checker (or its storage
+                // shape) proves is an Int/Float/Bool is a NaN-boxed
+                // scalar, never a heap object. `rt_is_obj` is always
+                // false for it, so a `retain` on a borrowed scalar is a
+                // guaranteed no-op. Classify it Primitive so the
+                // borrowed-return / borrowed-arg paths skip the
+                // pointless `call $rt_retain` (and its paired ownership
+                // event) entirely. Owned scalars stay Owned — they emit
+                // no retain already, and leaving them untouched keeps
+                // the store/transfer paths byte-for-byte unchanged.
+                let owned = self.expr_transfers_ownership(expr);
+                if !owned && self.expr_is_scalar_value(expr) {
+                    ExprResult::primitive(ValueShape::Boxed)
+                } else {
+                    ExprResult::boxed(owned)
+                }
+            }
             _ => ExprResult::primitive(shape),
         }
+    }
+
+    /// True when `expr` provably evaluates to a scalar (Int / Float /
+    /// Bool) — a NaN-boxed value that is never a heap object. Reference
+    /// counting (`retain`/`release`) on such a value is a guaranteed
+    /// no-op, so the boxed result can be classified `Primitive` and the
+    /// RC helper call elided. Conservative by construction: every signal
+    /// below is sound, and an unknown type falls through to `false`
+    /// (keeping the existing retain), so this can only remove provably
+    /// dead RC work.
+    fn expr_is_scalar_value(&self, expr: &Expression) -> bool {
+        // The checker's static type is the most general signal.
+        if matches!(
+            self.shape_for_expr(expr),
+            ValueShape::RawInt | ValueShape::RawFloat | ValueShape::RawBool
+        ) {
+            return true;
+        }
+        // Literals are always scalars.
+        if matches!(
+            expr,
+            Expression::NumberExpression(_) | Expression::BooleanExpression(_)
+        ) {
+            return true;
+        }
+        // A binding stored in a raw-scalar local holds a scalar
+        // regardless of what the checker type map recorded for the
+        // reference site (e.g. closure-local reads).
+        if let Expression::IdentifierExpression(id) = expr {
+            if let Some(binding) = self.lookup(&id.name) {
+                if matches!(
+                    binding.shape,
+                    ValueShape::RawInt | ValueShape::RawFloat | ValueShape::RawBool
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn compile_expr_result(&mut self, expr: &Expression) -> Result<ExprResult, BuildError> {
@@ -9396,6 +9558,21 @@ impl<'a, 'c> Builder<'a, 'c> {
     }
 
     fn compile_truthy_i32(&mut self, e: &Expression) -> Result<(), BuildError> {
+        // Statically-Bool condition fast path: compile straight to a
+        // raw i32 0/1 and branch on it — no box, no generic
+        // VAL_NULL/VOID/false truthiness comparison. `compile_expr`'s
+        // identifier arm force-boxes a `RawBool` local (so a bare
+        // `while running` / `if flag` would otherwise box the bool and
+        // run the full 3-sentinel truthiness check every iteration),
+        // which this path sidesteps. Sound because the only runtime
+        // representations of a Bool are a raw i32 0/1 or a NaN-boxed
+        // Bool that carries its value in the low bit — and the
+        // `Boxed→RawBool` conversion (`wrap; and 1`) extracts exactly
+        // that bit, correct for either. Hottest in the mandelbrot inner
+        // `while running` loop.
+        if self.expr_is_raw_bool(e) {
+            return self.compile_expr_as(e, ValueShape::RawBool);
+        }
         match self.compile_expr(e)? {
             ValueShape::RawBool => Ok(()),
             shape => {
@@ -9404,6 +9581,23 @@ impl<'a, 'c> Builder<'a, 'c> {
                 Ok(())
             }
         }
+    }
+
+    /// True when `e` provably evaluates to a Bool — the checker typed
+    /// it `Bool`, or it reads a binding stored in a `RawBool` local.
+    /// Conservative: an unknown type returns false and keeps the
+    /// generic truthiness path, so this only ever removes provably
+    /// redundant boxing + sentinel comparisons.
+    fn expr_is_raw_bool(&self, e: &Expression) -> bool {
+        if matches!(self.shape_for_expr(e), ValueShape::RawBool) {
+            return true;
+        }
+        if let Expression::IdentifierExpression(id) = e {
+            if let Some(binding) = self.lookup(&id.name) {
+                return matches!(binding.shape, ValueShape::RawBool);
+            }
+        }
+        false
     }
 
     /// `if cond1 body1 else if cond2 body2 else else_body end` lowers
@@ -9461,11 +9655,21 @@ impl<'a, 'c> Builder<'a, 'c> {
         cs: &fai_compiler::ast::CaseStatement,
         is_tail: bool,
     ) -> Result<(), BuildError> {
+        // When the scrutinee is statically a String, `when 'literal'`
+        // arms can compare bytes against the data-section literal
+        // (rt_str_eq) instead of allocating a String for each literal and
+        // running the generic rt_eq — the case-dispatch analogue of the
+        // `s == 'literal'` fast path. Hot in router-style dispatch.
+        let value_is_string = matches!(
+            self.expression_type_at(&cs.value),
+            Some(fai_checker::types::Type::String)
+        );
         self.compile_expr_as(&cs.value, ValueShape::Boxed)?;
         let val_local = self.alloc_local();
         self.emit(Instruction::LocalSet(val_local));
         self.compile_case_branches(
             val_local,
+            value_is_string,
             &cs.when_branches,
             cs.default_branch.as_deref(),
             is_tail,
@@ -9475,6 +9679,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     fn compile_case_branches(
         &mut self,
         val_local: u32,
+        value_is_string: bool,
         branches: &[fai_compiler::ast::CaseBranch],
         default: Option<&[Statement]>,
         is_tail: bool,
@@ -9500,11 +9705,34 @@ impl<'a, 'c> Builder<'a, 'c> {
             return Ok(());
         }
         let first = &branches[0];
-        // value == match_expr, then truthy-check to an i32 flag.
-        self.emit(Instruction::LocalGet(val_local));
-        self.compile_expr_as(&first.match_expr, ValueShape::Boxed)?;
-        self.emit(Instruction::Call(self.rt().base + RT_EQ));
-        self.emit_truthy_i32();
+        // value == match_expr → i32 truth flag.
+        if let (true, Expression::StringExpression(lit)) =
+            (value_is_string, &first.match_expr)
+        {
+            // String scrutinee vs string-literal arm: compare bytes
+            // against the interned data-section literal via rt_str_eq —
+            // no String alloc for the literal, no generic rt_eq. The
+            // scrutinee local is only read (obj_addr), not consumed.
+            let (off, len) = self.ctx.strings.borrow_mut().intern(&lit.value);
+            self.emit(Instruction::LocalGet(val_local));
+            self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+            self.emit(Instruction::I64And);
+            self.emit(Instruction::I32WrapI64);
+            let addr = self.alloc_i32_local();
+            self.emit(Instruction::LocalTee(addr));
+            self.emit(Instruction::I32Const(8));
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalGet(addr));
+            self.emit(Instruction::I32Load(mem_off(4)));
+            self.emit(Instruction::I32Const(off as i32));
+            self.emit(Instruction::I32Const(len as i32));
+            self.emit(Instruction::Call(self.rt().base + RT_STR_EQ));
+        } else {
+            self.emit(Instruction::LocalGet(val_local));
+            self.compile_expr_as(&first.match_expr, ValueShape::Boxed)?;
+            self.emit(Instruction::Call(self.rt().base + RT_EQ));
+            self.emit_truthy_i32();
+        }
         self.emit_open(Instruction::If(BlockType::Empty));
         self.push_scope();
         if is_tail {
@@ -9517,7 +9745,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.pop_scope();
         if branches.len() > 1 || default.is_some() {
             self.emit(Instruction::Else);
-            self.compile_case_branches(val_local, &branches[1..], default, is_tail)?;
+            self.compile_case_branches(
+                val_local,
+                value_is_string,
+                &branches[1..],
+                default,
+                is_tail,
+            )?;
         }
         self.emit_close();
         Ok(())
@@ -9993,8 +10227,14 @@ impl<'a, 'c> Builder<'a, 'c> {
         let counter = self.alloc_i32_local();
         self.emit(Instruction::LocalGet(start_i32));
         self.emit(Instruction::LocalSet(counter));
-        // item slot (NaN-boxed) for the user's loop variable.
-        let item_local = self.alloc_local();
+        // The loop variable holds an Int (the range is integer-typed),
+        // so bind it in a RawInt local rather than eagerly boxing the
+        // counter with an `rt_make_int` CALL every iteration. Boxing now
+        // happens lazily, only where the body actually needs a boxed
+        // value — and uses like `arr[i]` / `total + i` stay fully native
+        // (no box→unbox round trip). The shape-aware read/convert and
+        // closure-capture machinery handles the rest.
+        let item_local = self.alloc_typed_local(ValueShape::RawInt);
 
         let cleanup_depth = self.cleanup_depth();
         self.emit_open(Instruction::Block(BlockType::Empty)); // $break
@@ -10020,13 +10260,13 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         self.emit(Instruction::BrIf(self.block_depth - break_abs));
 
-        // item = make_int(counter)
+        // item = counter (raw — no rt_make_int box)
         self.emit(Instruction::LocalGet(counter));
-        self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
+        self.emit(Instruction::I64ExtendI32S);
         self.emit(Instruction::LocalSet(item_local));
 
         self.push_scope();
-        self.bind(&s.item_name, item_local);
+        self.bind_shape(&s.item_name, item_local, ValueShape::RawInt);
         for st in &s.body {
             self.compile_stmt(st)?;
         }
@@ -10806,7 +11046,9 @@ impl<'a, 'c> Builder<'a, 'c> {
                         }
                     }
                 }
-                self.compile_field_access(&me.object, &me.property)?;
+                if !self.try_compile_record_field_read(me)? {
+                    self.compile_field_access(&me.object, &me.property)?;
+                }
                 Ok(ValueShape::Boxed)
             }
             _ => Err(BuildError::UnsupportedExpression(expr_variant_name(expr))),
@@ -11333,6 +11575,20 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// hazard that blocks blanket arg release is `Boxed`-only: there the host
     /// receives the object handle and may stash it.) Plan 115 arg-temp mop-up.
     fn emit_string_arg_stashing(&mut self, e: &Expression) -> Result<Option<u32>, BuildError> {
+        // String literal: its bytes are already interned in the data
+        // section, so push (ptr, len) straight from there instead of
+        // allocating a String object, stringifying it (identity), reading
+        // its data pointer, and releasing it afterward. The consumer
+        // (e.g. RT_GET_FIELD's key, json.parse's input) only reads the
+        // (ptr, len) as a borrowed slice, so nothing is allocated or
+        // released. Hot in literal-keyed dict access — `getString(d,
+        // 'name')` / `getInt(props, 'padding')` run ~20×/node in render.
+        if let Expression::StringExpression(s) = e {
+            let (off, len) = self.ctx.strings.borrow_mut().intern(&s.value);
+            self.emit(Instruction::I32Const(off as i32));
+            self.emit(Instruction::I32Const(len as i32));
+            return Ok(None);
+        }
         self.compile_expr_as(e, ValueShape::Boxed)?;
         self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
         let stash = if self.expr_transfers_ownership(e) {
@@ -12878,9 +13134,96 @@ impl<'a, 'c> Builder<'a, 'c> {
         &mut self,
         ix: &fai_compiler::ast::IndexExpression,
     ) -> Result<(), BuildError> {
+        // Fast path: a statically-Array receiver indexed by a
+        // statically-Int index. Inline the element fetch instead of
+        // calling the fully-polymorphic `rt_get_index` (which resolves
+        // the object address via a nested call, dispatches on the
+        // container tag for array/tuple/string/dict/instance/module,
+        // and takes a *boxed* index it immediately unboxes). The inline
+        // form skips the index boxing, the tag dispatch, and the call,
+        // and exactly replicates `rt_get_index`'s array branch: negative
+        // indices wrap by length, and an out-of-range index yields
+        // VAL_NULL. The element is read straight from the slot (still a
+        // borrowed value, same ownership as before), so RC is unchanged.
+        if self.index_is_array_int(ix) {
+            return self.compile_array_index_fast(ix);
+        }
         self.compile_expr(&ix.object)?;
         self.compile_expr(&ix.index)?;
         self.emit(Instruction::Call(self.rt().base + RT_GET_INDEX));
+        Ok(())
+    }
+
+    /// Eligibility for the inline array-index read fast path: the
+    /// receiver's checker type is a (non-optional) `Array` and the index
+    /// is a statically-Int expression. Conservative — anything the
+    /// checker didn't prove an array/int falls back to `rt_get_index`.
+    fn index_is_array_int(&self, ix: &fai_compiler::ast::IndexExpression) -> bool {
+        // The checker recorded this IndexExpression as a proven
+        // Array-receiver / Int-index site (membership encodes both
+        // facts), keyed by the IndexExpression's own location.
+        self.checker().array_int_index_sites.contains(&(
+            self.module_key.clone(),
+            ix.location.line,
+            ix.location.column,
+        ))
+    }
+
+    /// Inline `arr[i]` element read for a proven Array/Int pair. Mirrors
+    /// the array branch of `rt_get_index` exactly:
+    ///   addr = obj & 0x0000_FFFF_FFFF_FFFF   (inlined rt_obj_addr)
+    ///   len  = mem[addr+4]
+    ///   if i < 0 { i += len }                (negative-index wrap)
+    ///   if i < 0 || i >= len { VAL_NULL }     (bounds → null)
+    ///   else { mem[addr + 8 + i*8] }
+    fn compile_array_index_fast(
+        &mut self,
+        ix: &fai_compiler::ast::IndexExpression,
+    ) -> Result<(), BuildError> {
+        // addr = obj_addr(object)  — inline the mask + wrap.
+        self.compile_expr_as(&ix.object, ValueShape::Boxed)?;
+        self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+        self.emit(Instruction::I64And);
+        self.emit(Instruction::I32WrapI64);
+        let addr = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(addr));
+        // i = index as i32 (raw — no NaN-box round trip).
+        self.compile_expr_as(&ix.index, ValueShape::RawInt)?;
+        self.emit(Instruction::I32WrapI64);
+        let i = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(i));
+        // Negative-index wrap: if i < 0 { i += len }.
+        self.emit(Instruction::LocalGet(i));
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::I32LtS);
+        self.emit_open(Instruction::If(BlockType::Empty));
+        self.emit(Instruction::LocalGet(i));
+        self.emit(Instruction::LocalGet(addr));
+        self.emit(Instruction::I32Load(mem_off(4)));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::LocalSet(i));
+        self.emit_close();
+        // Bounds check → VAL_NULL on out-of-range, else the slot value.
+        self.emit(Instruction::LocalGet(i));
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::I32LtS);
+        self.emit(Instruction::LocalGet(i));
+        self.emit(Instruction::LocalGet(addr));
+        self.emit(Instruction::I32Load(mem_off(4)));
+        self.emit(Instruction::I32GeS);
+        self.emit(Instruction::I32Or);
+        self.emit_open(Instruction::If(BlockType::Result(ValType::I64)));
+        self.emit(Instruction::I64Const(VAL_NULL));
+        self.emit(Instruction::Else);
+        self.emit(Instruction::LocalGet(addr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::LocalGet(i));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::I32Mul);
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::I64Load(mem0()));
+        self.emit_close();
         Ok(())
     }
 
@@ -12889,6 +13232,49 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Works on dicts, instances, error objects, and even strings
     /// (the runtime handles tag-based dispatch). Returns
     /// `VAL_NULL` if the key is absent.
+    /// Inline a record field read when the checker proved `me`'s
+    /// receiver is a user-defined record type (recorded in
+    /// `record_field_read_sites`). Records are dict-backed and the
+    /// constructor lays fields out in declaration order, so field at
+    /// declaration index `slot` has its value at `addr + 16 + slot*16`
+    /// (dict header 8 + slot*16 for the entry, +8 past the key box).
+    /// Reading the slot directly skips the string-keyed `rt_get_field`
+    /// scan and the call. The stored value is returned borrowed —
+    /// identical ownership to `rt_get_field`. Returns true if it emitted
+    /// the fast path, false to fall back to the generic path.
+    fn try_compile_record_field_read(
+        &mut self,
+        me: &fai_compiler::ast::MemberExpression,
+    ) -> Result<bool, BuildError> {
+        let key = (
+            self.module_key.clone(),
+            me.location.line,
+            me.location.column,
+            fai_checker::checker::member_chain_depth(me),
+        );
+        let Some(type_name) = self.checker().record_field_read_sites.get(&key).cloned() else {
+            return Ok(false);
+        };
+        // Declaration-order field index = dict slot index. Looked up from
+        // the same ordered table the constructor uses to lay out the dict.
+        let slot = match self.ctx.type_fields.get(&type_name) {
+            Some(fields) => match fields.iter().position(|f| f.name == me.property) {
+                Some(s) => s,
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        // addr = obj_addr(object)  — inline the NaN-box mask + wrap.
+        self.compile_expr_as(&me.object, ValueShape::Boxed)?;
+        self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+        self.emit(Instruction::I64And);
+        self.emit(Instruction::I32WrapI64);
+        // value = mem[addr + 16 + slot*16]
+        let value_off = 16 + (slot as u64) * 16;
+        self.emit(Instruction::I64Load(mem_off(value_off)));
+        Ok(true)
+    }
+
     fn compile_field_access(&mut self, obj: &Expression, field: &str) -> Result<(), BuildError> {
         let (key_off, key_len) = self.ctx.strings.borrow_mut().intern(field);
         self.compile_expr(obj)?;
@@ -12901,7 +13287,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Template string `"before {expr} after"`. Each `Text` part
     /// is a literal String; each `Expression` part is stringified
     /// via `RT_VALUE_TO_STR`. Concatenation proceeds left-to-right
-    /// with `RT_CONCAT(a, b)`. An empty template evaluates to the
+    /// into one allocation. An empty template evaluates to the
     /// empty String.
     fn compile_template_string(
         &mut self,
@@ -12936,22 +13322,120 @@ impl<'a, 'c> Builder<'a, 'c> {
             return Ok(());
         }
 
-        emit_part(self, &parts[0])?;
-        for p in &parts[1..] {
-            let left = self.alloc_local();
-            self.emit(Instruction::LocalTee(left));
-            emit_part(self, p)?;
-            let right = self.alloc_local();
-            self.emit(Instruction::LocalTee(right));
-            // Two strings on the stack — concatenate into one.
-            self.emit(Instruction::Call(self.rt().base + RT_CONCAT));
-            // RT_CONCAT reads its operands and returns a fresh string; it does
-            // not consume either operand's ownership.
-            self.emit(Instruction::LocalGet(left));
-            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
-            self.emit(Instruction::LocalGet(right));
+        // Single part: no concatenation needed — emit it directly. A
+        // Text part is one alloc; an Expr part is its own owned string.
+        if parts.len() == 1 {
+            return emit_part(self, &parts[0]);
+        }
+
+        // Multi-part: build the result in ONE allocation instead of a
+        // left-fold of `rt_concat`s (each of which allocated an
+        // intermediate string and re-copied the growing prefix —
+        // O(parts²) bytes). Materialize every part as a (data_ptr, len)
+        // pair, sum the lengths, allocate the result once, then
+        // `memory.copy` each part into place. Text parts copy straight
+        // from the interned data section (no String object allocated);
+        // Expr parts are stringified into owned temps that are released
+        // after the copy. Hot in SSR / template-heavy rendering.
+        //
+        // `ptr`/`len` for each part are held in i32 locals; the owned
+        // Expr temps are tracked so they can be released once copied.
+        let mut part_ptrs: Vec<u32> = Vec::with_capacity(parts.len());
+        let mut part_lens: Vec<u32> = Vec::with_capacity(parts.len());
+        let mut owned_temps: Vec<u32> = Vec::new();
+        for part in parts {
+            let ptr_l = self.alloc_i32_local();
+            let len_l = self.alloc_i32_local();
+            match part {
+                TemplateStringPart::Text { value } => {
+                    let (off, len) = self.ctx.strings.borrow_mut().intern(value);
+                    self.emit(Instruction::I32Const(off as i32));
+                    self.emit(Instruction::LocalSet(ptr_l));
+                    self.emit(Instruction::I32Const(len as i32));
+                    self.emit(Instruction::LocalSet(len_l));
+                }
+                TemplateStringPart::Expression { expression } => {
+                    // Owned boxed String; stash it, then derive its data
+                    // ptr (addr+8) and length (mem[addr+4]).
+                    self.emit_to_string_owned(expression)?;
+                    let s = self.alloc_local();
+                    self.emit(Instruction::LocalTee(s));
+                    owned_temps.push(s);
+                    // addr = obj_addr(s) inline (mask + wrap)
+                    self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+                    self.emit(Instruction::I64And);
+                    self.emit(Instruction::I32WrapI64);
+                    let addr = self.alloc_i32_local();
+                    self.emit(Instruction::LocalTee(addr));
+                    self.emit(Instruction::I32Const(8));
+                    self.emit(Instruction::I32Add);
+                    self.emit(Instruction::LocalSet(ptr_l));
+                    self.emit(Instruction::LocalGet(addr));
+                    self.emit(Instruction::I32Load(mem_off(4)));
+                    self.emit(Instruction::LocalSet(len_l));
+                }
+            }
+            part_ptrs.push(ptr_l);
+            part_lens.push(len_l);
+        }
+
+        // total_len = sum of part lengths.
+        let total_len = self.alloc_i32_local();
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::LocalSet(total_len));
+        for &len_l in &part_lens {
+            self.emit(Instruction::LocalGet(total_len));
+            self.emit(Instruction::LocalGet(len_l));
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalSet(total_len));
+        }
+
+        // result = alloc(8 + total_len); tag = STRING; len = total_len.
+        let result = self.alloc_i32_local();
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::LocalGet(total_len));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
+        self.emit(Instruction::LocalSet(result));
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::I32Const(OBJ_TAG_STRING));
+        self.emit(Instruction::I32Store(mem0()));
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::LocalGet(total_len));
+        self.emit(Instruction::I32Store(mem_off(4)));
+
+        // Copy each part into result+8, advancing a running offset.
+        let cursor = self.alloc_i32_local();
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::LocalSet(cursor));
+        for (&ptr_l, &len_l) in part_ptrs.iter().zip(part_lens.iter()) {
+            // memory.copy(dst = cursor, src = ptr_l, len = len_l)
+            self.emit(Instruction::LocalGet(cursor));
+            self.emit(Instruction::LocalGet(ptr_l));
+            self.emit(Instruction::LocalGet(len_l));
+            self.emit(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+            // cursor += len_l
+            self.emit(Instruction::LocalGet(cursor));
+            self.emit(Instruction::LocalGet(len_l));
+            self.emit(Instruction::I32Add);
+            self.emit(Instruction::LocalSet(cursor));
+        }
+
+        // Release the owned Expr-part temps now that their bytes are
+        // copied. (Note: derive ptrs BEFORE this — done above.)
+        for &s in &owned_temps {
+            self.emit(Instruction::LocalGet(s));
             self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
         }
+
+        // Box the result as an object.
+        self.emit(Instruction::LocalGet(result));
+        self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
         Ok(())
     }
 
@@ -13673,6 +14157,23 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// the alias (result `==` the arg value) and retain it. A fresh result is
     /// already +1 and left untouched.
     fn emit_to_string_owned(&mut self, arg: &Expression) -> Result<(), BuildError> {
+        // Statically-String argument: `RT_VALUE_TO_STR` is the identity
+        // on a String (returns it as-is), so skip the call entirely and
+        // just make the value uniformly owned (+1): a borrowed string is
+        // retained; an owned/fresh one is already +1. Hot in template
+        // interpolation of string fields (`"<div>{{title}}</div>"`).
+        if matches!(
+            self.expression_type_at(arg),
+            Some(fai_checker::types::Type::String)
+        ) {
+            let owned = self.expr_transfers_ownership(arg);
+            self.compile_expr_as(arg, ValueShape::Boxed)?;
+            if !owned {
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
+            return Ok(());
+        }
+
         let transfers = self.expr_transfers_ownership(arg);
         self.compile_expr_as(arg, ValueShape::Boxed)?;
         let argl = self.alloc_local();
@@ -15002,12 +15503,92 @@ impl<'a, 'c> Builder<'a, 'c> {
         false
     }
 
+    /// `s == 'literal'` / `s != 'literal'` (either operand order) where
+    /// the non-literal side is statically a (non-optional) `String`.
+    /// Emits a direct `rt_str_eq` of the dynamic operand's bytes against
+    /// the literal's interned data-section bytes — no `rt_alloc_string`
+    /// for the literal, no `rt_eq` dispatch, no `rt_release`. Returns
+    /// `Some(RawBool)` when it handled the comparison, `None` to fall
+    /// back. Requires the dynamic side to be exactly `String`: an
+    /// optional `String?` could be null, whose NaN-box bits must not be
+    /// masked into a heap address.
+    fn try_compile_string_literal_eq(
+        &mut self,
+        be: &BinaryExpression,
+    ) -> Result<Option<ValueShape>, BuildError> {
+        use fai_checker::types::Type;
+        if be.operator != "==" && be.operator != "!=" {
+            return Ok(None);
+        }
+        // Identify exactly one literal operand and a non-literal,
+        // statically-String dynamic operand.
+        let is_str_lit =
+            |e: &Expression| matches!(e, Expression::StringExpression(_));
+        let (dynamic, literal) = match (&*be.left, &*be.right) {
+            (l, r) if is_str_lit(r) && !is_str_lit(l) => (&be.left, r),
+            (l, r) if is_str_lit(l) && !is_str_lit(r) => (&be.right, l),
+            _ => return Ok(None),
+        };
+        if !matches!(self.expression_type_at(dynamic), Some(Type::String)) {
+            return Ok(None);
+        }
+        let Expression::StringExpression(lit) = literal else {
+            return Ok(None);
+        };
+        let (lit_off, lit_len) = self.ctx.strings.borrow_mut().intern(&lit.value);
+
+        // Evaluate the dynamic operand; release it after the read if it
+        // is an owned temp (rt_str_eq only reads — mirrors the boxed
+        // operand mop-up in the generic path).
+        self.compile_expr_as(dynamic, ValueShape::Boxed)?;
+        let owned = self.expr_transfers_ownership(dynamic);
+        let val_local = self.alloc_local();
+        self.emit(Instruction::LocalTee(val_local));
+        // addr = obj_addr(dynamic) inline (mask NaN-box tag bits, wrap)
+        self.emit(Instruction::I64Const(0x0000_FFFF_FFFF_FFFF));
+        self.emit(Instruction::I64And);
+        self.emit(Instruction::I32WrapI64);
+        let addr = self.alloc_i32_local();
+        self.emit(Instruction::LocalSet(addr));
+        // rt_str_eq(ptr_a = addr+8, len_a = mem[addr+4], ptr_b = lit_off, len_b)
+        self.emit(Instruction::LocalGet(addr));
+        self.emit(Instruction::I32Const(8));
+        self.emit(Instruction::I32Add);
+        self.emit(Instruction::LocalGet(addr));
+        self.emit(Instruction::I32Load(mem_off(4)));
+        self.emit(Instruction::I32Const(lit_off as i32));
+        self.emit(Instruction::I32Const(lit_len as i32));
+        self.emit(Instruction::Call(self.rt().base + RT_STR_EQ));
+        if be.operator == "!=" {
+            self.emit(Instruction::I32Eqz);
+        }
+        if owned {
+            // Result (i32) is independent of the operand; stash it,
+            // release the operand temp, restore the result.
+            let res = self.alloc_i32_local();
+            self.emit(Instruction::LocalSet(res));
+            self.emit(Instruction::LocalGet(val_local));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            self.emit(Instruction::LocalGet(res));
+        }
+        Ok(Some(ValueShape::RawBool))
+    }
+
     fn compile_binary(&mut self, be: &BinaryExpression) -> Result<ValueShape, BuildError> {
         // Short-circuit Bool ops. The checker enforces Bool operands,
         // so the non-evaluated side is never touched at runtime —
         // patterns like `x? and x!.field == 42` rely on this.
         if be.operator == "and" || be.operator == "or" {
             return self.compile_short_circuit(be);
+        }
+
+        // String == / != against a string literal: compare bytes
+        // directly against the interned data-section bytes instead of
+        // allocating a fresh String object for the literal (and then
+        // releasing it) on every evaluation. Hot in router-style
+        // dispatch (`if path == '/users'`).
+        if let Some(shape) = self.try_compile_string_literal_eq(be)? {
+            return Ok(shape);
         }
 
         let left_numeric = self.numeric_shape_for_expr(&be.left);
@@ -15312,6 +15893,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder.clone(),
             expression_types: checker.expression_types.clone(),
             generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
         };
         let main = prepared
             .serde_ast
@@ -15918,6 +16501,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder.clone(),
             expression_types: checker.expression_types.clone(),
             generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
         };
 
         let mut decls: Vec<fai_compiler::ast::FunctionDeclaration> = Vec::new();
@@ -17222,6 +17807,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         let mut infos: Vec<FunctionInfo> = Vec::new();
         let mut main = None;
@@ -20822,11 +21409,17 @@ mod tests {
 
     #[test]
     fn direct_remote_call_releases_owned_string_arguments() {
+        // Args are concatenations (`a + b`) so each is a genuinely OWNED
+        // fresh String temp that must be released after the host import
+        // (plan 115 arg-temp mop-up). Bare string *literals* now take the
+        // zero-alloc data-section path in `emit_string_arg_stashing` (no
+        // String object, nothing to release), so this regression test
+        // uses owned temps to actually exercise the release path.
         let wasm = build_standalone_module_many(compile_all(concat!(
             "def main\n",
             "    @return Int\n",
             "do\n",
-            "  let _ = remoteCall('http://localhost:3040', 'data.chat.listMessages', '[29]', '')\n",
+            "  let _ = remoteCall('http://' + 'localhost', 'data.' + 'chat', '[' + '29]', 'h' + 'ash')\n",
             "  42\n",
             "end\n",
         )));
@@ -20872,6 +21465,568 @@ mod tests {
         assert!(
             releases_after_remote >= 4,
             "remoteCall must release url/fn/args/hash string temps after host import"
+        );
+    }
+
+    // ── scalar RC elision (perf) ────────────────────────────────
+    //
+    // A NaN-boxed scalar (Int/Float/Bool) is never a heap object, so
+    // `rt_retain`/`rt_release` on it are guaranteed no-ops. The
+    // builder classifies a provably-scalar borrowed value as
+    // `Primitive` and skips the `call $rt_retain` the borrowed-return
+    // / borrowed-arg paths would otherwise emit. This is the hot-path
+    // win behind the `fib` benchmark (~165M leaf returns each used to
+    // pay a `rt_retain`→`rt_is_obj` call pair for nothing).
+    //
+    // These tests are the mechanical ratchet: they count `rt_retain`
+    // calls in *user* function bodies (the code-section bodies after
+    // the `RT_COUNT` runtime helpers) and assert a scalar-returning
+    // function emits none, while an object-returning function still
+    // retains its borrowed return. Reverting the elision flips the
+    // scalar count above zero and fails `scalar_return_emits_no_retain`.
+
+    /// Count `call $rt_retain` instructions across the *user* function
+    /// bodies of a built module — i.e. every code-section body after the
+    /// first `RT_COUNT` runtime-helper bodies. Function indices in the
+    /// `Call` operator are absolute (`import_count + body_position`), so
+    /// the retain target is `rt_base_for_standalone() + RT_RETAIN`.
+    fn user_body_retain_count(wasm: &[u8]) -> usize {
+        let retain_target = rt_base_for_standalone() + runtime::RT_RETAIN;
+        let mut count = 0;
+        for (body_pos, body) in wasmparser::Parser::new(0)
+            .parse_all(wasm)
+            .filter_map(|p| match p.expect("payload") {
+                wasmparser::Payload::CodeSectionEntry(body) => Some(body),
+                _ => None,
+            })
+            .enumerate()
+        {
+            // Skip the runtime-helper bodies; only user code counts.
+            if (body_pos as u32) < runtime::RT_COUNT {
+                continue;
+            }
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                if let wasmparser::Operator::Call { function_index } = op {
+                    if function_index == retain_target {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Count occurrences of a specific operator across the *user*
+    /// function bodies (code-section bodies after the `RT_COUNT`
+    /// runtime helpers). `pred` matches the operator of interest.
+    fn user_body_op_count(wasm: &[u8], pred: impl Fn(&wasmparser::Operator) -> bool) -> usize {
+        let mut count = 0;
+        for (body_pos, body) in wasmparser::Parser::new(0)
+            .parse_all(wasm)
+            .filter_map(|p| match p.expect("payload") {
+                wasmparser::Payload::CodeSectionEntry(body) => Some(body),
+                _ => None,
+            })
+            .enumerate()
+        {
+            if (body_pos as u32) < runtime::RT_COUNT {
+                continue;
+            }
+            for op in body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .map(|op| op.expect("operator"))
+            {
+                if pred(&op) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn bool_var_while_condition_skips_truthiness_check() {
+        // `while running` where `running` is a Bool var must branch on
+        // the raw i32 flag directly. The generic truthiness path would
+        // box the bool and compare it against VAL_NULL / VAL_VOID /
+        // FALSE — three `i64.eq` per check. This program's only
+        // comparison is `i < 10` (lowers to `i64.lt_s`, never `i64.eq`),
+        // so a correct fast path leaves the user body with zero
+        // `i64.eq`.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    var running = true\n",
+            "    var i = 0\n",
+            "    while running\n",
+            "        i = i + 1\n",
+            "        running = i < 10\n",
+            "    end\n",
+            "    i\n",
+            "end\n",
+        )));
+        let eqs = user_body_op_count(&wasm, |op| matches!(op, wasmparser::Operator::I64Eq));
+        assert_eq!(
+            eqs, 0,
+            "a statically-Bool while condition must not emit the boxed-truthiness sentinel comparisons",
+        );
+        // ...and the loop must still run to completion (i reaches 10).
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 10;
+        assert_eq!(result, expected, "bool-condition fast path changed the result");
+    }
+
+    #[test]
+    fn literal_dict_key_skips_alloc_and_value_to_str() {
+        // `getString(d, 'name')` with a literal key must push the key's
+        // data-section (ptr, len) directly — no rt_value_to_str (and no
+        // rt_alloc_string for the key). The dict literal allocates its
+        // own keys, but the lookup key does not, and value_to_str only
+        // appears on the old key-stashing path, so the user body has zero
+        // rt_value_to_str. Result: length('Alice') == 5.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let d = { name: 'Alice' }\n",
+            "    length(getString(d, 'name'))\n",
+            "end\n",
+        )));
+        let v2s_target = rt_base_for_standalone() + runtime::RT_VALUE_TO_STR;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "a literal dict key must not be stringified via rt_value_to_str",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 5; // "Alice"
+        assert_eq!(result, expected, "literal-key dict get gave the wrong value");
+    }
+
+    #[test]
+    fn string_interpolation_skips_value_to_str() {
+        // Interpolating a statically-String value (`{{s}}`) must not call
+        // the polymorphic rt_value_to_str — a String stringifies to
+        // itself. "<x>{{s}}" with s='ab' → "<x>ab" = 5 chars.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let s = 'ab'\n",
+            "    length(\"<x>{{s}}\")\n",
+            "end\n",
+        )));
+        let v2s_target = rt_base_for_standalone() + runtime::RT_VALUE_TO_STR;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "interpolating a String must not call rt_value_to_str",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 5; // "<x>ab"
+        assert_eq!(result, expected, "string interpolation fast path gave wrong length");
+    }
+
+    #[test]
+    fn multi_part_template_builds_in_one_alloc_no_concat() {
+        // A multi-part template must build in a single allocation — no
+        // `rt_concat` left-fold. Result length is verified via length().
+        // "a {{x}} bc" with x=7 → "a 7 bc" = 6 chars.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let x = 7\n",
+            "    length(\"a {{x}} bc\")\n",
+            "end\n",
+        )));
+        let concat_target = rt_base_for_standalone() + runtime::RT_CONCAT;
+        let concat_calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == concat_target)
+        });
+        assert_eq!(
+            concat_calls, 0,
+            "multi-part template must build in one alloc, not a chain of rt_concat",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 6; // "a 7 bc"
+        assert_eq!(result, expected, "single-alloc template produced the wrong length");
+    }
+
+    #[test]
+    fn string_case_dispatch_uses_str_eq_not_alloc() {
+        // `case p when '/a' when '/b'` on a String scrutinee must compare
+        // each literal arm via rt_str_eq against the data section — no
+        // rt_alloc_string per arm, no generic rt_eq. p='/b' → arm 2.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let p = '/b'\n",
+            "    case p\n",
+            "    when '/a'\n",
+            "        1\n",
+            "    when '/b'\n",
+            "        2\n",
+            "    default\n",
+            "        0\n",
+            "    end\n",
+            "end\n",
+        )));
+        let eq_target = rt_base_for_standalone() + runtime::RT_EQ;
+        let str_eq_target = rt_base_for_standalone() + runtime::RT_STR_EQ;
+        let eq_calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target)
+        });
+        let str_eq_calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target)
+        });
+        assert_eq!(eq_calls, 0, "string case arms must not use generic rt_eq");
+        assert!(str_eq_calls >= 2, "string case arms should lower to rt_str_eq");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 2;
+        assert_eq!(result, expected, "string case dispatch matched the wrong arm");
+    }
+
+    #[test]
+    fn string_literal_eq_uses_str_eq_not_alloc() {
+        // `p == 'lit'` must compare bytes via rt_str_eq against the
+        // data-section literal — no rt_alloc_string for the literal and
+        // no generic rt_eq dispatch. Both comparisons below take the
+        // fast path, so the user body has zero RT_EQ calls and at least
+        // two RT_STR_EQ calls. Result: only the first route matches.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let p = '/users'\n",
+            "    var n = 0\n",
+            "    if p == '/users'\n",
+            "        n = n + 1\n",
+            "    end\n",
+            "    if p == '/admin'\n",
+            "        n = n + 1\n",
+            "    end\n",
+            "    n\n",
+            "end\n",
+        )));
+        let eq_target = rt_base_for_standalone() + runtime::RT_EQ;
+        let str_eq_target = rt_base_for_standalone() + runtime::RT_STR_EQ;
+        let eq_calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target)
+        });
+        let str_eq_calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target)
+        });
+        assert_eq!(eq_calls, 0, "string==literal must not use the generic rt_eq dispatch");
+        assert!(str_eq_calls >= 2, "both comparisons should lower to rt_str_eq");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 1;
+        assert_eq!(result, expected, "string literal eq fast path gave the wrong match count");
+    }
+
+    #[test]
+    fn string_literal_ne_is_correct() {
+        // `!=` fast path: '/users' != '/admin' is true, != '/users' is false.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let p = '/users'\n",
+            "    var n = 0\n",
+            "    if p != '/admin'\n",
+            "        n = n + 1\n",
+            "    end\n",
+            "    if p != '/users'\n",
+            "        n = n + 10\n",
+            "    end\n",
+            "    n\n",
+            "end\n",
+        )));
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 1; // only the first holds
+        assert_eq!(result, expected, "string != literal fast path is wrong");
+    }
+
+    #[test]
+    fn range_for_loop_var_is_raw_no_per_iteration_box() {
+        // `for i in lo..hi` must bind `i` in a raw Int local, not box the
+        // counter with an `rt_make_int` call each iteration. Bounds come
+        // from RawInt let-locals (no make_int at setup either), so a
+        // correct lowering leaves the user body with zero rt_make_int.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let lo = 0\n",
+            "    let hi = 1000\n",
+            "    var total = 0\n",
+            "    for i in lo..hi\n",
+            "        total = total + i\n",
+            "    end\n",
+            "    total\n",
+            "end\n",
+        )));
+        let make_int_target = rt_base_for_standalone() + runtime::RT_MAKE_INT;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == make_int_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "range-for loop variable must be raw, not boxed per iteration via rt_make_int",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 499500; // sum 0..999
+        assert_eq!(result, expected, "range-for native loop var changed the sum");
+    }
+
+    #[test]
+    fn length_in_int_condition_inlines_no_obj_addr_call() {
+        // `while j < length(arr)` must read the header count inline — no
+        // `rt_obj_addr` call (nor `rt_make_int` box). This program has no
+        // other obj_addr user (no indexing), so the fast path drives the
+        // user-body obj_addr call count to zero.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let arr = [10, 20, 30]\n",
+            "    var c = 0\n",
+            "    var j = 0\n",
+            "    while j < length(arr)\n",
+            "        c = c + 1\n",
+            "        j = j + 1\n",
+            "    end\n",
+            "    c\n",
+            "end\n",
+        )));
+        let obj_addr_target = rt_base_for_standalone() + runtime::RT_OBJ_ADDR;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == obj_addr_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "length() in an Int condition must inline (no rt_obj_addr call)",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 3; // loop ran 3 times
+        assert_eq!(result, expected, "length fast path changed the loop count");
+    }
+
+    #[test]
+    fn for_in_int_arithmetic_uses_native_add() {
+        // `total = total + x` where `x` is a `for x in ints` loop
+        // variable must use a native `i64.add`, not a `rt_add` call.
+        // The loop variable is a Boxed local, but the checker proves it
+        // Int, so `numeric_shape_for_expr` reports RawInt and arithmetic
+        // unboxes + adds natively.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let xs = [10, 20, 30]\n",
+            "    var total = 0\n",
+            "    for x in xs\n",
+            "        total = total + x\n",
+            "    end\n",
+            "    total\n",
+            "end\n",
+        )));
+        let add_target = rt_base_for_standalone() + runtime::RT_ADD;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == add_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "Int arithmetic over a for-in loop variable must use native i64.add, not rt_add",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 60; // 10+20+30
+        assert_eq!(result, expected, "for-in native arithmetic produced the wrong sum");
+    }
+
+    #[test]
+    fn record_field_read_inlines_no_rt_get_field() {
+        // `p.x` / `p.y` on a statically-known record must read the field
+        // slot directly — no string-keyed `rt_get_field` call.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "type Point\n",
+            "  x Int\n",
+            "  y Int\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let p = Point(x: 3, y: 7)\n",
+            "    p.x + p.y\n",
+            "end\n",
+        )));
+        let get_field_target = rt_base_for_standalone() + runtime::RT_GET_FIELD;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_field_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "a proven record field read must inline, not call rt_get_field",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 10; // 3+7
+        assert_eq!(result, expected, "inline field read produced the wrong value");
+    }
+
+    #[test]
+    fn record_field_chain_repeated_property_is_correct() {
+        // Regression guard for the chain-collision fix: a MemberExpression's
+        // source location is its receiver's, so every level of `o.inner.inner`
+        // shares (line, col) AND property name. Only the chain depth
+        // distinguishes them. With `Outer{tag, inner}` (inner at slot 1) and
+        // `Inner{inner, extra}` (inner at slot 0), a depth-blind key would
+        // misread `o.inner.inner` as Outer slot 0 (tag, an Int treated as a
+        // pointer). Correct result is the nested inner's value, 42.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "type Inner\n",
+            "  inner Int\n",
+            "  extra Int\n",
+            "end\n",
+            "\n",
+            "type Outer\n",
+            "  tag Int\n",
+            "  inner Inner\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let o = Outer(tag: 7, inner: Inner(inner: 42, extra: 5))\n",
+            "    o.inner.inner\n",
+            "end\n",
+        )));
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(
+            result, expected,
+            "repeated-property chain o.inner.inner must read the nested field, not collide",
+        );
+    }
+
+    #[test]
+    fn array_int_index_inlines_no_rt_get_index() {
+        // `arr[j]` with a statically-Int[] receiver and Int index must
+        // compile to an inline element read — no call into the
+        // polymorphic `rt_get_index`.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let arr = [10, 20, 30]\n",
+            "    var total = 0\n",
+            "    var j = 0\n",
+            "    while j < 3\n",
+            "        total = total + arr[j]\n",
+            "        j = j + 1\n",
+            "    end\n",
+            "    total\n",
+            "end\n",
+        )));
+        let get_index_target = rt_base_for_standalone() + runtime::RT_GET_INDEX;
+        let calls = user_body_op_count(&wasm, |op| {
+            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_index_target)
+        });
+        assert_eq!(
+            calls, 0,
+            "a proven Array/Int index must inline, not call rt_get_index",
+        );
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 60; // 10+20+30
+        assert_eq!(result, expected, "inline array index produced the wrong sum");
+    }
+
+    #[test]
+    fn array_int_index_fast_path_negative_index_wraps() {
+        // The inline path must mirror rt_get_index's negative-index
+        // wrap: arr[-1] is the last element.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let arr = [10, 20, 30]\n",
+            "    let i = 0 - 1\n",
+            "    arr[i]\n",
+            "end\n",
+        )));
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 30;
+        assert_eq!(result, expected, "arr[-1] must wrap to the last element");
+    }
+
+    #[test]
+    fn scalar_return_emits_no_retain() {
+        // `id` returns a borrowed Int param. The boxed scalar is never
+        // a heap object, so no `rt_retain` is needed on the return —
+        // nor on `main` returning its borrowed Int local.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "# Identity on an Int.\n",
+            "def id\n",
+            "    @param n Int\n",
+            "    @return Int\n",
+            "do\n",
+            "    n\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "    let r = id(7)\n",
+            "    r\n",
+            "end\n",
+        )));
+        assert_eq!(
+            user_body_retain_count(&wasm),
+            0,
+            "a scalar-returning function must not emit rt_retain (RC is a no-op on scalars)",
+        );
+        // ...and it must still compute the right value.
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 7;
+        assert_eq!(result, expected, "scalar RC elision changed the result");
+    }
+
+    #[test]
+    fn object_return_still_retains_borrowed() {
+        // Contrast: `id` returns a borrowed String — a heap object whose
+        // borrowed return MUST be retained so the caller owns a live
+        // ref. The scalar elision must not touch this path.
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "# Identity on a String.\n",
+            "def id\n",
+            "    @param s String\n",
+            "    @return String\n",
+            "do\n",
+            "    s\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return String\n",
+            "do\n",
+            "    id('hello')\n",
+            "end\n",
+        )));
+        assert!(
+            user_body_retain_count(&wasm) >= 1,
+            "a borrowed-object return must still retain — object RC was broken",
         );
     }
 
@@ -21160,6 +22315,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         crate::try_codegen_direct(&prepared.serde_ast, &info, target)
     }
@@ -21352,6 +22509,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         crate::try_codegen_direct_with_modules(&prepared.serde_ast, &prepared.modules, &info, None)
     }
@@ -21518,6 +22677,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         let wasm = crate::try_codegen_direct_full(
             &prepared.serde_ast,
@@ -21645,6 +22806,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         let wasm = crate::try_codegen_direct_full(
             &prepared.serde_ast,
@@ -21689,6 +22852,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         let wasm = crate::try_codegen_direct_full(
             &prepared.serde_ast,
@@ -22057,6 +23222,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder,
             expression_types: checker.expression_types,
             generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
         };
         let wasm = crate::try_codegen_direct(&prepared.serde_ast, &info, Some("wasm-html"))
             .expect("wasm-html build should succeed");
@@ -22778,6 +23945,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder.clone(),
             expression_types: checker.expression_types.clone(),
             generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
         };
         crate::codegen_direct_full_reasoned(&prepared.serde_ast, &[], &checker_info, None, false)
             .expect("full-pipeline codegen failed")
@@ -22953,6 +24122,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder.clone(),
             expression_types: checker.expression_types.clone(),
             generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
         };
         let rt = RtOffsets {
             base: direct_rt_base(),

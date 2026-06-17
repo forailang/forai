@@ -760,6 +760,8 @@ mod tests {
             named_param_reorder: checker.named_param_reorder.clone(),
             expression_types: checker.expression_types.clone(),
             generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
         };
         fai_codegen_wasm::try_codegen_direct_full(
             &prepared.serde_ast,
@@ -1943,6 +1945,8 @@ mod tests {
                 named_param_reorder: checker.named_param_reorder.clone(),
                 expression_types: checker.expression_types.clone(),
                 generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
             },
             None,
             true,

@@ -42,6 +42,23 @@ pub fn expression_key(expr: &Expression, module_key: String) -> ExpressionKey {
     (module_key, loc.line, loc.column, rline, rcol)
 }
 
+/// Depth of a `MemberExpression` within its receiver chain: the number
+/// of nested `MemberExpression`s in the object spine. `a.b` is depth 0
+/// (object `a` is not a member), `a.b.c` is depth 1, `a.b.c.d` depth 2.
+/// Because a MemberExpression's source location is its receiver's
+/// location, every level of one chain shares (line, col); this depth is
+/// the stable per-level disambiguator both the checker and direct
+/// codegen use to key `record_field_read_sites`.
+pub fn member_chain_depth(me: &MemberExpression) -> u32 {
+    let mut depth = 0;
+    let mut cur = &*me.object;
+    while let Expression::MemberExpression(inner) = cur {
+        depth += 1;
+        cur = &*inner.object;
+    }
+    depth
+}
+
 fn expression_location(expr: &Expression) -> &SourceLocation {
     match expr {
         Expression::IdentifierExpression(e) => &e.location,
@@ -127,6 +144,32 @@ pub struct Checker {
     /// An empty string means the param was not resolved to a known user type.
     /// Same key convention as `ufcs_calls`.
     pub generic_type_args: HashMap<(String, u32, u32), Vec<String>>,
+    /// Index expressions `arr[i]` proven to have an `Array` receiver and
+    /// an `Int` index, keyed by (module_name, line, column) of the
+    /// IndexExpression. Direct wasm codegen consults this to emit an
+    /// inline element read instead of the polymorphic `rt_get_index`.
+    /// A dedicated set is needed because an IndexExpression and its
+    /// object share a source location, so their `expression_types`
+    /// entries collide — the object's `Array` type can't be recovered
+    /// from that map. Same module-prefixed key convention as
+    /// `ufcs_calls`.
+    pub array_int_index_sites: HashSet<(String, u32, u32)>,
+    /// Field reads `obj.field` proven to have a user-defined record
+    /// (`Type::Named`/`Type`) receiver, mapping the MemberExpression's
+    /// (module_name, line, column) to the receiver's type name. Direct
+    /// wasm codegen looks the type's declared field order up from its
+    /// own ordered field table to emit a direct slot read instead of
+    /// the string-keyed `rt_get_field` scan. Only value-position field
+    /// reads are recorded — method calls go through the call path and
+    /// never reach here. The key is (module, line, col, chain_depth):
+    /// a MemberExpression's source location is its *receiver's*
+    /// location, so every level of a chain (`a.b.c` — both `a.b` and
+    /// `a.b.c` start at `a`) shares (line, col). The chain depth (count
+    /// of nested MemberExpressions in the receiver spine, via
+    /// `member_chain_depth`) disambiguates the levels — including
+    /// repeated-property chains like `a.b.b` that the property name
+    /// alone can't separate.
+    pub record_field_read_sites: HashMap<(String, u32, u32, u32), String>,
     /// Errors collected during top-level statement checking. The checker
     /// attempts to continue past a failed statement so that one typo
     /// doesn't hide unrelated errors in other functions. When non-empty,
@@ -154,6 +197,8 @@ impl Checker {
             expression_types: HashMap::new(),
             warnings: Vec::new(),
             generic_type_args: HashMap::new(),
+            array_int_index_sites: HashSet::new(),
+            record_field_read_sites: HashMap::new(),
             collected_errors: Vec::new(),
         }
     }

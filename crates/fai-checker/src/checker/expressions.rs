@@ -200,7 +200,29 @@ impl Checker {
             }
             Expression::MemberExpression(me) => {
                 let obj_type = self.check_expression(&me.object, env)?;
-                self.check_member_access(&obj_type, &me.property)
+                let result = self.check_member_access(&obj_type, &me.property)?;
+                // Record a field read on a user record type so codegen can
+                // inline the slot read (see `record_field_read_sites`). Only
+                // reached for value-position field access; `obj.method(...)`
+                // goes through the call path.
+                if let Type::Named {
+                    name,
+                    category: NamedCategory::Type,
+                    ..
+                } = &obj_type
+                {
+                    let module_key = self.location_key();
+                    self.record_field_read_sites.insert(
+                        (
+                            module_key,
+                            me.location.line,
+                            me.location.column,
+                            crate::checker::member_chain_depth(me),
+                        ),
+                        name.clone(),
+                    );
+                }
+                Ok(result)
             }
             Expression::UnaryExpression(ue) => {
                 let inner = self.check_expression(&ue.expression, env)?;
@@ -243,6 +265,15 @@ impl Checker {
                                 describe_type(&idx_type)
                             )));
                         }
+                        // Record the proven Array/Int index site so direct
+                        // codegen can inline the element read (see
+                        // `array_int_index_sites`).
+                        let module_key = self.location_key();
+                        self.array_int_index_sites.insert((
+                            module_key,
+                            ie.location.line,
+                            ie.location.column,
+                        ));
                         Ok((**inner).clone())
                     }
                     Type::Dictionary => Ok(optional_of(Type::Unknown)),

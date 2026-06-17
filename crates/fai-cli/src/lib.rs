@@ -942,6 +942,8 @@ fn run_tests_module(
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
@@ -1243,6 +1245,8 @@ fn run_tests_file(path: &str, reporter: &Reporter, opts: &wasm_runner::TestRunOp
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
@@ -5656,6 +5660,8 @@ fn compile_fai_to_wasm(
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
+            array_int_index_sites: checker.array_int_index_sites.clone(),
+            record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
