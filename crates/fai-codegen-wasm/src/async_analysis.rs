@@ -24,6 +24,12 @@ pub enum AsyncCauseKind {
     /// Calls `remoteCall(...)` — the RPC client transport, lowered as a
     /// suspending host op so the task yields while the request is in flight.
     RemoteCall,
+    /// Calls `std.http.request.*` — lowered as a generic suspending host op so
+    /// the scheduler can run other tasks while native HTTP work is in flight.
+    HttpRequest,
+    /// Calls a blocking native stdlib operation that lowers through the generic
+    /// host-op boundary instead of running on the scheduler thread.
+    BlockingHostOp,
     /// `let/var x = externCall(...)` for an offloadable (scalar) extern — the
     /// blocking C call is offloaded to the boundary, so the binding is a
     /// suspension point (plan 101 U8). Detected positionally.
@@ -638,6 +644,13 @@ fn resolve_call_target(
                 // keeping the UI thread free instead of blocking on sync XHR.
                 return Some((id.name.clone(), Some(AsyncCauseKind::RemoteCall)));
             }
+            if let Some(imported) = node.named_imports.get(name) {
+                if let Some((module, method)) = imported.rsplit_once('.') {
+                    if let Some(kind) = stdlib_async_cause(module, method) {
+                        return Some((id.name.clone(), Some(kind)));
+                    }
+                }
+            }
             if let Some(target) = resolve_bare_function(name, node, known_functions) {
                 return Some((target, None));
             }
@@ -655,6 +668,9 @@ fn resolve_call_target(
             };
             let canonical = node.aliases.get(&obj.name)?;
             let target = format!("{}.{}", canonical, me.property);
+            if let Some(kind) = stdlib_async_cause(canonical, &me.property) {
+                return Some((target, Some(kind)));
+            }
             if known_functions.contains(&target) {
                 Some((target, None))
             } else {
@@ -668,6 +684,20 @@ fn resolve_call_target(
         | Expression::CallExpression(_) => {
             Some(("<closure>".to_string(), Some(AsyncCauseKind::ClosureCall)))
         }
+        _ => None,
+    }
+}
+
+fn stdlib_async_cause(module: &str, method: &str) -> Option<AsyncCauseKind> {
+    match crate::direct::stdlib_scheduling(module, method)? {
+        crate::direct::StdlibScheduling::AwaitHostOp {
+            await_kind: crate::direct::AwaitHostOpKind::HttpRequest,
+            ..
+        } => Some(AsyncCauseKind::HttpRequest),
+        crate::direct::StdlibScheduling::AwaitHostOp {
+            await_kind: crate::direct::AwaitHostOpKind::BlockingIo,
+            ..
+        } => Some(AsyncCauseKind::BlockingHostOp),
         _ => None,
     }
 }
@@ -771,6 +801,77 @@ mod tests {
         let analysis = analyze(&entry, &[helper]);
         assert!(analysis.async_functions.contains("helper.child"));
         assert!(analysis.async_functions.contains("main"));
+    }
+
+    #[test]
+    fn detects_http_request_namespace_import_as_async() {
+        let ast = parse(
+            "use std.http.request\n\n\
+             def main\n    @return Void\ndo\n  let _resp = request.get('http://example.com')\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.async_functions.contains("main"));
+        assert_eq!(
+            analysis.causes.get("main").map(|c| &c.kind),
+            Some(&AsyncCauseKind::HttpRequest)
+        );
+    }
+
+    #[test]
+    fn detects_http_request_named_import_as_async() {
+        let ast = parse(
+            "use { get } from std.http.request\n\n\
+             def main\n    @return Void\ndo\n  let _resp = get('http://example.com')\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.async_functions.contains("main"));
+        assert_eq!(
+            analysis.causes.get("main").map(|c| &c.kind),
+            Some(&AsyncCauseKind::HttpRequest)
+        );
+    }
+
+    #[test]
+    fn detects_blocking_host_op_namespace_import_as_async() {
+        let ast = parse(
+            "use std.process\n\n\
+             def main\n    @return Void\ndo\n  let _raw = process.run('printf ok', '.', '{}', 5000, 65536)\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.async_functions.contains("main"));
+        assert_eq!(
+            analysis.causes.get("main").map(|c| &c.kind),
+            Some(&AsyncCauseKind::BlockingHostOp)
+        );
+    }
+
+    #[test]
+    fn detects_blocking_host_op_named_import_as_async() {
+        let ast = parse(
+            "use { read } from std.file\n\n\
+             def main\n    @return Void\ndo\n  let _body = read('/tmp/example.txt')\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.async_functions.contains("main"));
+        assert_eq!(
+            analysis.causes.get("main").map(|c| &c.kind),
+            Some(&AsyncCauseKind::BlockingHostOp)
+        );
+    }
+
+    #[test]
+    fn detects_socket_wait_host_ops_as_async() {
+        let ast = parse(
+            "use std.net.tcp\n\
+             use { receive } from std.net.udp\n\n\
+             def main\n    @return Void\ndo\n  let conn = tcp.connect('127.0.0.1', 1)\n  let _line = tcp.readLine(conn)\n  let _packet = receive(2)\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.async_functions.contains("main"));
+        assert_eq!(
+            analysis.causes.get("main").map(|c| &c.kind),
+            Some(&AsyncCauseKind::BlockingHostOp)
+        );
     }
 
     #[test]

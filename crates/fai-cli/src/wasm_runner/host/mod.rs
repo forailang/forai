@@ -8,6 +8,7 @@ pub(crate) mod boundary;
 mod crypto;
 mod env;
 mod events;
+mod host_ops;
 mod http_server;
 mod io;
 mod json;
@@ -39,6 +40,7 @@ pub(super) fn install_all(linker: &mut Linker<()>) -> Result<(), String> {
     net::install(linker)?;
     process::install(linker)?;
     util::install(linker)?;
+    host_ops::install(linker)?;
     http_server::install(linker)?;
     storage::install(linker)?;
     env::install(linker)?;

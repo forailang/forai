@@ -1,6 +1,10 @@
 # nowait — start background work and return immediately (fire and forget).
-# Today this is a compatibility surface while scheduler-owned task
-# records continue to expand.
+# `nowait` is cooperative scheduling, not a separate thread or process.
+# Other tasks interleave when the running task reaches a suspension point:
+# `sleep`, `all`, an auto-awaited async call, `remoteCall`, or scheduler-aware
+# blocking host I/O such as std.http.request, std.process.run, std.file
+# read/write/list, std.env.load, and raw socket waits. Long CPU-bound guest
+# code keeps the scheduler turn until it reaches one of those points.
 def doc_nowait
     @return Void
 do

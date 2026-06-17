@@ -242,11 +242,11 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.test", name: "equal",  builtin_name: "testEqual",  doc: "Assert two values are equal, with an optional message." },
 
         // std.http.request
-        BuiltinDoc { module: "std.http.request", name: "get",    builtin_name: "httpRequestGet",    doc: "Send an HTTP GET request." },
-        BuiltinDoc { module: "std.http.request", name: "post",   builtin_name: "httpRequestPost",   doc: "Send an HTTP POST request with a body." },
-        BuiltinDoc { module: "std.http.request", name: "put",    builtin_name: "httpRequestPut",    doc: "Send an HTTP PUT request with a body." },
-        BuiltinDoc { module: "std.http.request", name: "patch",  builtin_name: "httpRequestPatch",  doc: "Send an HTTP PATCH request with a body." },
-        BuiltinDoc { module: "std.http.request", name: "delete", builtin_name: "httpRequestDelete", doc: "Send an HTTP DELETE request." },
+        BuiltinDoc { module: "std.http.request", name: "get",    builtin_name: "httpRequestGet",    doc: "Send a scheduler-aware HTTP GET request." },
+        BuiltinDoc { module: "std.http.request", name: "post",   builtin_name: "httpRequestPost",   doc: "Send a scheduler-aware HTTP POST request with a body." },
+        BuiltinDoc { module: "std.http.request", name: "put",    builtin_name: "httpRequestPut",    doc: "Send a scheduler-aware HTTP PUT request with a body." },
+        BuiltinDoc { module: "std.http.request", name: "patch",  builtin_name: "httpRequestPatch",  doc: "Send a scheduler-aware HTTP PATCH request with a body." },
+        BuiltinDoc { module: "std.http.request", name: "delete", builtin_name: "httpRequestDelete", doc: "Send a scheduler-aware HTTP DELETE request." },
 
         // std.http.server
         BuiltinDoc { module: "std.http.server", name: "ok",         builtin_name: "httpServerOk",             doc: "Return a 200 OK HTTP response with the given body." },

@@ -51,9 +51,9 @@ thread_local! {
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.http_server_response(kind, status, body_ptr, body_len) -> i64
     //
-    // Builds `{status: Int, body: String [, contentType: String | location: String]}`
-    // on the guest heap and returns a NaN-boxed Dict pointer. Mirrors
-    // the VM's native_http_server_{text,html,json,ok,redirect}.
+    // Builds the full `HttpResponse` shape on the guest heap and returns a
+    // NaN-boxed Dict pointer. Optional fields are present as null so typed
+    // field reads that inline by declaration slot still match dictionary reads.
     linker
         .func_wrap(
             "env",
@@ -949,29 +949,25 @@ fn build_response_dict(
 
     let key_status = wasm_alloc_str(caller, mem, "status");
     let key_body = wasm_alloc_str(caller, mem, "body");
+    let key_content_type = wasm_alloc_str(caller, mem, "contentType");
+    let key_location = wasm_alloc_str(caller, mem, "location");
+    let key_cookies = wasm_alloc_str(caller, mem, "cookies");
+    let key_headers = wasm_alloc_str(caller, mem, "headers");
 
     let body_val = wasm_alloc_str(caller, mem, body);
     let status_val = (QNAN | TAG_INT | (status as u32 as u64)) as i64;
 
-    // Optional third entry (contentType or location).
-    let extra: Option<(i64, i64)> = match kind {
-        KIND_TEXT => {
-            let k = wasm_alloc_str(caller, mem, "contentType");
-            let v = wasm_alloc_str(caller, mem, "text/plain");
-            Some((k, v))
-        }
-        KIND_HTML => {
-            let k = wasm_alloc_str(caller, mem, "contentType");
-            let v = wasm_alloc_str(caller, mem, "text/html; charset=utf-8");
-            Some((k, v))
-        }
-        KIND_REDIRECT => {
-            let k = wasm_alloc_str(caller, mem, "location");
-            // For redirect the `body` arg is actually the URL. The
-            // VM still sets body to "", so we match that.
-            Some((k, body_val))
-        }
-        _ => None,
+    let content_type_val = match kind {
+        KIND_TEXT => wasm_alloc_str(caller, mem, "text/plain"),
+        KIND_HTML => wasm_alloc_str(caller, mem, "text/html; charset=utf-8"),
+        _ => VAL_NULL,
+    };
+    // For redirect the `body` arg is actually the URL. The VM still sets body
+    // to "", so `location` keeps the supplied value and `body` is replaced.
+    let location_val = if kind == KIND_REDIRECT {
+        body_val
+    } else {
+        VAL_NULL
     };
 
     // For redirect, body is empty.
@@ -981,12 +977,18 @@ fn build_response_dict(
         body_val
     };
 
-    let entries: Vec<(i64, i64)> = match extra {
-        Some((k, v)) => vec![(key_status, status_val), (key_body, body_val_final), (k, v)],
-        None => vec![(key_status, status_val), (key_body, body_val_final)],
-    };
-
-    alloc_dict(caller, mem, &entries)
+    alloc_dict(
+        caller,
+        mem,
+        &[
+            (key_status, status_val),
+            (key_body, body_val_final),
+            (key_content_type, content_type_val),
+            (key_location, location_val),
+            (key_cookies, VAL_NULL),
+            (key_headers, VAL_NULL),
+        ],
+    )
 }
 
 /// Allocate a `Dict` on the guest heap and return a NaN-boxed pointer.

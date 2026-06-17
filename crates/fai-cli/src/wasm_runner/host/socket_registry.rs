@@ -11,13 +11,55 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub enum SocketEntry {
-    TcpListener(TcpListener),
-    TcpStream(BufReader<TcpStream>),
-    UdpSocket(UdpSocket),
+    TcpListener(RegisteredTcpListener),
+    TcpStream(RegisteredTcpStream),
+    UdpSocket(RegisteredUdpSocket),
+}
+
+pub struct RegisteredTcpListener {
+    listener: TcpListener,
+    cancel: Arc<AtomicBool>,
+}
+
+pub struct RegisteredTcpStream {
+    stream: TcpStream,
+    cancel: Arc<AtomicBool>,
+}
+
+pub struct RegisteredUdpSocket {
+    socket: UdpSocket,
+    cancel: Arc<AtomicBool>,
+}
+
+pub struct TcpListenerWait {
+    pub listener: TcpListener,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub struct TcpStreamWait {
+    pub stream: TcpStream,
+    pub cancel: Arc<AtomicBool>,
+}
+
+pub struct UdpSocketWait {
+    pub socket: UdpSocket,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl SocketEntry {
+    fn cancel(&self) {
+        match self {
+            SocketEntry::TcpListener(entry) => entry.cancel.store(true, Ordering::SeqCst),
+            SocketEntry::TcpStream(entry) => entry.cancel.store(true, Ordering::SeqCst),
+            SocketEntry::UdpSocket(entry) => entry.cancel.store(true, Ordering::SeqCst),
+        }
+    }
 }
 
 pub struct SocketTable {
@@ -42,7 +84,13 @@ impl SocketTable {
         self.sockets.get_mut(&id)
     }
     pub fn remove(&mut self, id: u32) -> bool {
-        self.sockets.remove(&id).is_some()
+        match self.sockets.remove(&id) {
+            Some(entry) => {
+                entry.cancel();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -56,7 +104,13 @@ pub fn tcp_listen(port: u16) -> Result<u32, String> {
     let addr = format!("0.0.0.0:{}", port);
     let listener =
         TcpListener::bind(&addr).map_err(|e| format!("failed to bind TCP on {}: {}", addr, e))?;
-    Ok(SOCKET_TABLE.with(|t| t.borrow_mut().insert(SocketEntry::TcpListener(listener))))
+    Ok(SOCKET_TABLE.with(|t| {
+        t.borrow_mut()
+            .insert(SocketEntry::TcpListener(RegisteredTcpListener {
+                listener,
+                cancel: Arc::new(AtomicBool::new(false)),
+            }))
+    }))
 }
 
 pub fn tcp_accept(handle: u32) -> Result<(u32, String), String> {
@@ -71,7 +125,8 @@ pub fn tcp_accept(handle: u32) -> Result<(u32, String), String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid TCP listener handle".to_string())?;
         match entry {
-            SocketEntry::TcpListener(l) => l
+            SocketEntry::TcpListener(entry) => entry
+                .listener
                 .try_clone()
                 .map_err(|e| format!("clone listener failed: {}", e)),
             _ => Err("handle is not a TCP listener".into()),
@@ -81,10 +136,7 @@ pub fn tcp_accept(handle: u32) -> Result<(u32, String), String> {
         .accept()
         .map_err(|e| format!("accept failed: {}", e))?;
     let address = addr.to_string();
-    let conn_id = SOCKET_TABLE.with(|t| {
-        t.borrow_mut()
-            .insert(SocketEntry::TcpStream(BufReader::new(stream)))
-    });
+    let conn_id = insert_tcp_stream(stream);
     Ok((conn_id, address))
 }
 
@@ -92,10 +144,17 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<u32, String> {
     let addr = format!("{}:{}", host, port);
     let stream =
         TcpStream::connect(&addr).map_err(|e| format!("failed to connect to {}: {}", addr, e))?;
-    Ok(SOCKET_TABLE.with(|t| {
+    Ok(insert_tcp_stream(stream))
+}
+
+pub fn insert_tcp_stream(stream: TcpStream) -> u32 {
+    SOCKET_TABLE.with(|t| {
         t.borrow_mut()
-            .insert(SocketEntry::TcpStream(BufReader::new(stream)))
-    }))
+            .insert(SocketEntry::TcpStream(RegisteredTcpStream {
+                stream,
+                cancel: Arc::new(AtomicBool::new(false)),
+            }))
+    })
 }
 
 pub fn tcp_read(handle: u32) -> Result<String, String> {
@@ -105,9 +164,10 @@ pub fn tcp_read(handle: u32) -> Result<String, String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid TCP connection handle".to_string())?;
         match entry {
-            SocketEntry::TcpStream(reader) => {
+            SocketEntry::TcpStream(entry) => {
                 let mut buf = [0u8; 8192];
-                let n = reader
+                let n = entry
+                    .stream
                     .read(&mut buf)
                     .map_err(|e| format!("read failed: {}", e))?;
                 Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
@@ -124,16 +184,28 @@ pub fn tcp_read_line(handle: u32) -> Result<String, String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid TCP connection handle".to_string())?;
         match entry {
-            SocketEntry::TcpStream(reader) => {
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .map_err(|e| format!("readLine failed: {}", e))?;
-                Ok(line)
-            }
+            SocketEntry::TcpStream(entry) => read_line_from_stream(&mut entry.stream),
             _ => Err("handle is not a TCP connection".into()),
         }
     })
+}
+
+fn read_line_from_stream(stream: &mut TcpStream) -> Result<String, String> {
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("readLine failed: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 pub fn tcp_write(handle: u32, data: &[u8]) -> Result<usize, String> {
@@ -143,9 +215,9 @@ pub fn tcp_write(handle: u32, data: &[u8]) -> Result<usize, String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid TCP connection handle".to_string())?;
         match entry {
-            SocketEntry::TcpStream(reader) => {
-                let stream = reader.get_mut();
-                stream
+            SocketEntry::TcpStream(entry) => {
+                entry
+                    .stream
                     .write_all(data)
                     .map_err(|e| format!("write failed: {}", e))?;
                 Ok(data.len())
@@ -162,12 +234,13 @@ pub fn tcp_address(handle: u32) -> Result<String, String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid TCP socket handle".to_string())?;
         match entry {
-            SocketEntry::TcpStream(reader) => reader
-                .get_ref()
+            SocketEntry::TcpStream(entry) => entry
+                .stream
                 .peer_addr()
                 .map(|a| a.to_string())
                 .map_err(|e| format!("address failed: {}", e)),
-            SocketEntry::TcpListener(listener) => listener
+            SocketEntry::TcpListener(entry) => entry
+                .listener
                 .local_addr()
                 .map(|a| a.to_string())
                 .map_err(|e| format!("address failed: {}", e)),
@@ -194,9 +267,49 @@ pub fn socket_local_addr(handle: u32) -> Result<SocketAddr, String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid socket handle".to_string())?;
         match entry {
-            SocketEntry::TcpListener(l) => l.local_addr().map_err(|e| e.to_string()),
-            SocketEntry::TcpStream(r) => r.get_ref().local_addr().map_err(|e| e.to_string()),
-            SocketEntry::UdpSocket(s) => s.local_addr().map_err(|e| e.to_string()),
+            SocketEntry::TcpListener(entry) => {
+                entry.listener.local_addr().map_err(|e| e.to_string())
+            }
+            SocketEntry::TcpStream(entry) => entry.stream.local_addr().map_err(|e| e.to_string()),
+            SocketEntry::UdpSocket(entry) => entry.socket.local_addr().map_err(|e| e.to_string()),
+        }
+    })
+}
+
+pub fn clone_tcp_listener_for_wait(handle: u32) -> Result<TcpListenerWait, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid TCP listener handle".to_string())?;
+        match entry {
+            SocketEntry::TcpListener(entry) => Ok(TcpListenerWait {
+                listener: entry
+                    .listener
+                    .try_clone()
+                    .map_err(|e| format!("clone listener failed: {}", e))?,
+                cancel: Arc::clone(&entry.cancel),
+            }),
+            _ => Err("handle is not a TCP listener".into()),
+        }
+    })
+}
+
+pub fn clone_tcp_stream_for_wait(handle: u32) -> Result<TcpStreamWait, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid TCP connection handle".to_string())?;
+        match entry {
+            SocketEntry::TcpStream(entry) => Ok(TcpStreamWait {
+                stream: entry
+                    .stream
+                    .try_clone()
+                    .map_err(|e| format!("clone stream failed: {}", e))?,
+                cancel: Arc::clone(&entry.cancel),
+            }),
+            _ => Err("handle is not a TCP connection".into()),
         }
     })
 }
@@ -207,7 +320,13 @@ pub fn udp_bind(port: u16) -> Result<u32, String> {
     let addr = format!("0.0.0.0:{}", port);
     let socket =
         UdpSocket::bind(&addr).map_err(|e| format!("failed to bind UDP on {}: {}", addr, e))?;
-    Ok(SOCKET_TABLE.with(|t| t.borrow_mut().insert(SocketEntry::UdpSocket(socket))))
+    Ok(SOCKET_TABLE.with(|t| {
+        t.borrow_mut()
+            .insert(SocketEntry::UdpSocket(RegisteredUdpSocket {
+                socket,
+                cancel: Arc::new(AtomicBool::new(false)),
+            }))
+    }))
 }
 
 pub fn udp_send(handle: u32, host: &str, port: u16, data: &[u8]) -> Result<usize, String> {
@@ -217,9 +336,10 @@ pub fn udp_send(handle: u32, host: &str, port: u16, data: &[u8]) -> Result<usize
             .get_mut(handle)
             .ok_or_else(|| "invalid UDP socket handle".to_string())?;
         match entry {
-            SocketEntry::UdpSocket(socket) => {
+            SocketEntry::UdpSocket(entry) => {
                 let addr = format!("{}:{}", host, port);
-                socket
+                entry
+                    .socket
                     .send_to(data, &addr)
                     .map_err(|e| format!("send failed: {}", e))
             }
@@ -235,9 +355,10 @@ pub fn udp_receive(handle: u32) -> Result<(Vec<u8>, String, u16), String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid UDP socket handle".to_string())?;
         match entry {
-            SocketEntry::UdpSocket(socket) => {
+            SocketEntry::UdpSocket(entry) => {
                 let mut buf = vec![0u8; 65_535];
-                let (n, addr) = socket
+                let (n, addr) = entry
+                    .socket
                     .recv_from(&mut buf)
                     .map_err(|e| format!("receive failed: {}", e))?;
                 buf.truncate(n);
@@ -255,9 +376,29 @@ pub fn udp_set_broadcast(handle: u32, enabled: bool) -> Result<(), String> {
             .get_mut(handle)
             .ok_or_else(|| "invalid UDP socket handle".to_string())?;
         match entry {
-            SocketEntry::UdpSocket(socket) => socket
+            SocketEntry::UdpSocket(entry) => entry
+                .socket
                 .set_broadcast(enabled)
                 .map_err(|e| format!("set_broadcast failed: {}", e)),
+            _ => Err("handle is not a UDP socket".into()),
+        }
+    })
+}
+
+pub fn clone_udp_socket_for_wait(handle: u32) -> Result<UdpSocketWait, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid UDP socket handle".to_string())?;
+        match entry {
+            SocketEntry::UdpSocket(entry) => Ok(UdpSocketWait {
+                socket: entry
+                    .socket
+                    .try_clone()
+                    .map_err(|e| format!("clone UDP socket failed: {}", e))?,
+                cancel: Arc::clone(&entry.cancel),
+            }),
             _ => Err("handle is not a UDP socket".into()),
         }
     })

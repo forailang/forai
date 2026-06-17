@@ -1486,6 +1486,7 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
     HostImportRow { canon: "", method: "", import: "remote_call", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
     HostImportRow { canon: "", method: "", import: "remote_result", ret: RBor, doc: "TODO unverified async RPC plumbing — conservatively borrowed" },
     HostImportRow { canon: "", method: "", import: "ffi_result", ret: RBor, doc: "async FFI offload result; primitives or fresh host allocations (ownership-neutral) — conservatively borrowed" },
+    HostImportRow { canon: "", method: "", import: "host_op_result", ret: RBor, doc: "generic async host-op result; primitives or host-marshaled fresh values — conservatively borrowed" },
 ];
 
 struct HostImportArgRow {
@@ -1815,10 +1816,10 @@ mod tests {
     fn host_import_surface_is_fully_classified() {
         // Plan 119 U1 started this as the verified boxed-import surface; plan
         // 117 phase 6 also records void/primitive imports whose arguments carry
-        // ownership conventions; plan 101 adds ffi_result. The count pin fails
+        // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 100, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 101, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

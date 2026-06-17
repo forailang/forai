@@ -2,11 +2,13 @@
 
 use wasmtime::*;
 
+use super::super::heap::build_value;
 #[cfg(feature = "http-client")]
-use super::super::heap::{build_value, wasm_alloc_str};
-use super::super::nan_box::{ADDR_MASK, OBJ_TAG_DICT, OBJ_TAG_STRING, QNAN, SIGN_BIT, VAL_NULL};
+use super::super::heap::wasm_alloc_str;
+use super::super::nan_box::{ADDR_MASK, OBJ_TAG_DICT, QNAN, SIGN_BIT, VAL_NULL};
 #[cfg(feature = "http-client")]
 use super::events::{alloc_dict, write_global_i32, write_global_i64};
+use super::host_ops::{read_string_value, submit_host_op, HostOpResult};
 
 #[cfg(feature = "http-client")]
 const HTTP_CLIENT_TIMEOUT_SECS: u64 = 120;
@@ -80,28 +82,22 @@ fn read_str(mem: &Memory, caller: &impl AsContext, ptr: i32, len: i32) -> String
     String::from_utf8_lossy(&data[start..end]).into_owned()
 }
 
-/// Build the `{status, body, headers}` response Dict on the guest heap and
-/// return a NaN-boxed pointer. Mirrors `native_http_*`'s Dict shape in
-/// fai-runtime.
 #[cfg(feature = "http-client")]
-fn build_http_response_dict(
-    caller: &mut Caller<'_, ()>,
-    mem: &Memory,
+fn build_http_response_value(
     status: i32,
     body: &str,
     headers: &[(String, String)],
-) -> i64 {
+) -> serde_json::Value {
     use serde_json::{json, Map, Value};
     let mut hdr_map = Map::new();
     for (k, v) in headers {
         hdr_map.insert(k.clone(), Value::String(v.clone()));
     }
-    let obj = json!({
+    json!({
         "status": status,
         "body": body,
         "headers": Value::Object(hdr_map),
-    });
-    build_value(caller, mem, &obj)
+    })
 }
 
 /// file:// URL handling for VM parity. `native_http_get` / `native_http_post`
@@ -123,71 +119,112 @@ fn do_verb(
     body: Option<&str>,
     request_headers: &[(String, String)],
 ) -> i64 {
+    match do_verb_owned(method, url, body, request_headers) {
+        Some(value) => build_value(caller, mem, &value),
+        None => VAL_NULL,
+    }
+}
+
+/// Owned, Store-free HTTP/file work. This is safe to run on a boundary worker;
+/// the caller handles guest-memory materialization after the task resumes.
+#[cfg(feature = "http-client")]
+fn do_verb_owned(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    request_headers: &[(String, String)],
+) -> Option<serde_json::Value> {
     // file:// parity with VM.
     if let Some(path) = file_url_to_path(url) {
         match method {
             "GET" => match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    #[cfg(feature = "http-client")]
-                    {
-                        return build_http_response_dict(caller, mem, 200, &content, &[]);
-                    }
-                    #[cfg(not(feature = "http-client"))]
-                    {
-                        let _ = (caller, mem, content);
-                        return VAL_NULL;
-                    }
-                }
-                Err(_) => return VAL_NULL,
+                Ok(content) => return Some(build_http_response_value(200, &content, &[])),
+                Err(_) => return None,
             },
             "POST" | "PUT" | "PATCH" => {
                 let data = body.unwrap_or("");
                 match std::fs::write(path, data) {
-                    Ok(_) => {
-                        #[cfg(feature = "http-client")]
-                        {
-                            return build_http_response_dict(caller, mem, 200, "ok", &[]);
-                        }
-                        #[cfg(not(feature = "http-client"))]
-                        {
-                            let _ = (caller, mem);
-                            return VAL_NULL;
-                        }
-                    }
-                    Err(_) => return VAL_NULL,
+                    Ok(_) => return Some(build_http_response_value(200, "ok", &[])),
+                    Err(_) => return None,
                 }
             }
             "DELETE" => match std::fs::remove_file(path) {
-                Ok(_) => {
-                    #[cfg(feature = "http-client")]
-                    {
-                        return build_http_response_dict(caller, mem, 200, "ok", &[]);
-                    }
-                    #[cfg(not(feature = "http-client"))]
-                    {
-                        let _ = (caller, mem);
-                        return VAL_NULL;
-                    }
-                }
-                Err(_) => return VAL_NULL,
+                Ok(_) => return Some(build_http_response_value(200, "ok", &[])),
+                Err(_) => return None,
             },
-            _ => return VAL_NULL,
+            _ => return None,
         }
     }
 
-    #[cfg(feature = "http-client")]
-    {
-        match do_http_request(method, url, body, request_headers) {
-            Ok((status, body_text, headers)) => {
-                build_http_response_dict(caller, mem, status, &body_text, &headers)
-            }
-            Err(_) => VAL_NULL,
+    match do_http_request(method, url, body, request_headers) {
+        Ok((status, body_text, headers)) => {
+            Some(build_http_response_value(status, &body_text, &headers))
         }
+        Err(_) => None,
     }
-    #[cfg(not(feature = "http-client"))]
-    {
-        let _ = (caller, mem, method, url, body);
-        VAL_NULL
+}
+
+#[cfg(not(feature = "http-client"))]
+fn do_verb_owned(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    request_headers: &[(String, String)],
+) -> Option<serde_json::Value> {
+    let _ = (method, url, body, request_headers);
+    None
+}
+
+pub(super) fn begin_http_request_host_op(
+    caller: &mut Caller<'_, ()>,
+    task_id: i32,
+    op_kind: i32,
+    args: &[i64],
+) -> bool {
+    let Some((method, has_body)) = http_method_for_host_op(op_kind) else {
+        return false;
+    };
+    let min_args = if has_body { 2 } else { 1 };
+    let max_args = min_args + 1;
+    if args.len() < min_args || args.len() > max_args {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    }
+    let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    };
+    let url = {
+        let data = mem.data(&*caller);
+        read_string_value(data, args[0]).unwrap_or("").to_string()
+    };
+    let body = if has_body {
+        let data = mem.data(&*caller);
+        Some(read_string_value(data, args[1]).unwrap_or("").to_string())
+    } else {
+        None
+    };
+    let headers = args
+        .get(min_args)
+        .map(|headers_val| read_headers_arg(&mem, caller, *headers_val))
+        .unwrap_or_default();
+    submit_host_op(task_id, move || {
+        match do_verb_owned(method, &url, body.as_deref(), &headers) {
+            Some(value) => HostOpResult::Json(value),
+            None => HostOpResult::Null,
+        }
+    });
+    true
+}
+
+fn http_method_for_host_op(op_kind: i32) -> Option<(&'static str, bool)> {
+    match op_kind {
+        fai_codegen_wasm::HOST_OP_HTTP_GET => Some(("GET", false)),
+        fai_codegen_wasm::HOST_OP_HTTP_POST => Some(("POST", true)),
+        fai_codegen_wasm::HOST_OP_HTTP_PUT => Some(("PUT", true)),
+        fai_codegen_wasm::HOST_OP_HTTP_PATCH => Some(("PATCH", true)),
+        fai_codegen_wasm::HOST_OP_HTTP_DELETE => Some(("DELETE", false)),
+        _ => None,
     }
 }
 
@@ -301,28 +338,6 @@ fn read_headers_arg(
     headers
 }
 
-fn read_string_value(data: &[u8], val: i64) -> Option<&str> {
-    let v = val as u64;
-    if (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
-        return None;
-    }
-    let addr = (v & ADDR_MASK) as usize;
-    if addr + 8 > data.len() {
-        return None;
-    }
-    let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().ok()?);
-    if tag != OBJ_TAG_STRING {
-        return None;
-    }
-    let len = i32::from_le_bytes(data[addr + 4..addr + 8].try_into().ok()?) as usize;
-    let start = addr + 8;
-    let end = start.checked_add(len)?;
-    if end > data.len() {
-        return None;
-    }
-    std::str::from_utf8(&data[start..end]).ok()
-}
-
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.http_post(url_ptr, url_len, body_ptr, body_len, result_buf_ptr) -> i32
     linker
@@ -360,7 +375,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // buffer; cap the copy so an oversized response fails
                     // cleanly instead of scribbling the guest heap (or
                     // panicking past memory end).
-                    let mut write_capped = |caller: &mut Caller<'_, ()>, text: &str| -> i32 {
+                    let write_capped = |caller: &mut Caller<'_, ()>, text: &str| -> i32 {
                         let bytes = text.as_bytes();
                         if bytes.len() > 65536 {
                             return -1;

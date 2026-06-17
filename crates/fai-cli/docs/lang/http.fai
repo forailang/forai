@@ -1,5 +1,6 @@
 # Make an HTTP GET request and read the response status and body.
 # Use `use std.http.request` for all HTTP methods.
+# In scheduler-backed code, requests yield while host I/O is in flight.
 # Response fields: status (Int), body (String), headers (Dictionary).
 def doc_get_request
     @return Void

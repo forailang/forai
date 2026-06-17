@@ -12,6 +12,36 @@ use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
 use super::super::nan_box::VAL_NULL;
+use super::host_ops::{read_string_arg, submit_host_op, HostOpResult};
+
+pub(super) fn begin_env_host_op(
+    caller: &mut Caller<'_, ()>,
+    task_id: i32,
+    op_kind: i32,
+    args: &[i64],
+) -> bool {
+    if op_kind != fai_codegen_wasm::HOST_OP_ENV_LOAD {
+        return false;
+    }
+    let Some(path) = read_string_arg(caller, args, 0) else {
+        submit_host_op(task_id, || HostOpResult::EnvLoad {
+            ok: false,
+            pairs: Vec::new(),
+        });
+        return true;
+    };
+    submit_host_op(task_id, move || match std::fs::read_to_string(&path) {
+        Ok(content) => HostOpResult::EnvLoad {
+            ok: true,
+            pairs: parse_dotenv(&content),
+        },
+        Err(_) => HostOpResult::EnvLoad {
+            ok: false,
+            pairs: Vec::new(),
+        },
+    });
+    true
+}
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.env_get(key_ptr, key_len) -> i64 (NaN-boxed String | VAL_NULL)

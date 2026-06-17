@@ -942,8 +942,8 @@ fn run_tests_module(
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
-            array_int_index_sites: checker.array_int_index_sites.clone(),
-            record_field_read_sites: checker.record_field_read_sites.clone(),
+        array_int_index_sites: checker.array_int_index_sites.clone(),
+        record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
@@ -1245,8 +1245,8 @@ fn run_tests_file(path: &str, reporter: &Reporter, opts: &wasm_runner::TestRunOp
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
-            array_int_index_sites: checker.array_int_index_sites.clone(),
-            record_field_read_sites: checker.record_field_read_sites.clone(),
+        array_int_index_sites: checker.array_int_index_sites.clone(),
+        record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     let wasm_bytes = match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
@@ -3643,6 +3643,8 @@ const env = {{
   random() {{ return Math.random(); }},
   sleep_ms() {{ throw new Error('FAI legacy sleep_ms is disabled; sleep() must lower through the async scheduler'); }},
   host_set_timer(taskId, ms) {{  setTimeout(() => {{ if (instance?.exports.__fai_resume_task) instance.exports.__fai_resume_task(taskId); pumpAsync(); }}, Math.max(0, ms | 0)); }},
+  host_op_begin(taskId) {{ setTimeout(() => {{ if (instance?.exports.__fai_resume_task) instance.exports.__fai_resume_task(taskId); pumpAsync(); }}, 0); }},
+  host_op_result() {{ return 0x7FFC000100000000n; }},
   call_ffi() {{ return 0x7FFC000100000000n; }},
   run_all() {{ throw new Error('FAI legacy run_all is disabled; all() must lower through the async scheduler'); }},
   spawn(closureVal) {{var cv=closureVal;setTimeout(function(){{var n=BigInt(cv);var a=Number(n&0x0000FFFFFFFFFFFFn);var m=instance.exports.memory.buffer;var dv=new DataView(m);if(a+16>m.byteLength)return;var tag=dv.getInt32(a,true);if(tag!==4)return;var tidx=dv.getInt32(a+4,true);var envAddr=a+16;if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(tbl){{try{{tbl.get(tidx)()}}catch(e){{console.error('FAI spawn failed',e)}}}}if(typeof faiServiceScheduler==='function')faiServiceScheduler()}},0);return 0x7FFC000200000000n}},
@@ -3820,6 +3822,11 @@ function rootResultText(result){{const v=wasmToJs(result);if(Array.isArray(v))re
 function publishRootResult(result){{window.__FAI_ROOT_RESULT_TEXT=rootResultText(result);window.__FAI_ROOT_FINISHED_AT=performance.now();window.__FAI_ROOT_DONE=true;const s=readNanBoxedStr(result);if(s&&s.startsWith('{{'))state=s;}}
 function pumpAsync(){{if(!instance||!instance.exports.__fai_poll||asyncRootDone)return 0;const status=invokeExport('__fai_poll');if(status===2){{asyncRootDone=true;if(instance.exports.__fai_task_result)publishRootResult(invokeExport('__fai_task_result',1));}}else if(status===3){{asyncRootDone=true;window.__FAI_ROOT_FINISHED_AT=performance.now();window.__FAI_ROOT_DONE=true;console.error('FAI async task failed',instance.exports.__fai_task_result?invokeExport('__fai_task_result',1):null)}}return status;}}
 function startFai(){{window.__FAI_ROOT_DONE=false;window.__FAI_ROOT_RESULT_TEXT='';window.__FAI_ROOT_STARTED_AT=performance.now();window.__FAI_ROOT_FINISHED_AT=undefined;if(instance.exports._start_async){{asyncRootDone=false;invokeExport('_start_async');pumpAsync();}}else{{publishRootResult(invokeExport('_start'));}}}}
+var __faiHostOpResults={{}};
+function readHostOpArgs(count,ptr){{var out=[];for(var i=0;i<count;i++)out.push(new BigInt64Array(instance.exports.memory.buffer,ptr+i*8,1)[0]);return out}}
+function fetchHeaders(headers){{var out={{}};headers.forEach(function(v,k){{out[k]=v}});return out}}
+function hostOpBegin(taskId,opKind,count,argsPtr,scheduler){{var args=readHostOpArgs(count,argsPtr),method={{1:'GET',2:'POST',3:'PUT',4:'PATCH',5:'DELETE'}}[opKind];function done(val){{__faiHostOpResults[taskId]=val;if(instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);scheduler()}}if(opKind===6||opKind===7){{done(NULL_VAL);return}}if(opKind===8||opKind===10){{done(jsToWasm(false));return}}if(opKind===9){{done(jsToWasm([]));return}}if(opKind===12){{done(jsToWasm(-1));return}}if(opKind>=11&&opKind<=15){{done(NULL_VAL);return}}if(!method){{done(NULL_VAL);return}}var hasBody=opKind===2||opKind===3||opKind===4,url=String(wasmToJs(args[0])||''),body=hasBody?String(wasmToJs(args[1])||''):undefined,headersArg=args[hasBody?2:1],headers=headersArg===undefined?{{}}:(wasmToJs(headersArg)||{{}}),opts={{method:method,headers:headers}};if(hasBody)opts.body=body;fetch(url,opts).then(function(r){{return r.text().then(function(t){{done(jsToWasm({{status:r.status,body:t||'',headers:fetchHeaders(r.headers)}}))}})}}).catch(function(e){{console.error('FAI host http op failed',e);done(NULL_VAL)}})}}
+function hostOpResult(taskId){{var v=__faiHostOpResults[taskId];delete __faiHostOpResults[taskId];return v===undefined?NULL_VAL:v}}
 function callWasm(name,arg){{const fn=instance.exports[name];if(!fn){{console.warn('FAI callWasm missing export', name);return;}}console.log('FAI callWasm', {{name,arg:arg||''}});const ptr=writeStrToWasm(arg||'');const result=invokeExport(name,ptr);return readNanBoxedStr(result)}}
 function rerender(stateArg){{debugLog('FAI rerender', {{stateArg:stateArg||''}});if(instance.exports.render){{callWasm('render',stateArg||'')}}else if(instance&&instance.exports&&(instance.exports._start_async||instance.exports._start)){{startFai();}}else{{console.warn('FAI rerender missing render and _start')}}}}
 function wireEvents(){{debugLog('FAI wireEvents');document.querySelectorAll('[data-fai-click]').forEach(el=>{{const h=el.getAttribute('data-fai-click');el.onclick=()=>{{console.log('FAI click', h);callWasm(h);rerender('')}}}});document.querySelectorAll('[data-fai-input]').forEach(el=>{{const h=el.getAttribute('data-fai-input');el.oninput=()=>{{const d=JSON.stringify({{_state:JSON.parse(state||'{{}}'),_value:el.value}});console.log('FAI input', {{handler:h,value:el.value}});state=callWasm(h,d);rerender(state)}}}})}}
@@ -3831,7 +3838,7 @@ function morphNode(o,n,p){{if(o.nodeType!==n.nodeType){{p.replaceChild(n,o);retu
 function patchAttrs(o,n){{var isF=o===document.activeElement&&o.tagName==='INPUT';var i,a,rm=[];for(i=0;i<n.attributes.length;i++){{a=n.attributes[i];if(a.name==='value'&&o.tagName==='INPUT'){{if(o.value!==a.value)o.value=a.value;continue;}}if(o.getAttribute(a.name)!==a.value)o.setAttribute(a.name,a.value)}}for(i=0;i<o.attributes.length;i++){{if(!n.hasAttribute(o.attributes[i].name))rm.push(o.attributes[i].name)}}for(i=0;i<rm.length;i++)o.removeAttribute(rm[i])}}
 const env={{
   print(p,l){{const text=readStr(p,l);debugLog('FAI print', text);output.style.display='block';output.textContent+=text+'\n'}},
-  read_file(){{return -1}},write_file(){{return -1}},now_ms(){{return Date.now()}},random(){{return Math.random()}},sleep_ms(){{throw new Error('FAI legacy sleep_ms is disabled; sleep() must lower through the async scheduler')}},host_set_timer(taskId,ms){{setTimeout(function(){{if(instance&&instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);pumpAsync()}},Math.max(0,ms|0))}},
+  read_file(){{return -1}},write_file(){{return -1}},now_ms(){{return Date.now()}},random(){{return Math.random()}},sleep_ms(){{throw new Error('FAI legacy sleep_ms is disabled; sleep() must lower through the async scheduler')}},host_set_timer(taskId,ms){{setTimeout(function(){{if(instance&&instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);pumpAsync()}},Math.max(0,ms|0))}},host_op_begin(taskId,opKind,count,argsPtr){{hostOpBegin(taskId,opKind,count,argsPtr,pumpAsync)}},host_op_result(taskId){{return hostOpResult(taskId)}},
   call_ffi(){{return 0x7FFC000100000000n}},run_all(){{throw new Error('FAI legacy run_all is disabled; all() must lower through the async scheduler')}},
   spawn(closureVal){{var cv=closureVal;setTimeout(function(){{var n=BigInt(cv);var a=Number(n&0x0000FFFFFFFFFFFFn);var m=instance.exports.memory.buffer;var dv=new DataView(m);if(a+16>m.byteLength)return;var tag=dv.getInt32(a,true);if(tag!==4)return;var tidx=dv.getInt32(a+4,true);var envAddr=a+16;if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(tbl){{try{{tbl.get(tidx)()}}catch(e){{console.error('FAI spawn failed',e)}}}}if(typeof faiServiceScheduler==='function')faiServiceScheduler()}},0);return 0x7FFC000200000000n}},
   http_post(a,b,c,d,e){{try{{const x=new XMLHttpRequest();x.open('POST',readStr(a,b),false);x.setRequestHeader('Content-Type','application/json');x.send(readStr(c,d));return writeStr(e,x.responseText)}}catch(e){{return -1}}}},
@@ -4091,6 +4098,11 @@ function pumpAsync(){{if(!instance||!instance.exports.__fai_poll)return 0;var st
 function startFai(){{window.__FAI_ROOT_DONE=false;window.__FAI_ROOT_RESULT_TEXT='';window.__FAI_ROOT_STARTED_AT=performance.now();window.__FAI_ROOT_FINISHED_AT=undefined;if(instance.exports._start_async){{asyncRootDone=false;invokeExport('_start_async');pumpAsync()}}else publishRootResult(invokeExport('_start'))}}
 function responseHeaders(xhr){{var headers={{}};String(xhr.getAllResponseHeaders()||'').trim().split(/[\r\n]+/).forEach(function(line){{if(!line)return;var i=line.indexOf(':');if(i>0)headers[line.slice(0,i).toLowerCase()]=line.slice(i+1).trim()}});return headers}}
 function httpRequest(method,url,body){{try{{var x=new XMLHttpRequest();x.open(method,url,false);if(body!==undefined)x.setRequestHeader('Content-Type','text/plain; charset=utf-8');x.send(body===undefined?null:body);return jsToWasm({{status:x.status,body:x.responseText||'',headers:responseHeaders(x)}})}}catch(e){{console.error('FAI http request failed',e);return NULL_VAL}}}}
+var __faiHostOpResults={{}};
+function readHostOpArgs(count,ptr){{var out=[];for(var i=0;i<count;i++)out.push(new BigInt64Array(instance.exports.memory.buffer,ptr+i*8,1)[0]);return out}}
+function fetchHeaders(headers){{var out={{}};headers.forEach(function(v,k){{out[k]=v}});return out}}
+function hostOpBegin(taskId,opKind,count,argsPtr,scheduler){{var args=readHostOpArgs(count,argsPtr),method={{1:'GET',2:'POST',3:'PUT',4:'PATCH',5:'DELETE'}}[opKind];function done(val){{__faiHostOpResults[taskId]=val;if(instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);scheduler()}}if(opKind===6||opKind===7){{done(NULL_VAL);return}}if(opKind===8||opKind===10){{done(jsToWasm(false));return}}if(opKind===9){{done(jsToWasm([]));return}}if(opKind===12){{done(jsToWasm(-1));return}}if(opKind>=11&&opKind<=15){{done(NULL_VAL);return}}if(!method){{done(NULL_VAL);return}}var hasBody=opKind===2||opKind===3||opKind===4,url=String(wasmToJs(args[0])||''),body=hasBody?String(wasmToJs(args[1])||''):undefined,headersArg=args[hasBody?2:1],headers=headersArg===undefined?{{}}:(wasmToJs(headersArg)||{{}}),opts={{method:method,headers:headers}};if(hasBody)opts.body=body;fetch(url,opts).then(function(r){{return r.text().then(function(t){{done(jsToWasm({{status:r.status,body:t||'',headers:fetchHeaders(r.headers)}}))}})}}).catch(function(e){{console.error('FAI host http op failed',e);done(NULL_VAL)}})}}
+function hostOpResult(taskId){{var v=__faiHostOpResults[taskId];delete __faiHostOpResults[taskId];return v===undefined?NULL_VAL:v}}
 var faiEventRegistry={{byName:Object.create(null),nextId:0,queue:[],draining:false}};
 var __faiRpcResults={{}};
 // Heap allocation ledger (plan 116 phase 5, `--check-leaks`). Armed by the
@@ -4146,7 +4158,7 @@ function patchAttrs(o,n){{var isF=o===document.activeElement&&o.tagName==='INPUT
 function wireEvents(){{document.querySelectorAll('[data-fai-click]').forEach(function(el){{var h=el.getAttribute('data-fai-click');el.onclick=function(){{invokeExport(h);startFai()}}}})}}
 var env={{
   print:function(p,l){{var text=readStr(p,l);debugLog('FAI print',text);output.style.display='block';output.textContent+=text+'\n'}},
-  read_file:function(){{return -1}},write_file:function(){{return -1}},now_ms:function(){{return Date.now()}},random:function(){{return Math.random()}},sleep_ms:function(){{throw new Error('FAI legacy sleep_ms is disabled; sleep() must lower through the async scheduler')}},host_set_timer:function(taskId,ms){{setTimeout(function(){{if(instance&&instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);faiServiceScheduler()}},Math.max(0,ms|0))}},
+  read_file:function(){{return -1}},write_file:function(){{return -1}},now_ms:function(){{return Date.now()}},random:function(){{return Math.random()}},sleep_ms:function(){{throw new Error('FAI legacy sleep_ms is disabled; sleep() must lower through the async scheduler')}},host_set_timer:function(taskId,ms){{setTimeout(function(){{if(instance&&instance.exports.__fai_resume_task)instance.exports.__fai_resume_task(taskId);faiServiceScheduler()}},Math.max(0,ms|0))}},host_op_begin:function(taskId,opKind,count,argsPtr){{hostOpBegin(taskId,opKind,count,argsPtr,faiServiceScheduler)}},host_op_result:function(taskId){{return hostOpResult(taskId)}},
   call_ffi:function(){{return 0x7FFC000100000000n}},run_all:function(){{throw new Error('FAI legacy run_all is disabled; all() must lower through the async scheduler')}},
   spawn:function(closureVal){{var cv=closureVal;setTimeout(function(){{var n=BigInt(cv);var a=Number(n&0x0000FFFFFFFFFFFFn);var m=instance.exports.memory.buffer;var dv=new DataView(m);if(a+16>m.byteLength)return;var tag=dv.getInt32(a,true);if(tag!==4)return;var tidx=dv.getInt32(a+4,true);var envAddr=a+16;if(instance.exports.__env_ptr)instance.exports.__env_ptr.value=envAddr;var tbl=instance.exports.__indirect_function_table;if(tbl){{try{{tbl.get(tidx)()}}catch(e){{console.error('FAI spawn failed',e)}}}}if(typeof faiServiceScheduler==='function')faiServiceScheduler()}},0);return 0x7FFC000200000000n}},
   http_post:function(a,b,c,d,e){{try{{var x=new XMLHttpRequest();x.open('POST',readStr(a,b),false);x.setRequestHeader('Content-Type','application/json');x.send(readStr(c,d));return writeStr(e,x.responseText)}}catch(e){{return -1}}}},
@@ -5660,8 +5672,8 @@ fn compile_fai_to_wasm(
         named_param_reorder: checker.named_param_reorder.clone(),
         expression_types: checker.expression_types.clone(),
         generic_type_args: checker.generic_type_args.clone(),
-            array_int_index_sites: checker.array_int_index_sites.clone(),
-            record_field_read_sites: checker.record_field_read_sites.clone(),
+        array_int_index_sites: checker.array_int_index_sites.clone(),
+        record_field_read_sites: checker.record_field_read_sites.clone(),
     };
     match fai_codegen_wasm::codegen_direct_full_reasoned_with_entry_file(
         &prepared.serde_ast,
@@ -6744,8 +6756,10 @@ mod tests {
         // fresh object graphs (json.parse/stringify, file.read, env.get)
         // were classified borrowed — over-retained on bind, one leaked
         // graph per call — and file.read leaked its 64 KiB scratch buffer
-        // plus an owned literal path temp per call. All must come back to
-        // an empty live set.
+        // plus an owned literal path temp per call. `file.read` now lowers
+        // through the async host-op path, so the known scheduler root may
+        // remain live until runtime teardown lands; per-call host results
+        // and argument temporaries must not.
         std::fs::write("/tmp/fai_check_leaks_std.txt", "file-content-here").unwrap();
         let stderr = run_with_check_leaks(
             "check_leaks_std_host",
@@ -6771,8 +6785,18 @@ mod tests {
                 "end\n",
             ),
         );
-        assert!(stderr.contains("live heap: 0 objects, 0 bytes"), "{stderr}",);
         assert!(stderr.contains("consistent"), "{stderr}");
+        let empty = stderr.contains("live heap: 0 objects, 0 bytes");
+        let scheduler_root_only =
+            stderr.contains("live heap: 1 objects") && stderr.contains("sched_start_async");
+        assert!(
+            empty || scheduler_root_only,
+            "expected no std-host-call leaks beyond the known async scheduler root:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("main#resume"),
+            "async host-op results or argument temporaries leaked per iteration:\n{stderr}",
+        );
     }
 
     #[test]
@@ -7754,6 +7778,32 @@ mod tests {
         );
         assert!(js.contains("window.__fai_assert_ownership"));
         assert!(js.contains("window.__fai_dump_ownership"));
+    }
+
+    #[test]
+    fn test_generate_runtime_js_exposes_async_host_op_http_bridge() {
+        let js = generate_runtime_js("prog.wasm");
+
+        assert!(js.contains("var __faiHostOpResults={}"));
+        assert!(js.contains("function readHostOpArgs"));
+        assert!(js.contains("function hostOpBegin"));
+        assert!(js.contains("function hostOpResult"));
+        assert!(js.contains("method={1:'GET',2:'POST',3:'PUT',4:'PATCH',5:'DELETE'}[opKind]"));
+        assert!(js.contains("if(opKind===8||opKind===10){done(jsToWasm(false));return}"));
+        assert!(js.contains("if(opKind===9){done(jsToWasm([]));return}"));
+        assert!(js.contains("if(opKind===12){done(jsToWasm(-1));return}"));
+        assert!(js.contains("if(opKind>=11&&opKind<=15){done(NULL_VAL);return}"));
+        assert!(js.contains("fetch(url,opts)"));
+        assert!(
+            js.contains("host_op_begin:function(taskId,opKind,count,argsPtr){hostOpBegin(taskId,opKind,count,argsPtr,faiServiceScheduler)}"),
+            "env.host_op_begin should delegate to the async host-op bridge:\n{}",
+            js
+        );
+        assert!(
+            js.contains("host_op_result:function(taskId){return hostOpResult(taskId)}"),
+            "env.host_op_result should read the host-op completion map:\n{}",
+            js
+        );
     }
 
     #[test]

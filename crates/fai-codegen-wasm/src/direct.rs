@@ -48,12 +48,12 @@ use crate::runtime::{
     METHOD_SPLIT, METHOD_STARTS_WITH, METHOD_SUBSTRING, METHOD_TO_LOWER, METHOD_TO_UPPER,
     METHOD_TRIM, METHOD_TRIM_END, METHOD_TRIM_START, OBJ_TAG_ARRAY, OBJ_TAG_CELL, OBJ_TAG_CLOSURE,
     OBJ_TAG_DICT, OBJ_TAG_NATIVE_FN, OBJ_TAG_STRING, OBJ_TAG_TUPLE, QNAN, RT_ADD, RT_ALLOC,
-    RT_ALLOC_STRING, RT_AS_NUMBER, RT_CALL_NATIVE, RT_COUNT, RT_DIV, RT_EQ, RT_GE,
-    RT_GET_FIELD, RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE,
-    RT_LIVE_OBJECTS, RT_LT, RT_MAKE_BOOL, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL,
-    RT_NE, RT_NEG, RT_OBJ_ADDR, RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_RELEASE,
-    RT_RETAIN, RT_SET_FIELD, RT_STR_EQ, RT_SUB, RT_VALUE_TO_STR, TAG_BOOL, TAG_INT, VAL_FALSE,
-    VAL_NULL, VAL_VOID,
+    RT_ALLOC_STRING, RT_AS_NUMBER, RT_CALL_NATIVE, RT_COUNT, RT_DIV, RT_EQ, RT_GE, RT_GET_FIELD,
+    RT_GET_INDEX, RT_GT, RT_IDIV, RT_IS_FLOAT, RT_IS_INT, RT_IS_OBJ, RT_LE, RT_LIVE_OBJECTS, RT_LT,
+    RT_MAKE_BOOL, RT_MAKE_FLOAT, RT_MAKE_INT, RT_MAKE_OBJ, RT_MOD, RT_MUL, RT_NE, RT_NEG,
+    RT_OBJ_ADDR, RT_PARSE_FLOAT, RT_PARSE_INT, RT_POW, RT_PRINT_VAL_NEW, RT_RELEASE, RT_RETAIN,
+    RT_SET_FIELD, RT_STR_EQ, RT_SUB, RT_VALUE_TO_STR, TAG_BOOL, TAG_INT, VAL_FALSE, VAL_NULL,
+    VAL_VOID,
 };
 
 /// Global index for `__env_ptr`. Matches the bytecode translator's
@@ -788,21 +788,160 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
 }
 
 fn resolve_http_request_call(module: &str, method: &str) -> Option<ModuleCall> {
-    if module != "std.http.request" {
-        return None;
-    }
-    let (import_idx, has_body) = match method {
-        "get" => (IMPORT_HTTP_REQUEST_GET, false),
-        "post" => (IMPORT_HTTP_REQUEST_POST, true),
-        "put" => (IMPORT_HTTP_REQUEST_PUT, true),
-        "patch" => (IMPORT_HTTP_REQUEST_PATCH, true),
-        "delete" => (IMPORT_HTTP_REQUEST_DELETE, false),
-        _ => return None,
+    let (_, has_body) = http_request_host_op_kind(module, method)?;
+    let import_idx = match method {
+        "get" => IMPORT_HTTP_REQUEST_GET,
+        "post" => IMPORT_HTTP_REQUEST_POST,
+        "put" => IMPORT_HTTP_REQUEST_PUT,
+        "patch" => IMPORT_HTTP_REQUEST_PATCH,
+        "delete" => IMPORT_HTTP_REQUEST_DELETE,
+        _ => unreachable!("http_request_host_op_kind accepted unknown method"),
     };
     Some(ModuleCall::HttpRequest {
         import_idx,
         has_body,
     })
+}
+
+pub(crate) fn http_request_host_op_kind(module: &str, method: &str) -> Option<(i32, bool)> {
+    if module != "std.http.request" {
+        return None;
+    }
+    match method {
+        "get" => Some((crate::runtime::HOST_OP_HTTP_GET, false)),
+        "post" => Some((crate::runtime::HOST_OP_HTTP_POST, true)),
+        "put" => Some((crate::runtime::HOST_OP_HTTP_PUT, true)),
+        "patch" => Some((crate::runtime::HOST_OP_HTTP_PATCH, true)),
+        "delete" => Some((crate::runtime::HOST_OP_HTTP_DELETE, false)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AwaitHostOpKind {
+    HttpRequest,
+    BlockingIo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StdlibScheduling {
+    /// The call can block on host I/O and must lower through
+    /// `host_op_begin` / `host_op_result` so the scheduler can run other tasks.
+    AwaitHostOp {
+        await_kind: AwaitHostOpKind,
+        op_kind: i32,
+        arity: HostOpArity,
+    },
+    /// Host-backed but expected to complete promptly on the scheduler thread.
+    DirectHostImport,
+    /// Potentially CPU-bound work that intentionally remains direct until a
+    /// separate fairness/preemption design exists.
+    CpuBoundDirect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostOpArity {
+    Exact(usize),
+    Range { min: usize, max: usize },
+}
+
+impl HostOpArity {
+    fn accepts(self, len: usize) -> bool {
+        match self {
+            HostOpArity::Exact(expected) => len == expected,
+            HostOpArity::Range { min, max } => len >= min && len <= max,
+        }
+    }
+}
+
+fn stdlib_host_op_kind(module: &str, method: &str) -> Option<(i32, HostOpArity)> {
+    match stdlib_scheduling(module, method)? {
+        StdlibScheduling::AwaitHostOp { op_kind, arity, .. } => Some((op_kind, arity)),
+        _ => None,
+    }
+}
+
+pub(crate) fn stdlib_scheduling(module: &str, method: &str) -> Option<StdlibScheduling> {
+    use StdlibScheduling::*;
+
+    if let Some((op_kind, has_body)) = http_request_host_op_kind(module, method) {
+        let min = if has_body { 2 } else { 1 };
+        return Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::HttpRequest,
+            op_kind,
+            arity: HostOpArity::Range { min, max: min + 1 },
+        });
+    }
+
+    match (module, method) {
+        ("std.process", "run") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_PROCESS_RUN,
+            arity: HostOpArity::Exact(5),
+        }),
+        ("std.file", "read") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_FILE_READ,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.file", "write") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_FILE_WRITE,
+            arity: HostOpArity::Exact(2),
+        }),
+        ("std.file", "list") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_FILE_LIST,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.env", "load") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_ENV_LOAD,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.net.tcp", "accept") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_TCP_ACCEPT,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.net.tcp", "connect") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_TCP_CONNECT,
+            arity: HostOpArity::Exact(2),
+        }),
+        ("std.net.tcp", "read") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_TCP_READ,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.net.tcp", "readLine") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_TCP_READ_LINE,
+            arity: HostOpArity::Exact(1),
+        }),
+        ("std.net.udp", "receive") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_UDP_RECEIVE,
+            arity: HostOpArity::Exact(1),
+        }),
+
+        ("std.array", "map" | "filter" | "find" | "isAny" | "isAll")
+        | ("std.json", "parse" | "stringify")
+        | (
+            "std.crypto",
+            "hmacSha256Hex" | "hmacSha1Base64" | "sha256Hex" | "hexEncode" | "base64Encode"
+            | "base64Decode",
+        ) => Some(CpuBoundDirect),
+
+        ("std.file", "exists")
+        | ("std.env", "get")
+        | ("std.net", "available")
+        | ("std.process", "available" | "start" | "write" | "read" | "stop")
+        | ("std.net.tcp", "listen" | "write" | "close" | "address")
+        | ("std.net.udp", "bind" | "send" | "broadcast")
+        | ("std.crypto", "available" | "constantTimeEquals") => Some(DirectHostImport),
+        _ => None,
+    }
 }
 
 /// Best-effort source-location lookup for a `BuildError`.
@@ -1061,8 +1200,7 @@ pub struct CheckerInfo {
     /// the MemberExpression's `(module, line, column)` to the receiver's
     /// type name. Lets the builder read the field's fixed dict slot
     /// directly instead of the string-keyed `rt_get_field` scan.
-    pub record_field_read_sites:
-        std::collections::HashMap<(String, u32, u32, u32), String>,
+    pub record_field_read_sites: std::collections::HashMap<(String, u32, u32, u32), String>,
 }
 
 impl CheckerInfo {
@@ -3762,6 +3900,42 @@ fn remote_call_args(
     Some((call.args.iter().map(|a| &a.value).collect(), &call.location))
 }
 
+fn host_op_call_args<'a>(
+    expr: &'a Expression,
+    fns: &AsyncResolve<'_>,
+) -> Option<(
+    i32,
+    Vec<&'a Expression>,
+    &'a fai_compiler::ast::SourceLocation,
+)> {
+    let Expression::CallExpression(call) = expr else {
+        return None;
+    };
+    let (op_kind, arity) = match &*call.callee {
+        Expression::MemberExpression(me) if !fns.is_ufcs_call(call) => {
+            let Expression::IdentifierExpression(obj) = &*me.object else {
+                return None;
+            };
+            let canonical = fns.aliases.get(&obj.name)?;
+            stdlib_host_op_kind(canonical, &me.property)?
+        }
+        Expression::IdentifierExpression(id) => {
+            let imported = fns.named_imports.get(&id.name)?;
+            let (module, method) = imported.rsplit_once('.')?;
+            stdlib_host_op_kind(module, method)?
+        }
+        _ => return None,
+    };
+    if !arity.accepts(call.args.len()) {
+        return None;
+    }
+    Some((
+        op_kind,
+        call.args.iter().map(|a| &a.value).collect(),
+        &call.location,
+    ))
+}
+
 /// If `expr` is a direct call to a *user* function (one of `fns`), return
 /// its name and argument expressions. Builtins (`print`, `sleep`, `all`,
 /// `Error`, …) are not user functions and never match. In the "everything
@@ -4030,9 +4204,7 @@ fn stmt_has_return(stmt: &Statement) -> bool {
         Statement::WhileStatement(ws) => stmts_have_return(&ws.body),
         Statement::ForStatement(fs) => stmts_have_return(&fs.body),
         Statement::CaseStatement(cs) => {
-            cs.when_branches
-                .iter()
-                .any(|b| stmts_have_return(&b.body))
+            cs.when_branches.iter().any(|b| stmts_have_return(&b.body))
                 || cs
                     .default_branch
                     .as_ref()
@@ -4118,6 +4290,9 @@ fn expr_has_user_call(expr: &Expression, fns: &AsyncResolve<'_>) -> bool {
     if remote_call_args(expr).is_some() {
         return true;
     }
+    if host_op_call_args(expr, fns).is_some() {
+        return true;
+    }
     match expr {
         Expression::CallExpression(c) => {
             expr_has_user_call(&c.callee, fns)
@@ -4135,9 +4310,10 @@ fn expr_has_user_call(expr: &Expression, fns: &AsyncResolve<'_>) -> bool {
         Expression::ForceUnwrapExpression(f) => expr_has_user_call(&f.expression, fns),
         Expression::ArrayExpression(a) => a.items.iter().any(|it| expr_has_user_call(it, fns)),
         Expression::TupleExpression(t) => t.items.iter().any(|it| expr_has_user_call(it, fns)),
-        Expression::DictionaryExpression(d) => {
-            d.entries.iter().any(|entry| expr_has_user_call(&entry.value, fns))
-        }
+        Expression::DictionaryExpression(d) => d
+            .entries
+            .iter()
+            .any(|entry| expr_has_user_call(&entry.value, fns)),
         Expression::RangeExpression(r) => {
             expr_has_user_call(&r.start, fns) || expr_has_user_call(&r.end, fns)
         }
@@ -4253,6 +4429,13 @@ enum Incoming {
     AwaitedFfi {
         bind: Option<String>,
     },
+    /// Resume of a generic blocking host operation: bind
+    /// `host_op_result(g_current)` to `bind` (or discard if `None`).
+    #[allow(dead_code)]
+    AwaitedHostOp {
+        bind: Option<String>,
+        on_error: Option<(usize, String)>,
+    },
 }
 
 /// A basic block in the resumable function's CFG: what to assign at entry
@@ -4311,6 +4494,17 @@ enum Term<'a> {
         loc: &'a fai_compiler::ast::SourceLocation,
         next: usize,
     },
+    /// Generic blocking stdlib host operation. `host_op_begin(g_current,
+    /// op_kind, count, args_buf)` copies owned inputs on the host side,
+    /// offloads work to the boundary, and parks this task. The next block
+    /// reads the value with `host_op_result(g_current)`.
+    #[allow(dead_code)]
+    AwaitHostOp {
+        op_kind: i32,
+        args: Vec<&'a Expression>,
+        loc: &'a fai_compiler::ast::SourceLocation,
+        next: usize,
+    },
     /// `await callee(args)` then resume at `next` (which binds the result).
     Await {
         callee: String,
@@ -4343,6 +4537,9 @@ enum Term<'a> {
     /// Complete the task with `remote_result(g_current)` — a `remoteCall(...)`
     /// in tail/return position (the generated RPC client stubs return it).
     CompleteRemote { on_error: Option<(usize, String)> },
+    /// Complete the task with `host_op_result(g_current)` — a generic host op
+    /// in tail/return position.
+    CompleteHostOp { on_error: Option<(usize, String)> },
     /// `throw value` inside a `try`: bind the value to the catch handler's
     /// name and jump to the catch block.
     ThrowTo {
@@ -4847,6 +5044,26 @@ impl<'a> CfgBuilder<'a> {
                 };
                 return Ok(Flow::Continue(next));
             }
+            // `let x = request.get(...)` / `post(...)` — suspend on the
+            // blocking host HTTP operation and bind the response dict (or null)
+            // after the worker completes.
+            if let Some((op_kind, hargs, loc)) = host_op_call_args(value, self.fns) {
+                let on_error = self.handler();
+                let next = self.new_block();
+                self.blocks[cur].term = Term::AwaitHostOp {
+                    op_kind,
+                    args: hargs,
+                    loc,
+                    next,
+                };
+                let bind = if name == "_" {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                self.blocks[next].incoming = Incoming::AwaitedHostOp { bind, on_error };
+                return Ok(Flow::Continue(next));
+            }
             // `let x = externCall(...)` for an offloadable scalar extern —
             // offload the blocking C call to the boundary and bind on resume
             // (plan 101 U8). `let _ =` discards.
@@ -4917,6 +5134,21 @@ impl<'a> CfgBuilder<'a> {
             // in a collect loop). Mirrors the let/var binding case.
             if let AssignmentTarget::Variables { names } = &asg.target {
                 if names.len() == 1 {
+                    if let Some((op_kind, hargs, loc)) = host_op_call_args(&asg.value, self.fns) {
+                        let on_error = self.handler();
+                        let next = self.new_block();
+                        self.blocks[cur].term = Term::AwaitHostOp {
+                            op_kind,
+                            args: hargs,
+                            loc,
+                            next,
+                        };
+                        self.blocks[next].incoming = Incoming::AwaitedHostOp {
+                            bind: Some(names[0].clone()),
+                            on_error,
+                        };
+                        return Ok(Flow::Continue(next));
+                    }
                     if let Some((ext_idx, fargs, loc)) = offloadable_extern_call_args(&asg.value) {
                         let next = self.new_block();
                         self.blocks[cur].term = Term::AwaitFfi {
@@ -4959,6 +5191,30 @@ impl<'a> CfgBuilder<'a> {
                     TailMode::StoreResult(_) => return Err(()),
                     TailMode::None => {
                         self.blocks[next].incoming = Incoming::AwaitedRemote {
+                            bind: None,
+                            on_error,
+                        };
+                        return Ok(Flow::Continue(next));
+                    }
+                }
+            }
+            if let Some((op_kind, hargs, loc)) = host_op_call_args(&es.expression, self.fns) {
+                let on_error = self.handler();
+                let next = self.new_block();
+                self.blocks[cur].term = Term::AwaitHostOp {
+                    op_kind,
+                    args: hargs,
+                    loc,
+                    next,
+                };
+                match mode {
+                    TailMode::Complete => {
+                        self.blocks[next].term = Term::CompleteHostOp { on_error };
+                        return Ok(Flow::Diverged);
+                    }
+                    TailMode::StoreResult(_) => return Err(()),
+                    TailMode::None => {
+                        self.blocks[next].incoming = Incoming::AwaitedHostOp {
                             bind: None,
                             on_error,
                         };
@@ -5065,6 +5321,16 @@ impl<'a> CfgBuilder<'a> {
                             next,
                         };
                         self.blocks[next].term = Term::CompleteRemote { on_error };
+                    } else if let Some((op_kind, hargs, loc)) = host_op_call_args(v, self.fns) {
+                        let on_error = self.handler();
+                        let next = self.new_block();
+                        self.blocks[cur].term = Term::AwaitHostOp {
+                            op_kind,
+                            args: hargs,
+                            loc,
+                            next,
+                        };
+                        self.blocks[next].term = Term::CompleteHostOp { on_error };
                     } else if let Some((callee, args, loc)) = user_callee(v, self.fns) {
                         if !self.args_ok(&args) {
                             return Err(());
@@ -5371,6 +5637,67 @@ fn emit_store_current_rstate(
     b.emit(Instruction::I32Store(mem_off(
         crate::async_engine::O_RSTATE,
     )));
+}
+
+/// Mark the current task as waiting on an external host completion. The host
+/// will resume it explicitly, so O_WAKE is set to -1 to avoid timer promotion.
+fn emit_park_current_task(b: &mut Builder, layout: &crate::async_engine::SchedLayout) {
+    let rec = |b: &mut Builder| {
+        b.emit(Instruction::GlobalGet(layout.g_table_base));
+        b.emit(Instruction::GlobalGet(layout.g_current));
+        b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
+        b.emit(Instruction::I32Mul);
+        b.emit(Instruction::I32Add);
+    };
+    rec(b);
+    b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
+    b.emit(Instruction::I32Store(mem_off(
+        crate::async_engine::O_STATUS,
+    )));
+    rec(b);
+    b.emit(Instruction::F64Const(-1.0));
+    b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
+}
+
+/// Build a temporary argv buffer containing one NaN-boxed i64 per argument.
+/// Host begin imports must copy anything they need before returning; callers
+/// free this buffer immediately after the begin import.
+fn emit_boxed_arg_buffer(
+    b: &mut Builder,
+    args: &[&Expression],
+) -> Result<(u32, i32, Vec<u32>), BuildError> {
+    let arg_count = args.len() as i32;
+    let byte_len = (arg_count * 8).max(8);
+    let buf = b.alloc_i32_local();
+    let mut owned_arg_locals = Vec::new();
+    b.emit(Instruction::I32Const(byte_len));
+    b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_ALLOC));
+    b.emit(Instruction::LocalSet(buf));
+    for (i, a) in args.iter().enumerate() {
+        b.emit(Instruction::LocalGet(buf));
+        b.emit(Instruction::I32Const((i as i32) * 8));
+        b.emit(Instruction::I32Add);
+        let result = b.compile_expr_result_as(a, ValueShape::Boxed)?;
+        if result.ownership == ExprOwnership::Owned {
+            let owned = b.alloc_local();
+            b.emit(Instruction::LocalTee(owned));
+            owned_arg_locals.push(owned);
+        }
+        b.emit(Instruction::I64Store(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
+    }
+    Ok((buf, byte_len, owned_arg_locals))
+}
+
+fn emit_release_owned_arg_locals(b: &mut Builder, locals: &[u32]) {
+    for local in locals {
+        b.emit(Instruction::LocalGet(*local));
+        b.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+        b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
+    }
 }
 
 /// Emit `frame_ptr_local = current_task.frame`.
@@ -6055,17 +6382,19 @@ fn build_resume_fn(
         }
         if let Incoming::AwaitedFfi { bind } = &blk.incoming {
             // The offloaded extern call finished; read its result for this task.
+            b.emit(Instruction::GlobalGet(layout.g_current));
+            b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+            let ffi_result_l = b.alloc_local();
+            b.emit(Instruction::LocalSet(ffi_result_l));
             if let Some(name) = bind {
                 let l = *var_local
                     .get(name)
                     .ok_or(BuildError::UnsupportedExpression("async-unknown-ffi-bind"))?;
                 if cell_vars.contains(name) {
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                    b.emit(Instruction::LocalGet(ffi_result_l));
                     b.emit_cell_store(l, ExprResult::boxed(true));
                 } else {
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                    b.emit(Instruction::LocalGet(ffi_result_l));
                     b.assign_to_async_frame_slot(
                         l,
                         ExprResult::boxed(true),
@@ -6073,8 +6402,38 @@ fn build_resume_fn(
                     );
                 }
             } else {
-                b.emit(Instruction::GlobalGet(layout.g_current));
-                b.emit_import_call(crate::runtime::IMPORT_FFI_RESULT);
+                b.emit(Instruction::LocalGet(ffi_result_l));
+                b.emit(Instruction::Drop);
+            }
+        }
+        if let Incoming::AwaitedHostOp { bind, on_error } = &blk.incoming {
+            // The offloaded generic host operation finished; read its result for
+            // this task. Host ops share the global error channel used by remote
+            // calls so async try/catch can catch operation-specific failures.
+            b.emit(Instruction::GlobalGet(layout.g_current));
+            b.emit_import_call(crate::runtime::IMPORT_HOST_OP_RESULT);
+            let host_result_l = b.alloc_local();
+            b.emit(Instruction::LocalSet(host_result_l));
+            check_global_error(&mut b, on_error.as_ref())?;
+            if let Some(name) = bind {
+                let l = *var_local
+                    .get(name)
+                    .ok_or(BuildError::UnsupportedExpression(
+                        "async-unknown-host-op-bind",
+                    ))?;
+                if cell_vars.contains(name) {
+                    b.emit(Instruction::LocalGet(host_result_l));
+                    b.emit_cell_store(l, ExprResult::boxed(true));
+                } else {
+                    b.emit(Instruction::LocalGet(host_result_l));
+                    b.assign_to_async_frame_slot(
+                        l,
+                        ExprResult::boxed(true),
+                        release_set.contains(name),
+                    );
+                }
+            } else {
+                b.emit(Instruction::LocalGet(host_result_l));
                 b.emit(Instruction::Drop);
             }
         }
@@ -6159,22 +6518,7 @@ fn build_resume_fn(
             Term::AwaitRemote { args, loc: _, next } => {
                 // Park the current task on the in-flight request (no timer): the
                 // host wakes it via `__fai_resume_task` when the response lands.
-                // Status = WAITING, O_WAKE = -1 (so `poll` won't timer-promote).
-                let rec = |b: &mut Builder| {
-                    b.emit(Instruction::GlobalGet(layout.g_table_base));
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
-                    b.emit(Instruction::I32Mul);
-                    b.emit(Instruction::I32Add);
-                };
-                rec(&mut b);
-                b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
-                b.emit(Instruction::I32Store(mem_off(
-                    crate::async_engine::O_STATUS,
-                )));
-                rec(&mut b);
-                b.emit(Instruction::F64Const(-1.0));
-                b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
+                emit_park_current_task(&mut b, layout);
                 // remote_begin(g_current, url*,len, fn*,len, args*,len, hash*,len)
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 let mut stashes: Vec<u32> = Vec::new();
@@ -6200,49 +6544,48 @@ fn build_resume_fn(
                 // Park the task (status WAITING, O_WAKE = -1) and offload the
                 // blocking extern call to the boundary; the driver loop resumes
                 // it via `__fai_resume_task` when the worker finishes.
-                let rec = |b: &mut Builder| {
-                    b.emit(Instruction::GlobalGet(layout.g_table_base));
-                    b.emit(Instruction::GlobalGet(layout.g_current));
-                    b.emit(Instruction::I32Const(crate::async_engine::REC_SIZE));
-                    b.emit(Instruction::I32Mul);
-                    b.emit(Instruction::I32Add);
-                };
-                rec(&mut b);
-                b.emit(Instruction::I32Const(crate::async_engine::ST_WAITING));
-                b.emit(Instruction::I32Store(mem_off(
-                    crate::async_engine::O_STATUS,
-                )));
-                rec(&mut b);
-                b.emit(Instruction::F64Const(-1.0));
-                b.emit(Instruction::F64Store(mem_off(crate::async_engine::O_WAKE)));
+                emit_park_current_task(&mut b, layout);
                 // Build the args buffer (one NaN-boxed i64 per arg), as a sync
                 // extern call would; `ffi_begin` copies the args out before the
                 // task parks, so the buffer can be freed right after.
                 let arg_count = args.len() as i32;
-                let buf = b.alloc_i32_local();
-                b.emit(Instruction::I32Const((arg_count * 8).max(8)));
-                b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_ALLOC));
-                b.emit(Instruction::LocalSet(buf));
-                for (i, a) in args.iter().enumerate() {
-                    b.emit(Instruction::LocalGet(buf));
-                    b.emit(Instruction::I32Const((i as i32) * 8));
-                    b.emit(Instruction::I32Add);
-                    b.compile_expr_as(a, ValueShape::Boxed)?;
-                    b.emit(Instruction::I64Store(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    }));
-                }
+                let (buf, byte_len, owned_arg_locals) = emit_boxed_arg_buffer(&mut b, args)?;
                 // ffi_begin(g_current, ext_idx, arg_count, args_buf)
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::I32Const(*ext_idx as i32));
                 b.emit(Instruction::I32Const(arg_count));
                 b.emit(Instruction::LocalGet(buf));
                 b.emit_import_call(crate::runtime::IMPORT_FFI_BEGIN);
+                emit_release_owned_arg_locals(&mut b, &owned_arg_locals);
                 // rt_free(ptr, size) — same size passed to rt_alloc above.
                 b.emit(Instruction::LocalGet(buf));
-                b.emit(Instruction::I32Const((arg_count * 8).max(8)));
+                b.emit(Instruction::I32Const(byte_len));
+                b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_FREE));
+                store_vars(&mut b);
+                emit_store_current_rstate(&mut b, layout, *next as i32);
+                b.emit(Instruction::Return);
+            }
+            Term::AwaitHostOp {
+                op_kind,
+                args,
+                loc: _,
+                next,
+            } => {
+                // Generic async host operation: park this task, submit owned
+                // copied arguments to the host, then resume at `next` when the
+                // boundary completion is ready.
+                emit_park_current_task(&mut b, layout);
+                let arg_count = args.len() as i32;
+                let (buf, byte_len, owned_arg_locals) = emit_boxed_arg_buffer(&mut b, args)?;
+                // host_op_begin(g_current, op_kind, arg_count, args_buf)
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit(Instruction::I32Const(*op_kind));
+                b.emit(Instruction::I32Const(arg_count));
+                b.emit(Instruction::LocalGet(buf));
+                b.emit_import_call(crate::runtime::IMPORT_HOST_OP_BEGIN);
+                emit_release_owned_arg_locals(&mut b, &owned_arg_locals);
+                b.emit(Instruction::LocalGet(buf));
+                b.emit(Instruction::I32Const(byte_len));
                 b.emit(Instruction::Call(b.rt().base + crate::runtime::RT_FREE));
                 store_vars(&mut b);
                 emit_store_current_rstate(&mut b, layout, *next as i32);
@@ -6267,6 +6610,26 @@ fn build_resume_fn(
                 );
                 b.emit(Instruction::GlobalGet(layout.g_current));
                 b.emit(Instruction::LocalGet(remote_result_l));
+                b.emit(Instruction::Call(layout.complete));
+                b.emit(Instruction::Return);
+            }
+            Term::CompleteHostOp { on_error } => {
+                // complete(g_current, host_op_result(g_current)) — the generic
+                // host-op result is this task's return value.
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit_import_call(crate::runtime::IMPORT_HOST_OP_RESULT);
+                let host_result_l = b.alloc_local();
+                b.emit(Instruction::LocalSet(host_result_l));
+                check_global_error(&mut b, on_error.as_ref())?;
+                emit_async_drops(
+                    &mut b,
+                    &release_names,
+                    &var_local,
+                    &cell_offsets,
+                    frame_ptr_l,
+                );
+                b.emit(Instruction::GlobalGet(layout.g_current));
+                b.emit(Instruction::LocalGet(host_result_l));
                 b.emit(Instruction::Call(layout.complete));
                 b.emit(Instruction::Return);
             }
@@ -6925,7 +7288,11 @@ fn anf_atom(
 ) -> Expression {
     let e = anf_nested(expr, r, counter, out);
     if let Expression::CallExpression(c) = &e {
-        if user_callee(&e, r).is_some() {
+        if remote_call_args(&e).is_some()
+            || host_op_call_args(&e, r).is_some()
+            || offloadable_extern_call_args(&e).is_some()
+            || user_callee(&e, r).is_some()
+        {
             let loc = c.location.clone();
             let name = format!("__anf_await_{}", *counter);
             *counter += 1;
@@ -9706,9 +10073,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let first = &branches[0];
         // value == match_expr → i32 truth flag.
-        if let (true, Expression::StringExpression(lit)) =
-            (value_is_string, &first.match_expr)
-        {
+        if let (true, Expression::StringExpression(lit)) = (value_is_string, &first.match_expr) {
             // String scrutinee vs string-literal arm: compare bytes
             // against the interned data-section literal via rt_str_eq —
             // no String alloc for the literal, no generic rt_eq. The
@@ -15522,8 +15887,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         // Identify exactly one literal operand and a non-literal,
         // statically-String dynamic operand.
-        let is_str_lit =
-            |e: &Expression| matches!(e, Expression::StringExpression(_));
+        let is_str_lit = |e: &Expression| matches!(e, Expression::StringExpression(_));
         let (dynamic, literal) = match (&*be.left, &*be.right) {
             (l, r) if is_str_lit(r) && !is_str_lit(l) => (&be.left, r),
             (l, r) if is_str_lit(l) && !is_str_lit(r) => (&be.right, l),
@@ -21581,7 +21945,10 @@ mod tests {
         // ...and the loop must still run to completion (i reaches 10).
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 10;
-        assert_eq!(result, expected, "bool-condition fast path changed the result");
+        assert_eq!(
+            result, expected,
+            "bool-condition fast path changed the result"
+        );
     }
 
     #[test]
@@ -21601,16 +21968,20 @@ mod tests {
             "end\n",
         )));
         let v2s_target = rt_base_for_standalone() + runtime::RT_VALUE_TO_STR;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target),
+        );
         assert_eq!(
             calls, 0,
             "a literal dict key must not be stringified via rt_value_to_str",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 5; // "Alice"
-        assert_eq!(result, expected, "literal-key dict get gave the wrong value");
+        assert_eq!(
+            result, expected,
+            "literal-key dict get gave the wrong value"
+        );
     }
 
     #[test]
@@ -21627,16 +21998,20 @@ mod tests {
             "end\n",
         )));
         let v2s_target = rt_base_for_standalone() + runtime::RT_VALUE_TO_STR;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == v2s_target),
+        );
         assert_eq!(
             calls, 0,
             "interpolating a String must not call rt_value_to_str",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 5; // "<x>ab"
-        assert_eq!(result, expected, "string interpolation fast path gave wrong length");
+        assert_eq!(
+            result, expected,
+            "string interpolation fast path gave wrong length"
+        );
     }
 
     #[test]
@@ -21653,16 +22028,20 @@ mod tests {
             "end\n",
         )));
         let concat_target = rt_base_for_standalone() + runtime::RT_CONCAT;
-        let concat_calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == concat_target)
-        });
+        let concat_calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == concat_target),
+        );
         assert_eq!(
             concat_calls, 0,
             "multi-part template must build in one alloc, not a chain of rt_concat",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 6; // "a 7 bc"
-        assert_eq!(result, expected, "single-alloc template produced the wrong length");
+        assert_eq!(
+            result, expected,
+            "single-alloc template produced the wrong length"
+        );
     }
 
     #[test]
@@ -21687,17 +22066,25 @@ mod tests {
         )));
         let eq_target = rt_base_for_standalone() + runtime::RT_EQ;
         let str_eq_target = rt_base_for_standalone() + runtime::RT_STR_EQ;
-        let eq_calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target)
-        });
-        let str_eq_calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target)
-        });
+        let eq_calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target),
+        );
+        let str_eq_calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target),
+        );
         assert_eq!(eq_calls, 0, "string case arms must not use generic rt_eq");
-        assert!(str_eq_calls >= 2, "string case arms should lower to rt_str_eq");
+        assert!(
+            str_eq_calls >= 2,
+            "string case arms should lower to rt_str_eq"
+        );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 2;
-        assert_eq!(result, expected, "string case dispatch matched the wrong arm");
+        assert_eq!(
+            result, expected,
+            "string case dispatch matched the wrong arm"
+        );
     }
 
     #[test]
@@ -21724,17 +22111,28 @@ mod tests {
         )));
         let eq_target = rt_base_for_standalone() + runtime::RT_EQ;
         let str_eq_target = rt_base_for_standalone() + runtime::RT_STR_EQ;
-        let eq_calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target)
-        });
-        let str_eq_calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target)
-        });
-        assert_eq!(eq_calls, 0, "string==literal must not use the generic rt_eq dispatch");
-        assert!(str_eq_calls >= 2, "both comparisons should lower to rt_str_eq");
+        let eq_calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == eq_target),
+        );
+        let str_eq_calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == str_eq_target),
+        );
+        assert_eq!(
+            eq_calls, 0,
+            "string==literal must not use the generic rt_eq dispatch"
+        );
+        assert!(
+            str_eq_calls >= 2,
+            "both comparisons should lower to rt_str_eq"
+        );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 1;
-        assert_eq!(result, expected, "string literal eq fast path gave the wrong match count");
+        assert_eq!(
+            result, expected,
+            "string literal eq fast path gave the wrong match count"
+        );
     }
 
     #[test]
@@ -21780,16 +22178,20 @@ mod tests {
             "end\n",
         )));
         let make_int_target = rt_base_for_standalone() + runtime::RT_MAKE_INT;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == make_int_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == make_int_target),
+        );
         assert_eq!(
             calls, 0,
             "range-for loop variable must be raw, not boxed per iteration via rt_make_int",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 499500; // sum 0..999
-        assert_eq!(result, expected, "range-for native loop var changed the sum");
+        assert_eq!(
+            result, expected,
+            "range-for native loop var changed the sum"
+        );
     }
 
     #[test]
@@ -21813,9 +22215,10 @@ mod tests {
             "end\n",
         )));
         let obj_addr_target = rt_base_for_standalone() + runtime::RT_OBJ_ADDR;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == obj_addr_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == obj_addr_target),
+        );
         assert_eq!(
             calls, 0,
             "length() in an Int condition must inline (no rt_obj_addr call)",
@@ -21845,16 +22248,20 @@ mod tests {
             "end\n",
         )));
         let add_target = rt_base_for_standalone() + runtime::RT_ADD;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == add_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == add_target),
+        );
         assert_eq!(
             calls, 0,
             "Int arithmetic over a for-in loop variable must use native i64.add, not rt_add",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 60; // 10+20+30
-        assert_eq!(result, expected, "for-in native arithmetic produced the wrong sum");
+        assert_eq!(
+            result, expected,
+            "for-in native arithmetic produced the wrong sum"
+        );
     }
 
     #[test]
@@ -21875,16 +22282,20 @@ mod tests {
             "end\n",
         )));
         let get_field_target = rt_base_for_standalone() + runtime::RT_GET_FIELD;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_field_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_field_target),
+        );
         assert_eq!(
             calls, 0,
             "a proven record field read must inline, not call rt_get_field",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 10; // 3+7
-        assert_eq!(result, expected, "inline field read produced the wrong value");
+        assert_eq!(
+            result, expected,
+            "inline field read produced the wrong value"
+        );
     }
 
     #[test]
@@ -21942,16 +22353,20 @@ mod tests {
             "end\n",
         )));
         let get_index_target = rt_base_for_standalone() + runtime::RT_GET_INDEX;
-        let calls = user_body_op_count(&wasm, |op| {
-            matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_index_target)
-        });
+        let calls = user_body_op_count(
+            &wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == get_index_target),
+        );
         assert_eq!(
             calls, 0,
             "a proven Array/Int index must inline, not call rt_get_index",
         );
         let result = run_module(&wasm) as u64;
         let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 60; // 10+20+30
-        assert_eq!(result, expected, "inline array index produced the wrong sum");
+        assert_eq!(
+            result, expected,
+            "inline array index produced the wrong sum"
+        );
     }
 
     #[test]
@@ -22359,6 +22774,139 @@ mod tests {
             }
         }
         None
+    }
+
+    fn user_body_import_call_count(wasm: &[u8], import_name: &str) -> usize {
+        let import_index = wasm_import_index(wasm, import_name)
+            .unwrap_or_else(|| panic!("missing import {import_name}"));
+        user_body_op_count(
+            wasm,
+            |op| matches!(op, wasmparser::Operator::Call { function_index } if *function_index == import_index),
+        )
+    }
+
+    #[test]
+    fn stdlib_scheduling_classifies_blocking_direct_and_cpu_bound_calls() {
+        let http = stdlib_scheduling("std.http.request", "get").expect("http get classified");
+        assert!(matches!(
+            http,
+            StdlibScheduling::AwaitHostOp {
+                await_kind: AwaitHostOpKind::HttpRequest,
+                op_kind: crate::runtime::HOST_OP_HTTP_GET,
+                arity: HostOpArity::Range { min: 1, max: 2 },
+            }
+        ));
+
+        let blocking =
+            stdlib_scheduling("std.net.tcp", "readLine").expect("tcp.readLine classified");
+        assert!(matches!(
+            blocking,
+            StdlibScheduling::AwaitHostOp {
+                await_kind: AwaitHostOpKind::BlockingIo,
+                op_kind: crate::runtime::HOST_OP_TCP_READ_LINE,
+                arity: HostOpArity::Exact(1),
+            }
+        ));
+
+        assert_eq!(
+            stdlib_scheduling("std.file", "exists"),
+            Some(StdlibScheduling::DirectHostImport)
+        );
+        assert_eq!(
+            stdlib_scheduling("std.json", "parse"),
+            Some(StdlibScheduling::CpuBoundDirect)
+        );
+        assert_eq!(
+            stdlib_scheduling("std.crypto", "sha256Hex"),
+            Some(StdlibScheduling::CpuBoundDirect)
+        );
+    }
+
+    #[test]
+    fn production_blocking_stdlib_calls_use_host_op_not_direct_imports() {
+        let wasm = try_compile_via_production(concat!(
+            "use std.env\n",
+            "use std.file\n",
+            "use std.http.request\n",
+            "use std.net.tcp\n",
+            "use std.net.udp\n",
+            "use std.process\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  let _http = request.get('file:///tmp/fai-missing')\n",
+            "  let _proc = process.run('printf ok', '.', '{}', 5000, 65536)\n",
+            "  let _read = file.read('/tmp/fai-missing')\n",
+            "  let _write = file.write('/tmp/fai-out', 'x')\n",
+            "  let _list = file.list('/tmp')\n",
+            "  let _env = env.load('/tmp/fai-missing.env')\n",
+            "  let conn = tcp.connect('127.0.0.1', 1)\n",
+            "  let _tcpRead = tcp.read(conn)\n",
+            "  let _line = tcp.readLine(conn)\n",
+            "  let listener = tcp.listen(1)\n",
+            "  let _accepted = tcp.accept(listener)\n",
+            "  let sock = udp.bind(1)\n",
+            "  let _packet = udp.receive(sock)\n",
+            "end\n",
+        ))
+        .expect("blocking stdlib program should compile through async host ops");
+
+        assert!(
+            user_body_import_call_count(&wasm, "host_op_begin") >= 11,
+            "blocking stdlib calls should lower to host_op_begin"
+        );
+        for direct_import in [
+            "http_request_get",
+            "process_run",
+            "file_read_str",
+            "write_file",
+            "file_list",
+            "env_load",
+            "tcp_connect",
+            "tcp_read",
+            "tcp_read_line",
+            "tcp_accept",
+            "udp_receive",
+        ] {
+            assert_eq!(
+                user_body_import_call_count(&wasm, direct_import),
+                0,
+                "{direct_import} should not be called directly by blocking stdlib lowering"
+            );
+        }
+    }
+
+    #[test]
+    fn production_direct_and_cpu_bound_stdlib_calls_stay_direct() {
+        let wasm = try_compile_via_production(concat!(
+            "use std.crypto\n",
+            "use std.file\n",
+            "use std.json\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  let _exists = file.exists('/tmp/fai-missing')\n",
+            "  let _parsed = json.parse('{}')\n",
+            "  let _hash = crypto.sha256Hex('abc')\n",
+            "end\n",
+        ))
+        .expect("direct stdlib program should compile");
+
+        assert_eq!(user_body_import_call_count(&wasm, "host_op_begin"), 0);
+        assert!(
+            user_body_import_call_count(&wasm, "file_exists") > 0,
+            "file.exists should remain direct"
+        );
+        assert!(
+            user_body_import_call_count(&wasm, "json_parse") > 0,
+            "json.parse stays direct until CPU-bound fairness is designed"
+        );
+        assert!(
+            user_body_import_call_count(&wasm, "crypto_sha256_hex") > 0,
+            "crypto.sha256Hex stays direct until CPU-bound fairness is designed"
+        );
     }
 
     #[derive(Debug, PartialEq, Eq)]

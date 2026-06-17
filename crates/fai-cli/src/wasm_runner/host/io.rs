@@ -6,6 +6,66 @@ use wasmtime::*;
 use super::super::heap::wasm_alloc_str;
 use super::super::nan_box::VAL_NULL;
 use super::super::output;
+use super::host_ops::{read_string_arg, submit_host_op, HostOpResult};
+
+pub(super) fn begin_file_host_op(
+    caller: &mut Caller<'_, ()>,
+    task_id: i32,
+    op_kind: i32,
+    args: &[i64],
+) -> bool {
+    match op_kind {
+        fai_codegen_wasm::HOST_OP_FILE_READ => {
+            let Some(path) = read_string_arg(caller, args, 0) else {
+                submit_host_op(task_id, || HostOpResult::Null);
+                return true;
+            };
+            submit_host_op(task_id, move || match std::fs::read_to_string(&path) {
+                Ok(content) => HostOpResult::Json(serde_json::Value::String(content)),
+                Err(_) => HostOpResult::Null,
+            });
+            true
+        }
+        fai_codegen_wasm::HOST_OP_FILE_WRITE => {
+            let (Some(path), Some(content)) = (
+                read_string_arg(caller, args, 0),
+                read_string_arg(caller, args, 1),
+            ) else {
+                submit_host_op(task_id, || {
+                    HostOpResult::Json(serde_json::Value::Bool(false))
+                });
+                return true;
+            };
+            submit_host_op(task_id, move || {
+                HostOpResult::Json(serde_json::Value::Bool(
+                    std::fs::write(&path, &content).is_ok(),
+                ))
+            });
+            true
+        }
+        fai_codegen_wasm::HOST_OP_FILE_LIST => {
+            let Some(path) = read_string_arg(caller, args, 0) else {
+                submit_host_op(task_id, || {
+                    HostOpResult::Json(serde_json::Value::Array(Vec::new()))
+                });
+                return true;
+            };
+            submit_host_op(task_id, move || {
+                let names = std::fs::read_dir(&path)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| entries.flatten())
+                    .map(|entry| {
+                        serde_json::Value::String(entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect();
+                HostOpResult::Json(serde_json::Value::Array(names))
+            });
+            true
+        }
+        _ => false,
+    }
+}
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.print(ptr, len) — write string to stdout

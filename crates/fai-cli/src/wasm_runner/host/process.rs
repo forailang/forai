@@ -16,6 +16,7 @@ use serde_json::json;
 use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
+use super::host_ops::{read_int_value, read_string_arg, submit_host_op, HostOpResult};
 
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -32,6 +33,39 @@ struct ShellSession {
 }
 
 type SharedBuffer = Arc<Mutex<Vec<u8>>>;
+
+pub(super) fn begin_process_host_op(
+    caller: &mut Caller<'_, ()>,
+    task_id: i32,
+    op_kind: i32,
+    args: &[i64],
+) -> bool {
+    if op_kind != fai_codegen_wasm::HOST_OP_PROCESS_RUN {
+        return false;
+    }
+    if args.len() != 5 {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    }
+    let Some(timeout_ms) = read_int_value(args[3]) else {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    };
+    let Some(max_output_bytes) = read_int_value(args[4]) else {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    };
+    let command = read_string_arg(caller, args, 0).unwrap_or_default();
+    let cwd = read_string_arg(caller, args, 1).unwrap_or_default();
+    let env_json = read_string_arg(caller, args, 2).unwrap_or_default();
+    let timeout_ms = clamp_timeout_ms(timeout_ms);
+    let max_output_bytes = clamp_output_bytes(max_output_bytes);
+    submit_host_op(task_id, move || {
+        let result = run_command(&command, &cwd, &env_json, timeout_ms, max_output_bytes);
+        HostOpResult::Json(serde_json::Value::String(result))
+    });
+    true
+}
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.process_available() -> i32 (1/0). Native always reports true;

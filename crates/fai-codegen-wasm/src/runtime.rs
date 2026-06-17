@@ -544,7 +544,34 @@ pub const IMPORT_FFI_BEGIN: u32 = 115;
 /// `env.ffi_result(task_id) -> i64` — the NaN-boxed result of the offloaded
 /// extern call started by `ffi_begin`.
 pub const IMPORT_FFI_RESULT: u32 = 116;
-pub const IMPORT_COUNT: u32 = 117;
+/// `env.host_op_begin(task_id, op_kind, arg_count, args_ptr) -> void` — generic
+/// async host-operation begin hook. The host copies NaN-boxed args out of guest
+/// memory, submits blocking work to the boundary, and leaves the task parked.
+pub const IMPORT_HOST_OP_BEGIN: u32 = 117;
+/// `env.host_op_result(task_id) -> i64` — the NaN-boxed result of the generic
+/// host operation started by `host_op_begin`.
+pub const IMPORT_HOST_OP_RESULT: u32 = 118;
+pub const IMPORT_COUNT: u32 = 119;
+
+/// Internal proof operation for the generic async host-op ABI. It echoes the
+/// first boxed argument and is not exposed as a user-facing stdlib operation.
+#[allow(dead_code)]
+pub const HOST_OP_ECHO_BOXED: i32 = 0;
+pub const HOST_OP_HTTP_GET: i32 = 1;
+pub const HOST_OP_HTTP_POST: i32 = 2;
+pub const HOST_OP_HTTP_PUT: i32 = 3;
+pub const HOST_OP_HTTP_PATCH: i32 = 4;
+pub const HOST_OP_HTTP_DELETE: i32 = 5;
+pub const HOST_OP_PROCESS_RUN: i32 = 6;
+pub const HOST_OP_FILE_READ: i32 = 7;
+pub const HOST_OP_FILE_WRITE: i32 = 8;
+pub const HOST_OP_FILE_LIST: i32 = 9;
+pub const HOST_OP_ENV_LOAD: i32 = 10;
+pub const HOST_OP_TCP_ACCEPT: i32 = 11;
+pub const HOST_OP_TCP_CONNECT: i32 = 12;
+pub const HOST_OP_TCP_READ: i32 = 13;
+pub const HOST_OP_TCP_READ_LINE: i32 = 14;
+pub const HOST_OP_UDP_RECEIVE: i32 = 15;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in
@@ -9090,6 +9117,14 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_FFI_RESULT: (task_id) -> i64 (NaN-boxed value)
         ("ffi_result", vec![ValType::I32], vec![ValType::I64]),
+        // IMPORT_HOST_OP_BEGIN: (task_id, op_kind, arg_count, args_ptr) -> ()
+        (
+            "host_op_begin",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![],
+        ),
+        // IMPORT_HOST_OP_RESULT: (task_id) -> i64 (NaN-boxed value)
+        ("host_op_result", vec![ValType::I32], vec![ValType::I64]),
     ]
 }
 
@@ -9346,6 +9381,24 @@ mod ownership_roundtrip_tests {
             unsigned.is_empty(),
             "i64-returning imports with no ownership row and no allow-list entry:\n  {}",
             unsigned.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn generic_host_op_imports_are_declared_at_expected_indices() {
+        let sigs = import_signatures();
+        assert_eq!(sigs.len(), IMPORT_COUNT as usize);
+        assert_eq!(
+            sigs[IMPORT_HOST_OP_BEGIN as usize],
+            (
+                "host_op_begin",
+                vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+                vec![]
+            )
+        );
+        assert_eq!(
+            sigs[IMPORT_HOST_OP_RESULT as usize],
+            ("host_op_result", vec![ValType::I32], vec![ValType::I64])
         );
     }
 }

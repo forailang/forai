@@ -256,6 +256,23 @@ Browser event fixtures can click a target before asserting leaks or ownership:
 # leak: flat
 ```
 
+### Scheduler and blocking host I/O fixtures
+
+`nowait` is cooperative. Fixtures that assert interleaving should use a real
+suspension point such as `sleep`, `all`, an auto-awaited async call,
+`remoteCall`, or a stdlib operation that lowers through the generic host-op
+await path. Blocking host I/O fixtures should prove ordering with an observable
+peer task or delayed local server rather than only checking that a value
+returns.
+
+Known blocking host-I/O surfaces such as `std.http.request.*`,
+`std.process.run`, `std.file.read/write/list`, `std.env.load`, raw TCP waits,
+and `std.net.udp.receive` are expected to park the current task and resume with
+owned results materialized on the scheduler thread. CPU-bound direct helpers
+such as `std.array` closure helpers, `std.json`, and `std.crypto` are a separate
+fairness problem; do not use them as evidence that `nowait` has independent
+thread/process isolation.
+
 ## Conventions
 
 - **Canonical only.** Run `cargo run --bin fai -- fmt <fixture>` once

@@ -256,7 +256,8 @@ it returns `String?`, so handle the missing case.
             doc: r#"
 `std.http` is split into client request helpers and server router helpers:
 
-- `std.http.request` sends HTTP requests and returns `Response` dictionaries.
+- `std.http.request` sends scheduler-aware HTTP requests and returns
+  `Response` dictionaries.
 - `std.http.server` builds responses and runs a small router.
 
 Use `fai doc std.http.request` and `fai doc std.http.server` for the concrete
@@ -266,8 +267,12 @@ APIs and examples.
         StdlibModuleOverview {
             name: "http.request",
             doc: r#"
-`std.http.request` sends synchronous HTTP requests. Each helper returns a
-`Response` shaped like a dictionary with `status`, `body`, and `headers`.
+`std.http.request` sends scheduler-aware HTTP requests. In scheduler-backed
+code, each helper parks the current task while the host performs network or
+`file://` work, so other ready `nowait` tasks can continue. Each helper returns
+a `Response` shaped like a dictionary with `status`, `body`, and `headers`.
+Native builds offload network and `file://` work to host workers; browser builds
+use the generated runtime's `fetch` bridge for request helpers.
 
 ```fai
 use std.http.request
@@ -296,9 +301,9 @@ let payload = json.stringify({ name: 'Ada' })
 let res = request.post('https://api.example.com/users', payload, headers)
 ```
 
-Transport failures return `null` in current WASM/native host paths rather than
-a `Response`, so guard when calling unreliable networks. HTTP error statuses
-still return a response with the server status and body.
+Transport failures return `null` in current native and browser host paths
+rather than a `Response`, so guard when calling unreliable networks. HTTP error
+statuses still return a response with the server status and body.
 "#,
         },
         StdlibModuleOverview {
@@ -361,6 +366,8 @@ Use `std.http.request` for normal HTTP calls. Use `std.net.tcp` and
             doc: r#"
 `std.net.tcp` exposes raw TCP listener and connection handles. Handle-returning
 functions return an `Int`; close every listener or connection handle when done.
+In scheduler-backed code, `connect`, `accept`, `read`, and `readLine` park the
+current task while the host waits so sibling `nowait` tasks can continue.
 
 ```fai
 use std.net.tcp
@@ -396,6 +403,8 @@ returns `Void` and ignores invalid handles.
             doc: r#"
 `std.net.udp` exposes raw UDP socket handles. Bind a socket, send datagrams,
 receive dictionaries, and close the socket when done.
+In scheduler-backed code, `udp.receive` parks the current task while waiting
+for a datagram; `bind`, `send`, and `broadcast` remain direct host calls.
 
 ```fai
 use std.net.udp
@@ -452,6 +461,9 @@ stubs, so server/native code should own environment-dependent behavior.
             doc: r#"
 `std.file` reads, writes, checks, and lists files relative to the process
 working directory unless you pass an absolute path.
+In scheduler-backed code, `file.read`, `file.write`, and `file.list` park the
+current task while the host performs filesystem work. Cheap probes such as
+`file.exists` remain direct host calls.
 
 ```fai
 use std.file
@@ -477,6 +489,8 @@ for success. `file.list` returns entry names in the directory; join them with
 Native-only: `process.available()` returns `false` in browser builds, where
 the other functions are not linked. Commands run via `bash -lc`, so pipes,
 globs, and env expansion work.
+In scheduler-backed code, `process.run` parks the current task while the host
+waits for the command or timeout.
 
 ```fai
 use std.process
@@ -491,7 +505,7 @@ if process.available()
 end
 ```
 
-`process.run(command, cwd, envJson, timeoutMs, maxOutputBytes)` blocks until
+`process.run(command, cwd, envJson, timeoutMs, maxOutputBytes)` waits until
 the command exits or the timeout kills it, and returns a JSON string:
 `{ok, command, cwd, exitCode, stdout, stderr, timedOut, durationMs,
 truncated}`. `ok` is true only for a zero exit without timeout; `exitCode`
@@ -2076,6 +2090,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_std_http_request_overview_describes_scheduler_aware_requests() {
+        let entries = collect_stdlib_docs();
+        let e = entries
+            .iter()
+            .find(|e| {
+                e.full_path == "std.http.request" && matches!(e.kind, EntryKind::PackageOverview)
+            })
+            .expect("expected std.http.request overview");
+        assert!(
+            e.doc.contains("scheduler-aware HTTP requests"),
+            "overview should describe scheduler-aware requests:\n{}",
+            e.doc
+        );
+        assert!(
+            e.doc.contains("parks the current task"),
+            "overview should describe yielding instead of blocking:\n{}",
+            e.doc
+        );
+        assert!(
+            e.doc.contains("generated runtime's `fetch` bridge"),
+            "overview should state browser runtime behavior:\n{}",
+            e.doc
+        );
+        assert!(
+            !e.doc.contains("synchronous HTTP requests"),
+            "overview should not describe request helpers as synchronous:\n{}",
+            e.doc
+        );
+    }
+
+    #[test]
+    fn test_stdlib_io_overviews_describe_scheduler_aware_waits() {
+        let entries = collect_stdlib_docs();
+        for (path, expected) in [
+            ("std.file", "file.read`, `file.write`, and `file.list` park"),
+            ("std.process", "`process.run` parks the current task"),
+            (
+                "std.net.tcp",
+                "`connect`, `accept`, `read`, and `readLine` park",
+            ),
+            ("std.net.udp", "`udp.receive` parks the current task"),
+        ] {
+            let e = entries
+                .iter()
+                .find(|e| e.full_path == path && matches!(e.kind, EntryKind::PackageOverview))
+                .unwrap_or_else(|| panic!("expected {path} overview"));
+            assert!(
+                e.doc.contains(expected),
+                "{path} overview missing scheduler-aware wait text `{expected}`:\n{}",
+                e.doc
+            );
+        }
+    }
+
     // ── signature_to_def_block ───────────────────────────────────────
 
     #[test]
@@ -2486,6 +2555,30 @@ mod tests {
         assert!(
             e.doc.contains("generated RPC route installer"),
             "should mention generated RPC route installation"
+        );
+    }
+
+    #[test]
+    fn test_lang_concurrency_nowait_describes_cooperative_suspension_points() {
+        let entries = collect_lang_docs();
+        let e = entries
+            .iter()
+            .find(|e| e.full_path == "lang.concurrency.nowait")
+            .expect("lang.concurrency.nowait should exist");
+        assert!(
+            e.doc.contains("cooperative scheduling"),
+            "nowait doc should describe cooperative scheduling:\n{}",
+            e.doc
+        );
+        assert!(
+            e.doc.contains("suspension point"),
+            "nowait doc should name suspension points:\n{}",
+            e.doc
+        );
+        assert!(
+            e.doc.contains("Long CPU-bound guest"),
+            "nowait doc should keep CPU-bound fairness separate:\n{}",
+            e.doc
         );
     }
 
