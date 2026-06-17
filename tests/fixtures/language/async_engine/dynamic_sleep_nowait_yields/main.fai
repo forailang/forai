@@ -1,0 +1,56 @@
+# expect: ok
+# stdout:
+#   parked
+#   done
+
+var done = false
+
+def main
+    @return Void
+do
+    done = false
+    nowait background()
+    sleep(1)
+    if done
+        print('done early')
+    else
+        print('parked')
+    end
+    sleep(50)
+    if done
+        print('done')
+    else
+        print('still waiting')
+    end
+end
+
+private:
+
+# Sleeps using a computed delay before marking completion.
+def background
+    @return Void
+do
+    sleep(delayMs())
+    done = true
+end
+
+test background
+    it 'marks the background work done'
+        done = false
+        background()
+        assert.isTrue(done)
+    end
+end
+
+# Returns the background sleep delay in milliseconds.
+def delayMs
+    @return Int
+do
+    30
+end
+
+test delayMs
+    it 'returns the configured delay'
+        assert.equals(delayMs(), 30)
+    end
+end

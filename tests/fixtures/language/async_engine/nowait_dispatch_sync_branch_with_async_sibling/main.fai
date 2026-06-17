@@ -1,0 +1,78 @@
+# expect: ok
+# stdout:
+#   main done
+#   handler before dispatch
+#   dispatch sync before try
+#   sync call
+#   dispatch sync after try
+#   handler got sync result
+def main
+    @return Void
+do
+    nowait handler()
+    print('main done')
+end
+
+private:
+
+# Simulate an HTTP/RPC handler task.
+def handler
+    @return Void
+do
+    print('handler before dispatch')
+    let result = dispatch('sync')
+    print('handler got ' + result)
+end
+
+# Simulate the generated RPC dispatcher: one branch is sync, but a sibling
+# branch awaits, so the whole dispatcher is async.
+def dispatch
+    @param name String
+    @return String
+do
+    if name == 'sync'
+        print('dispatch sync before try')
+        var out = ''
+        try
+            out = syncEndpoint()
+        catch e
+            out = 'error'
+        end
+        print('dispatch sync after try')
+        out
+    else
+        if name == 'async'
+            var out = ''
+            try
+                out = asyncEndpoint()
+            catch e
+                out = 'error'
+            end
+            out
+        else
+            ''
+        end
+    end
+end
+
+# Return a sync dispatcher result.
+def syncEndpoint
+    @return String
+do
+    print('sync call')
+    'sync result'
+end
+
+# Return an async dispatcher result.
+def asyncEndpoint
+    @return String
+do
+    sleep(1)
+    'async result'
+end
+
+test handler
+    it 'dispatches the sync branch'
+        handler()
+    end
+end

@@ -1,0 +1,72 @@
+# expect: ok
+# stdout:
+#   main done
+#   parent before if
+#   child before rules
+#   rules before sleep
+#   rules returning
+#   child after rules 1
+#   child returning true
+#   parent matched
+#   parent done
+def main
+    @return Void
+do
+    nowait parent()
+    print('main done')
+end
+
+private:
+
+# Run the parent branch.
+def parent
+    @return Void
+do
+    print('parent before if')
+    if child()
+        print('parent matched')
+    end
+    print('parent done')
+end
+
+# Return true after awaiting another helper and looping over its result.
+def child
+    @return Bool
+do
+    print('child before rules')
+    let rules = listRules()
+    print('child after rules ' + toString(length(rules)))
+    for n in rules
+        print('child returning true')
+        return true
+    end
+    false
+end
+
+# Return rules after suspension.
+def listRules
+    @return Int[]
+do
+    print('rules before sleep')
+    sleep(1)
+    print('rules returning')
+    [1]
+end
+
+test parent
+    it 'runs'
+        parent()
+    end
+end
+
+test child
+    it 'returns true'
+        assert.isTrue(child())
+    end
+end
+
+test listRules
+    it 'returns rules'
+        assert.equals(length(listRules()), 1)
+    end
+end
