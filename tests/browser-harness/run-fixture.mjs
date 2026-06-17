@@ -175,8 +175,19 @@ try {
     if (dump === null) {
       throw new Error('leak gate: window.__fai_dump_leaks unavailable — runtime JS predates browser leak diagnostics');
     }
-    if (dump.includes('no guest events')) {
-      throw new Error(`leak gate: browser guest leak hooks were not active\n${dump}`);
+    // Whether the build is leak-instrumented is a BUILD fact — does the
+    // wasm import `__fai_alloc_event` — not a runtime event count. An
+    // instrumented program that happens to allocate nothing (e.g. a
+    // host call taking only data-section string literals) legitimately
+    // produces zero guest events and is trivially leak-flat; rejecting
+    // on "no guest events" alone false-fails it. Only reject when the
+    // import is genuinely absent (someone forgot --check-leaks).
+    const wasmBytes = await readFile(join(root, 'main.wasm'));
+    const instrumented = WebAssembly.Module.imports(new WebAssembly.Module(wasmBytes)).some(
+      (imp) => imp.name === '__fai_alloc_event'
+    );
+    if (!instrumented) {
+      throw new Error(`leak gate: module not built with --check-leaks (no __fai_alloc_event import)\n${dump}`);
     }
     const live = await page.evaluate(() =>
       typeof window.__fai_live_objects === 'function' ? window.__fai_live_objects() : null
