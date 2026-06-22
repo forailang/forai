@@ -1157,6 +1157,46 @@ pub enum BuildError {
     AsyncLoweringUnsupported { function: String, cause: String },
 }
 
+thread_local! {
+    static LAST_ASYNC_ENGINE_ERROR: RefCell<Option<crate::LocatedBuildError>> = RefCell::new(None);
+}
+
+pub fn take_last_async_engine_error() -> Option<crate::LocatedBuildError> {
+    LAST_ASYNC_ENGINE_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+fn clear_last_async_engine_error() {
+    LAST_ASYNC_ENGINE_ERROR.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
+fn record_async_engine_error(
+    err: BuildError,
+    fd: &FunctionDeclaration,
+    module: Option<&str>,
+    file: Option<&str>,
+    entry_file: Option<&str>,
+) {
+    let file = file.map(str::to_string).or_else(|| {
+        module
+            .is_none()
+            .then(|| entry_file.map(str::to_string))
+            .flatten()
+    });
+    let line = (fd.location.line > 0).then_some(fd.location.line);
+    let col = (fd.location.column > 0).then_some(fd.location.column);
+    LAST_ASYNC_ENGINE_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(crate::LocatedBuildError {
+            err,
+            file,
+            line,
+            col,
+            module: module.map(str::to_string),
+        });
+    });
+}
+
 /// Runtime-helper offset the function's `Call` instructions use.
 /// Identical to the one `translate.rs` consumes: wasm function index
 /// `rt_base + RT_*` selects the right helper.
@@ -7108,21 +7148,30 @@ fn anf_async_stmt(
             // from the resume function. Desugar it into an index-driven `while`
             // loop, which the engine already lowers through the async CFG:
             //
-            //   let  __for_coll = <items>
-            //   var  __for_idx  = 0
-            //   while __for_idx < length(__for_coll) do
-            //       let <item> = __for_coll[__for_idx]
-            //       <body>
-            //       __for_idx = __for_idx + 1
-            //   end
+            //   for <item> in <start>..<end>:
+            //       var __for_idx = <start>
+            //       let __for_end = <end>
+            //       while __for_idx < __for_end do
+            //           let <item> = __for_idx
+            //           <body>
+            //           __for_idx = __for_idx + 1
+            //       end
+            //
+            //   for <item> in <items>:
+            //       let  __for_coll = <items>
+            //       var  __for_idx  = 0
+            //       while __for_idx < length(__for_coll) do
+            //           let <item> = __for_coll[__for_idx]
+            //           <body>
+            //           __for_idx = __for_idx + 1
+            //       end
             //
             // The loop index and collection live in the frame, so they survive a
-            // suspension inside the body. (Plain fall-through `for` loops keep the
-            // fast inline path below.)
+            // suspension inside the body. Range expressions are not first-class
+            // values in direct wasm, so they need the counter form instead of a
+            // synthetic `let __for_coll = start..end`. Plain fall-through `for`
+            // loops keep the fast inline path below.
             let loc = fs.location.clone();
-            let coll = atomize(&fs.items, counter, out);
-            let coll_name = format!("__for_coll_{}", *counter);
-            *counter += 1;
             let idx_name = format!("__for_idx_{}", *counter);
             *counter += 1;
             let ident = |name: &str| {
@@ -7138,41 +7187,101 @@ fn anf_async_stmt(
                     location: loc.clone(),
                 })
             };
-            out.push(Statement::LetStatement(ast::LetStatement {
-                bindings: vec![ast::BindingDeclaration {
-                    name: coll_name.clone(),
-                    type_name: None,
-                }],
-                value: coll,
-                is_private: None,
-                is_shared: None,
-                location: loc.clone(),
-            }));
-            out.push(Statement::VarStatement(ast::VarStatement {
-                bindings: vec![ast::BindingDeclaration {
-                    name: idx_name.clone(),
-                    type_name: None,
-                }],
-                value: int_lit(0.0),
-                is_private: None,
-                is_shared: None,
-                location: loc.clone(),
-            }));
             let mut wbody: Vec<Statement> = Vec::new();
-            wbody.push(Statement::LetStatement(ast::LetStatement {
-                bindings: vec![ast::BindingDeclaration {
-                    name: fs.item_name.clone(),
-                    type_name: None,
-                }],
-                value: Expression::IndexExpression(ast::IndexExpression {
-                    object: Box::new(ident(&coll_name)),
-                    index: Box::new(ident(&idx_name)),
+            let condition = if let Expression::RangeExpression(range) = &fs.items {
+                let end_name = format!("__for_end_{}", *counter);
+                *counter += 1;
+                let start = atomize(&range.start, counter, out);
+                let end = atomize(&range.end, counter, out);
+                out.push(Statement::VarStatement(ast::VarStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: idx_name.clone(),
+                        type_name: None,
+                    }],
+                    value: start,
+                    is_private: None,
+                    is_shared: None,
                     location: loc.clone(),
-                }),
-                is_private: None,
-                is_shared: None,
-                location: loc.clone(),
-            }));
+                }));
+                out.push(Statement::LetStatement(ast::LetStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: end_name.clone(),
+                        type_name: None,
+                    }],
+                    value: end,
+                    is_private: None,
+                    is_shared: None,
+                    location: loc.clone(),
+                }));
+                wbody.push(Statement::LetStatement(ast::LetStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: fs.item_name.clone(),
+                        type_name: None,
+                    }],
+                    value: ident(&idx_name),
+                    is_private: None,
+                    is_shared: None,
+                    location: loc.clone(),
+                }));
+                Expression::BinaryExpression(ast::BinaryExpression {
+                    left: Box::new(ident(&idx_name)),
+                    operator: if range.inclusive { "<=" } else { "<" }.to_string(),
+                    right: Box::new(ident(&end_name)),
+                    location: loc.clone(),
+                })
+            } else {
+                let coll = atomize(&fs.items, counter, out);
+                let coll_name = format!("__for_coll_{}", *counter);
+                *counter += 1;
+                out.push(Statement::LetStatement(ast::LetStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: coll_name.clone(),
+                        type_name: None,
+                    }],
+                    value: coll,
+                    is_private: None,
+                    is_shared: None,
+                    location: loc.clone(),
+                }));
+                out.push(Statement::VarStatement(ast::VarStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: idx_name.clone(),
+                        type_name: None,
+                    }],
+                    value: int_lit(0.0),
+                    is_private: None,
+                    is_shared: None,
+                    location: loc.clone(),
+                }));
+                wbody.push(Statement::LetStatement(ast::LetStatement {
+                    bindings: vec![ast::BindingDeclaration {
+                        name: fs.item_name.clone(),
+                        type_name: None,
+                    }],
+                    value: Expression::IndexExpression(ast::IndexExpression {
+                        object: Box::new(ident(&coll_name)),
+                        index: Box::new(ident(&idx_name)),
+                        location: loc.clone(),
+                    }),
+                    is_private: None,
+                    is_shared: None,
+                    location: loc.clone(),
+                }));
+                Expression::BinaryExpression(ast::BinaryExpression {
+                    left: Box::new(ident(&idx_name)),
+                    operator: "<".to_string(),
+                    right: Box::new(Expression::CallExpression(ast::CallExpression {
+                        callee: Box::new(ident("length")),
+                        args: vec![ast::CallArgument {
+                            label: None,
+                            value: ident(&coll_name),
+                            location: loc.clone(),
+                        }],
+                        location: loc.clone(),
+                    })),
+                    location: loc.clone(),
+                })
+            };
             for s in &fs.body {
                 anf_async_stmt(s, r, counter, &mut wbody);
             }
@@ -7188,20 +7297,6 @@ fn anf_async_stmt(
                 }),
                 location: loc.clone(),
             }));
-            let condition = Expression::BinaryExpression(ast::BinaryExpression {
-                left: Box::new(ident(&idx_name)),
-                operator: "<".to_string(),
-                right: Box::new(Expression::CallExpression(ast::CallExpression {
-                    callee: Box::new(ident("length")),
-                    args: vec![ast::CallArgument {
-                        label: None,
-                        value: ident(&coll_name),
-                        location: loc.clone(),
-                    }],
-                    location: loc.clone(),
-                })),
-                location: loc.clone(),
-            });
             out.push(Statement::WhileStatement(ast::WhileStatement {
                 condition,
                 body: wbody,
@@ -7429,6 +7524,8 @@ pub fn try_codegen_async_engine(
         MemoryType, Module as EncModule, RefType, TableSection, TableType, TypeSection,
     };
 
+    clear_last_async_engine_error();
+
     // ── v1 gate ──
     // (A4) Browser targets now engage the real engine too. `sleep` arranges a
     // host wakeup via `host_set_timer` instead of the native busy-poll.
@@ -7623,7 +7720,7 @@ pub fn try_codegen_async_engine(
                     continue;
                 };
                 let qualified = qualify_module_path_for_codegen(current, &u.module_path);
-                let mut put =
+                let put =
                     |out: &mut std::collections::HashMap<String, String>, k: String, v: String| {
                         if entry_wins {
                             out.insert(k, v);
@@ -7684,6 +7781,18 @@ pub fn try_codegen_async_engine(
     // single file these are bare names; module fns are `{module}.{fn}`.
     let all_user_fns: std::collections::HashSet<String> =
         decls.iter().map(|(fd, _, _)| fd.name.clone()).collect();
+    let mut reachable_functions = analysis.reachable_functions.clone();
+    if all_user_fns.contains("main") {
+        reachable_functions.insert("main".to_string());
+    }
+    if let Some(name) = &master_init_name {
+        reachable_functions.insert(name.clone());
+        for (fd, _, _) in &decls {
+            if fd.name.starts_with("<__module_init__:") {
+                reachable_functions.insert(fd.name.clone());
+            }
+        }
+    }
     // A spawned function (`nowait f()` / `all(f(), ...)`) must be a resume
     // task even if its own body never suspends — fold those targets in
     // (resolved to their canonical names in each fn's module context).
@@ -7691,6 +7800,9 @@ pub fn try_codegen_async_engine(
         let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (fd, mctx, fctx) in &decls {
+            if !reachable_functions.contains(&fd.name) {
+                continue;
+            }
             let mk = fctx.as_deref().or(mctx.as_deref()).unwrap_or("");
             let r = AsyncResolve {
                 async_set: &empty,
@@ -7703,8 +7815,10 @@ pub fn try_codegen_async_engine(
             };
             collect_spawn_targets(&fd.body, &r, &mut targets);
         }
+        reachable_functions.extend(targets.iter().cloned());
         async_set.extend(targets);
     }
+    async_set.retain(|name| reachable_functions.contains(name));
     // main must exist and take no arguments. Resolved against `decls` here — the
     // borrowing `all_fns` view is rebuilt after the A-normalization rewrite
     // below (which needs `&mut decls`).
@@ -7750,6 +7864,9 @@ pub fn try_codegen_async_engine(
     let all_fns: Vec<&FunctionDeclaration> = decls.iter().map(|(fd, _, _)| fd).collect();
     let main = *all_fns.iter().find(|fd| fd.name == "main")?;
     for fd in &all_fns {
+        if !reachable_functions.contains(&fd.name) {
+            continue;
+        }
         let is_async = async_set.contains(&fd.name);
         // A sync fn becomes a `FaiFunc(arity)` in the table-type space.
         if !is_async && (fd.params.len() + fd.type_params.len()) > MAX_DIRECT_ARITY as usize {
@@ -7763,7 +7880,7 @@ pub fn try_codegen_async_engine(
     let mut rest: Vec<&FunctionDeclaration> = all_fns
         .iter()
         .copied()
-        .filter(|fd| fd.name != "main")
+        .filter(|fd| fd.name != "main" && reachable_functions.contains(&fd.name))
         .collect();
     rest.sort_by(|a, b| a.name.cmp(&b.name));
     ordered.extend(rest);
@@ -8069,6 +8186,7 @@ pub fn try_codegen_async_engine(
                     if std::env::var("FAI_ASYNC_DEBUG").is_ok() {
                         eprintln!("[async-engine] resume fn '{}' failed: {:?}", fd.name, e);
                     }
+                    record_async_engine_error(e, fd, mctx, fctx, entry_file);
                     return None;
                 }
             };
@@ -8115,6 +8233,7 @@ pub fn try_codegen_async_engine(
                 if std::env::var("FAI_ASYNC_DEBUG").is_ok() {
                     eprintln!("[async-engine] sync fn '{}' failed: {:?}", fd.name, e);
                 }
+                record_async_engine_error(e, fd, mctx, fctx, entry_file);
                 return None;
             }
         };

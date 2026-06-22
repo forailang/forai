@@ -57,6 +57,10 @@ pub struct AsyncAnalysis {
     pub causes: HashMap<String, AsyncCause>,
     pub scheduler_functions: HashSet<String>,
     pub scheduler_causes: HashMap<String, AsyncCause>,
+    /// Functions reachable from the entry `main`, following normal calls and
+    /// spawned task targets. Codegen uses this to avoid compiling imported
+    /// helper functions that are discovered but dead for the current target.
+    pub reachable_functions: HashSet<String>,
 }
 
 impl AsyncAnalysis {
@@ -110,6 +114,8 @@ struct BodyEffects {
     direct_cause: Option<DirectCause>,
     scheduler_cause: Option<DirectCause>,
     calls: Vec<CallSite>,
+    spawn_calls: Vec<CallSite>,
+    function_refs: Vec<CallSite>,
 }
 
 thread_local! {
@@ -261,7 +267,44 @@ pub fn analyze(ast: &fai_compiler::ast::Program, modules: &[DiscoveredModule]) -
         }
     }
 
+    out.reachable_functions = compute_reachable_functions("main", &body_effects);
+
     out
+}
+
+fn compute_reachable_functions(
+    root: &str,
+    body_effects: &HashMap<String, BodyEffects>,
+) -> HashSet<String> {
+    let debug = std::env::var_os("FAI_ASYNC_DEBUG").is_some();
+    let mut reachable = HashSet::new();
+    let mut stack = vec![root.to_string()];
+    while let Some(name) = stack.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(effects) = body_effects.get(&name) else {
+            continue;
+        };
+        for (kind, calls) in [
+            ("call", effects.calls.as_slice()),
+            ("spawn", effects.spawn_calls.as_slice()),
+            ("function-ref", effects.function_refs.as_slice()),
+        ] {
+            for call in calls {
+                if body_effects.contains_key(&call.target) {
+                    if debug {
+                        eprintln!(
+                            "[async-analysis] reachable {}: {} -> {}",
+                            kind, name, call.target
+                        );
+                    }
+                    stack.push(call.target.clone());
+                }
+            }
+        }
+    }
+    reachable
 }
 
 fn module_function_exports(modules: &[DiscoveredModule]) -> HashMap<String, Vec<String>> {
@@ -403,6 +446,24 @@ fn qualify_module_path(current_module: Option<&str>, path: &[String]) -> String 
         return path.join(".");
     }
     let raw = path.join(".");
+    if path
+        .first()
+        .map(|s| s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return raw;
+    }
+    if let Some(current) = current_module {
+        let package = current.split('.').next().unwrap_or(current);
+        if package
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+        {
+            return format!("{}.{}", package, raw);
+        }
+    }
     if path.len() > 1 {
         return raw;
     }
@@ -518,6 +579,7 @@ fn collect_statement_effects(
         }
         Statement::NowaitStatement(nw) => {
             set_scheduler_cause(effects, AsyncCauseKind::NowaitBoundary, nw.location.clone());
+            collect_spawn_expression(&nw.expression, node, known_functions, effects);
         }
         Statement::FunctionDeclaration(_)
         | Statement::FunctionTypeDefDeclaration(_)
@@ -528,6 +590,23 @@ fn collect_statement_effects(
         | Statement::ExternBlockDeclaration(_)
         | Statement::BreakStatement(_)
         | Statement::ContinueStatement(_) => {}
+    }
+}
+
+fn collect_spawn_expression(
+    expr: &Expression,
+    node: &FunctionNode,
+    known_functions: &HashSet<String>,
+    effects: &mut BodyEffects,
+) {
+    let Expression::CallExpression(call) = expr else {
+        return;
+    };
+    if let Some((target, None)) = resolve_call_target(call, node, known_functions) {
+        effects.spawn_calls.push(CallSite {
+            target,
+            location: call.location.clone(),
+        });
     }
 }
 
@@ -580,6 +659,9 @@ fn collect_expression_effects(
             collect_expression_effects(&re.end, node, known_functions, effects);
         }
         Expression::MemberExpression(me) => {
+            if let Some(call) = resolve_function_ref(expr, node, known_functions) {
+                effects.function_refs.push(call);
+            }
             collect_expression_effects(&me.object, node, known_functions, effects)
         }
         Expression::UnaryExpression(ue) => {
@@ -604,11 +686,42 @@ fn collect_expression_effects(
                 collect_statement_effects(stmt, node, known_functions, effects);
             }
         }
-        Expression::IdentifierExpression(_)
-        | Expression::StringExpression(_)
+        Expression::IdentifierExpression(_) => {
+            if let Some(call) = resolve_function_ref(expr, node, known_functions) {
+                effects.function_refs.push(call);
+            }
+        }
+        Expression::StringExpression(_)
         | Expression::NumberExpression(_)
         | Expression::BooleanExpression(_)
         | Expression::NullExpression(_) => {}
+    }
+}
+
+fn resolve_function_ref(
+    expr: &Expression,
+    node: &FunctionNode,
+    known_functions: &HashSet<String>,
+) -> Option<CallSite> {
+    match expr {
+        Expression::IdentifierExpression(id) => {
+            resolve_bare_function(&id.name, node, known_functions).map(|target| CallSite {
+                target,
+                location: id.location.clone(),
+            })
+        }
+        Expression::MemberExpression(me) => {
+            let Expression::IdentifierExpression(obj) = &*me.object else {
+                return None;
+            };
+            let canonical = node.aliases.get(&obj.name)?;
+            let target = format!("{}.{}", canonical, me.property);
+            known_functions.contains(&target).then(|| CallSite {
+                target,
+                location: me.location.clone(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -663,19 +776,22 @@ fn resolve_call_target(
             None
         }
         Expression::MemberExpression(me) => {
-            let Expression::IdentifierExpression(obj) = &*me.object else {
-                return None;
-            };
-            let canonical = node.aliases.get(&obj.name)?;
-            let target = format!("{}.{}", canonical, me.property);
-            if let Some(kind) = stdlib_async_cause(canonical, &me.property) {
-                return Some((target, Some(kind)));
+            if let Expression::IdentifierExpression(obj) = &*me.object {
+                if let Some(canonical) = node.aliases.get(&obj.name) {
+                    let target = format!("{}.{}", canonical, me.property);
+                    if let Some(kind) = stdlib_async_cause(canonical, &me.property) {
+                        return Some((target, Some(kind)));
+                    }
+                    if known_functions.contains(&target) {
+                        return Some((target, None));
+                    }
+                }
             }
-            if known_functions.contains(&target) {
-                Some((target, None))
-            } else {
-                None
-            }
+            node.named_imports
+                .get(&me.property)
+                .filter(|target| known_functions.contains(*target))
+                .cloned()
+                .map(|target| (target, None))
         }
         // A computed callee — `handlers[i]()`, `cb!()`, `getCb()()` — can only be
         // a closure value, so invoking it is a potential suspension point.
@@ -887,6 +1003,96 @@ mod tests {
         assert_eq!(
             analysis.scheduler_causes.get("main").map(|c| &c.kind),
             Some(&AsyncCauseKind::NowaitBoundary)
+        );
+        assert!(analysis.reachable_functions.contains("child"));
+    }
+
+    #[test]
+    fn reachable_functions_exclude_unreachable_async_helpers() {
+        let entry = parse(
+            "use { updatePerson } from data.people\n\n\
+             def main\n    @return String\ndo\n  updatePerson(1, 'A')\nend\n",
+        );
+        let people = module(
+            "data.people",
+            "def updatePerson\n    @param id Int\n    @param name String\n    @return String\ndo\n  remoteCall('http://localhost', 'data.people.updatePerson', '[]', 'hash')\nend\n\n\
+             def unusedAsyncHelper\n    @return Void\ndo\n  for i in 0..3\n    sleep(1)\n  end\nend\n",
+        );
+        let analysis = analyze(&entry, &[people]);
+        assert!(analysis
+            .async_functions
+            .contains("data.people.unusedAsyncHelper"));
+        assert!(analysis
+            .reachable_functions
+            .contains("data.people.updatePerson"));
+        assert!(
+            !analysis
+                .reachable_functions
+                .contains("data.people.unusedAsyncHelper"),
+            "unreachable imported helpers should not be emitted for this target"
+        );
+    }
+
+    #[test]
+    fn reachable_functions_include_function_reference_targets() {
+        let ast = parse(
+            "type def Producer\n    @return Int\nend\n\n\
+             def piece\n    @return Int\ndo\n  7\nend\n\n\
+             def callIt\n    @param f Producer\n    @return Int\ndo\n  sleep(0)\n  f()\nend\n\n\
+             def main\n    @return Int\ndo\n  callIt(piece)\nend\n",
+        );
+        let analysis = analyze(&ast, &[]);
+        assert!(analysis.reachable_functions.contains("main"));
+        assert!(analysis.reachable_functions.contains("callIt"));
+        assert!(
+            analysis.reachable_functions.contains("piece"),
+            "function references passed as closure values still need emitted function bodies"
+        );
+    }
+
+    #[test]
+    fn reachable_functions_resolve_external_package_root_imports() {
+        let entry = parse(
+            "use { mount } from Forui\n\n\
+             def main\n    @return Void\ndo\n  mount()\nend\n",
+        );
+        let forui = module(
+            "Forui",
+            "use { installViewEventBridge } from view\n\n\
+             def mount\n    @return Void\ndo\n  installViewEventBridge()\nend\n",
+        );
+        let view = module(
+            "Forui.view",
+            "def installViewEventBridge\n    @return Void\ndo\nend\n",
+        );
+        let analysis = analyze(&entry, &[forui, view]);
+        assert!(analysis.reachable_functions.contains("Forui.mount"));
+        assert!(
+            analysis
+                .reachable_functions
+                .contains("Forui.view.installViewEventBridge"),
+            "package root imports should resolve like direct codegen"
+        );
+    }
+
+    #[test]
+    fn reachable_functions_include_named_import_ufcs_member_calls() {
+        let entry = parse(
+            "use { widget } from components\n\n\
+             def main\n    @return Int\ndo\n  widget()\nend\n",
+        );
+        let components = module(
+            "components",
+            "use { width } from Forui.view\n\n\
+             def makeNode\n    @return Int\ndo\n  1\nend\n\n\
+             def widget\n    @return Int\ndo\n  makeNode().width('100%')\n  1\nend\n",
+        );
+        let forui_view = module("Forui.view", "def width\n    @return Int\ndo\n  1\nend\n");
+        let analysis = analyze(&entry, &[components, forui_view]);
+        assert!(analysis.reachable_functions.contains("components.widget"));
+        assert!(
+            analysis.reachable_functions.contains("Forui.view.width"),
+            "UFCS member-call syntax should keep the imported function body reachable"
         );
     }
 }

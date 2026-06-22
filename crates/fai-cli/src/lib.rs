@@ -1833,15 +1833,19 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
     // dereferencing null SQLite handles). When `rpc_server = true` —
     // or when no remote URL is configured — the rewrite is skipped
     // and bodies stay intact.
+    let canonical_entry = std::fs::canonicalize(&path).ok();
+    let project_root_for_entry = canonical_entry
+        .as_ref()
+        .and_then(|entry| find_project_root(entry));
     let active_sub = {
-        let canonical_entry = std::fs::canonicalize(&path).ok();
-        info.sub_projects.values().find(|sub| {
+        let canonical_entry = canonical_entry.clone();
+        let project_root = project_root_for_entry.clone();
+        info.sub_projects.iter().find(|(_, sub)| {
             sub.main
                 .as_ref()
                 .and_then(|m| {
-                    let candidate = source_root
-                        .as_deref()
-                        .and_then(|sr| std::path::Path::new(sr).parent())
+                    let candidate = project_root
+                        .as_ref()
                         .map(|root| root.join(m))
                         .unwrap_or_else(|| std::path::PathBuf::from(m));
                     std::fs::canonicalize(&candidate).ok()
@@ -1851,11 +1855,25 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
                 .unwrap_or(false)
         })
     };
-    let project_root_for_hash = source_root
-        .as_deref()
-        .and_then(|sr| std::path::Path::new(sr).parent().map(|p| p.to_path_buf()));
+    let project_root_for_hash = project_root_for_entry.or_else(|| {
+        source_root
+            .as_deref()
+            .and_then(|sr| find_project_root(std::path::Path::new(sr)))
+    });
+    if std::env::var_os("FAI_RPC_DEBUG").is_some() {
+        eprintln!(
+            "[rpc-proxy] entry={} source_root={:?} project_root={:?} active_target={:?} remote_deps={:?}",
+            path,
+            source_root,
+            project_root_for_hash,
+            active_sub.map(|(name, _)| name.as_str()),
+            active_sub
+                .map(|(_, sub)| sub.remote_deps.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+    }
     let rpc_proxy_substitution: Option<(String, String)> = match active_sub {
-        Some(sub) if !sub.rpc_server => sub.remote_deps.iter().find_map(|(dep_name, envs)| {
+        Some((_, sub)) if !sub.rpc_server => sub.remote_deps.iter().find_map(|(dep_name, envs)| {
             let cfg = envs.get("dev").or_else(|| envs.values().next())?;
             let hash = project_root_for_hash
                 .as_ref()
@@ -2531,7 +2549,8 @@ fn rewrite_remote_def_bodies(
     modules: &mut [fai_compiler::module::DiscoveredModule],
     url: &str,
     hash: &str,
-) {
+) -> usize {
+    let mut rewritten = 0usize;
     for module in modules.iter_mut() {
         let module_name = module.name.clone();
         let mut had_rewrite = false;
@@ -2568,6 +2587,7 @@ fn rewrite_remote_def_bodies(
                 // up server-side too — the body is now a client stub.
                 fd.is_remote = false;
                 had_rewrite = true;
+                rewritten += 1;
             }
         }
         if had_rewrite {
@@ -2598,6 +2618,7 @@ fn rewrite_remote_def_bodies(
             }
         }
     }
+    rewritten
 }
 
 /// Plan 101 Phase 4: Inject generated RPC dispatch for server targets.
@@ -5658,7 +5679,15 @@ fn compile_fai_to_wasm(
     };
 
     if let Some((url, hash)) = rpc_proxy_substitution {
-        rewrite_remote_def_bodies(&mut prepared.modules, url, hash);
+        let rewritten = rewrite_remote_def_bodies(&mut prepared.modules, url, hash);
+        if std::env::var_os("FAI_RPC_DEBUG").is_some() {
+            eprintln!(
+                "[rpc-proxy] rewrote {} remote def bod{} for {}",
+                rewritten,
+                if rewritten == 1 { "y" } else { "ies" },
+                path
+            );
+        }
     }
 
     let mut checker = fai_checker::Checker::new();
@@ -5751,17 +5780,24 @@ fn format_codegen_error(err: &fai_codegen_wasm::LocatedBuildError) -> String {
         raw.to_string()
     };
     let mut out = String::from("\nSource codegen errors:\n");
-    let body = match (err.line, err.col) {
+    let mut body = match (err.line, err.col) {
         (Some(l), Some(c)) => format!("  {:?} (line {}:{})\n", err.err, l, c),
         (Some(l), None) => format!("  {:?} (line {})\n", err.err, l),
         _ => format!("  {:?}\n", err.err),
     };
+    body.push_str("  Suggestion: ");
+    body.push_str(&codegen_error_suggestion(&err.err));
+    body.push('\n');
 
     // Heading priority: module name (always, no conditional on
     // external vs user) → file path → `(no file)` bucket.
     if let Some(module) = err.module.as_deref() {
         out.push('\n');
         out.push_str(&format!("package: {}\n", module));
+        if let Some(f) = err.file.as_deref() {
+            out.push_str(&display_path(f));
+            out.push('\n');
+        }
         out.push_str(&body);
         if err.is_external_package() {
             out.push_str(
@@ -5778,6 +5814,41 @@ fn format_codegen_error(err: &fai_codegen_wasm::LocatedBuildError) -> String {
         out.push_str(&body);
     }
     out
+}
+
+fn codegen_error_suggestion(err: &fai_codegen_wasm::direct::BuildError) -> String {
+    use fai_codegen_wasm::direct::BuildError;
+
+    match err {
+        BuildError::UnsupportedExpression(kind) => format!(
+            "the direct wasm backend does not lower `{}` here yet. If this code should be unreachable for the current target, check the target's imports/reachability; otherwise reduce the construct or add backend support.",
+            kind
+        ),
+        BuildError::UnsupportedStatement(kind) => format!(
+            "the direct wasm backend does not lower `{}` here yet. Move this shape behind an unreachable target boundary or add backend support for the statement.",
+            kind
+        ),
+        BuildError::UnknownIdentifier(name) => format!(
+            "`{}` is not in scope for codegen. Check the import, module path, spelling, or generated remote proxy for this target.",
+            name
+        ),
+        BuildError::ModuleAccessNotYetSupported(name) => format!(
+            "`{}` did not resolve to a supported module function or stdlib member. Check the module import and exported function name.",
+            name
+        ),
+        BuildError::DuplicateModuleName(name) => format!(
+            "`{}` is defined by more than one discovered module. Rename the local module or dependency package so codegen has one canonical owner.",
+            name
+        ),
+        BuildError::AsyncLoweringUnsupported { function, cause } => format!(
+            "`{}` is async because of `{}` but could not be lowered. Run with FAI_ASYNC_DEBUG=1 for the concrete async-engine refusal, then fix that source location or reduce it into a compiler fixture.",
+            function, cause
+        ),
+        other => format!(
+            "codegen refused with `{:?}`. Run with FAI_ASYNC_DEBUG=1 for async-engine context, then reduce this to the smallest failing fixture under tests/fixtures/projects/ if the source looks valid.",
+            other
+        ),
+    }
 }
 
 /// Group check errors by source file under a `Source check errors:`
@@ -5968,6 +6039,37 @@ mod tests {
         // Not an array → empty vec.
         assert_eq!(parse_string_array("\"web\""), Vec::<String>::new());
         assert_eq!(parse_string_array("[]"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_format_codegen_error_includes_actionable_async_hint() {
+        let err = fai_codegen_wasm::LocatedBuildError {
+            err: fai_codegen_wasm::direct::BuildError::UnsupportedExpression("RangeExpression"),
+            file: Some("src/data/wiki/main.fai".to_string()),
+            line: Some(17),
+            col: Some(5),
+            module: None,
+        };
+        let formatted = format_codegen_error(&err);
+        assert!(formatted.contains("src/data/wiki/main.fai"));
+        assert!(formatted.contains("line 17:5"));
+        assert!(formatted.contains("UnsupportedExpression"));
+        assert!(
+            formatted.contains("Suggestion:"),
+            "formatter should tell a human or agent what to try next:\n{}",
+            formatted
+        );
+
+        let module_err = fai_codegen_wasm::LocatedBuildError {
+            err: fai_codegen_wasm::direct::BuildError::UnsupportedExpression("RangeExpression"),
+            file: Some("src/data/wiki/embeddings.fai".to_string()),
+            line: Some(232),
+            col: Some(1),
+            module: Some("data.wiki".to_string()),
+        };
+        let formatted = format_codegen_error(&module_err);
+        assert!(formatted.contains("package: data.wiki"));
+        assert!(formatted.contains("src/data/wiki/embeddings.fai"));
     }
 
     /// Build a minimal `ProjectInfo` with a list of (name, deps,
@@ -8021,6 +8123,173 @@ mod tests {
             schema
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_remote_target_ignores_unreachable_async_helpers() {
+        let dir = temp_dir("cmd_build_remote_dead_async_helper");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("platforms/web")).unwrap();
+        std::fs::create_dir_all(src.join("platforms/server")).unwrap();
+        std::fs::create_dir_all(src.join("data/people")).unwrap();
+
+        std::fs::write(
+            dir.join("fai.toml"),
+            concat!(
+                "[project]\n",
+                "name = \"RemoteReachability\"\n",
+                "version = \"0.1.0\"\n",
+                "source_root = \"src\"\n",
+                "\n",
+                "[project.web]\n",
+                "target = \"wasm-html\"\n",
+                "source = \"src\"\n",
+                "main = \"src/platforms/web/main.fai\"\n",
+                "build_dir = \"build/web\"\n",
+                "\n",
+                "[project.server]\n",
+                "target = \"wasm\"\n",
+                "source = \"src\"\n",
+                "main = \"src/platforms/server/main.fai\"\n",
+                "build_dir = \"build/server\"\n",
+                "rpc_server = true\n",
+                "required_targets = [\"web\"]\n",
+                "\n",
+                "[project.web.dependencies.server.remote.dev]\n",
+                "url = \"http://localhost:3040\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("platforms/web/main.fai"),
+            concat!(
+                "use { updatePerson } from data.people\n\n",
+                "def main\n",
+                "    @return String\n",
+                "do\n",
+                "  updatePerson(1, 'A')\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("platforms/server/main.fai"),
+            concat!(
+                "use { updatePerson } from data.people\n\n",
+                "def main\n",
+                "    @return Void\n",
+                "do\n",
+                "  let _ = updatePerson(1, 'A')\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("data/people/updatePerson.fai"),
+            concat!(
+                "# Updates a person.\n",
+                "remote def updatePerson\n",
+                "    @param id Int\n",
+                "    @param name String\n",
+                "    @return String\n",
+                "do\n",
+                "  name\n",
+                "end\n\n",
+                "# Unused async helper.\n",
+                "def unusedAsyncHelper\n",
+                "    @return Void\n",
+                "do\n",
+                "  for i in 0..3\n",
+                "    sleep(1)\n",
+                "  end\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&["server".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(dir.join("build/web/web.wasm").exists());
+        assert!(dir.join("build/server/server.wasm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cmd_build_remote_target_rewrites_reachable_remote_body() {
+        let dir = temp_dir("cmd_build_remote_rewrites_body");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("platforms/web")).unwrap();
+        std::fs::create_dir_all(src.join("data/people")).unwrap();
+
+        std::fs::write(
+            dir.join("fai.toml"),
+            concat!(
+                "[project]\n",
+                "name = \"RemoteRewriteBody\"\n",
+                "version = \"0.1.0\"\n",
+                "source_root = \"src\"\n",
+                "\n",
+                "[project.web]\n",
+                "target = \"wasm-html\"\n",
+                "source = \"src\"\n",
+                "main = \"src/platforms/web/main.fai\"\n",
+                "build_dir = \"build/web\"\n",
+                "\n",
+                "[project.web.dependencies.server.remote.dev]\n",
+                "url = \"http://localhost:3040\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("platforms/web/main.fai"),
+            concat!(
+                "use { updatePerson } from data.people\n\n",
+                "def main\n",
+                "    @return String\n",
+                "do\n",
+                "  updatePerson(1, 'A')\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("data/people/updatePerson.fai"),
+            concat!(
+                "# Updates a person.\n",
+                "remote def updatePerson\n",
+                "    @param id Int\n",
+                "    @param name String\n",
+                "    @return String\n",
+                "do\n",
+                "  updatePersonInternal(id, name)\n",
+                "end\n\n",
+                "# Server-only implementation reached by the real remote body.\n",
+                "def updatePersonInternal\n",
+                "    @param id Int\n",
+                "    @param name String\n",
+                "    @return String\n",
+                "do\n",
+                "  for i in 0..3\n",
+                "    sleep(1)\n",
+                "  end\n",
+                "  name\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+
+        let _guard = cwd_test_lock();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        cmd_build(&["web".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(dir.join("build/web/web.wasm").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
