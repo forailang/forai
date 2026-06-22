@@ -551,7 +551,9 @@ pub const IMPORT_HOST_OP_BEGIN: u32 = 117;
 /// `env.host_op_result(task_id) -> i64` — the NaN-boxed result of the generic
 /// host operation started by `host_op_begin`.
 pub const IMPORT_HOST_OP_RESULT: u32 = 118;
-pub const IMPORT_COUNT: u32 = 119;
+/// `env.crypto_rs256_sign_base64_url(key_ptr, key_len, msg_ptr, msg_len) -> i64`.
+pub const IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: u32 = 119;
+pub const IMPORT_COUNT: u32 = 120;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -801,6 +803,7 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             avail[IMPORT_CRYPTO_CONSTANT_TIME_EQUALS as usize] = false;
             avail[IMPORT_CRYPTO_BASE64_ENCODE as usize] = false;
             avail[IMPORT_CRYPTO_BASE64_DECODE as usize] = false;
+            avail[IMPORT_CRYPTO_RS256_SIGN_BASE64_URL as usize] = false;
             // FFI is native-only; an extern call reached on the browser
             // compiles to `unreachable` like the other stripped imports.
             avail[IMPORT_FFI_BEGIN as usize] = false;
@@ -9125,6 +9128,12 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_HOST_OP_RESULT: (task_id) -> i64 (NaN-boxed value)
         ("host_op_result", vec![ValType::I32], vec![ValType::I64]),
+        // IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: (key_ptr, key_len, msg_ptr, msg_len) -> i64.
+        (
+            "crypto_rs256_sign_base64_url",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
     ]
 }
 

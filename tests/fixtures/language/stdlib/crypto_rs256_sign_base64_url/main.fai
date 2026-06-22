@@ -1,0 +1,12 @@
+use std.crypto
+
+def main
+    @return Void
+do
+    if crypto.available()
+        let key = '-----BEGIN PRIVATE KEY-----\nMIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAOkzDOZHUJ3M0FyX\nNpPY3XxZCb7ozRwvJp5+ZYkPqPtt2Y5wMT6gm+K+1d8cPrfLeGin11LknZEnHNXs\nclMt3Y4aurI56mPV8aJNIRtcWdBYZq9vfa/STvhyl12K2a9RoxbyTNNv5liRySkK\nZDNR5oJIQYYX7KEMyJbuaLXL+FM3AgMBAAECgYEAowBlBt1YU0Sja+TiaEuQ3Wcb\nMc9l90pZ8zUkYb6Jfl2VUUPImB8Jd1+u/MmwaSYXHwgasT1NifVN6ZXhf5SypFjn\nhvgN8R74B6IXk1WNxwuhxyINuR+14L98jy6/5x8izFGzGVb8CaWFZ5/AhdkLERol\n+RalBTpcLZOFhxDpEZECQQD9uaNW1J+4ZDHuG+2pcHQJpYXXBNosgdI3XlUkUhvL\nsNxgcX5C2uSiN+BBwIYMxyp/bSEXKXHop00f0df0L/f5AkEA60pM+3qejPIWsW53\nszUGQqrzJ3VKXt+EE166g1Co2TKG0L2uKl8Ro1AvGTZgCOyntXn+sqh2BcV+RdQy\nOzBQrwJBAINn35aa7FW9XrapND9rBE3ysgyYcL5YRh1y97ml5Mtrv9cbMH9DiuIQ\n+k5TfZmklPgF9vtd9aa+7wypy6SmK1ECQEA4p4p8jYorCcakQEfJ0UuhHX1HpmT+\n3S3sTTxKZ8vg3qtbGo62JDpPSIu5K71D2wLNqZdaI9yvayfkI1HEfkECQQDgXybI\nxcxAsC9p+ku4D+QjgZ5C5GhZqCVgLsotbrpFdbeTAar99jlhJ6AYwUuHeQWkkJw9\nNlY8x0vxtX80gpXH\n-----END PRIVATE KEY-----\n'
+        let sig = crypto.rs256SignBase64Url(key, 'header.payload')
+        assert.equals(sig, 'hnWxfXFGx0uJ_ZnCz2VmLZplvS2m0aTJeEavJr_Wj9BXcZjA-OfxIz-HJeahVzISEPYoXXRBmZexCb5mjSY7BnioW_owADCfoEJcl7U7JgAhPYoldud6IM4q5ZB4Lns1P93RmEzC9YVdEbd60hPaaAYgemcsoaA-jzH312AykEE')
+        assert.equals(crypto.rs256SignBase64Url('not a key', 'header.payload'), '')
+    end
+end

@@ -22,27 +22,28 @@ use crate::runtime::{
     IMPORT_ARRAY_MAP, IMPORT_CALL_FFI, IMPORT_CLI_CLEAR, IMPORT_CLI_MOVE_TO, IMPORT_CLI_READ_LINE,
     IMPORT_CLI_WRITE, IMPORT_CLI_WRITE_LINE, IMPORT_CRYPTO_AVAILABLE, IMPORT_CRYPTO_BASE64_DECODE,
     IMPORT_CRYPTO_BASE64_ENCODE, IMPORT_CRYPTO_CONSTANT_TIME_EQUALS, IMPORT_CRYPTO_HEX_ENCODE,
-    IMPORT_CRYPTO_HMAC_SHA1_BASE64, IMPORT_CRYPTO_HMAC_SHA256_HEX, IMPORT_CRYPTO_SHA256_HEX,
-    IMPORT_ENV_GET, IMPORT_ENV_LOAD, IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL,
-    IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT, IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF,
-    IMPORT_EVENT_ON, IMPORT_EVENT_ONCE, IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS,
-    IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS, IMPORT_FILE_LIST, IMPORT_FILE_READ_STR,
-    IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE, IMPORT_HTTP_REQUEST_DELETE,
-    IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH, IMPORT_HTTP_REQUEST_POST,
-    IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY,
-    IMPORT_LOG_ERROR, IMPORT_LOG_INFO, IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS,
-    IMPORT_OWNERSHIP_EVENT, IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME,
-    IMPORT_PATH_JOIN, IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN,
-    IMPORT_PROCESS_START, IMPORT_PROCESS_STOP, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE,
-    IMPORT_RANDOM, IMPORT_REMOTE_CALL, IMPORT_REPLACE_LOCATION, IMPORT_SET_HTML,
-    IMPORT_SET_HTML_AT, IMPORT_SET_TRAP_MSG, IMPORT_SPAWN, IMPORT_STORAGE_CLEAR,
-    IMPORT_STORAGE_GET_STR, IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET, IMPORT_TCP_ACCEPT,
-    IMPORT_TCP_ADDRESS, IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN, IMPORT_TCP_READ,
-    IMPORT_TCP_READ_LINE, IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND,
-    IMPORT_UDP_BROADCAST, IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK,
-    METHOD_APPEND, METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS,
-    METHOD_INDEX_OF, METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT,
-    METHOD_REPLACE, METHOD_REVERSE, METHOD_SERVER_GET, METHOD_SERVER_HTML, METHOD_SERVER_JSON,
+    IMPORT_CRYPTO_HMAC_SHA1_BASE64, IMPORT_CRYPTO_HMAC_SHA256_HEX,
+    IMPORT_CRYPTO_RS256_SIGN_BASE64_URL, IMPORT_CRYPTO_SHA256_HEX, IMPORT_ENV_GET, IMPORT_ENV_LOAD,
+    IMPORT_EVENT_CLEAR, IMPORT_EVENT_CLEAR_ALL, IMPORT_EVENT_DRAIN, IMPORT_EVENT_EMIT,
+    IMPORT_EVENT_EMIT_DEFERRED, IMPORT_EVENT_OFF, IMPORT_EVENT_ON, IMPORT_EVENT_ONCE,
+    IMPORT_EVENT_QUEUE_LEN, IMPORT_EVENT_SUBSCRIBERS, IMPORT_FFI_AVAILABLE, IMPORT_FILE_EXISTS,
+    IMPORT_FILE_LIST, IMPORT_FILE_READ_STR, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE,
+    IMPORT_HTTP_REQUEST_DELETE, IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH,
+    IMPORT_HTTP_REQUEST_POST, IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE,
+    IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY, IMPORT_LOG_ERROR, IMPORT_LOG_INFO,
+    IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS, IMPORT_OWNERSHIP_EVENT,
+    IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
+    IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
+    IMPORT_PROCESS_STOP, IMPORT_PROCESS_WRITE, IMPORT_PUSH_HISTORY_STATE, IMPORT_RANDOM,
+    IMPORT_REMOTE_CALL, IMPORT_REPLACE_LOCATION, IMPORT_SET_HTML, IMPORT_SET_HTML_AT,
+    IMPORT_SET_TRAP_MSG, IMPORT_SPAWN, IMPORT_STORAGE_CLEAR, IMPORT_STORAGE_GET_STR,
+    IMPORT_STORAGE_REMOVE, IMPORT_STORAGE_SET, IMPORT_TCP_ACCEPT, IMPORT_TCP_ADDRESS,
+    IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN, IMPORT_TCP_READ, IMPORT_TCP_READ_LINE,
+    IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND, IMPORT_UDP_BROADCAST,
+    IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK, METHOD_APPEND,
+    METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS, METHOD_INDEX_OF,
+    METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT, METHOD_REPLACE,
+    METHOD_REVERSE, METHOD_SERVER_GET, METHOD_SERVER_HTML, METHOD_SERVER_JSON,
     METHOD_SERVER_LISTEN, METHOD_SERVER_OK, METHOD_SERVER_POST, METHOD_SERVER_REDIRECT,
     METHOD_SERVER_ROUTER, METHOD_SERVER_SERVE_FILES, METHOD_SERVER_TEXT, METHOD_SLICE, METHOD_SORT,
     METHOD_SPLIT, METHOD_STARTS_WITH, METHOD_SUBSTRING, METHOD_TO_LOWER, METHOD_TO_UPPER,
@@ -727,6 +728,11 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         ),
         ("std.crypto", "base64Encode") => (IMPORT_CRYPTO_BASE64_ENCODE, &[AS::String], RS::Boxed),
         ("std.crypto", "base64Decode") => (IMPORT_CRYPTO_BASE64_DECODE, &[AS::String], RS::Boxed),
+        ("std.crypto", "rs256SignBase64Url") => (
+            IMPORT_CRYPTO_RS256_SIGN_BASE64_URL,
+            &[AS::String, AS::String],
+            RS::Boxed,
+        ),
         ("std.ffi", "available") => (IMPORT_FFI_AVAILABLE, &[AS::String], RS::MakeBool),
 
         // std.net.tcp — handle-based TCP surface.
@@ -930,7 +936,7 @@ pub(crate) fn stdlib_scheduling(module: &str, method: &str) -> Option<StdlibSche
         | (
             "std.crypto",
             "hmacSha256Hex" | "hmacSha1Base64" | "sha256Hex" | "hexEncode" | "base64Encode"
-            | "base64Decode",
+            | "base64Decode" | "rs256SignBase64Url",
         ) => Some(CpuBoundDirect),
 
         ("std.file", "exists")
@@ -7858,6 +7864,11 @@ pub fn try_codegen_async_engine(
         g_table_base: 9,
         g_live: 10,
         g_free_head: 11,
+        // Appended after heap debug globals so existing module-var global
+        // indices stay stable.
+        g_timer_waiting: 14 + module_var_count,
+        g_completed_head: 15 + module_var_count,
+        g_completed_tail: 16 + module_var_count,
         main_resume_table_idx: 0,
         capacity: 4096,
         root_frame_size,
@@ -8204,9 +8215,10 @@ pub fn try_codegen_async_engine(
     funcs.function(t_i32_i64); // task_result
     funcs.function(t_i32i32_void); // await
     funcs.function(t_i64i64_i64); // drive_closure
-                                  // Closures, after the scheduler: async closures are resume fns (`t_resume`),
-                                  // sync closures are `FaiFunc(arity)`. async-fn closures first, then sync-fn,
-                                  // matching the table-slot order.
+    funcs.function(t_void_i32); // completed_pop
+                                // Closures, after the scheduler: async closures are resume fns (`t_resume`),
+                                // sync closures are `FaiFunc(arity)`. async-fn closures first, then sync-fn,
+                                // matching the table-slot order.
     for c in async_closures.iter().chain(sync_closures.iter()) {
         if c.is_async {
             funcs.function(t_resume);
@@ -8217,6 +8229,7 @@ pub fn try_codegen_async_engine(
     // Appended after the closures so their indices never shift: the unified
     // host driver loop's spawn-without-drive and task-status entries (plan 101).
     funcs.function(t_i64i64_i64); // __fai_spawn_closure (i64,i64)->i64
+    funcs.function(t_i64i64_i64); // __fai_spawn_queued_closure (i64,i64)->i64
     funcs.function(t_i32_i32); // __fai_task_status (i32)->i32
     funcs.function(t_i32_void); // __fai_free_task (i32)->()
     module.section(&funcs);
@@ -8293,12 +8306,23 @@ pub fn try_codegen_async_engine(
     globals.global(i32mut, &ConstExpr::i32_const(0));
     // Live-object counter (plan 113), appended after the free-list.
     globals.global(i32mut, &ConstExpr::i32_const(0));
+    // Native timer wait count for skipping poll's task-table timer scan when
+    // no timer waits exist. Appended after heap globals to avoid moving module
+    // vars or existing debug globals.
+    globals.global(i32mut, &ConstExpr::i32_const(0));
+    // Host-queued completion FIFO for server handlers; appended to preserve all
+    // earlier global indices.
+    globals.global(i32mut, &ConstExpr::i32_const(-1)); // completed_head
+    globals.global(i32mut, &ConstExpr::i32_const(-1)); // completed_tail
     module.section(&globals);
 
     // Heap free-list / live-count globals, appended after fixed+sched+
     // module-var globals (also referenced by the export section below).
     let freelist_global = 12 + module_var_count;
     let live_count_global = freelist_global + 1;
+    let timer_waiting_global = live_count_global + 1;
+    let completed_head_global = timer_waiting_global + 1;
+    let completed_tail_global = completed_head_global + 1;
 
     let mut exports = ExportSection::new();
     exports.export("_start_async", ExportKind::Func, start_async_idx);
@@ -8308,14 +8332,22 @@ pub fn try_codegen_async_engine(
     // Host-driver entry: spawn+drive an async guest closure (route/event handler)
     // to completion. await = sb+11, drive_closure = sb+12 (appended last).
     exports.export("__fai_drive_closure", ExportKind::Func, sb + 12);
+    exports.export("__fai_pop_completed_task", ExportKind::Func, sb + 13);
     // Host-driver loop entries (plan 101), appended after the closures so the
     // closure table indices never shift. Scheduler block is sb..sb+13; closures
-    // occupy sb+13..sb+13+nclosures; these two sit just past them.
+    // occupy sb+SCHED_FN_COUNT..+nclosures; these sit just past them.
     let nclosures = (async_closures.len() + sync_closures.len()) as u32;
-    let spawn_closure_idx = sb + 13 + nclosures;
-    let task_status_idx = sb + 14 + nclosures;
-    let free_task_idx = sb + 15 + nclosures;
+    let host_driver_base = sb + async_engine::SCHED_FN_COUNT + nclosures;
+    let spawn_closure_idx = host_driver_base;
+    let spawn_queued_closure_idx = host_driver_base + 1;
+    let task_status_idx = host_driver_base + 2;
+    let free_task_idx = host_driver_base + 3;
     exports.export("__fai_spawn_closure", ExportKind::Func, spawn_closure_idx);
+    exports.export(
+        "__fai_spawn_queued_closure",
+        ExportKind::Func,
+        spawn_queued_closure_idx,
+    );
     exports.export("__fai_task_status", ExportKind::Func, task_status_idx);
     exports.export("__fai_free_task", ExportKind::Func, free_task_idx);
     // Host-callable refcount helpers: lets the host retain guest handles it
@@ -8362,6 +8394,21 @@ pub fn try_codegen_async_engine(
     exports.export("__dbg_free_head", ExportKind::Global, layout.g_free_head);
     exports.export("__dbg_head", ExportKind::Global, layout.g_head);
     exports.export("__dbg_tail", ExportKind::Global, layout.g_tail);
+    exports.export(
+        "__dbg_timer_waiting",
+        ExportKind::Global,
+        timer_waiting_global,
+    );
+    exports.export(
+        "__dbg_completed_head",
+        ExportKind::Global,
+        completed_head_global,
+    );
+    exports.export(
+        "__dbg_completed_tail",
+        ExportKind::Global,
+        completed_tail_global,
+    );
     // Heap overflow free-list head (blocks too large for the size
     // buckets) — the post-mortem heap stats walk it.
     exports.export("__free_list", ExportKind::Global, freelist_global);
@@ -8416,9 +8463,10 @@ pub fn try_codegen_async_engine(
     for c in async_closures.iter().chain(sync_closures.iter()) {
         code.function(&c.function);
     }
-    // Appended after the closures (function-section order matches): the two
-    // host-driver-loop entries (plan 101). Indices computed at the export below.
+    // Appended after the closures (function-section order matches): host driver
+    // loop entries (plan 101). Indices are computed in the export section.
     code.function(&async_engine::emit_spawn_closure(&layout));
+    code.function(&async_engine::emit_spawn_queued_closure(&layout));
     code.function(&async_engine::emit_task_status(&layout));
     code.function(&async_engine::emit_free_task(&layout));
     module.section(&code);
@@ -8471,6 +8519,7 @@ pub fn try_codegen_async_engine(
         "sched_task_result",
         "sched_await",
         "sched_drive_closure",
+        "sched_completed_pop",
     ]
     .iter()
     .enumerate()

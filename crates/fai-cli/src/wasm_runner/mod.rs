@@ -286,7 +286,6 @@ pub fn run_wasm_with_externs_opts(
                     return Err(msg);
                 }
             }
-            std::thread::sleep(Duration::from_millis(1));
             for task_id in host::boundary::pump_ready() {
                 if let Some(rt) = &resume_task {
                     let _ = rt.call(&mut store, task_id);
@@ -296,6 +295,13 @@ pub fn run_wasm_with_externs_opts(
                 Ok(s) => s,
                 Err(e) => return Err(fail("WASM async poll error", &e, &mut store)),
             };
+            if status != 2 && status != 3 {
+                if host::boundary::has_inflight() {
+                    let _ = host::boundary::wait_for_ready(Duration::from_millis(1));
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
         if status == 3 {
             let result = task_result

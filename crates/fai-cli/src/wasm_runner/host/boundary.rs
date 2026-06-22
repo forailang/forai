@@ -113,7 +113,7 @@ impl Boundary {
     where
         F: FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
+        self.inflight.fetch_add(1, Ordering::Relaxed);
         {
             let mut q = self.shared.queue.lock().unwrap();
             q.jobs.push_back((task_id, Box::new(work)));
@@ -127,7 +127,7 @@ impl Boundary {
         let mut q = self.completions.queue.lock().unwrap();
         let drained: Vec<Completion> = q.drain(..).collect();
         if !drained.is_empty() {
-            self.inflight.fetch_sub(drained.len(), Ordering::SeqCst);
+            self.inflight.fetch_sub(drained.len(), Ordering::Relaxed);
         }
         drained
     }
@@ -145,7 +145,7 @@ impl Boundary {
 
     /// Jobs submitted but not yet drained. Zero means no outstanding work.
     pub(crate) fn inflight(&self) -> usize {
-        self.inflight.load(Ordering::SeqCst)
+        self.inflight.load(Ordering::Relaxed)
     }
 }
 
@@ -259,6 +259,13 @@ pub(crate) fn has_inflight() -> bool {
     try_with_boundary(|b| b.inflight() > 0).unwrap_or(false)
 }
 
+/// Wait until at least one completion is ready, or until `timeout` elapses.
+/// Unlike `pump_ready`, this does not create the boundary pool for programs
+/// that never offload work.
+pub(crate) fn wait_for_ready(timeout: Duration) -> bool {
+    try_with_boundary(|b| b.wait(timeout)).unwrap_or(false)
+}
+
 /// Take the finished result for `task_id` (surfaced by `pump_ready`). The guest
 /// calls its `*_result` import after being resumed; that import calls this.
 pub(crate) fn take_ready(task_id: i32) -> Option<JobResult> {
@@ -270,6 +277,9 @@ pub(crate) fn take_ready(task_id: i32) -> Option<JobResult> {
 pub(crate) fn shutdown_boundary() {
     BOUNDARY.with(|slot| {
         slot.borrow_mut().take();
+    });
+    READY.with(|map| {
+        map.borrow_mut().clear();
     });
 }
 

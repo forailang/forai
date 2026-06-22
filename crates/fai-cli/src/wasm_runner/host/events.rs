@@ -751,96 +751,30 @@ fn invoke_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) -> i6
 }
 
 fn drive_async_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) -> i64 {
-    let Some(task_id) = spawn_handler(caller, handler_val, arg) else {
+    let scheduler = super::guest_scheduler::GuestScheduler::new(caller);
+    let Some(task_id) = scheduler.spawn_closure(caller, handler_val, arg) else {
         return VAL_NULL;
     };
     loop {
-        guest_poll(caller);
         for ready_id in super::boundary::pump_ready() {
-            guest_resume_task(caller, ready_id);
+            scheduler.resume_task(caller, ready_id);
         }
-        let status = guest_task_status(caller, task_id);
+        scheduler.poll(caller);
+        let status = scheduler.task_status(caller, task_id);
         if status >= ST_COMPLETE {
             let result = if status == ST_FAILED {
                 VAL_NULL
             } else {
-                guest_task_result(caller, task_id)
+                scheduler.task_result(caller, task_id)
             };
-            guest_free_task(caller, task_id);
+            scheduler.free_task(caller, task_id);
             return result;
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-fn spawn_handler(caller: &mut Caller<'_, ()>, handler: i64, arg: i64) -> Option<i32> {
-    let f = caller
-        .get_export("__fai_spawn_closure")
-        .and_then(|e| e.into_func())?;
-    let mut out = [Val::I64(0)];
-    f.call(&mut *caller, &[Val::I64(handler), Val::I64(arg)], &mut out)
-        .ok()?;
-    match out[0] {
-        Val::I64(v) => Some(v as i32),
-        _ => None,
-    }
-}
-
-fn guest_poll(caller: &mut Caller<'_, ()>) {
-    if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
-        let _ = f.call(&mut *caller, &[], &mut [Val::I32(0)]);
-    }
-}
-
-fn guest_resume_task(caller: &mut Caller<'_, ()>, id: i32) {
-    if let Some(f) = caller
-        .get_export("__fai_resume_task")
-        .and_then(|e| e.into_func())
-    {
-        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut [Val::I32(0)]);
-    }
-}
-
-fn guest_task_status(caller: &mut Caller<'_, ()>, id: i32) -> i32 {
-    let Some(f) = caller
-        .get_export("__fai_task_status")
-        .and_then(|e| e.into_func())
-    else {
-        return ST_FAILED;
-    };
-    let mut out = [Val::I32(0)];
-    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
-        return ST_FAILED;
-    }
-    match out[0] {
-        Val::I32(v) => v,
-        _ => ST_FAILED,
-    }
-}
-
-fn guest_task_result(caller: &mut Caller<'_, ()>, id: i32) -> i64 {
-    let Some(f) = caller
-        .get_export("__fai_task_result")
-        .and_then(|e| e.into_func())
-    else {
-        return VAL_NULL;
-    };
-    let mut out = [Val::I64(0)];
-    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
-        return VAL_NULL;
-    }
-    match out[0] {
-        Val::I64(v) => v,
-        _ => VAL_NULL,
-    }
-}
-
-fn guest_free_task(caller: &mut Caller<'_, ()>, id: i32) {
-    if let Some(f) = caller
-        .get_export("__fai_free_task")
-        .and_then(|e| e.into_func())
-    {
-        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut []);
+        if super::boundary::has_inflight() {
+            let _ = super::boundary::wait_for_ready(Duration::from_millis(1));
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

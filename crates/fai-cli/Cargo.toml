@@ -25,11 +25,12 @@ fai-codegen-wasm = { path = "../fai-codegen-wasm" }
 fai-ffi = { path = "../fai-ffi" }
 wasmtime = "29"
 wasmparser = "0.221"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 sha1 = "0.10"
 hmac = "0.12"
 base64 = "0.21"
 subtle = "2"
+rsa = "0.9"
 ureq = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }

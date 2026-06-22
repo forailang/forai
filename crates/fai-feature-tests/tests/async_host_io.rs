@@ -80,6 +80,31 @@ fn spawn_capture_http_stub() -> (u16, Receiver<String>) {
     (port, rx)
 }
 
+fn spawn_status_http_stub(
+    status: u16,
+    reason: &'static str,
+    body: &'static str,
+) -> (u16, Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let _ = tx.send(());
+        let resp = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+    });
+    (port, rx)
+}
+
 fn spawn_delayed_tcp_client(port: u16, delay: Duration) -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -509,6 +534,40 @@ fn post_http_source(stub_port: u16) -> String {
     )
 }
 
+fn post_form_http_source(stub_port: u16) -> String {
+    format!(
+        "use std.convert\n\
+         use std.dictionary\n\
+         use std.http.request\n\
+         \n\
+         def main\n\
+         \x20   @return Void\n\
+         do\n\
+         \x20 var headers = {{}}\n\
+         \x20 headers = dictionary.set(headers, 'content-type', 'application/x-www-form-urlencoded')\n\
+         \x20 let resp = request.post('http://127.0.0.1:{stub_port}/submit', 'a=b', headers)\n\
+         \x20 print('status=' + convert.toString(resp.status))\n\
+         end\n",
+        stub_port = stub_port,
+    )
+}
+
+fn http_status_source(stub_port: u16) -> String {
+    format!(
+        "use std.convert\n\
+         use std.http.request\n\
+         \n\
+         def main\n\
+         \x20   @return Void\n\
+         do\n\
+         \x20 let resp = request.get('http://127.0.0.1:{stub_port}/status')\n\
+         \x20 print('status=' + convert.toString(resp.status))\n\
+         \x20 print('body=' + resp.body)\n\
+         end\n",
+        stub_port = stub_port,
+    )
+}
+
 fn nowait_process_source() -> String {
     "use std.process\n\
      \n\
@@ -786,6 +845,60 @@ fn async_http_post_response_is_ownership_balanced() {
     assert!(
         request.starts_with("POST /submit HTTP/1.1"),
         "unexpected request line:\n{request}"
+    );
+}
+
+#[test]
+fn async_http_post_respects_caller_content_type() {
+    let (stub_port, rx) = spawn_capture_http_stub();
+    let output = run_fai_source(
+        "async_host_io_post_content_type",
+        stub_port,
+        &post_form_http_source(stub_port),
+    );
+    assert!(
+        output.status.success(),
+        "fai run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout_string(&output),
+        stderr_string(&output)
+    );
+
+    let request = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("captured outbound POST request");
+    let lower = request.to_lowercase();
+    assert!(
+        lower.contains("content-type: application/x-www-form-urlencoded"),
+        "missing form content type:\n{request}"
+    );
+    assert!(
+        !lower.contains("application/json"),
+        "default JSON content type should not be sent with caller content type:\n{request}"
+    );
+}
+
+#[test]
+fn async_http_error_status_returns_response_shape() {
+    let (stub_port, rx) = spawn_status_http_stub(418, "I'm a Teapot", "short and stout");
+    let output = run_fai_source(
+        "async_host_io_http_status",
+        stub_port,
+        &http_status_source(stub_port),
+    );
+    assert!(
+        output.status.success(),
+        "fai run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout_string(&output),
+        stderr_string(&output)
+    );
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("stub received outbound request");
+
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("status=418"), "missing status:\n{stdout}");
+    assert!(
+        stdout.contains("body=short and stout"),
+        "missing body:\n{stdout}"
     );
 }
 

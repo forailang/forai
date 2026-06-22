@@ -69,6 +69,10 @@ pub const ST_FAILED: i32 = 4;
 /// status is COMPLETE/FAILED; a freed (or live/reused) slot is skipped.
 pub const ST_FREED: i32 = 5;
 
+const WAITER_NONE: i32 = -1;
+const WAITER_HOST: i32 = -2;
+const WAITER_HOST_QUEUED: i32 = -3;
+
 /// Resolved function/global indices for the scheduler helpers. Both the
 /// test module and the production assembler fill this in for their own
 /// layout and pass it to the emitters.
@@ -123,6 +127,14 @@ pub struct SchedLayout {
     /// closure invocation, so without reclamation the table grows unbounded and
     /// overflows its allocation into live heap).
     pub g_free_head: u32,
+    /// Count of WAITING tasks parked on native timer deadlines. Browser timers
+    /// use host callbacks and host ops use explicit resumes, so `poll` can skip
+    /// its high-water task-table scan when this is zero.
+    pub g_timer_waiting: u32,
+    /// FIFO of host-queued task completions. `server.listen` uses this to drain
+    /// finished async route handlers without polling every pending request.
+    pub g_completed_head: u32,
+    pub g_completed_tail: u32,
     /// Function-table slot of `main`'s resume function.
     pub main_resume_table_idx: i32,
     /// Maximum number of tasks (v1: fixed-capacity bump, no reclamation).
@@ -146,8 +158,8 @@ pub struct SchedLayout {
 /// Number of scheduler helper functions emitted by [`emit_scheduler_functions`],
 /// in this order: ready_push, ready_pop, spawn, complete, fail, sleep,
 /// notify_waiter, poll, start_async, resume_task, task_result, await,
-/// drive_closure.
-pub const SCHED_FN_COUNT: u32 = 13;
+/// drive_closure, completed_pop.
+pub const SCHED_FN_COUNT: u32 = 14;
 
 fn ma(offset: u64) -> MemArg {
     MemArg {
@@ -221,6 +233,59 @@ fn emit_ready_pop(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(-1));
     f.instruction(&Instruction::GlobalSet(l.g_tail));
     f.instruction(&Instruction::End);
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+    f
+}
+
+fn emit_completed_push(f: &mut Function, l: &SchedLayout, id_local: u32, addr_local: u32) {
+    // task[id].next = -1
+    f.instruction(&Instruction::LocalGet(addr_local));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Store(ma(O_NEXT)));
+    // Empty queue: head = tail = id. Otherwise append after tail.
+    f.instruction(&Instruction::GlobalGet(l.g_completed_tail));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(id_local));
+    f.instruction(&Instruction::GlobalSet(l.g_completed_head));
+    f.instruction(&Instruction::LocalGet(id_local));
+    f.instruction(&Instruction::GlobalSet(l.g_completed_tail));
+    f.instruction(&Instruction::Else);
+    rec_addr_global(f, l, l.g_completed_tail);
+    f.instruction(&Instruction::LocalGet(id_local));
+    f.instruction(&Instruction::I32Store(ma(O_NEXT)));
+    f.instruction(&Instruction::LocalGet(id_local));
+    f.instruction(&Instruction::GlobalSet(l.g_completed_tail));
+    f.instruction(&Instruction::End);
+}
+
+fn emit_completed_pop(l: &SchedLayout) -> Function {
+    // -> i32; local 0 = id
+    let mut f = Function::new([(1, ValType::I32)]);
+    f.instruction(&Instruction::GlobalGet(l.g_completed_head));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::GlobalGet(l.g_completed_head));
+    f.instruction(&Instruction::LocalSet(0));
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I32Load(ma(O_NEXT)));
+    f.instruction(&Instruction::GlobalSet(l.g_completed_head));
+    f.instruction(&Instruction::GlobalGet(l.g_completed_head));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::GlobalSet(l.g_completed_tail));
+    f.instruction(&Instruction::End);
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Store(ma(O_NEXT)));
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
@@ -337,15 +402,24 @@ fn emit_complete_or_fail(l: &SchedLayout, status: i32, value_off: u64) -> Functi
     f.instruction(&Instruction::GlobalSet(l.g_live));
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(l.notify));
+    // Host-queued tasks are completed route handlers: the server loop drains
+    // this FIFO instead of scanning every pending task for every poll.
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Load(ma(O_WAITER)));
+    f.instruction(&Instruction::I32Const(WAITER_HOST_QUEUED));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    emit_completed_push(&mut f, l, 0, 2);
+    f.instruction(&Instruction::End);
     // Reclaim a detached task (`O_WAITER == -1`: no scheduler waiter, e.g. a
     // `nowait` fire-and-forget, whose result no one reads). Tasks with a real
     // waiter (>= 0) are freed by that waiter after it consumes the result; the
-    // host-driven sentinel (-2: root / `__fai_drive_closure`) is freed by the
-    // host after it reads `task_result`. Without this, every detached task
-    // permanently consumes a table slot and the table grows unbounded.
+    // host-driven sentinels (-2 root/event, -3 queued server handler) are freed
+    // by the host after it reads `task_result`. Without this, every detached
+    // task permanently consumes a table slot and the table grows unbounded.
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Load(ma(O_WAITER)));
-    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::I32Const(WAITER_NONE));
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::If(BlockType::Empty));
     // Detached tasks have no result consumer. Release the stored completion
@@ -393,6 +467,10 @@ fn emit_sleep(l: &SchedLayout) -> Function {
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::F64Add);
         f.instruction(&Instruction::F64Store(ma(O_WAKE)));
+        f.instruction(&Instruction::GlobalGet(l.g_timer_waiting));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(l.g_timer_waiting));
     }
     f.instruction(&Instruction::End);
     f
@@ -480,7 +558,11 @@ fn emit_poll(l: &SchedLayout) -> Function {
     // -> i32; locals: i = 0, id = 1, stall counter = 2
     let mut f = Function::new([(3, ValType::I32)]);
 
-    // timer promotion: for i in 0..count
+    // timer promotion: for i in 0..count, but only when native timers exist.
+    // Host-resumed waits (remote/FFI/host ops) and browser timers keep
+    // g_timer_waiting at zero, avoiding a high-water task-table scan per poll.
+    f.instruction(&Instruction::GlobalGet(l.g_timer_waiting));
+    f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(0));
     f.instruction(&Instruction::Block(BlockType::Empty));
@@ -507,6 +589,10 @@ fn emit_poll(l: &SchedLayout) -> Function {
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I32Const(ST_READY));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
+    f.instruction(&Instruction::GlobalGet(l.g_timer_waiting));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::GlobalSet(l.g_timer_waiting));
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(l.ready_push));
     f.instruction(&Instruction::End);
@@ -517,6 +603,7 @@ fn emit_poll(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::LocalSet(0));
     f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
 
@@ -641,7 +728,25 @@ fn emit_start_async(l: &SchedLayout) -> Function {
 
 fn emit_resume_task(l: &SchedLayout) -> Function {
     // param: id = 0; -> i32
-    let mut f = Function::new([]);
+    let mut f = Function::new([(1, ValType::I32)]);
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::LocalSet(1));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    f.instruction(&Instruction::I32Const(ST_WAITING));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::F64Load(ma(O_WAKE)));
+    f.instruction(&Instruction::F64Const(0.0));
+    f.instruction(&Instruction::F64Ge);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::GlobalGet(l.g_timer_waiting));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::GlobalSet(l.g_timer_waiting));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I32Const(ST_READY));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
@@ -695,9 +800,10 @@ fn emit_await(l: &SchedLayout) -> Function {
     f
 }
 
-/// The 11 scheduler helper functions, in declaration order:
+/// The scheduler helper functions, in declaration order:
 /// `ready_push, ready_pop, spawn, complete, fail, sleep, notify_waiter,
-/// poll, start_async, resume_task, task_result`.
+/// poll, start_async, resume_task, task_result, await, drive_closure,
+/// completed_pop`.
 pub fn emit_scheduler_functions(l: &SchedLayout) -> Vec<Function> {
     vec![
         emit_ready_push(l),
@@ -715,6 +821,7 @@ pub fn emit_scheduler_functions(l: &SchedLayout) -> Vec<Function> {
         emit_task_result(l),
         emit_await(l),
         emit_drive_closure(l),
+        emit_completed_pop(l),
     ]
 }
 
@@ -850,16 +957,7 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f
 }
 
-/// `__fai_spawn_closure(closure_val: i64, arg: i64) -> i64`: spawn an async
-/// closure as a scheduler task and return its task id (as i64) WITHOUT driving
-/// it to completion. This is `emit_drive_closure`'s spawn prologue with the
-/// drive loop removed, so the unified host driver loop can keep many handler
-/// tasks in flight on the single scheduler thread at once: it spawns each, polls
-/// the scheduler, and reads each result via `__fai_task_result` once
-/// `__fai_task_status` reports completion. The task is marked host-driven (-2)
-/// so the scheduler won't recycle its slot — the host reads the result and frees
-/// it, exactly as for a `__fai_drive_closure` task.
-pub fn emit_spawn_closure(l: &SchedLayout) -> Function {
+fn emit_spawn_closure_with_waiter(l: &SchedLayout, waiter: i32) -> Function {
     // params: closure_val = 0 (i64), arg = 1 (i64); locals: addr=2, frame=3, id=4 (i32)
     let mut f = Function::new([(3, ValType::I32)]);
     // addr = (closure_val & ADDR_MASK) as i32
@@ -903,15 +1001,30 @@ pub fn emit_spawn_closure(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Load(ma(12)));
     f.instruction(&Instruction::I32Store(ma(O_FRAME_SIZE)));
-    // Mark the task host-driven (-2) so its completion doesn't recycle the slot.
+    // Mark the task host-driven so its completion doesn't recycle the slot.
     rec_addr_local(&mut f, l, 4);
-    f.instruction(&Instruction::I32Const(-2));
+    f.instruction(&Instruction::I32Const(waiter));
     f.instruction(&Instruction::I32Store(ma(O_WAITER)));
     // return id as i64
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::I64ExtendI32S);
     f.instruction(&Instruction::End);
     f
+}
+
+/// `__fai_spawn_closure(closure_val: i64, arg: i64) -> i64`: spawn an async
+/// closure as a scheduler task and return its task id (as i64) WITHOUT driving
+/// it to completion. The task is marked host-driven but not enqueued on
+/// completion; single-task drivers poll `__fai_task_status` directly.
+pub fn emit_spawn_closure(l: &SchedLayout) -> Function {
+    emit_spawn_closure_with_waiter(l, WAITER_HOST)
+}
+
+/// `__fai_spawn_queued_closure(closure_val: i64, arg: i64) -> i64`: spawn an
+/// async closure for a host loop that wants finished task ids pushed into the
+/// scheduler completion FIFO and drained via `__fai_pop_completed_task`.
+pub fn emit_spawn_queued_closure(l: &SchedLayout) -> Function {
+    emit_spawn_closure_with_waiter(l, WAITER_HOST_QUEUED)
 }
 
 /// `__fai_task_status(id: i32) -> i32`: the task's status word (READY=0,
@@ -1029,16 +1142,16 @@ mod tests {
             resume_task: 10,
             task_result: 11,
             await_fn: 12,
-            // 13 = drive_closure (emitted by emit_scheduler_functions before alloc)
-            alloc: 14,
-            // 15 = no-op free (test frames record size 0, so it's never called
+            // 13 = drive_closure, 14 = completed_pop (emitted before alloc)
+            alloc: 15,
+            // 16 = no-op free (test frames record size 0, so it's never called
             // at runtime — present only so `complete`'s `Call(free)` validates).
-            free: 15,
-            // 16 = identity retain (test harness has no RC; present only so
+            free: 16,
+            // 17 = identity retain (test harness has no RC; present only so
             // `drive_closure`'s `Call(retain)` validates).
-            retain: 16,
-            // 17 = no-op release (test harness has no RC).
-            release: 17,
+            retain: 17,
+            // 18 = no-op release (test harness has no RC).
+            release: 18,
             resume_type: 1, // () -> ()
             g_count: 0,
             g_head: 1,
@@ -1048,6 +1161,9 @@ mod tests {
             g_table_base: 5,
             g_live: 6,
             g_free_head: 7,
+            g_timer_waiting: 8,
+            g_completed_head: 9,
+            g_completed_tail: 10,
             main_resume_table_idx: 0,
             capacity: 64,
             root_frame_size: 16,
@@ -1101,6 +1217,7 @@ mod tests {
         funcs.function(8); // task_result (i32)->i64
         funcs.function(9); // await (i32,i32)->()
         funcs.function(10); // drive_closure (i64,i64)->i64
+        funcs.function(3); // completed_pop ()->i32
         funcs.function(7); // alloc (i32)->i32
         funcs.function(9); // free (i32,i32)->() — no-op stub (type 9)
         funcs.function(11); // retain (i64)->i64 — identity stub (type 11)
@@ -1144,6 +1261,9 @@ mod tests {
         globals.global(g, &ConstExpr::i32_const(0)); // table_base
         globals.global(g, &ConstExpr::i32_const(0)); // live
         globals.global(g, &ConstExpr::i32_const(-1)); // free_head
+        globals.global(g, &ConstExpr::i32_const(0)); // timer_waiting
+        globals.global(g, &ConstExpr::i32_const(-1)); // completed_head
+        globals.global(g, &ConstExpr::i32_const(-1)); // completed_tail
         module.section(&globals);
 
         let mut exports = ExportSection::new();
@@ -1151,12 +1271,14 @@ mod tests {
         exports.export("__fai_poll", ExportKind::Func, 8);
         exports.export("__fai_resume_task", ExportKind::Func, 10);
         exports.export("__fai_task_result", ExportKind::Func, 11);
+        exports.export("__fai_pop_completed_task", ExportKind::Func, 14);
+        exports.export("__dbg_timer_waiting", ExportKind::Global, 8);
         exports.export("memory", ExportKind::Memory, 0);
         module.section(&exports);
 
         if n > 0 {
             let mut elements = ElementSection::new();
-            let idxs: Vec<u32> = (0..n).map(|i| 18 + i).collect();
+            let idxs: Vec<u32> = (0..n).map(|i| 19 + i).collect();
             elements.active(
                 Some(0),
                 &ConstExpr::i32_const(0),
@@ -1211,8 +1333,28 @@ mod tests {
         (store, instance)
     }
 
+    fn timer_waiting(inst: &Instance, store: &mut Store<()>) -> i32 {
+        inst.get_global(&mut *store, "__dbg_timer_waiting")
+            .expect("timer wait counter export")
+            .get(&mut *store)
+            .i32()
+            .expect("timer wait counter should be i32")
+    }
+
     fn body_immediate(l: &SchedLayout, value: i64) -> Function {
         let mut f = Function::new([]);
+        emit_complete_current_with(&mut f, l, |f| {
+            f.instruction(&Instruction::I64Const(value));
+        });
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    fn body_queued_host_complete(l: &SchedLayout, value: i64) -> Function {
+        let mut f = Function::new([]);
+        rec_addr_global(&mut f, l, l.g_current);
+        f.instruction(&Instruction::I32Const(WAITER_HOST_QUEUED));
+        f.instruction(&Instruction::I32Store(ma(O_WAITER)));
         emit_complete_current_with(&mut f, l, |f| {
             f.instruction(&Instruction::I64Const(value));
         });
@@ -1254,6 +1396,41 @@ mod tests {
     }
 
     #[test]
+    fn normal_host_driven_task_does_not_enter_completed_queue() {
+        CLOCK_MS.with(|c| c.set(0.0));
+        let (_, layout) = test_module(vec![Function::new([])]);
+        let wasm = test_module(vec![body_immediate(&layout, 123)]).0;
+        let (mut store, inst) = instantiate(&wasm);
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .unwrap();
+        let pop = inst
+            .get_typed_func::<(), i32>(&mut store, "__fai_pop_completed_task")
+            .unwrap();
+
+        assert_eq!(start.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(pop.call(&mut store, ()).unwrap(), -1);
+    }
+
+    #[test]
+    fn queued_host_driven_task_enters_completed_queue_once() {
+        CLOCK_MS.with(|c| c.set(0.0));
+        let (_, layout) = test_module(vec![Function::new([])]);
+        let wasm = test_module(vec![body_queued_host_complete(&layout, 123)]).0;
+        let (mut store, inst) = instantiate(&wasm);
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .unwrap();
+        let pop = inst
+            .get_typed_func::<(), i32>(&mut store, "__fai_pop_completed_task")
+            .unwrap();
+
+        assert_eq!(start.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(pop.call(&mut store, ()).unwrap(), 0);
+        assert_eq!(pop.call(&mut store, ()).unwrap(), -1);
+    }
+
+    #[test]
     fn task_suspends_on_sleep_then_resumes_when_the_clock_passes() {
         CLOCK_MS.with(|c| c.set(0.0));
         let (_, layout) = test_module(vec![Function::new([])]);
@@ -1269,6 +1446,7 @@ mod tests {
             .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
             .unwrap();
         assert_eq!(start.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(timer_waiting(&inst, &mut store), 1);
         // Not yet completed: result slot still holds VAL_VOID.
         assert_eq!(
             result.call(&mut store, 0).unwrap(),
@@ -1276,8 +1454,10 @@ mod tests {
         );
         CLOCK_MS.with(|c| c.set(20.0));
         assert_eq!(poll.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(timer_waiting(&inst, &mut store), 1);
         CLOCK_MS.with(|c| c.set(50.0));
         assert_eq!(poll.call(&mut store, ()).unwrap(), 2);
+        assert_eq!(timer_waiting(&inst, &mut store), 0);
         assert_eq!(result.call(&mut store, 0).unwrap(), 456);
     }
 
@@ -1300,7 +1480,9 @@ mod tests {
             .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
             .unwrap();
         assert_eq!(start.call(&mut store, ()).unwrap(), 1);
+        assert_eq!(timer_waiting(&inst, &mut store), 1);
         assert_eq!(resume.call(&mut store, 0).unwrap(), 0);
+        assert_eq!(timer_waiting(&inst, &mut store), 0);
         assert_eq!(poll.call(&mut store, ()).unwrap(), 2);
         assert_eq!(result.call(&mut store, 0).unwrap(), 77);
     }

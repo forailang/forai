@@ -52,6 +52,12 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("data", Type::String)],
         &[Type::String],
     );
+    ins(
+        b,
+        "cryptoRs256SignBase64Url",
+        &[p("privateKeyPem", Type::String), p("message", Type::String)],
+        &[Type::String],
+    );
 }
 
 #[cfg(test)]
@@ -76,6 +82,7 @@ mod tests {
             "cryptoConstantTimeEquals",
             "cryptoBase64Encode",
             "cryptoBase64Decode",
+            "cryptoRs256SignBase64Url",
         ] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
@@ -114,6 +121,18 @@ mod tests {
             Type::Function(sig) => {
                 assert_eq!(sig.params.len(), 2);
                 assert!(matches!(sig.returns[0], Type::Bool));
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_rs256_sign_takes_two_strings_returns_string() {
+        let b = fresh();
+        match b.get("cryptoRs256SignBase64Url").unwrap() {
+            Type::Function(sig) => {
+                assert_eq!(sig.params.len(), 2);
+                assert!(matches!(sig.returns[0], Type::String));
             }
             _ => panic!("expected Function"),
         }

@@ -240,7 +240,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     .and_then(|v| v.parse().ok());
                 let mut accepted: u64 = 0;
                 let mut pending_connections: Vec<TcpStream> = Vec::new();
-                let mut pending: Vec<PendingRequest> = Vec::new();
+                let mut pending = PendingRequests::default();
+                let scheduler = super::guest_scheduler::GuestScheduler::new(&mut caller);
                 let _ = listener.set_nonblocking(true);
                 loop {
                     let accepting = max_requests.map_or(true, |m| accepted < m);
@@ -261,6 +262,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     process_ready_connections(
                         &mut caller,
                         id as u32,
+                        &scheduler,
                         &mut pending_connections,
                         &mut pending,
                     );
@@ -275,7 +277,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // rather than spinning, then loop back to the drain.
                     if pending_connections.is_empty()
                         && pending.is_empty()
-                        && guest_live_count(&mut caller) <= 1
+                        && scheduler.live_count(&mut caller) <= 1
                     {
                         let _ = listener.set_nonblocking(false);
                         if let Ok((stream, _)) = listener.accept() {
@@ -291,20 +293,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // 4. Advance in-flight handler tasks: run ready ones, resume
                     // any whose offloaded boundary work finished (outbound RPC,
                     // etc.), then write responses for tasks that completed.
-                    let _ = guest_poll(&mut caller);
                     for task_id in super::boundary::pump_ready() {
-                        guest_resume_task(&mut caller, task_id);
+                        scheduler.resume_task(&mut caller, task_id);
                     }
-                    finish_completed(&mut caller, &mut pending);
+                    let _ = scheduler.poll(&mut caller);
+                    finish_completed(&mut caller, &scheduler, &mut pending);
 
                     // 5. While handlers remain parked (on a sleep timer or a
                     // boundary job), poll again shortly without a hot spin.
                     if !pending.is_empty() {
-                        std::thread::sleep(Duration::from_millis(1));
+                        sleep_or_wait_for_boundary(Duration::from_millis(1));
                     } else if !pending_connections.is_empty() {
                         std::thread::sleep(Duration::from_millis(1));
-                    } else if guest_live_count(&mut caller) > 1 {
-                        std::thread::sleep(Duration::from_millis(25));
+                    } else if scheduler.live_count(&mut caller) > 1 {
+                        sleep_or_wait_for_boundary(Duration::from_millis(25));
                     }
                 }
             },
@@ -320,6 +322,45 @@ struct PendingRequest {
     stream: std::net::TcpStream,
     request_val: i64,
     task_id: i32,
+}
+
+#[derive(Default)]
+struct PendingRequests {
+    entries: Vec<PendingRequest>,
+    by_task: HashMap<i32, usize>,
+}
+
+impl PendingRequests {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn task_id(&self, index: usize) -> i32 {
+        self.entries[index].task_id
+    }
+
+    fn push(&mut self, request: PendingRequest) {
+        self.by_task.insert(request.task_id, self.entries.len());
+        self.entries.push(request);
+    }
+
+    fn remove_task(&mut self, task_id: i32) -> Option<PendingRequest> {
+        let index = *self.by_task.get(&task_id)?;
+        Some(self.remove_index(index))
+    }
+
+    fn remove_index(&mut self, index: usize) -> PendingRequest {
+        let removed = self.entries.swap_remove(index);
+        self.by_task.remove(&removed.task_id);
+        if index < self.entries.len() {
+            self.by_task.insert(self.entries[index].task_id, index);
+        }
+        removed
+    }
 }
 
 enum ConnectionReadiness {
@@ -339,15 +380,16 @@ const ST_FAILED: i32 = 4;
 fn process_ready_connections(
     caller: &mut Caller<'_, ()>,
     router_id: u32,
+    scheduler: &super::guest_scheduler::GuestScheduler,
     pending_connections: &mut Vec<TcpStream>,
-    pending: &mut Vec<PendingRequest>,
+    pending: &mut PendingRequests,
 ) {
     let mut i = 0;
     while i < pending_connections.len() {
         match connection_readiness(&pending_connections[i]) {
             ConnectionReadiness::Ready => {
                 let stream = pending_connections.swap_remove(i);
-                accept_connection(caller, router_id, stream, pending);
+                accept_connection(caller, router_id, scheduler, stream, pending);
             }
             ConnectionReadiness::Pending => {
                 i += 1;
@@ -380,8 +422,9 @@ fn connection_readiness(stream: &TcpStream) -> ConnectionReadiness {
 fn accept_connection(
     caller: &mut Caller<'_, ()>,
     router_id: u32,
+    scheduler: &super::guest_scheduler::GuestScheduler,
     stream: std::net::TcpStream,
-    pending: &mut Vec<PendingRequest>,
+    pending: &mut PendingRequests,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     if is_options_request(&stream) {
@@ -410,7 +453,7 @@ fn accept_connection(
     // 404s, and handler errors all resolve inline via dispatch_router_request.
     if let Some(handler) = find_matching_handler(caller, router_id, request_val) {
         if handler_is_async(caller, handler) {
-            if let Some(task_id) = spawn_handler(caller, handler, request_val) {
+            if let Some(task_id) = scheduler.spawn_queued_closure(caller, handler, request_val) {
                 pending.push(PendingRequest {
                     stream,
                     request_val,
@@ -428,44 +471,92 @@ fn accept_connection(
 /// Write the response for every pending request whose handler task finished
 /// this poll, and reclaim its slot. A failed task answers 500 rather than
 /// writing its non-response result value.
-fn finish_completed(caller: &mut Caller<'_, ()>, pending: &mut Vec<PendingRequest>) {
+fn finish_completed(
+    caller: &mut Caller<'_, ()>,
+    scheduler: &super::guest_scheduler::GuestScheduler,
+    pending: &mut PendingRequests,
+) {
+    if scheduler.has_completed_queue() {
+        while let Some(task_id) = scheduler.pop_completed_task(caller) {
+            let _ = finish_completed_task(caller, scheduler, pending, task_id);
+        }
+        return;
+    }
+
     let mut i = 0;
     while i < pending.len() {
-        let status = guest_task_status(caller, pending[i].task_id);
+        let status = scheduler.task_status(caller, pending.task_id(i));
         if status >= ST_COMPLETE {
-            let p = pending.swap_remove(i);
-            let response = if status == ST_FAILED {
-                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-                let error_val = guest_task_result(caller, p.task_id);
-                let error = describe_guest_error(caller, &mem, error_val);
-                let (method, path) = request_method_path(caller, &mem, p.request_val);
-                output::stderr_line(&format!(
-                    "[router] handler error for {} {}: {}",
-                    method, path, error
-                ));
-                let err_payload = build_http_error(caller, p.request_val, &error);
-                super::events::dispatch_event(caller, "http:error", err_payload);
-                host_release_value(caller, err_payload);
-                let response = build_response_dict(
-                    caller,
-                    &mem,
-                    KIND_TEXT,
-                    500,
-                    &format!("Handler error: {}", error),
-                );
-                host_release_value(caller, error_val);
-                response
-            } else {
-                guest_task_result(caller, p.task_id)
-            };
-            complete_request(caller, p.stream, p.request_val, response);
-            // Slot was marked host-driven, so reclaim it ourselves now that we
-            // have read the result (mirrors __fai_drive_closure's inline free).
-            guest_free_task(caller, p.task_id);
+            finish_completed_at(caller, scheduler, pending, i, status);
         } else {
             i += 1;
         }
     }
+}
+
+fn finish_completed_task(
+    caller: &mut Caller<'_, ()>,
+    scheduler: &super::guest_scheduler::GuestScheduler,
+    pending: &mut PendingRequests,
+    task_id: i32,
+) -> bool {
+    let Some(p) = pending.remove_task(task_id) else {
+        return false;
+    };
+    let status = scheduler.task_status(caller, task_id);
+    if status < ST_COMPLETE {
+        pending.push(p);
+        return false;
+    }
+    finish_completed_request(caller, scheduler, p, status);
+    true
+}
+
+fn finish_completed_at(
+    caller: &mut Caller<'_, ()>,
+    scheduler: &super::guest_scheduler::GuestScheduler,
+    pending: &mut PendingRequests,
+    index: usize,
+    status: i32,
+) {
+    let p = pending.remove_index(index);
+    finish_completed_request(caller, scheduler, p, status);
+}
+
+fn finish_completed_request(
+    caller: &mut Caller<'_, ()>,
+    scheduler: &super::guest_scheduler::GuestScheduler,
+    p: PendingRequest,
+    status: i32,
+) {
+    let response = if status == ST_FAILED {
+        let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+        let error_val = scheduler.task_result(caller, p.task_id);
+        let error = describe_guest_error(caller, &mem, error_val);
+        let (method, path) = request_method_path(caller, &mem, p.request_val);
+        output::stderr_line(&format!(
+            "[router] handler error for {} {}: {}",
+            method, path, error
+        ));
+        let err_payload = build_http_error(caller, p.request_val, &error);
+        super::events::dispatch_event(caller, "http:error", err_payload);
+        host_release_value(caller, err_payload);
+        let response = build_response_dict(
+            caller,
+            &mem,
+            KIND_TEXT,
+            500,
+            &format!("Handler error: {}", error),
+        );
+        host_release_value(caller, error_val);
+        response
+    } else {
+        scheduler.task_result(caller, p.task_id)
+    };
+    complete_request(caller, p.stream, p.request_val, response);
+    // Slot was marked host-driven, so reclaim it ourselves now that we have
+    // read the result (mirrors __fai_drive_closure's inline free).
+    scheduler.free_task(caller, p.task_id);
 }
 
 /// The afterResponse → drain → write → reclaim sequence, shared by inline and
@@ -592,101 +683,11 @@ fn describe_guest_error(caller: &mut Caller<'_, ()>, mem: &Memory, val: i64) -> 
     format!("0x{v:016x}")
 }
 
-/// Run one scheduler poll cycle (advances every READY task once).
-fn guest_poll(caller: &mut Caller<'_, ()>) -> i32 {
-    if let Some(f) = caller.get_export("__fai_poll").and_then(|e| e.into_func()) {
-        let mut out = [Val::I32(0)];
-        if f.call(&mut *caller, &[], &mut out).is_ok() {
-            if let Val::I32(v) = out[0] {
-                return v;
-            }
-        }
-    }
-    0
-}
-
-/// Number of live guest scheduler tasks. While inside `server.listen`, the root
-/// task itself is live, so values above one mean detached/background work exists.
-fn guest_live_count(caller: &mut Caller<'_, ()>) -> i32 {
-    caller
-        .get_export("__dbg_live")
-        .and_then(|e| e.into_global())
-        .and_then(|g| match g.get(&mut *caller) {
-            Val::I32(v) => Some(v),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-/// Mark a parked task READY (e.g. after its boundary job finished) so the next
-/// poll runs its continuation.
-fn guest_resume_task(caller: &mut Caller<'_, ()>, id: i32) {
-    if let Some(f) = caller
-        .get_export("__fai_resume_task")
-        .and_then(|e| e.into_func())
-    {
-        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut [Val::I32(0)]);
-    }
-}
-
-/// Spawn an async handler closure as a scheduler task, returning its id.
-fn spawn_handler(caller: &mut Caller<'_, ()>, handler: i64, arg: i64) -> Option<i32> {
-    let f = caller
-        .get_export("__fai_spawn_closure")
-        .and_then(|e| e.into_func())?;
-    let mut out = [Val::I64(0)];
-    f.call(&mut *caller, &[Val::I64(handler), Val::I64(arg)], &mut out)
-        .ok()?;
-    match out[0] {
-        Val::I64(v) => Some(v as i32),
-        _ => None,
-    }
-}
-
-/// A spawned task's status word; treats a missing export or trap as FAILED so a
-/// wedged task still gets a 500 rather than hanging the connection.
-fn guest_task_status(caller: &mut Caller<'_, ()>, id: i32) -> i32 {
-    let Some(f) = caller
-        .get_export("__fai_task_status")
-        .and_then(|e| e.into_func())
-    else {
-        return ST_FAILED;
-    };
-    let mut out = [Val::I32(0)];
-    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
-        return ST_FAILED;
-    }
-    match out[0] {
-        Val::I32(v) => v,
-        _ => ST_FAILED,
-    }
-}
-
-/// A completed task's NaN-boxed result value.
-fn guest_task_result(caller: &mut Caller<'_, ()>, id: i32) -> i64 {
-    let Some(f) = caller
-        .get_export("__fai_task_result")
-        .and_then(|e| e.into_func())
-    else {
-        return VAL_NULL;
-    };
-    let mut out = [Val::I64(0)];
-    if f.call(&mut *caller, &[Val::I32(id)], &mut out).is_err() {
-        return VAL_NULL;
-    }
-    match out[0] {
-        Val::I64(v) => v,
-        _ => VAL_NULL,
-    }
-}
-
-/// Recycle a host-driven task's slot once its result has been read.
-fn guest_free_task(caller: &mut Caller<'_, ()>, id: i32) {
-    if let Some(f) = caller
-        .get_export("__fai_free_task")
-        .and_then(|e| e.into_func())
-    {
-        let _ = f.call(&mut *caller, &[Val::I32(id)], &mut []);
+fn sleep_or_wait_for_boundary(timeout: Duration) {
+    if super::boundary::has_inflight() {
+        let _ = super::boundary::wait_for_ready(timeout);
+    } else {
+        std::thread::sleep(timeout);
     }
 }
 

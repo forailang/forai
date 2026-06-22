@@ -236,11 +236,16 @@ fn do_http_request(
     request_headers: &[(String, String)],
 ) -> Result<(i32, String, Vec<(String, String)>), String> {
     let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(
             HTTP_CLIENT_TIMEOUT_SECS,
         )))
         .build()
         .new_agent();
+
+    let has_content_type = request_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
 
     let req_result = match (method, body) {
         ("GET", _) => {
@@ -258,21 +263,30 @@ fn do_http_request(
             req.call()
         }
         ("POST", Some(b)) => {
-            let mut req = agent.post(url).header("Content-Type", "application/json");
+            let mut req = agent.post(url);
+            if !has_content_type {
+                req = req.header("Content-Type", "application/json");
+            }
             for (name, value) in request_headers {
                 req = req.header(name, value);
             }
             req.send(b.as_bytes())
         }
         ("PUT", Some(b)) => {
-            let mut req = agent.put(url).header("Content-Type", "application/json");
+            let mut req = agent.put(url);
+            if !has_content_type {
+                req = req.header("Content-Type", "application/json");
+            }
             for (name, value) in request_headers {
                 req = req.header(name, value);
             }
             req.send(b.as_bytes())
         }
         ("PATCH", Some(b)) => {
-            let mut req = agent.patch(url).header("Content-Type", "application/json");
+            let mut req = agent.patch(url);
+            if !has_content_type {
+                req = req.header("Content-Type", "application/json");
+            }
             for (name, value) in request_headers {
                 req = req.header(name, value);
             }

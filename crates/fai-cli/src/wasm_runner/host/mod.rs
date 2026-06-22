@@ -8,6 +8,7 @@ pub(crate) mod boundary;
 mod crypto;
 mod env;
 mod events;
+mod guest_scheduler;
 mod host_ops;
 mod http_server;
 mod io;

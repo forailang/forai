@@ -1088,6 +1088,13 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
     },
     HostImportRow {
         canon: "std.crypto",
+        method: "rs256SignBase64Url",
+        import: "crypto_rs256_sign_base64_url",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
         method: "constantTimeEquals",
         import: "crypto_constant_time_equals",
         ret: RPrim,
@@ -1819,7 +1826,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 101, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 102, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

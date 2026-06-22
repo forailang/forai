@@ -292,6 +292,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.crypto", name: "constantTimeEquals", builtin_name: "cryptoConstantTimeEquals", doc: "Compare two strings in constant time. False on length mismatch." },
         BuiltinDoc { module: "std.crypto", name: "base64Encode",       builtin_name: "cryptoBase64Encode",       doc: "Return the standard padded base64 encoding of the UTF-8 input." },
         BuiltinDoc { module: "std.crypto", name: "base64Decode",       builtin_name: "cryptoBase64Decode",       doc: "Decode standard base64 and return the bytes as a UTF-8 (lossy) string. Empty on invalid input." },
+        BuiltinDoc { module: "std.crypto", name: "rs256SignBase64Url", builtin_name: "cryptoRs256SignBase64Url", doc: "Sign a UTF-8 message with an RSA private key using RSASSA-PKCS1-v1_5 SHA-256 and return unpadded base64url. Empty on invalid key." },
 
         // std.storage
         BuiltinDoc { module: "std.storage", name: "storageGet",    builtin_name: "storageGet",    doc: "Read a value for a key from the platform's persistent store. Returns null if absent." },
