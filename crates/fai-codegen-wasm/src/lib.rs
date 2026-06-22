@@ -200,6 +200,7 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
     // guest scheduler + resumable lowering. Only runs for non-test builds
     // for now; unsupported shapes return None and fall through to the
     // facade below.
+    let mut async_engine_error = None;
     if !is_test {
         if let Some(wasm) = direct::try_codegen_async_engine(
             ast,
@@ -211,12 +212,15 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
         ) {
             return Ok(wasm);
         }
+        async_engine_error = direct::take_last_async_engine_error();
     }
     if let Some(outcome) = async_codegen::try_codegen_async(ast, modules, &async_analysis, is_test)
     {
         match outcome {
             async_codegen::AsyncBuildOutcome::Compiled(wasm) => return Ok(wasm),
-            async_codegen::AsyncBuildOutcome::Unsupported(err) => return Err(err),
+            async_codegen::AsyncBuildOutcome::Unsupported(err) => {
+                return Err(async_engine_error.unwrap_or(err));
+            }
         }
     }
 
@@ -330,6 +334,37 @@ mod located_error_tests {
         assert!(
             result.is_ok(),
             "async lowering should support post-wait let bindings: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn async_effect_program_compiles_suspending_range_for() {
+        let src = concat!(
+            "def embed\n",
+            "    @param i Int\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(1)\n",
+            "  i + 1\n",
+            "end\n\n",
+            "def main\n",
+            "    @return Int\n",
+            "do\n",
+            "  var total = 0\n",
+            "  for i in 0..4\n",
+            "    let next = embed(i)\n",
+            "    total = total + next\n",
+            "  end\n",
+            "  total\n",
+            "end\n",
+        );
+        let prep = fai_compiler::prepare_source(src, None).expect("prepare");
+        let info = direct::CheckerInfo::default();
+        let result = codegen_direct_full_reasoned(&prep.serde_ast, &[], &info, None, false);
+        assert!(
+            result.is_ok(),
+            "async lowering should support suspending range-for loops: {:?}",
             result.err()
         );
     }
