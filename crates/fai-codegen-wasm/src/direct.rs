@@ -12878,7 +12878,8 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// - `Float` → passthrough (already raw f64 bits).
     /// - `Int`   → unbox, convert i64→f64, reinterpret as Float bits.
     /// - `String` → parse via `RT_PARSE_FLOAT`.
-    /// - other → passthrough.
+    /// - other (`Unknown`, etc.) → dynamically coerce boxed Int/Float
+    ///   values through `rt_as_number`, then emit canonical Float bits.
     fn compile_convert_to_float(&mut self, arg: &Expression) -> Result<(), BuildError> {
         let arg_ty = self.expression_type_at(arg).cloned();
         match arg_ty {
@@ -12893,6 +12894,8 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
             _ => {
                 self.compile_expr(arg)?;
+                self.emit(Instruction::Call(self.rt().base + RT_AS_NUMBER));
+                self.emit(Instruction::I64ReinterpretF64);
             }
         }
         Ok(())
@@ -20469,6 +20472,30 @@ mod tests {
         )));
         let result = run_module(&wasm) as u64;
         let expected = 3.5_f64.to_bits();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn direct_module_convert_to_float_converts_unknown_int() {
+        let wasm = build_standalone_module_many(compile_all(concat!(
+            "use std.convert\n",
+            "\n",
+            "# Convert an unknown value to float.\n",
+            "def fromUnknown\n",
+            "    @param value Unknown\n",
+            "    @return Float\n",
+            "do\n",
+            "  convert.toFloat(value)\n",
+            "end\n",
+            "\n",
+            "def main\n",
+            "    @return Float\n",
+            "do\n",
+            "  fromUnknown(1)\n",
+            "end\n",
+        )));
+        let result = run_module(&wasm) as u64;
+        let expected = 1.0_f64.to_bits();
         assert_eq!(result, expected);
     }
 

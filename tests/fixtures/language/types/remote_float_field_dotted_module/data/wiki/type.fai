@@ -1,0 +1,21 @@
+remote type Page
+    id Int
+    slug String
+    title String
+    body String
+    status String
+    sourceType String
+    sourceId Int
+    currentRevisionId Int
+    createdByType String
+    createdById Int
+    createdAt String
+    updatedAt String
+end
+
+remote type SearchResult
+    page Page
+    score Float
+    reason String
+    snippet String
+end

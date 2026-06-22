@@ -1,0 +1,9 @@
+[project]
+name = "remote_float_field_dotted_module"
+version = "0.1.0"
+source_root = "."
+
+[project.server]
+target = "native"
+source = "."
+main = "platforms/server/main.fai"

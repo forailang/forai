@@ -1,0 +1,56 @@
+use std.array
+
+use std.math
+
+use { SearchResult, searchResultsInternal } from data.wiki
+
+# Bucket a hook score with raw float arithmetic.
+def hookScoreBucket
+    @param score Float
+    @return Int
+do
+    math.floor(score * 1000000.0)
+end
+
+# Return true when left meets right after score bucketing.
+def hookScoreGte
+    @param left Float
+    @param right Float
+    @return Bool
+do
+    hookScoreBucket(left) >= hookScoreBucket(right)
+end
+
+# Filter semantic pages by reading an imported result's score field.
+def hookSemanticPages
+    @return SearchResult[]
+do
+    var output SearchResult[] = []
+    let results = searchResultsInternal()
+    for result in results
+        if hookScoreGte(result.score, 0.3)
+            output = array.append(output, result)
+        end
+    end
+    output
+end
+
+test hookScoreBucket
+    it 'scales literal hook scores'
+        assert.equals(hookScoreBucket(1.0), 1000000)
+    end
+end
+
+test hookScoreGte
+    it 'compares literal hook scores'
+        assert.isTrue(hookScoreGte(1.0, 0.3))
+    end
+end
+
+test hookSemanticPages
+    it 'keeps imported result float fields above the threshold'
+        let results = hookSemanticPages()
+        assert.equals(length(results), 1)
+        assert.equals(hookScoreBucket(results[0].score), 1000000)
+    end
+end

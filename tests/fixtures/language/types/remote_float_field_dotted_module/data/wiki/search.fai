@@ -1,0 +1,103 @@
+use std.array
+
+use std.convert
+
+use std.json
+
+use std.math
+
+# Return cosine similarity for two vectors.
+def cosineScore
+    @param left Float[]
+    @param right Float[]
+    @return Float
+do
+    var dot = 0.0
+    var leftNorm = 0.0
+    var rightNorm = 0.0
+    for i in 0..length(left)
+        dot = dot + left[i] * right[i]
+        leftNorm = leftNorm + left[i] * left[i]
+        rightNorm = rightNorm + right[i] * right[i]
+    end
+    dot / (math.sqrt(leftNorm) * math.sqrt(rightNorm))
+end
+
+# Bucket a score with raw float arithmetic.
+def scoreBucket
+    @param score Float
+    @return Int
+do
+    math.floor(score * 1000000.0)
+end
+
+# Return true when left meets right after score bucketing.
+def scoreGte
+    @param left Float
+    @param right Float
+    @return Bool
+do
+    scoreBucket(left) >= scoreBucket(right)
+end
+
+# Return one semantic search result through the same array-insertion shape.
+def searchResultsInternal
+    @return SearchResult[]
+do
+    let score = cosineScore(embeddingJsonToVector('[1,0,0]'), embeddingJsonToVector('[1,0,0]'))
+    var results SearchResult[] = []
+    if scoreGte(score, 0.0)
+        results = array.append(results, SearchResult(page: Page(id: 7, slug: 'semantic', title: 'Semantic', body: 'Body', status: 'active', sourceType: 'system', sourceId: 0, currentRevisionId: 1, createdByType: 'system', createdById: 0, createdAt: '', updatedAt: ''), score: score, reason: 'semantic', snippet: 'Body'))
+    end
+    results
+end
+
+# Convert embedding JSON into a float vector.
+def embeddingJsonToVector
+    @param embeddingJson String
+    @return Float[]
+do
+    var result Float[] = []
+    let values Unknown[] = json.parse(embeddingJson)
+    for value in values
+        if is_float(value)
+            result = array.append(result, value)
+        else if is_int(value)
+            result = array.append(result, convert.toFloat(value))
+        end
+    end
+    result
+end
+
+test cosineScore
+    it 'returns one for matching vectors'
+        assert.equals(cosineScore([1.0 0.0], [1.0 0.0]), 1.0)
+    end
+end
+
+test scoreBucket
+    it 'scales literal scores'
+        assert.equals(scoreBucket(1.0), 1000000)
+    end
+end
+
+test scoreGte
+    it 'compares literal scores'
+        assert.isTrue(scoreGte(1.0, 0.3))
+    end
+end
+
+test searchResultsInternal
+    it 'stores a semantic result'
+        let results = searchResultsInternal()
+        assert.equals(length(results), 1)
+        assert.equals(results[0].score, 1.0)
+    end
+end
+
+test embeddingJsonToVector
+    it 'returns floats from json'
+        let values = embeddingJsonToVector('[1,0]')
+        assert.equals(values[0], 1.0)
+    end
+end
