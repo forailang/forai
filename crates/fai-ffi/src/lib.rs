@@ -44,6 +44,24 @@ impl std::fmt::Display for FfiError {
 static LIBRARY_CACHE: Mutex<Option<HashMap<String, &'static libloading::Library>>> =
     Mutex::new(None);
 
+/// Open a shared library making its symbols (and those of its dependencies)
+/// globally available, so loadable extensions a library later dlopens (e.g.
+/// sqlite-vec via `sqlite3_load_extension`) can resolve symbols pulled in by
+/// the host's dependency chain — notably libm's `sqrtf`, which the `fai` binary
+/// itself does not link. The default `libloading::Library::new` uses RTLD_LOCAL,
+/// which hides those symbols and makes such extensions fail with
+/// "undefined symbol". Windows has no equivalent flag, so it loads normally.
+#[cfg(unix)]
+unsafe fn open_library_global(name: &str) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+    Library::open(Some(name), RTLD_NOW | RTLD_GLOBAL).map(libloading::Library::from)
+}
+
+#[cfg(not(unix))]
+unsafe fn open_library_global(name: &str) -> Result<libloading::Library, libloading::Error> {
+    libloading::Library::new(name)
+}
+
 fn get_library(lib_name: &str) -> Result<&'static libloading::Library, FfiError> {
     let mut cache = LIBRARY_CACHE.lock().unwrap();
     let cache = cache.get_or_insert_with(HashMap::new);
@@ -70,7 +88,7 @@ fn get_library(lib_name: &str) -> Result<&'static libloading::Library, FfiError>
     };
 
     for candidate in &candidates {
-        match unsafe { libloading::Library::new(candidate) } {
+        match unsafe { open_library_global(candidate) } {
             Ok(lib) => {
                 let lib = Box::leak(Box::new(lib));
                 cache.insert(lib_name.to_string(), lib);

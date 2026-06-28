@@ -336,3 +336,31 @@ fn test_null_string_marshals_to_null_ptr() {
     assert!(result.is_ok());
     assert_eq!(args.len(), 1);
 }
+
+// ── Regression: RTLD_GLOBAL exposes dependency symbols to extensions ──
+//
+// Loadable extensions dlopened *by* a loaded library (e.g. sqlite-vec via
+// `sqlite3_load_extension`) must be able to resolve symbols from the host's
+// dependency chain. libsqlite3 depends on libm; after the FFI bridge loads it,
+// libm's `sqrtf` must be resolvable in the global symbol scope. With the old
+// `RTLD_LOCAL` load it was hidden and such extensions failed with
+// "undefined symbol: sqrtf". `get_library` now loads with `RTLD_GLOBAL`.
+#[cfg(unix)]
+#[test]
+fn loaded_library_exposes_dependency_symbols_globally() {
+    use libloading::os::unix::{Library, RTLD_NOW};
+
+    // Force libsqlite3 (which depends on libm) through the FFI bridge.
+    crate::get_library("sqlite3").expect("libsqlite3 should be loadable");
+
+    // dlopen(NULL) yields a handle over the process-global symbol scope.
+    let global =
+        unsafe { Library::open(None::<&str>, RTLD_NOW) }.expect("global symbol handle");
+    let sqrtf: Result<libloading::os::unix::Symbol<*const std::os::raw::c_void>, _> =
+        unsafe { global.get(b"sqrtf\0") };
+    assert!(
+        sqrtf.is_ok(),
+        "libm's sqrtf must be globally resolvable after loading libsqlite3 \
+         (RTLD_GLOBAL regression — extensions like sqlite-vec depend on this)"
+    );
+}
