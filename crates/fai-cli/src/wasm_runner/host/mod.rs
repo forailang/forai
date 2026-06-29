@@ -21,6 +21,7 @@ mod spy;
 mod storage;
 pub(super) mod util;
 
+pub(crate) use async_ops::{next_poll_timeout, prune_fired_timers};
 pub(crate) use http_server::drain_retained_values as drain_router_retained_values;
 pub(crate) use spy::drain_retained_values as drain_spy_retained_values;
 

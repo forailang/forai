@@ -295,10 +295,18 @@ pub fn run_wasm_with_externs_opts(
                 Ok(s) => s,
                 Err(e) => return Err(fail("WASM async poll error", &e, &mut store)),
             };
+            host::prune_fired_timers();
             if status != 2 && status != 3 {
                 if host::boundary::has_inflight() {
-                    let _ = host::boundary::wait_for_ready(Duration::from_millis(1));
+                    // Parked on an outbound call / FFI offload: block on its
+                    // completion (woken immediately), bounded by the nearest timer
+                    // / backstop, instead of re-polling every 1ms for the whole
+                    // duration. This is the busy-wait that pegged a core.
+                    let _ = host::boundary::wait_for_ready(host::next_poll_timeout());
                 } else {
+                    // No offloaded work: keep a prompt re-poll so the cooperative
+                    // scheduler can advance runnable tasks (a "working" poll does
+                    // not guarantee every task is parked).
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }

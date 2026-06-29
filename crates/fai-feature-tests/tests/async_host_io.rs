@@ -1097,3 +1097,109 @@ fn pending_tcp_accept_returns_null_when_listener_is_closed() {
         "pending accept did not finish with null after close:\n{stdout}"
     );
 }
+
+// A server whose request handler performs a slow outbound HTTP call, so the
+// handler task parks on the boundary while the driver loop keeps running.
+fn slow_handler_server_source(port: u16, stub_port: u16) -> String {
+    format!(
+        "use std.http.request\n\
+         use std.http.server\n\
+         \n\
+         def main\n\
+         \x20   @return Void\n\
+         do\n\
+         \x20 let router = server.router()\n\
+         \x20 server.get(router, '/slow') do with req HttpRequest\n\
+         \x20   let _resp = request.get('http://127.0.0.1:{stub_port}/slow')\n\
+         \x20   server.text(200, 'done')\n\
+         \x20 end\n\
+         \x20 server.listen(router, {port})\n\
+         end\n",
+        port = port,
+        stub_port = stub_port,
+    )
+}
+
+// Regression test for the busy-wait fix: while a request handler is parked on a
+// long outbound call, the server driver loop must wait for the next real event
+// (boundary completion or nearest sleep-timer) instead of re-polling the guest
+// scheduler every 1ms. We count polls rather than CPU because a minimal program's
+// poll is cheap — the spin's cost only shows at scale (e.g. the brain server) —
+// but the poll *rate* exposes the bug regardless of poll cost.
+#[test]
+fn server_handler_parked_on_outbound_call_does_not_busy_poll() {
+    let (stub_port, _rx) = spawn_delayed_http_stub(Duration::from_millis(3000));
+    let port = free_port();
+    let dir = tmp_dir("async_host_io_pollcount", port);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("server.fai");
+    std::fs::write(&src, slow_handler_server_source(port, stub_port)).unwrap();
+
+    // Serve exactly one request then exit, printing the loop's total poll count.
+    let mut child = Command::new(fai_binary())
+        .arg("run")
+        .arg(&src)
+        .env("FAI_HTTP_MAX_REQUESTS", "1")
+        .env("FAI_DEBUG_SERVER_POLLS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fai run");
+
+    // Connect and send the request in one shot. With a 1-request cap we must not
+    // use a throwaway readiness probe — that connection would consume the quota.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let start = Instant::now();
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let mut err = String::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        let _ = s.read_to_string(&mut err);
+                    }
+                    panic!("fai server exited early ({status}); stderr:\n{err}");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("fai server did not start listening within 20s");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write request");
+    // The handler parks ~3s waiting on the outbound stub before replying.
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read response");
+    let dur = start.elapsed();
+    assert!(resp.contains("done"), "handler did not complete:\n{resp}");
+    assert!(
+        dur >= Duration::from_millis(2500),
+        "outbound delay was not actually awaited: {dur:?}"
+    );
+
+    let output = child.wait_with_output().expect("collect fai server output");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = stderr_string(&output);
+    let polls: u64 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("__server_polls="))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no __server_polls marker in stderr:\n{stderr}"));
+
+    // Lower bound: the loop must actually iterate while the handler is parked
+    // (proving we exercised the parked-poll path, not a synchronous block).
+    // Upper bound: a fixed-1ms re-poll would do ~3000 polls over the ~3s wait;
+    // the timer-aware wait (≤250ms backstop, woken at completion) does ~12.
+    assert!(
+        (3..400).contains(&polls),
+        "expected a parked-but-not-spinning poll count, got {polls} over {dur:?}"
+    );
+}

@@ -243,6 +243,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mut pending = PendingRequests::default();
                 let scheduler = super::guest_scheduler::GuestScheduler::new(&mut caller);
                 let _ = listener.set_nonblocking(true);
+                // Test-only: count guest-scheduler polls so a regression test can
+                // assert the loop parks instead of busy-polling while a handler
+                // awaits a long call. Reported on loop exit when the env var is set.
+                let count_polls = std::env::var("FAI_DEBUG_SERVER_POLLS").is_ok();
+                let mut poll_count: u64 = 0;
                 loop {
                     let accepting = max_requests.map_or(true, |m| accepted < m);
 
@@ -270,6 +275,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // 2. Request cap reached and all in-flight work drained →
                     // exit the server loop so the program can terminate.
                     if !accepting && pending_connections.is_empty() && pending.is_empty() {
+                        if count_polls {
+                            output::stderr_line(&format!("__server_polls={}", poll_count));
+                        }
                         break;
                     }
 
@@ -297,11 +305,22 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         scheduler.resume_task(&mut caller, task_id);
                     }
                     let _ = scheduler.poll(&mut caller);
+                    poll_count += 1;
+                    super::async_ops::prune_fired_timers();
                     finish_completed(&mut caller, &scheduler, &mut pending);
 
                     // 5. While handlers remain parked (on a sleep timer or a
-                    // boundary job), poll again shortly without a hot spin.
+                    // boundary job), wait until the next real event — the nearest
+                    // pending sleep-timer, or a boundary completion that wakes the
+                    // condvar in `sleep_or_wait_for_boundary` earlier. Previously
+                    // this re-polled every 1ms, which pegged a CPU core for the
+                    // whole duration of a long outbound call (LLM/MCP) the handler
+                    // was parked on, since each wake ran a full guest poll.
                     if !pending.is_empty() {
+                        // A handler is parked. If it's on an outbound call,
+                        // sleep_or_wait_for_boundary blocks on completion (no 1ms
+                        // re-poll spin); if on a sleep timer, the short interval
+                        // keeps cooperative scheduling responsive.
                         sleep_or_wait_for_boundary(Duration::from_millis(1));
                     } else if !pending_connections.is_empty() {
                         std::thread::sleep(Duration::from_millis(1));
@@ -683,11 +702,19 @@ fn describe_guest_error(caller: &mut Caller<'_, ()>, mem: &Memory, val: i64) -> 
     format!("0x{v:016x}")
 }
 
-fn sleep_or_wait_for_boundary(timeout: Duration) {
+// Park the driver between scheduler polls. With boundary work in flight (an
+// outbound call or FFI offload), block on its completion — the condvar wakes the
+// instant it finishes — bounded by the nearest pending timer / a backstop. This
+// is the wait that used to peg a CPU core: it would re-poll every 1ms for the
+// whole duration of a long outbound call. With NO offloaded work, sleep only the
+// short cooperative interval: a "working" poll can still mean runnable tasks
+// remain (the scheduler advances incrementally, e.g. `all` spawning children),
+// so the loop must re-poll promptly rather than sleep until the next timer.
+fn sleep_or_wait_for_boundary(short_no_inflight: Duration) {
     if super::boundary::has_inflight() {
-        let _ = super::boundary::wait_for_ready(timeout);
+        let _ = super::boundary::wait_for_ready(super::async_ops::next_poll_timeout());
     } else {
-        std::thread::sleep(timeout);
+        std::thread::sleep(short_no_inflight);
     }
 }
 

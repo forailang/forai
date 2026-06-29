@@ -13,25 +13,68 @@
 //! same way.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use wasmtime::*;
 
 use super::super::heap::{decode_closure_header, host_retain, reserve};
 use super::super::nan_box::{encode_object, OBJ_TAG_TUPLE, VAL_NULL, VAL_VOID};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TimerRequest {
-    pub task_id: i32,
-    pub ms: i32,
-}
-
 thread_local! {
-    static TIMER_REQUESTS: RefCell<Vec<TimerRequest>> = const { RefCell::new(Vec::new()) };
+    /// task_id -> absolute deadline at which that task's guest `sleep` timer
+    /// fires. The guest scheduler still decides expiry by polling time; the host
+    /// keeps these deadlines so its driver loop can park until the *nearest* one
+    /// instead of re-polling at a fixed fine cadence. The fixed cadence pegged a
+    /// CPU core while a request handler was merely parked on a long outbound call
+    /// (e.g. an LLM/MCP request taking tens of seconds), because each wake ran a
+    /// full guest scheduler poll ~1000x/second for the whole duration.
+    static TIMER_DEADLINES: RefCell<HashMap<i32, Instant>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(test)]
 pub(crate) fn clear_timer_requests() {
-    TIMER_REQUESTS.with(|requests| requests.borrow_mut().clear());
+    TIMER_DEADLINES.with(|t| t.borrow_mut().clear());
+}
+
+/// Shortest time until any pending guest sleep timer fires, or `None` when none
+/// are pending. A past-due timer reports `Duration::ZERO`, so the driver polls
+/// promptly to let the guest scheduler resume it.
+pub(crate) fn next_timer_timeout() -> Option<Duration> {
+    let now = Instant::now();
+    TIMER_DEADLINES.with(|t| {
+        t.borrow()
+            .values()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+    })
+}
+
+/// How long a host driver loop may sleep before it must poll the guest scheduler
+/// again: until the nearest pending timer, capped by a backstop so an untracked
+/// wakeup source can't hang the loop, and floored so a just-due timer can't spin.
+/// A boundary completion (outbound call, FFI offload) still wakes the loop
+/// earlier through the condvar in `boundary::wait_for_ready`.
+pub(crate) fn next_poll_timeout() -> Duration {
+    // The backstop bounds how long the loop sleeps when nothing nearer is
+    // tracked. It also bounds connection-accept latency on an idle server (the
+    // loop accepts between polls), so it trades a little accept latency for a
+    // large drop in idle/await CPU — at 250ms an idle server polls ~4x/sec
+    // instead of 40x. A boundary completion still wakes the loop immediately.
+    const BACKSTOP: Duration = Duration::from_millis(250);
+    const FLOOR: Duration = Duration::from_millis(1);
+    match next_timer_timeout() {
+        Some(d) => d.clamp(FLOOR, BACKSTOP),
+        None => BACKSTOP,
+    }
+}
+
+/// Drop timers whose deadline has passed: the guest scheduler resumes their tasks
+/// on the next poll, so the host need not wake for them again. Keeps the map
+/// bounded over a long-running server.
+pub(crate) fn prune_fired_timers() {
+    let now = Instant::now();
+    TIMER_DEADLINES.with(|t| t.borrow_mut().retain(|_, deadline| *deadline > now));
 }
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -76,16 +119,15 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.host_set_timer(task_id: i32, ms: i32)
-    // Records task wakeup requests for the host event loop. The current
-    // CLI runner still polls time directly, but keeping these requests
-    // makes the host side of the scheduler ABI real and testable.
+    // Records when this task's sleep timer fires as an absolute deadline, so the
+    // host driver loop can sleep until the nearest pending timer instead of
+    // re-polling at a fixed fine cadence. The guest scheduler still resumes the
+    // task by polling time; the host only needs to be awake at the deadline.
     linker
         .func_wrap("env", "host_set_timer", |task_id: i32, ms: i32| {
-            TIMER_REQUESTS.with(|requests| {
-                requests.borrow_mut().push(TimerRequest {
-                    task_id,
-                    ms: ms.max(0),
-                });
+            let deadline = Instant::now() + Duration::from_millis(ms.max(0) as u64);
+            TIMER_DEADLINES.with(|t| {
+                t.borrow_mut().insert(task_id, deadline);
             });
         })
         .map_err(|e| format!("linker error: {}", e))?;
@@ -237,5 +279,78 @@ fn call_via_table(caller: &mut Caller<'_, ()>, table_idx: u32) -> i64 {
             _ => VAL_NULL,
         },
         Err(_) => VAL_NULL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Seed a deadline `ms_from_now` milliseconds away (negative = already past).
+    fn set_deadline(task_id: i32, ms_from_now: i64) {
+        let now = Instant::now();
+        let deadline = if ms_from_now >= 0 {
+            now + Duration::from_millis(ms_from_now as u64)
+        } else {
+            now - Duration::from_millis((-ms_from_now) as u64)
+        };
+        TIMER_DEADLINES.with(|t| {
+            t.borrow_mut().insert(task_id, deadline);
+        });
+    }
+
+    #[test]
+    fn next_timeout_is_none_when_no_timers() {
+        clear_timer_requests();
+        assert_eq!(next_timer_timeout(), None);
+    }
+
+    #[test]
+    fn next_timeout_picks_the_nearest_deadline() {
+        clear_timer_requests();
+        set_deadline(1, 5000);
+        set_deadline(2, 200);
+        set_deadline(3, 9000);
+        let t = next_timer_timeout().expect("a timer is pending");
+        // Nearest is task 2 (~200ms); allow a little scheduling slack.
+        assert!(t <= Duration::from_millis(200), "expected <=200ms, got {t:?}");
+        assert!(t >= Duration::from_millis(100), "expected >=100ms, got {t:?}");
+        clear_timer_requests();
+    }
+
+    #[test]
+    fn past_due_timer_reports_zero_and_poll_timeout_floors_to_1ms() {
+        clear_timer_requests();
+        set_deadline(7, -10);
+        assert_eq!(next_timer_timeout(), Some(Duration::ZERO));
+        // A due timer must poll promptly but never spin at a zero-length wait.
+        assert_eq!(next_poll_timeout(), Duration::from_millis(1));
+        clear_timer_requests();
+    }
+
+    #[test]
+    fn poll_timeout_is_backstopped_when_idle_or_far() {
+        clear_timer_requests();
+        // No timers pending -> the backstop, so the loop never sleeps forever and
+        // a boundary completion still wakes it earlier via the condvar.
+        assert_eq!(next_poll_timeout(), Duration::from_millis(250));
+        // A far-off timer is capped to the backstop, not waited on in full.
+        set_deadline(1, 10_000);
+        assert_eq!(next_poll_timeout(), Duration::from_millis(250));
+        clear_timer_requests();
+    }
+
+    #[test]
+    fn prune_drops_only_fired_timers() {
+        clear_timer_requests();
+        set_deadline(1, -5);
+        set_deadline(2, 5000);
+        prune_fired_timers();
+        TIMER_DEADLINES.with(|t| {
+            let map = t.borrow();
+            assert!(!map.contains_key(&1), "a fired timer should be pruned");
+            assert!(map.contains_key(&2), "a pending timer should remain");
+        });
+        clear_timer_requests();
     }
 }
