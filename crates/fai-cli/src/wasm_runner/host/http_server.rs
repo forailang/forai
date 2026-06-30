@@ -309,23 +309,55 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     super::async_ops::prune_fired_timers();
                     finish_completed(&mut caller, &scheduler, &mut pending);
 
-                    // 5. While handlers remain parked (on a sleep timer or a
-                    // boundary job), wait until the next real event — the nearest
-                    // pending sleep-timer, or a boundary completion that wakes the
-                    // condvar in `sleep_or_wait_for_boundary` earlier. Previously
-                    // this re-polled every 1ms, which pegged a CPU core for the
-                    // whole duration of a long outbound call (LLM/MCP) the handler
-                    // was parked on, since each wake ran a full guest poll.
+                    // Driver diagnostic (FAI_DEBUG_SERVER_POLLS): every 100 polls,
+                    // report the guest live-task count + pending requests, plus a
+                    // task-status histogram when live_count is high. The poll_count
+                    // cadence itself is the signal — at the timer-aware park rate an
+                    // idle server emits these ~every 25s, not every 2.5s. A climbing
+                    // live_count that never returns to baseline would mean completed
+                    // tasks are leaking and the loop can't reach the blocking accept.
+                    if count_polls && poll_count % 100 == 0 {
+                        let lc = scheduler.live_count(&mut caller);
+                        let mut ready = 0;
+                        let mut running = 0;
+                        let mut waiting = 0;
+                        let mut complete = 0;
+                        if lc > 8 {
+                            let mut id = 0;
+                            while id < 512 {
+                                match scheduler.task_status(&mut caller, id) {
+                                    0 => ready += 1,
+                                    1 => running += 1,
+                                    2 => waiting += 1,
+                                    3 => complete += 1,
+                                    _ => {}
+                                }
+                                id += 1;
+                            }
+                        }
+                        output::stderr_line(&format!(
+                            "__driver poll_count={} live_count={} pending={} ready={} running={} waiting={} complete={}",
+                            poll_count, lc, pending.len(), ready, running, waiting, complete,
+                        ));
+                    }
+
+                    // 5. Park until the next real event — a boundary completion
+                    // (condvar), the nearest pending sleep-timer, or the backstop
+                    // cap. `__fai_poll` already ran the ready queue to quiescence,
+                    // so nothing is runnable right now; the only reasons to wake
+                    // are a timer firing, an offloaded job finishing, or a new
+                    // connection (bounded by the backstop in next_poll_timeout).
+                    // This is what stops a server with always-live background
+                    // `nowait` loops from spinning ~40x/sec while otherwise idle.
                     if !pending.is_empty() {
-                        // A handler is parked. If it's on an outbound call,
-                        // sleep_or_wait_for_boundary blocks on completion (no 1ms
-                        // re-poll spin); if on a sleep timer, the short interval
-                        // keeps cooperative scheduling responsive.
-                        sleep_or_wait_for_boundary(Duration::from_millis(1));
+                        park_until_next_event();
                     } else if !pending_connections.is_empty() {
+                        // A connection is accepted but the client hasn't sent its
+                        // request bytes yet — there is no timer/boundary event for
+                        // "socket became readable", so poll it at a short cadence.
                         std::thread::sleep(Duration::from_millis(1));
                     } else if scheduler.live_count(&mut caller) > 1 {
-                        sleep_or_wait_for_boundary(Duration::from_millis(25));
+                        park_until_next_event();
                     }
                 }
             },
@@ -702,19 +734,24 @@ fn describe_guest_error(caller: &mut Caller<'_, ()>, mem: &Memory, val: i64) -> 
     format!("0x{v:016x}")
 }
 
-// Park the driver between scheduler polls. With boundary work in flight (an
-// outbound call or FFI offload), block on its completion — the condvar wakes the
-// instant it finishes — bounded by the nearest pending timer / a backstop. This
-// is the wait that used to peg a CPU core: it would re-poll every 1ms for the
-// whole duration of a long outbound call. With NO offloaded work, sleep only the
-// short cooperative interval: a "working" poll can still mean runnable tasks
-// remain (the scheduler advances incrementally, e.g. `all` spawning children),
-// so the loop must re-poll promptly rather than sleep until the next timer.
-fn sleep_or_wait_for_boundary(short_no_inflight: Duration) {
+// Park the driver until its next real event: a boundary completion (an outbound
+// call or FFI offload — the condvar wakes the instant it finishes), the nearest
+// pending sleep-timer deadline, or the backstop cap, whichever comes first.
+// `__fai_poll` runs the guest ready queue to quiescence before returning, so once
+// a poll returns there is no runnable task left to advance — every live task is
+// parked on a timer or a host op. Re-polling before the next tracked event would
+// only burn CPU: the old fixed 1ms/25ms re-poll pegged a core, and on a server
+// whose background `nowait` loops keep live_count>1 (e.g. the brain server) it
+// spun ~40x/sec even while fully idle, because the no-inflight path slept a fixed
+// 25ms instead of honoring the timer. `next_poll_timeout` returns the nearest
+// pending timer clamped to [1ms, 250ms], so even with no boundary work in flight
+// the loop sleeps until that deadline rather than a fixed fine cadence.
+fn park_until_next_event() {
+    let timeout = super::async_ops::next_poll_timeout();
     if super::boundary::has_inflight() {
-        let _ = super::boundary::wait_for_ready(super::async_ops::next_poll_timeout());
+        let _ = super::boundary::wait_for_ready(timeout);
     } else {
-        std::thread::sleep(short_no_inflight);
+        std::thread::sleep(timeout);
     }
 }
 

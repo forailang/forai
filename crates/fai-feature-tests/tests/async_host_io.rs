@@ -1203,3 +1203,105 @@ fn server_handler_parked_on_outbound_call_does_not_busy_poll() {
         "expected a parked-but-not-spinning poll count, got {polls} over {dur:?}"
     );
 }
+
+// Source for a server whose handler parks on a pure guest `sleep` timer — no
+// outbound call, so NO boundary work is in flight while it waits. This is the
+// no-inflight park path that the brain server hits constantly (its background
+// `nowait` loops sleep between iterations, keeping tasks parked on timers with
+// nothing offloaded). Before the fix this path slept a fixed short interval and
+// re-polled the guest scheduler ~1000x/sec for the whole sleep.
+fn sleep_handler_server_source(port: u16) -> String {
+    format!(
+        "use std.http.server\n\
+         \n\
+         def main\n\
+         \x20   @return Void\n\
+         do\n\
+         \x20 let router = server.router()\n\
+         \x20 server.get(router, '/slow') do with req HttpRequest\n\
+         \x20   sleep(2000)\n\
+         \x20   server.text(200, 'done')\n\
+         \x20 end\n\
+         \x20 server.listen(router, {port})\n\
+         end\n",
+        port = port,
+    )
+}
+
+// Regression test for the no-boundary park path (the brain CPU-spin bug): a
+// handler parked on a pure `sleep` timer has no boundary completion to wait on,
+// so the driver must still sleep until the nearest timer deadline (capped by the
+// 250ms backstop) rather than re-polling the guest scheduler at a fixed fine
+// cadence. `__fai_poll` runs the ready queue to quiescence, so there is nothing
+// runnable to advance between polls — a re-poll before the timer is pure waste.
+#[test]
+fn server_handler_parked_on_sleep_timer_does_not_busy_poll() {
+    let port = free_port();
+    let dir = tmp_dir("async_host_io_sleeppoll", port);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("server.fai");
+    std::fs::write(&src, sleep_handler_server_source(port)).unwrap();
+
+    let mut child = Command::new(fai_binary())
+        .arg("run")
+        .arg(&src)
+        .env("FAI_HTTP_MAX_REQUESTS", "1")
+        .env("FAI_DEBUG_SERVER_POLLS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fai run");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let start = Instant::now();
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let mut err = String::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        let _ = s.read_to_string(&mut err);
+                    }
+                    panic!("fai server exited early ({status}); stderr:\n{err}");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("fai server did not start listening within 20s");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write request");
+    // The handler parks ~2s on the sleep timer before replying.
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read response");
+    let dur = start.elapsed();
+    assert!(resp.contains("done"), "handler did not complete:\n{resp}");
+    assert!(
+        dur >= Duration::from_millis(1800),
+        "sleep was not actually awaited: {dur:?}"
+    );
+
+    let output = child.wait_with_output().expect("collect fai server output");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = stderr_string(&output);
+    let polls: u64 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("__server_polls="))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no __server_polls marker in stderr:\n{stderr}"));
+
+    // A fixed-1ms re-poll would do ~2000 polls over the 2s sleep. The timer-aware
+    // park sleeps to the nearest timer (≤250ms backstop) → roughly a dozen.
+    assert!(
+        (2..300).contains(&polls),
+        "expected a parked-but-not-spinning poll count, got {polls} over {dur:?}"
+    );
+}
