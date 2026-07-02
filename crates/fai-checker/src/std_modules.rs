@@ -85,6 +85,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             "toBool",
             "parseInt",
             "parseFloat",
+            "typeOf",
         ]
         .into_iter()
         .map(|n| (n.into(), n.into()))
@@ -129,6 +130,8 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("parse", "jsonParse"),
             ("stringify", "jsonStringify"),
             ("requireString", "jsonRequireString"),
+            ("query", "jsonQuery"),
+            ("queryPage", "jsonQueryPage"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))

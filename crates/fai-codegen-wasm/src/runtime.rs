@@ -571,7 +571,19 @@ pub const IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: u32 = 119;
 /// Event 0 is START; event 1 is END. Declared only when
 /// FAI_DEBUG_FUNCTION_CALLS is enabled.
 pub const IMPORT_DEBUG_FUNCTION_CALL: u32 = 120;
-pub const IMPORT_COUNT: u32 = 121;
+/// `env.json_query(json_ptr, json_len, path_ptr, path_len) -> i64` —
+/// host-side JSON selection: parse natively, evaluate a dot-path
+/// (`a.b[].c`; `seg[]` expands arrays, empty path selects the root), and
+/// materialize ONLY the matched values as a guest Array. Null on invalid
+/// JSON. Large documents never build a full guest tree.
+pub const IMPORT_JSON_QUERY: u32 = 121;
+/// `env.json_query_page(json_ptr, json_len, path_ptr, path_len, offset,
+/// limit) -> i64` — windowed variant returning a Dict
+/// `{ total: Int, items: Array }` so callers can page a big match set
+/// without materializing it. Null on invalid JSON; offset/limit are
+/// clamped host-side.
+pub const IMPORT_JSON_QUERY_PAGE: u32 = 122;
+pub const IMPORT_COUNT: u32 = 123;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -9597,6 +9609,26 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             "__fai_debug_function_call",
             vec![ValType::I32, ValType::I32, ValType::I32],
             vec![],
+        ),
+        // IMPORT_JSON_QUERY: (json_ptr, json_len, path_ptr, path_len) -> i64.
+        (
+            "json_query",
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_JSON_QUERY_PAGE:
+        // (json_ptr, json_len, path_ptr, path_len, offset, limit) -> i64.
+        (
+            "json_query_page",
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            vec![ValType::I64],
         ),
     ]
 }

@@ -206,6 +206,25 @@ let ratio = convert.parseFloat('0.75')
 let label = convert.toString(port)
 ```
 
+`typeOf(value)` returns the runtime kind of any value — `'int'`, `'float'`,
+`'bool'`, `'null'`, `'void'`, `'string'`, `'array'`, `'dictionary'`,
+`'tuple'`, `'closure'`, or `'module'` (records are dict-shaped and report
+`'dictionary'`) — so `Unknown` data (parsed
+JSON, dynamic tool results) can branch on shape without try/catch cast probes
+or stringify-and-inspect tricks. Like the other conversion helpers it is also
+callable bare, without a `use`.
+
+```fai
+let parsed = json.parse(body)
+if typeOf(parsed) == 'array'
+    let items Unknown[] = parsed
+    print(length(items))
+else if typeOf(parsed) == 'dictionary'
+    let dict Dictionary = parsed
+    print(length(getKeys(dict)))
+end
+```
+
 `parseInt` and `parseFloat` parse strings and return `null` for invalid input.
 Guard the result before using it in code that might receive bad data.
 
@@ -249,6 +268,29 @@ let user = User(
 `json.stringify(value)` serializes Forai values back to JSON. `requireString`
 is a small convenience for extracting a required string field from a dictionary;
 it returns `String?`, so handle the missing case.
+
+For large documents, prefer `json.query` / `json.queryPage` over `parse`: they
+parse host-side and materialize only the values a dot-path matches, so cost
+scales with the matches instead of the document. Path segments are separated
+by `.`; a trailing `[]` expands an array (`items[].name` selects each item's
+`name`); an empty path selects the root. Missing fields and non-array
+expansions drop out silently; invalid JSON returns `null`.
+
+```fai
+use std.json
+use std.dictionary
+
+let body = '{"task":{"items":[{"name":"a"},{"name":"b"}]}}'
+let names = json.query(body, 'task.items[].name')   # ['a', 'b']
+
+let page = json.queryPage(body, 'task.items[]', 0, 20)
+let total = dictionary.getInt(page, 'total')!         # 2
+let items Unknown[] = dictionary.get(page, 'items')!
+```
+
+`queryPage` windows a large match set with `offset`/`limit` and reports the
+full match count as `total`, so tools can paginate without holding every
+match in memory.
 "#,
         },
         StdlibModuleOverview {

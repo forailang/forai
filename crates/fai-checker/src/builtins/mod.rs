@@ -152,6 +152,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.convert", name: "toBool",     builtin_name: "toBool",     doc: "Convert a value to a boolean." },
         BuiltinDoc { module: "std.convert", name: "parseInt",   builtin_name: "parseInt",   doc: "Parse an integer from a string, or null if unparseable. Returns Int?." },
         BuiltinDoc { module: "std.convert", name: "parseFloat", builtin_name: "parseFloat", doc: "Parse a float from a string, or null if unparseable. Returns Float?." },
+        BuiltinDoc { module: "std.convert", name: "typeOf",     builtin_name: "typeOf",     doc: "Return the runtime kind of any value: 'int', 'float', 'bool', 'null', 'void', 'string', 'array', 'dictionary', 'tuple', 'closure', or 'module'. Records are dict-shaped and report 'dictionary'. Branch on Unknown data without cast probes." },
 
         // std.dictionary
         BuiltinDoc { module: "std.dictionary", name: "get",       builtin_name: "get",       doc: "Look up a value by key, returns null if missing." },
@@ -176,6 +177,8 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.json", name: "parse",         builtin_name: "jsonParse",         doc: "Parse a JSON string into a value." },
         BuiltinDoc { module: "std.json", name: "stringify",     builtin_name: "jsonStringify",     doc: "Serialize a value to a JSON string." },
         BuiltinDoc { module: "std.json", name: "requireString", builtin_name: "jsonRequireString", doc: "Extract a required string field from a JSON object." },
+        BuiltinDoc { module: "std.json", name: "query",         builtin_name: "jsonQuery",         doc: "Select values from a JSON string with a dot-path ('a.b[].c'; 'seg[]' expands arrays, '' selects the root). Parses host-side and materializes only the matches — use it instead of parse for large documents. Null on invalid JSON." },
+        BuiltinDoc { module: "std.json", name: "queryPage",     builtin_name: "jsonQueryPage",     doc: "Like query, but returns one window of matches with the total count as { total: Int, items: [...] }. Offset/limit are clamped. Null on invalid JSON." },
 
         // std.html
         BuiltinDoc { module: "std.html", name: "escape", builtin_name: "htmlEscape", doc: "Escape special HTML characters in a string." },

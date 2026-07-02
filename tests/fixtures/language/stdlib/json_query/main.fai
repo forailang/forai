@@ -1,0 +1,47 @@
+# json.query(text, path) — host-side JSON selection. The document is parsed
+# natively and only the dot-path matches are materialized as guest values.
+# Covers: nested field chains, `[]` array expansion (mid-path and trailing),
+# root selection via the empty path, missing fields dropping out silently,
+# non-array expansion dropping out, a leading '.' tolerated, and null on
+# invalid JSON.
+# expect: ok
+# stdout:
+#   2
+#   a
+#   b
+#   3
+#   1
+#   dictionary
+#   0
+#   0
+#   42
+#   invalid-json-null
+# leak: flat
+# ownership: balanced
+
+use std.json
+
+def main
+    @return Void
+do
+    let body = '{"task":{"items":[{"name":"a","n":1},{"name":"b","n":2},{"n":3}],"summary":"s"}}'
+    let names = json.query(body, 'task.items[].name')!
+    print(length(names))
+    print(names[0])
+    print(names[1])
+    let items = json.query(body, 'task.items[]')!
+    print(length(items))
+    let root = json.query(body, '')!
+    print(length(root))
+    print(typeOf(root[0]))
+    print(length(json.query(body, 'task.missing[].x')!))
+    print(length(json.query(body, 'task.summary[]')!))
+    let answer = json.query('{"a":{"b":42}}', '.a.b')!
+    print(answer[0])
+    let bad = json.query('not json', 'a')
+    if bad?
+        print('unexpected')
+    else
+        print('invalid-json-null')
+    end
+end

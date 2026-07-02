@@ -30,7 +30,7 @@ use crate::runtime::{
     IMPORT_FILE_LIST, IMPORT_FILE_READ_STR, IMPORT_GET_LOCATION_PATH, IMPORT_HTML_ESCAPE,
     IMPORT_HTTP_REQUEST_DELETE, IMPORT_HTTP_REQUEST_GET, IMPORT_HTTP_REQUEST_PATCH,
     IMPORT_HTTP_REQUEST_POST, IMPORT_HTTP_REQUEST_PUT, IMPORT_JSON_PARSE,
-    IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY, IMPORT_LOG_ERROR, IMPORT_LOG_INFO,
+    IMPORT_JSON_QUERY, IMPORT_JSON_QUERY_PAGE, IMPORT_JSON_REQUIRE_STRING, IMPORT_JSON_STRINGIFY, IMPORT_LOG_ERROR, IMPORT_LOG_INFO,
     IMPORT_LOG_WARN, IMPORT_NET_AVAILABLE, IMPORT_NOW_MS, IMPORT_OWNERSHIP_EVENT,
     IMPORT_PATH_BASENAME, IMPORT_PATH_DIRNAME, IMPORT_PATH_EXTNAME, IMPORT_PATH_JOIN,
     IMPORT_PROCESS_AVAILABLE, IMPORT_PROCESS_READ, IMPORT_PROCESS_RUN, IMPORT_PROCESS_START,
@@ -697,6 +697,16 @@ fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCall> {
         // `requireString` takes (Dict, String) and returns String/null.
         ("std.json", "parse") => (IMPORT_JSON_PARSE, &[AS::String], RS::Boxed),
         ("std.json", "stringify") => (IMPORT_JSON_STRINGIFY, &[AS::Boxed], RS::Boxed),
+        // Host-side JSON selection: parse natively, walk the dot-path, and
+        // materialize only the matches (query) or one window of them with a
+        // total count (queryPage). Large artifacts never build a full guest
+        // tree the way `parse` does.
+        ("std.json", "query") => (IMPORT_JSON_QUERY, &[AS::String, AS::String], RS::Boxed),
+        ("std.json", "queryPage") => (
+            IMPORT_JSON_QUERY_PAGE,
+            &[AS::String, AS::String, AS::Int, AS::Int],
+            RS::Boxed,
+        ),
         ("std.json", "requireString") => (
             IMPORT_JSON_REQUIRE_STRING,
             &[AS::Boxed, AS::String],
@@ -14362,6 +14372,7 @@ impl<'a, 'c> Builder<'a, 'c> {
 
             // ── conversions ──────────────────────────────────
             "toString" => self.compile_to_string_bare(args).map(Some),
+            "typeOf" => self.compile_type_of_bare(args).map(Some),
             "toInt" => {
                 if args.len() != 1 {
                     return Err(BuildError::UnsupportedExpression("toInt-arg-count"));
@@ -14971,6 +14982,122 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I64Const(QNAN | TAG_BOOL));
         self.emit(Instruction::I64Eq);
         self.emit(Instruction::Call(self.rt().base + RT_MAKE_BOOL));
+        Ok(())
+    }
+
+    /// Allocate a fresh guest String for an interned kind name and store
+    /// it in `result_local`. Shared by the `typeOf` branches.
+    fn emit_kind_string(&mut self, name: &str, result_local: u32) {
+        let (off, len) = self.ctx.strings.borrow_mut().intern(name);
+        self.emit(Instruction::I32Const(off as i32));
+        self.emit(Instruction::I32Const(len as i32));
+        self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
+        self.emit(Instruction::LocalSet(result_local));
+    }
+
+    /// `typeOf(value)` — the runtime kind of any value as a fresh owned
+    /// String: 'int', 'float', 'bool', 'null', 'void', or the heap tag name
+    /// ('string', 'array', 'tuple', 'dictionary', 'closure', 'module',
+    /// 'record'; anything else reports 'unknown'). A NaN-box/tag inspection —
+    /// no stringify, no cast probes — so Unknown-typed data (parsed JSON,
+    /// dynamic tool payloads) can branch on shape cheaply.
+    fn compile_type_of_bare(&mut self, args: &[&Expression]) -> Result<(), BuildError> {
+        if args.len() != 1 {
+            return Err(BuildError::UnsupportedExpression("typeOf-arg-count"));
+        }
+        // An owned argument temp (fresh call/literal) is only inspected, so
+        // release it after the tag is read — compile_binary's operand mop-up.
+        let owned = self.expr_transfers_ownership(args[0]);
+        self.compile_expr_as(args[0], ValueShape::Boxed)?;
+        let val = self.alloc_local();
+        self.emit(Instruction::LocalSet(val));
+        let result = self.alloc_local();
+
+        self.emit(Instruction::LocalGet(val));
+        self.emit(Instruction::Call(self.rt().base + RT_IS_INT));
+        self.emit_open(Instruction::If(BlockType::Empty));
+        self.emit_kind_string("int", result);
+        self.emit(Instruction::Else);
+        {
+            self.emit(Instruction::LocalGet(val));
+            self.emit(Instruction::Call(self.rt().base + RT_IS_OBJ));
+            self.emit_open(Instruction::If(BlockType::Empty));
+            {
+                // Heap object: dispatch on the tag word at offset 0 via a
+                // nested else-chain, so exactly ONE kind string is
+                // allocated per call (a default-then-override would leak
+                // the overwritten default).
+                let tag = self.alloc_i32_local();
+                self.emit(Instruction::LocalGet(val));
+                self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
+                self.emit(Instruction::I32Load(mem0()));
+                self.emit(Instruction::LocalSet(tag));
+                let tags = [
+                    (OBJ_TAG_STRING, "string"),
+                    (OBJ_TAG_ARRAY, "array"),
+                    (OBJ_TAG_TUPLE, "tuple"),
+                    (OBJ_TAG_DICT, "dictionary"),
+                    (OBJ_TAG_CLOSURE, "closure"),
+                    (crate::runtime::OBJ_TAG_MODULE, "module"),
+                    (crate::runtime::OBJ_TAG_INSTANCE, "record"),
+                ];
+                for (t, name) in tags {
+                    self.emit(Instruction::LocalGet(tag));
+                    self.emit(Instruction::I32Const(t));
+                    self.emit(Instruction::I32Eq);
+                    self.emit_open(Instruction::If(BlockType::Empty));
+                    self.emit_kind_string(name, result);
+                    self.emit(Instruction::Else);
+                }
+                self.emit_kind_string("unknown", result);
+                for _ in tags {
+                    self.emit_close();
+                }
+            }
+            self.emit(Instruction::Else);
+            {
+                self.emit(Instruction::LocalGet(val));
+                self.emit(Instruction::I64Const(crate::runtime::VAL_NULL));
+                self.emit(Instruction::I64Eq);
+                self.emit_open(Instruction::If(BlockType::Empty));
+                self.emit_kind_string("null", result);
+                self.emit(Instruction::Else);
+                {
+                    self.emit(Instruction::LocalGet(val));
+                    self.emit(Instruction::I64Const(VAL_VOID));
+                    self.emit(Instruction::I64Eq);
+                    self.emit_open(Instruction::If(BlockType::Empty));
+                    self.emit_kind_string("void", result);
+                    self.emit(Instruction::Else);
+                    {
+                        self.emit(Instruction::LocalGet(val));
+                        self.emit(Instruction::I64Const(crate::runtime::VAL_TRUE));
+                        self.emit(Instruction::I64Eq);
+                        self.emit(Instruction::LocalGet(val));
+                        self.emit(Instruction::I64Const(VAL_FALSE));
+                        self.emit(Instruction::I64Eq);
+                        self.emit(Instruction::I32Or);
+                        self.emit_open(Instruction::If(BlockType::Empty));
+                        self.emit_kind_string("bool", result);
+                        self.emit(Instruction::Else);
+                        // Everything left is a non-QNAN double (or the
+                        // canonical NaN itself).
+                        self.emit_kind_string("float", result);
+                        self.emit_close();
+                    }
+                    self.emit_close();
+                }
+                self.emit_close();
+            }
+            self.emit_close();
+        }
+        self.emit_close();
+
+        if owned {
+            self.emit(Instruction::LocalGet(val));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
+        self.emit(Instruction::LocalGet(result));
         Ok(())
     }
 

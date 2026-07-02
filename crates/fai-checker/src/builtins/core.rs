@@ -69,6 +69,13 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
 
     // Conversion
     ins(b, "toString", &[p("value", Type::Unknown)], &[Type::String]);
+    // Runtime type inspection: the kind name of any value ('int', 'float',
+    // 'bool', 'null', 'void', 'string', 'array', 'dictionary', 'tuple',
+    // 'closure', 'module', 'unknown'; records are dict-shaped and report
+    // 'dictionary'). Lets Unknown-typed data
+    // (parsed JSON, dynamic tool results) branch without try/catch cast
+    // probes or stringify-and-inspect hacks.
+    ins(b, "typeOf", &[p("value", Type::Unknown)], &[Type::String]);
     ins(b, "toInt", &[p("value", Type::Unknown)], &[Type::Int]);
     ins(b, "toFloat", &[p("value", Type::Unknown)], &[Type::Float]);
     ins(b, "toBool", &[p("value", Type::Unknown)], &[Type::Bool]);

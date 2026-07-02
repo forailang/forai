@@ -1,0 +1,52 @@
+# json.queryPage(text, path, offset, limit) — windowed host-side JSON
+# selection returning { total: Int, items: [...] }. Covers: a middle window,
+# total reported independently of the window, offset past the end and a
+# zero limit yielding empty windows, negative offset clamping to 0, and
+# null on invalid JSON.
+# expect: ok
+# stdout:
+#   4
+#   2
+#   20
+#   30
+#   0
+#   0
+#   4
+#   1
+#   10
+#   invalid-json-null
+# leak: flat
+# ownership: balanced
+
+use std.dictionary
+
+use std.json
+
+def main
+    @return Void
+do
+    let body = '{"ns":[10,20,30,40]}'
+    let page = json.queryPage(body, 'ns[]', 1, 2)!
+    print(getInt(page, 'total')!)
+    let items Unknown[] = get(page, 'items')!
+    print(length(items))
+    print(items[0])
+    print(items[1])
+    let past = json.queryPage(body, 'ns[]', 99, 5)!
+    let pastItems Unknown[] = get(past, 'items')!
+    print(length(pastItems))
+    let zero = json.queryPage(body, 'ns[]', 0, 0)!
+    let zeroItems Unknown[] = get(zero, 'items')!
+    print(length(zeroItems))
+    print(getInt(zero, 'total')!)
+    let neg = json.queryPage(body, 'ns[]', 0 - 3, 1)!
+    let negItems Unknown[] = get(neg, 'items')!
+    print(length(negItems))
+    print(negItems[0])
+    let bad = json.queryPage('{oops', 'ns[]', 0, 1)
+    if bad?
+        print('unexpected')
+    else
+        print('invalid-json-null')
+    end
+end

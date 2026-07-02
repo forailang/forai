@@ -130,7 +130,189 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.json_query(json_ptr, json_len, path_ptr, path_len) -> i64.
+    //
+    // Host-side JSON selection: parse with serde, evaluate the dot-path
+    // (`a.b[].c` — `seg[]` expands arrays, empty path selects the root),
+    // and materialize ONLY the matched values as a guest Array. The full
+    // document never becomes a guest tree, so multi-MB payloads cost
+    // guest allocation proportional to the matches, not the document.
+    // Returns VAL_NULL on invalid JSON (same convention as json_parse).
+    // The browser runtime implements a JS twin with identical semantics.
+    linker
+        .func_wrap(
+            "env",
+            "json_query",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32, p_ptr: i32, p_len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let (text, path) = {
+                    let data = mem.data(&caller);
+                    (
+                        read_guest_str(data, ptr, len),
+                        read_guest_str(data, p_ptr, p_len),
+                    )
+                };
+                let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    return VAL_NULL;
+                };
+                let matches = eval_json_path(&root, &path);
+                let arr =
+                    serde_json::Value::Array(matches.into_iter().cloned().collect());
+                build_value(&mut caller, &mem, &arr)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.json_query_page(json_ptr, json_len, path_ptr, path_len,
+    //                     offset, limit) -> i64.
+    //
+    // Windowed variant of json_query: returns a guest Dict
+    // `{ total: Int, items: Array }` where `items` is `matches[offset ..
+    // offset+limit]`. Offset clamps into range; a non-positive limit
+    // yields an empty window (the total still reports). VAL_NULL on
+    // invalid JSON.
+    linker
+        .func_wrap(
+            "env",
+            "json_query_page",
+            |mut caller: Caller<'_, ()>,
+             ptr: i32,
+             len: i32,
+             p_ptr: i32,
+             p_len: i32,
+             offset: i32,
+             limit: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let (text, path) = {
+                    let data = mem.data(&caller);
+                    (
+                        read_guest_str(data, ptr, len),
+                        read_guest_str(data, p_ptr, p_len),
+                    )
+                };
+                let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    return VAL_NULL;
+                };
+                let matches = eval_json_path(&root, &path);
+                let total = matches.len();
+                let start = (offset.max(0) as usize).min(total);
+                let take = limit.max(0) as usize;
+                let items: Vec<serde_json::Value> = matches[start..]
+                    .iter()
+                    .take(take)
+                    .map(|v| (*v).clone())
+                    .collect();
+                let page = serde_json::json!({
+                    "total": total,
+                    "items": items,
+                });
+                build_value(&mut caller, &mem, &page)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
+}
+
+/// Copy a guest string range out of linear memory (lossy on bad UTF-8,
+/// empty on an out-of-bounds range).
+fn read_guest_str(data: &[u8], ptr: i32, len: i32) -> String {
+    let (ptr, len) = (ptr as usize, len as usize);
+    match data.get(ptr..ptr + len) {
+        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// Evaluate a bounded jq-like dot-path against a parsed document and
+/// return references to every match, in document order.
+///
+/// Dialect: segments are separated by `.`; a segment `name` selects that
+/// object field (objects lacking the field drop out silently); a trailing
+/// `[]` on a segment expands the selected array into its elements
+/// (non-arrays drop out); a bare `[]` segment expands the current values;
+/// an empty path (or only empty segments) selects the root. A leading
+/// `.` (jq style, `.a.b`) is tolerated via the empty-segment skip.
+fn eval_json_path<'v>(root: &'v serde_json::Value, path: &str) -> Vec<&'v serde_json::Value> {
+    let mut current: Vec<&'v serde_json::Value> = vec![root];
+    for raw in path.split('.') {
+        let segment = raw.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let expands = segment.ends_with("[]");
+        let field = if expands {
+            &segment[..segment.len() - 2]
+        } else {
+            segment
+        };
+        let mut next: Vec<&'v serde_json::Value> = Vec::new();
+        for value in current {
+            let selected = if field.is_empty() {
+                Some(value)
+            } else {
+                value.get(field)
+            };
+            let Some(selected) = selected else { continue };
+            if expands {
+                if let serde_json::Value::Array(items) = selected {
+                    next.extend(items.iter());
+                }
+            } else {
+                next.push(selected);
+            }
+        }
+        current = next;
+    }
+    current
+}
+
+#[cfg(test)]
+mod eval_json_path_tests {
+    use super::eval_json_path;
+    use serde_json::json;
+
+    #[test]
+    fn empty_path_selects_root() {
+        let doc = json!({"a": 1});
+        let m = eval_json_path(&doc, "");
+        assert_eq!(m, vec![&doc]);
+    }
+
+    #[test]
+    fn field_chain_selects_nested_value() {
+        let doc = json!({"a": {"b": {"c": 42}}});
+        let m = eval_json_path(&doc, "a.b.c");
+        assert_eq!(m, vec![&json!(42)]);
+    }
+
+    #[test]
+    fn leading_dot_is_tolerated() {
+        let doc = json!({"a": 1});
+        assert_eq!(eval_json_path(&doc, ".a"), vec![&json!(1)]);
+    }
+
+    #[test]
+    fn expansion_fans_out_and_selects_each() {
+        let doc = json!({"items": [{"s": "x"}, {"s": "y"}, {"n": 3}]});
+        let m = eval_json_path(&doc, "items[].s");
+        assert_eq!(m, vec![&json!("x"), &json!("y")]);
+    }
+
+    #[test]
+    fn bare_expansion_expands_root_array() {
+        let doc = json!([1, 2, 3]);
+        let m = eval_json_path(&doc, "[]");
+        assert_eq!(m, vec![&json!(1), &json!(2), &json!(3)]);
+    }
+
+    #[test]
+    fn missing_field_and_non_array_expansion_drop_out() {
+        let doc = json!({"a": {"b": 1}, "s": "text"});
+        assert!(eval_json_path(&doc, "a.missing").is_empty());
+        assert!(eval_json_path(&doc, "s[]").is_empty());
+    }
 }
 
 /// Serialize a NaN-boxed guest value into `out`.

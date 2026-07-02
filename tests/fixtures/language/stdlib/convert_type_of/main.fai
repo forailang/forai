@@ -1,0 +1,50 @@
+# typeOf(value) — runtime kind inspection for Unknown-typed data. Covers
+# every kind JSON parsing can produce (int, float, bool, null, string,
+# array, dictionary), record instances (dict-shaped in the direct backend,
+# so they report 'dictionary'), both call forms (bare and convert.typeOf),
+# and branching on the result without cast probes.
+# expect: ok
+# stdout:
+#   int
+#   float
+#   bool
+#   null
+#   string
+#   array
+#   dictionary
+#   dictionary
+#   int
+#   array
+#   dict-branch
+# leak: flat
+# ownership: balanced
+
+use std.convert
+
+use std.json
+
+type Point
+    x Int
+    y Int
+end
+
+def main
+    @return Void
+do
+    print(typeOf(7))
+    print(typeOf(1.5))
+    print(typeOf(false))
+    print(typeOf(null))
+    print(typeOf('hello'))
+    print(typeOf([1 2 3]))
+    print(typeOf({
+        a: 1
+    }))
+    print(typeOf(Point(x: 1, y: 2)))
+    let parsed = json.parse('{"count":3,"items":["a"]}')
+    print(convert.typeOf(get(parsed, 'count')!))
+    print(typeOf(get(parsed, 'items')!))
+    if typeOf(parsed) == 'dictionary'
+        print('dict-branch')
+    end
+end

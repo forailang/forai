@@ -309,6 +309,7 @@ pub const FRESH_BARE_CALLS: &[&str] = &[
     "join",
     "replace",
     "toString",
+    "typeOf",
     "jsonParse",
     "parse",
     "jsonStringify",
@@ -391,6 +392,12 @@ pub const INLINE_STD_CALLS: &[StdCallRow] = &[
         method: "toString",
         ret: ReturnConvention::Owned,
         doc: "codegen normalizes RT_VALUE_TO_STR to a uniform +1 string",
+    },
+    StdCallRow {
+        canon: "std.convert",
+        method: "typeOf",
+        ret: ReturnConvention::Owned,
+        doc: "kind name is a fresh +1 string allocated per call",
     },
     StdCallRow {
         canon: "std.convert",
@@ -1018,6 +1025,20 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         import: "json_parse",
         ret: ROwn,
         doc: "fresh graph via heap::build_value; null on parse error",
+    },
+    HostImportRow {
+        canon: "std.json",
+        method: "query",
+        import: "json_query",
+        ret: ROwn,
+        doc: "fresh match array via heap::build_value; null on parse error",
+    },
+    HostImportRow {
+        canon: "std.json",
+        method: "queryPage",
+        import: "json_query_page",
+        ret: ROwn,
+        doc: "fresh {total, items} dict via heap::build_value; null on parse error",
     },
     HostImportRow {
         canon: "std.json",
@@ -1826,7 +1847,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 102, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 104, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(
