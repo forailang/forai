@@ -16483,6 +16483,14 @@ impl<'a, 'c> Builder<'a, 'c> {
         if let Expression::CallExpression(ce) = expr {
             return self.call_returns_owned(ce);
         }
+        // `x!` yields the same value as `x` — ownership classification
+        // passes through to the unwrapped expression. Without this, an
+        // owned-returning optional call (`json.queryPage(...)!`,
+        // `json.requireString(...)!`) classified as borrowed gets an extra
+        // retain on bind and its host-allocated +1 is never released.
+        if let Expression::ForceUnwrapExpression(fe) = expr {
+            return self.expr_transfers_ownership(&fe.expression);
+        }
         // A function REFERENCE — an identifier that resolves to no binding
         // but names a top-level function — compiles to a FRESH closure
         // wrapper per use (`compile_function_reference`), an owned +1.
