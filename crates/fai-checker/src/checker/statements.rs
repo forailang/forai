@@ -140,7 +140,9 @@ impl Checker {
                      def {}\n  \
                      ...\n\n\
                      Every named `def`, `remote def`, and `test` block needs one. \
-                     `main` is the only exemption.",
+                     `main` is the only exemption. Note: a blank line between \
+                     a comment and its `def` breaks the attachment — the doc \
+                     comment must sit directly above the declaration.",
                     fd.name, fd.name
                 ));
                 self.collected_errors

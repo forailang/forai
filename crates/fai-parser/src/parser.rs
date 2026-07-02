@@ -10,6 +10,12 @@ pub struct Parser {
     type_params_in_scope: Vec<String>,
     /// Accumulated doc comment lines from `#` comments before a declaration.
     pending_doc: Vec<String>,
+    /// Comment blocks separated from what follows by a blank line. A blank
+    /// line breaks doc-comment attachment (matching Go/Rust convention): the
+    /// block is a standalone file/in-body comment, never the next
+    /// declaration's doc. Flushed as `Statement::Comment` (or into
+    /// `Program.leading_comments`) at the next statement boundary.
+    detached_comments: Vec<String>,
     /// Nesting depth inside `[...]` array literals. When > 0, `-` is treated
     /// as unary (start of a new negative item) rather than binary subtraction.
     array_depth: usize,
@@ -23,6 +29,7 @@ impl Parser {
             errors: Vec::new(),
             type_params_in_scope: Vec::new(),
             pending_doc: Vec::new(),
+            detached_comments: Vec::new(),
             array_depth: 0,
         }
     }
@@ -39,13 +46,24 @@ impl Parser {
         // verbatim. Doc comments on the first `def` still flow through
         // `pending_doc` unchanged.
         let first_is_doc_target = self.check(TokenType::Def) || self.check(TokenType::Remote);
-        let leading_comments =
-            if !self.pending_doc.is_empty() && !first_is_doc_target && !self.is_at_end() {
-                std::mem::take(&mut self.pending_doc)
-            } else {
-                Vec::new()
-            };
+        // Blank-line-separated leading blocks (harness directives, license
+        // headers) were detached by `skip_newlines`; they are file comments
+        // regardless of what follows.
+        let mut leading_comments = std::mem::take(&mut self.detached_comments);
+        if !self.pending_doc.is_empty() && !first_is_doc_target && !self.is_at_end() {
+            leading_comments.extend(std::mem::take(&mut self.pending_doc));
+        }
         while !self.is_at_end() {
+            // Detached blocks between statements survive as standalone
+            // Comment statements (the formatter separates top-level parts
+            // with a blank line, so the round-trip re-detaches them).
+            if !self.detached_comments.is_empty() {
+                let lines = std::mem::take(&mut self.detached_comments);
+                statements.push(Statement::Comment(CommentStatement {
+                    lines,
+                    location: self.peek_location(),
+                }));
+            }
             if self.match_t(TokenType::Private) {
                 self.consume(TokenType::Colon, "Expected ':' after private")?;
                 self.consume(TokenType::Newline, "Expected newline after private:")?;
@@ -70,6 +88,13 @@ impl Parser {
             self.skip_newlines();
         }
 
+        if !self.detached_comments.is_empty() {
+            let lines = std::mem::take(&mut self.detached_comments);
+            statements.push(Statement::Comment(CommentStatement {
+                lines,
+                location: self.peek_location(),
+            }));
+        }
         if !self.errors.is_empty() {
             return Err(self.errors.join("\n"));
         }
@@ -1408,6 +1433,13 @@ impl Parser {
             // its doc comment; otherwise they are an in-body comment that
             // would otherwise be dropped, so emit them as a standalone
             // Comment statement to survive a fmt round-trip.
+            if !self.detached_comments.is_empty() {
+                let lines = std::mem::take(&mut self.detached_comments);
+                stmts.push(Statement::Comment(CommentStatement {
+                    lines,
+                    location: self.peek_location(),
+                }));
+            }
             if !self.pending_doc.is_empty() && !self.next_is_doc_target() {
                 stmts.push(self.take_pending_comment_statement());
             }
@@ -1416,6 +1448,13 @@ impl Parser {
         }
         // Comments sitting just before the block's closing token belong to
         // this block; flush them so they are not lost.
+        if !self.detached_comments.is_empty() {
+            let lines = std::mem::take(&mut self.detached_comments);
+            stmts.push(Statement::Comment(CommentStatement {
+                lines,
+                location: self.peek_location(),
+            }));
+        }
         if !self.pending_doc.is_empty() {
             stmts.push(self.take_pending_comment_statement());
         }
@@ -1765,6 +1804,7 @@ impl Parser {
                 // Only skip newlines if a `do` actually follows (peek ahead without consuming)
                 let saved_index = self.index;
                 let saved_doc = self.pending_doc.clone();
+                let saved_detached = self.detached_comments.clone();
                 self.skip_newlines();
                 if self.check(TokenType::Do) {
                     let block = self.parse_do_block()?;
@@ -1778,6 +1818,7 @@ impl Parser {
                     // No trailing do — restore position so newlines aren't consumed
                     self.index = saved_index;
                     self.pending_doc = saved_doc;
+                    self.detached_comments = saved_detached;
                 }
                 let loc = expr.location().clone();
                 expr = Expression::Call(CallExpr {
@@ -2198,12 +2239,22 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
+        // Consecutive newlines after a comment block = a blank line between
+        // the block and whatever follows. That breaks doc attachment: the
+        // block moves to `detached_comments` (a standalone comment), so only
+        // a comment *immediately* above a declaration becomes its doc.
+        let mut newline_run = 0;
         while !self.is_at_end() {
             if self.check(TokenType::Newline) {
                 self.advance();
+                newline_run += 1;
+                if newline_run >= 2 && !self.pending_doc.is_empty() {
+                    self.detached_comments.append(&mut self.pending_doc);
+                }
             } else if self.check(TokenType::Comment) {
                 let tok = self.advance();
                 self.pending_doc.push(tok.lexeme.clone());
+                newline_run = 0;
             } else {
                 break;
             }

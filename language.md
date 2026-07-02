@@ -253,6 +253,10 @@ end
 - `@type`, `@param`, `@return` must appear in that order
 - `# comments` above any annotation are captured as documentation
 - Doc comments on individual `@param`/`@return` lines are optional
+- A doc comment must sit *directly* above its `def` — a blank line between
+  a comment block and the declaration breaks the attachment, and the block
+  becomes an ordinary standalone comment (file headers and test-harness
+  directives are therefore never doc comments)
 
 ### Default values
 
