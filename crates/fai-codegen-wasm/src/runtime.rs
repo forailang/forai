@@ -2773,7 +2773,7 @@ fn emit_copy_deep(base: u32) -> Function {
     f.instruction(&Instruction::End);
 
     // recursively copy each pointer child from src entry to dst entry.
-    let mut emit_copy_children =
+    let emit_copy_children =
         |f: &mut Function, entry_base: i32, stride: i32, child_offsets: &[u64]| {
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(4)); // i = 0
@@ -3360,7 +3360,7 @@ fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u32>]) -> Fu
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(5));
 
-    let mut emit_entry_loop =
+    let emit_entry_loop =
         |f: &mut Function, entry_base: i32, stride: i32, child_offsets: &[u64]| {
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(4)); // i = 0

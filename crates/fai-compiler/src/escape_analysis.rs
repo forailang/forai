@@ -560,7 +560,7 @@ fn collect_binding_verdicts(
     escaping: &HashSet<String>,
     out: &mut EscapeReport,
 ) {
-    let mut push = |name: &str, init: InitKind, out: &mut EscapeReport| {
+    let push = |name: &str, init: InitKind, out: &mut EscapeReport| {
         out.verdicts.push(BindingVerdict {
             function: func.to_string(),
             name: name.to_string(),

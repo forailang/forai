@@ -1965,7 +1965,7 @@ pub fn build_function_with_spy(
 /// so call-indirect lands on the right wasm function when a
 /// program has multiple top-level functions each registering
 /// their own closures.
-pub fn build_function_with_spy_and_offset(
+pub(crate) fn build_function_with_spy_and_offset(
     fd: &FunctionDeclaration,
     rt: RtOffsets,
     functions: &[FunctionInfo],
@@ -3994,7 +3994,7 @@ fn user_callee<'a>(
 /// lowered as a resume fn (frame leads with `env_ptr`, params follow). Present
 /// only on the real-engine path; `None` on the pure-sync builder.
 #[derive(Clone, Copy)]
-struct AsyncClosureCtx<'a> {
+pub(crate) struct AsyncClosureCtx<'a> {
     async_set: &'a std::collections::HashSet<String>,
     all_fns: &'a std::collections::HashSet<String>,
     layout: &'a crate::async_engine::SchedLayout,
@@ -4415,7 +4415,6 @@ enum Term<'a> {
     /// so the UI thread stays free while it's in flight.
     AwaitRemote {
         args: Vec<&'a Expression>,
-        loc: &'a fai_compiler::ast::SourceLocation,
         next: usize,
     },
     /// `let x = externCall(args)` for an offloadable (scalar) extern — lowered
@@ -4426,7 +4425,6 @@ enum Term<'a> {
     AwaitFfi {
         ext_idx: u16,
         args: Vec<&'a Expression>,
-        loc: &'a fai_compiler::ast::SourceLocation,
         next: usize,
     },
     /// Generic blocking stdlib host operation. `host_op_begin(g_current,
@@ -4969,12 +4967,11 @@ impl<'a> CfgBuilder<'a> {
         // single-binding let/var
         if let Some((name, value)) = single_binding(stmt) {
             // `let x = remoteCall(...)` — suspend on the RPC, bind the result.
-            if let Some((rargs, loc)) = remote_call_args(value) {
+            if let Some((rargs, _loc)) = remote_call_args(value) {
                 let on_error = self.handler();
                 let next = self.new_block();
                 self.blocks[cur].term = Term::AwaitRemote {
                     args: rargs,
-                    loc,
                     next,
                 };
                 self.blocks[next].incoming = Incoming::AwaitedRemote {
@@ -5006,12 +5003,11 @@ impl<'a> CfgBuilder<'a> {
             // `let x = externCall(...)` for an offloadable scalar extern —
             // offload the blocking C call to the boundary and bind on resume
             // (plan 101 U8). `let _ =` discards.
-            if let Some((ext_idx, fargs, loc)) = offloadable_extern_call_args(value) {
+            if let Some((ext_idx, fargs, _loc)) = offloadable_extern_call_args(value) {
                 let next = self.new_block();
                 self.blocks[cur].term = Term::AwaitFfi {
                     ext_idx,
                     args: fargs,
-                    loc,
                     next,
                 };
                 let bind = if name == "_" {
@@ -5088,12 +5084,11 @@ impl<'a> CfgBuilder<'a> {
                         };
                         return Ok(Flow::Continue(next));
                     }
-                    if let Some((ext_idx, fargs, loc)) = offloadable_extern_call_args(&asg.value) {
+                    if let Some((ext_idx, fargs, _loc)) = offloadable_extern_call_args(&asg.value) {
                         let next = self.new_block();
                         self.blocks[cur].term = Term::AwaitFfi {
                             ext_idx,
                             args: fargs,
-                            loc,
                             next,
                         };
                         self.blocks[next].incoming = Incoming::AwaitedFfi {
@@ -5114,12 +5109,11 @@ impl<'a> CfgBuilder<'a> {
             // `remoteCall(...)` as a statement — in tail position the RPC result
             // is the function's value (the generated stubs do exactly this);
             // otherwise it's run for effect and the result discarded.
-            if let Some((rargs, loc)) = remote_call_args(&es.expression) {
+            if let Some((rargs, _loc)) = remote_call_args(&es.expression) {
                 let on_error = self.handler();
                 let next = self.new_block();
                 self.blocks[cur].term = Term::AwaitRemote {
                     args: rargs,
-                    loc,
                     next,
                 };
                 match mode {
@@ -5251,12 +5245,11 @@ impl<'a> CfgBuilder<'a> {
         if let Statement::ReturnStatement(rs) = stmt {
             match &rs.value {
                 Some(v) => {
-                    if let Some((rargs, loc)) = remote_call_args(v) {
+                    if let Some((rargs, _loc)) = remote_call_args(v) {
                         let on_error = self.handler();
                         let next = self.new_block();
                         self.blocks[cur].term = Term::AwaitRemote {
                             args: rargs,
-                            loc,
                             next,
                         };
                         self.blocks[next].term = Term::CompleteRemote { on_error };
@@ -6521,7 +6514,7 @@ fn build_resume_fn(
                 b.emit(Instruction::Call(layout.sleep));
                 b.emit(Instruction::Return);
             }
-            Term::AwaitRemote { args, loc: _, next } => {
+            Term::AwaitRemote { args, next } => {
                 // Park the current task on the in-flight request (no timer): the
                 // host wakes it via `__fai_resume_task` when the response lands.
                 emit_park_current_task(&mut b, layout);
@@ -6544,7 +6537,6 @@ fn build_resume_fn(
             Term::AwaitFfi {
                 ext_idx,
                 args,
-                loc: _,
                 next,
             } => {
                 // Park the task (status WAITING, O_WAKE = -1) and offload the
