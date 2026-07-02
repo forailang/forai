@@ -758,6 +758,10 @@ fn drive_async_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) 
         for ready_id in super::boundary::pump_ready() {
             scheduler.resume_task(caller, ready_id);
         }
+        let mut fired_watches = super::boundary::take_readiness();
+        for ready_id in super::sockets::handle_ready_watches(&mut fired_watches) {
+            scheduler.resume_task(caller, ready_id);
+        }
         scheduler.poll(caller);
         let status = scheduler.task_status(caller, task_id);
         if status >= ST_COMPLETE {

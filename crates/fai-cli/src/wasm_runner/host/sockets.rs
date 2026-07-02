@@ -15,12 +15,7 @@
 //! `native_tcp_*` / `native_udp_*` in fai-runtime raise typed errors
 //! instead; that divergence is documented in plans/93-audit-natives.md.
 
-use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use wasmtime::*;
 
@@ -28,8 +23,6 @@ use super::super::heap::{build_value, wasm_alloc_str};
 use super::super::nan_box::VAL_NULL;
 use super::host_ops::{read_int_value, read_string_arg, submit_host_op, submit_host_wait, HostOpResult};
 use super::socket_registry as reg;
-
-const SOCKET_WAIT_POLL: Duration = Duration::from_millis(20);
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // ── TCP ──────────────────────────────────────────────────────────
@@ -142,6 +135,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
 
     linker
         .func_wrap("env", "tcp_close", |_c: Caller<'_, ()>, handle: i32| {
+            // Complete any readiness-parked wait on this handle with Null
+            // before the fd disappears — epoll drops a closed fd silently,
+            // so without this the parked task would never resume.
+            cancel_reactor_waits(handle as u32);
             let _ = reg::socket_close(handle as u32);
         })
         .map_err(|e| format!("linker error: {}", e))?;
@@ -254,15 +251,7 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_null(task_id);
                 return true;
             };
-            match reg::clone_tcp_listener_for_wait(handle as u32) {
-                Ok(wait) => {
-                    submit_host_wait(task_id, move || match wait_tcp_accept(wait) {
-                        Some((stream, address)) => HostOpResult::TcpAccepted { stream, address },
-                        None => HostOpResult::Null,
-                    });
-                }
-                Err(_) => submit_socket_null(task_id),
-            }
+            begin_reactor_wait(task_id, handle as u32, ReactorWaitKind::Accept);
             true
         }
         fai_codegen_wasm::HOST_OP_TCP_CONNECT => {
@@ -274,6 +263,9 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_int(task_id, -1);
                 return true;
             };
+            // Connect stays a boundary Wait: it is a one-shot blocking call
+            // (DNS + handshake) rather than an indefinite readable-wait, and
+            // the reactor only reports readability.
             submit_host_wait(task_id, move || {
                 let addr = format!("{}:{}", host, port as u16);
                 match TcpStream::connect(&addr) {
@@ -288,15 +280,7 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_null(task_id);
                 return true;
             };
-            match reg::clone_tcp_stream_for_wait(handle as u32) {
-                Ok(wait) => {
-                    submit_host_wait(task_id, move || match wait_tcp_read(wait) {
-                        Some(data) => HostOpResult::String(data),
-                        None => HostOpResult::Null,
-                    });
-                }
-                Err(_) => submit_socket_null(task_id),
-            }
+            begin_reactor_wait(task_id, handle as u32, ReactorWaitKind::Read);
             true
         }
         fai_codegen_wasm::HOST_OP_TCP_READ_LINE => {
@@ -304,15 +288,11 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_null(task_id);
                 return true;
             };
-            match reg::clone_tcp_stream_for_wait(handle as u32) {
-                Ok(wait) => {
-                    submit_host_wait(task_id, move || match wait_tcp_read_line(wait) {
-                        Some(data) => HostOpResult::String(data),
-                        None => HostOpResult::Null,
-                    });
-                }
-                Err(_) => submit_socket_null(task_id),
-            }
+            begin_reactor_wait(
+                task_id,
+                handle as u32,
+                ReactorWaitKind::ReadLine(Vec::new()),
+            );
             true
         }
         fai_codegen_wasm::HOST_OP_UDP_RECEIVE => {
@@ -320,25 +300,161 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_null(task_id);
                 return true;
             };
-            match reg::clone_udp_socket_for_wait(handle as u32) {
-                Ok(wait) => {
-                    submit_host_wait(task_id, move || match wait_udp_receive(wait) {
-                        Some((data, host, port)) => {
-                            let data_str = String::from_utf8_lossy(&data).into_owned();
-                            HostOpResult::Json(serde_json::json!({
-                                "data": data_str,
-                                "host": host,
-                                "port": port as i64,
-                            }))
-                        }
-                        None => HostOpResult::Null,
-                    });
-                }
-                Err(_) => submit_socket_null(task_id),
-            }
+            begin_reactor_wait(task_id, handle as u32, ReactorWaitKind::UdpReceive);
             true
         }
         _ => false,
+    }
+}
+
+// ── Readiness-driven socket waits (plan 103 U5) ──────────────────────────
+//
+// A parked socket op no longer occupies a waiter thread in a poll loop.
+// `begin_reactor_wait` first attempts the non-blocking op inline (data may
+// already be buffered); on WouldBlock it registers a one-shot readable watch
+// with the reactor and parks the task. The driver loop hands fired watch ids
+// to `handle_ready_watches`, which performs the I/O on the main thread and
+// either completes the parked task (via `boundary::insert_ready`) or re-arms
+// the watch. `tcp.close` cancels pending waits (`cancel_reactor_waits`) —
+// epoll forgets closed fds silently, so close must resolve them to Null.
+
+enum ReactorWaitKind {
+    Accept,
+    Read,
+    ReadLine(Vec<u8>),
+    UdpReceive,
+}
+
+struct ReactorWait {
+    task_id: i32,
+    handle: u32,
+    kind: ReactorWaitKind,
+}
+
+thread_local! {
+    /// Parked socket waits keyed by their reactor watch id.
+    static REACTOR_WAITS: std::cell::RefCell<std::collections::HashMap<u64, ReactorWait>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Tasks completed outside a readiness event (close-cancel, inline
+    /// completion) that still need `__fai_resume_task`.
+    static PENDING_RESUMES: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One attempt at a wait's non-blocking op.
+enum WaitProgress {
+    Done(HostOpResult),
+    NotReady,
+}
+
+fn attempt(wait: &mut ReactorWait) -> WaitProgress {
+    match &mut wait.kind {
+        ReactorWaitKind::Accept => match reg::try_tcp_accept(wait.handle) {
+            Ok(Some((stream, address))) => {
+                WaitProgress::Done(HostOpResult::TcpAccepted { stream, address })
+            }
+            Ok(None) => WaitProgress::NotReady,
+            Err(_) => WaitProgress::Done(HostOpResult::Null),
+        },
+        ReactorWaitKind::Read => match reg::try_tcp_read(wait.handle) {
+            Ok(Some(data)) => WaitProgress::Done(HostOpResult::String(data)),
+            Ok(None) => WaitProgress::NotReady,
+            Err(_) => WaitProgress::Done(HostOpResult::Null),
+        },
+        ReactorWaitKind::ReadLine(partial) => match reg::try_tcp_read_line(wait.handle, partial) {
+            reg::TryLineStep::Line(line) => WaitProgress::Done(HostOpResult::String(line)),
+            reg::TryLineStep::Pending => WaitProgress::NotReady,
+            reg::TryLineStep::Failed(_) => WaitProgress::Done(HostOpResult::Null),
+        },
+        ReactorWaitKind::UdpReceive => match reg::try_udp_receive(wait.handle) {
+            Ok(Some((data, host, port))) => {
+                let data_str = String::from_utf8_lossy(&data).into_owned();
+                WaitProgress::Done(HostOpResult::Json(serde_json::json!({
+                    "data": data_str,
+                    "host": host,
+                    "port": port as i64,
+                })))
+            }
+            Ok(None) => WaitProgress::NotReady,
+            Err(_) => WaitProgress::Done(HostOpResult::Null),
+        },
+    }
+}
+
+fn complete_wait(task_id: i32, result: HostOpResult) {
+    super::boundary::insert_ready(task_id, Ok(Box::new(result)));
+    PENDING_RESUMES.with(|q| q.borrow_mut().push(task_id));
+}
+
+fn begin_reactor_wait(task_id: i32, handle: u32, kind: ReactorWaitKind) {
+    let mut wait = ReactorWait {
+        task_id,
+        handle,
+        kind,
+    };
+    // Fast path: the data (or connection) may already be waiting.
+    if let WaitProgress::Done(result) = attempt(&mut wait) {
+        complete_wait(task_id, result);
+        return;
+    }
+    arm_wait(wait);
+}
+
+fn arm_wait(wait: ReactorWait) {
+    let fd = match reg::socket_raw_fd(wait.handle) {
+        Ok(fd) => fd,
+        Err(_) => {
+            complete_wait(wait.task_id, HostOpResult::Null);
+            return;
+        }
+    };
+    let watch_id = super::reactor::watch_readable(fd);
+    REACTOR_WAITS.with(|w| {
+        w.borrow_mut().insert(watch_id, wait);
+    });
+}
+
+/// Driver hook: consume fired watch ids that belong to socket waits, perform
+/// their I/O, and return the task ids now ready to resume (including waits
+/// completed inline or cancelled by `tcp.close` since the last call). Ids
+/// that belong to other subsystems (the HTTP server's connection watches)
+/// are left in `ids`.
+pub(crate) fn handle_ready_watches(ids: &mut Vec<u64>) -> Vec<i32> {
+    let mut resumed: Vec<i32> = PENDING_RESUMES.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    ids.retain(|watch_id| {
+        let Some(mut wait) = REACTOR_WAITS.with(|w| w.borrow_mut().remove(watch_id)) else {
+            return true; // not a socket wait — leave for other consumers
+        };
+        match attempt(&mut wait) {
+            WaitProgress::Done(result) => {
+                super::boundary::insert_ready(wait.task_id, Ok(Box::new(result)));
+                resumed.push(wait.task_id);
+            }
+            WaitProgress::NotReady => arm_wait(wait), // spurious/partial: re-arm
+        }
+        false
+    });
+    resumed
+}
+
+/// Resolve every parked wait on `handle` to Null (the socket is closing).
+fn cancel_reactor_waits(handle: u32) {
+    let cancelled: Vec<(u64, i32)> = REACTOR_WAITS.with(|w| {
+        let mut map = w.borrow_mut();
+        let ids: Vec<u64> = map
+            .iter()
+            .filter(|(_, wait)| wait.handle == handle)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .map(|id| {
+                let wait = map.remove(&id).unwrap();
+                (id, wait.task_id)
+            })
+            .collect()
+    });
+    for (watch_id, task_id) in cancelled {
+        super::reactor::unwatch(watch_id);
+        complete_wait(task_id, HostOpResult::Null);
     }
 }
 
@@ -354,123 +470,11 @@ fn submit_socket_int(task_id: i32, value: i32) {
     submit_host_op(task_id, move || HostOpResult::Int(value));
 }
 
-fn wait_tcp_accept(wait: reg::TcpListenerWait) -> Option<(TcpStream, String)> {
-    if wait.listener.set_nonblocking(true).is_err() {
-        return None;
-    }
-    loop {
-        if is_cancelled(&wait.cancel) {
-            return None;
-        }
-        match wait.listener.accept() {
-            Ok((stream, addr)) => {
-                if is_cancelled(&wait.cancel) {
-                    return None;
-                }
-                return Some((stream, addr.to_string()));
-            }
-            Err(e) if retry_socket_wait(&e) => {
-                thread::sleep(SOCKET_WAIT_POLL);
-            }
-            Err(_) => return None,
-        }
-    }
-}
 
-fn wait_tcp_read(mut wait: reg::TcpStreamWait) -> Option<String> {
-    if wait
-        .stream
-        .set_read_timeout(Some(SOCKET_WAIT_POLL))
-        .is_err()
-    {
-        return None;
-    }
-    let mut buf = [0u8; 8192];
-    loop {
-        if is_cancelled(&wait.cancel) {
-            return None;
-        }
-        match wait.stream.read(&mut buf) {
-            Ok(n) => {
-                if is_cancelled(&wait.cancel) {
-                    return None;
-                }
-                return Some(String::from_utf8_lossy(&buf[..n]).into_owned());
-            }
-            Err(e) if retry_socket_wait(&e) => {}
-            Err(_) => return None,
-        }
-    }
-}
 
-fn wait_tcp_read_line(mut wait: reg::TcpStreamWait) -> Option<String> {
-    if wait
-        .stream
-        .set_read_timeout(Some(SOCKET_WAIT_POLL))
-        .is_err()
-    {
-        return None;
-    }
-    let mut line = Vec::new();
-    loop {
-        if is_cancelled(&wait.cancel) {
-            return None;
-        }
-        let mut byte = [0u8; 1];
-        match wait.stream.read(&mut byte) {
-            Ok(0) => return Some(String::from_utf8_lossy(&line).into_owned()),
-            Ok(_) => {
-                if is_cancelled(&wait.cancel) {
-                    return None;
-                }
-                line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    return Some(String::from_utf8_lossy(&line).into_owned());
-                }
-            }
-            Err(e) if retry_socket_wait(&e) => {}
-            Err(_) => return None,
-        }
-    }
-}
 
-fn wait_udp_receive(wait: reg::UdpSocketWait) -> Option<(Vec<u8>, String, u16)> {
-    if wait
-        .socket
-        .set_read_timeout(Some(SOCKET_WAIT_POLL))
-        .is_err()
-    {
-        return None;
-    }
-    let mut buf = vec![0u8; 65_535];
-    loop {
-        if is_cancelled(&wait.cancel) {
-            return None;
-        }
-        match wait.socket.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                if is_cancelled(&wait.cancel) {
-                    return None;
-                }
-                buf.truncate(n);
-                return Some((buf, addr.ip().to_string(), addr.port()));
-            }
-            Err(e) if retry_socket_wait(&e) => {}
-            Err(_) => return None,
-        }
-    }
-}
 
-fn retry_socket_wait(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-    )
-}
 
-fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
-    cancel.load(Ordering::SeqCst)
-}
 
 fn read_guest_str(caller: &mut Caller<'_, ()>, ptr: i32, len: i32) -> String {
     let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {

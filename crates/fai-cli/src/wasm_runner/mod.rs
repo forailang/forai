@@ -291,6 +291,14 @@ pub fn run_wasm_with_externs_opts(
                     let _ = rt.call(&mut store, task_id);
                 }
             }
+            // Socket waits whose fd fired: do the non-blocking I/O and
+            // resume the parked tasks (plan 103 U5).
+            let mut fired_watches = host::boundary::take_readiness();
+            for task_id in host::dispatch_socket_readiness(&mut fired_watches) {
+                if let Some(rt) = &resume_task {
+                    let _ = rt.call(&mut store, task_id);
+                }
+            }
             status = match poll.call(&mut store, ()) {
                 Ok(s) => s,
                 Err(e) => return Err(fail("WASM async poll error", &e, &mut store)),

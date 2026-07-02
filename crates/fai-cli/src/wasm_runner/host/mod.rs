@@ -23,6 +23,14 @@ mod storage;
 pub(super) mod util;
 
 pub(crate) use async_ops::{park_for_next_event, prune_fired_timers};
+
+/// Dispatch fired reactor watches to their owners (plan 103 U5): socket waits
+/// perform their non-blocking I/O and return the guest task ids to resume;
+/// ids the sockets don't own are left in `ids` for the caller (the HTTP
+/// server's listener/connection watches).
+pub(crate) fn dispatch_socket_readiness(ids: &mut Vec<u64>) -> Vec<i32> {
+    sockets::handle_ready_watches(ids)
+}
 pub(crate) use http_server::drain_retained_values as drain_router_retained_values;
 pub(crate) use spy::drain_retained_values as drain_spy_retained_values;
 

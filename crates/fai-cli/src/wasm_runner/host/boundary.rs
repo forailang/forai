@@ -486,6 +486,15 @@ pub(crate) fn take_ready(task_id: i32) -> Option<JobResult> {
     READY.with(|r| r.borrow_mut().remove(&task_id))
 }
 
+/// Complete a parked task from the main thread without a boundary job —
+/// used when a readiness event let the main thread finish the I/O inline
+/// (plan 103 U5). The caller resumes the task itself.
+pub(crate) fn insert_ready(task_id: i32, result: JobResult) {
+    READY.with(|r| {
+        r.borrow_mut().insert(task_id, result);
+    });
+}
+
 /// Tear down the main thread's boundary (joins workers). Used by test teardown
 /// and finite-run cleanup.
 pub(crate) fn shutdown_boundary() {

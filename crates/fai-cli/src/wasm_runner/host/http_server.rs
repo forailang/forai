@@ -239,7 +239,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     .ok()
                     .and_then(|v| v.parse().ok());
                 let mut accepted: u64 = 0;
-                let mut pending_connections: Vec<TcpStream> = Vec::new();
+                let mut pending_connections: Vec<PendingConn> = Vec::new();
+                let listener_raw_fd = {
+                    use std::os::fd::AsRawFd;
+                    listener.as_raw_fd()
+                };
                 let mut pending = PendingRequests::default();
                 // Request reads submitted to the boundary but not yet handed
                 // back by take_server_reads (plan 103 U3).
@@ -260,6 +264,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         }
                     };
                 }
+                // Wake source for new connections (plan 103 U5): a one-shot
+                // readable watch on the listener, re-armed after each fire,
+                // so a parked loop wakes the instant a client connects
+                // instead of at the 250ms backstop.
+                let mut listener_watch: Option<u64> = None;
                 loop {
                     let accepting = max_requests.map_or(true, |m| accepted < m);
 
@@ -269,7 +278,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             match listener.accept() {
                                 Ok((stream, _)) => {
                                     trace!("accepted connection");
-                                    pending_connections.push(stream);
+                                    pending_connections.push(PendingConn {
+                                        stream,
+                                        watch: None,
+                                    });
                                     accepted += 1;
                                 }
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -291,25 +303,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         if count_polls {
                             output::stderr_line(&format!("__server_polls={}", poll_count));
                         }
-                        break;
-                    }
-
-                    // 3. Idle but still accepting: block for the next connection
-                    // rather than spinning, then loop back to the drain.
-                    if pending_connections.is_empty()
-                        && pending.is_empty()
-                        && in_flight_reads == 0
-                        && scheduler.live_count(&mut caller) <= 1
-                    {
-                        let _ = listener.set_nonblocking(false);
-                        if let Ok((stream, _)) = listener.accept() {
-                            let _ = listener.set_nonblocking(true);
-                            pending_connections.push(stream);
-                            accepted += 1;
-                        } else {
-                            let _ = listener.set_nonblocking(true);
+                        if let Some(watch) = listener_watch.take() {
+                            super::reactor::unwatch(watch);
                         }
-                        continue;
+                        break;
                     }
 
                     // 4. Advance in-flight handler tasks: run ready ones, resume
@@ -317,6 +314,25 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // etc.), then write responses for tasks that completed.
                     for task_id in super::boundary::pump_ready() {
                         scheduler.resume_task(&mut caller, task_id);
+                    }
+                    // Fired reactor watches: stdlib socket waits first (they
+                    // resume guest tasks); what remains belongs to this loop —
+                    // the listener watch or a pending connection's watch. A
+                    // fired watch is consumed (one-shot), so clear it here and
+                    // re-arm below / next pass.
+                    let mut fired_watches = super::boundary::take_readiness();
+                    for task_id in super::sockets::handle_ready_watches(&mut fired_watches) {
+                        scheduler.resume_task(&mut caller, task_id);
+                    }
+                    for watch_id in fired_watches {
+                        if listener_watch == Some(watch_id) {
+                            listener_watch = None;
+                        } else if let Some(conn) = pending_connections
+                            .iter_mut()
+                            .find(|c| c.watch == Some(watch_id))
+                        {
+                            conn.watch = None;
+                        }
                     }
                     // Requests whose off-thread read finished (routed out of
                     // the completion queue by the pump_ready above): build the
@@ -377,29 +393,25 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     }
 
                     // 5. Park until the next real event — a boundary completion
-                    // (condvar), the nearest pending sleep-timer, or the backstop
-                    // cap. `__fai_poll` already ran the ready queue to quiescence,
-                    // so nothing is runnable right now; the only reasons to wake
-                    // are a timer firing, an offloaded job finishing, or a new
-                    // connection (bounded by the backstop in next_poll_timeout).
-                    // This is what stops a server with always-live background
-                    // `nowait` loops from spinning ~40x/sec while otherwise idle.
-                    if !pending.is_empty() || in_flight_reads > 0 {
-                        // An in-flight off-thread request read counts as
-                        // boundary work, so its completion wakes this park.
-                        trace!("park A (pending={} reads={})", pending.len(), in_flight_reads);
-                        park_until_next_event();
-                        trace!("park A wake");
-                    } else if !pending_connections.is_empty() {
-                        // A connection is accepted but the client hasn't sent its
-                        // request bytes yet — there is no timer/boundary event for
-                        // "socket became readable", so poll it at a short cadence.
-                        std::thread::sleep(Duration::from_millis(1));
-                    } else if scheduler.live_count(&mut caller) > 1 {
-                        trace!("park B (live tasks)");
-                        park_until_next_event();
-                        trace!("park B wake");
+                    // (condvar), a fired reactor watch (new connection, request
+                    // bytes on a pending connection, a stdlib socket wait), or
+                    // the nearest pending sleep-timer. `__fai_poll` already ran
+                    // the ready queue to quiescence, so nothing is runnable
+                    // right now. Every external wake source is watch- or
+                    // condvar-driven (plan 103 U5), so there is no polling
+                    // branch left — the backstop only bounds the park.
+                    if accepting && listener_watch.is_none() {
+                        listener_watch =
+                            Some(super::reactor::watch_readable(listener_raw_fd));
                     }
+                    trace!(
+                        "park (pending={} reads={} conns={})",
+                        pending.len(),
+                        in_flight_reads,
+                        pending_connections.len()
+                    );
+                    park_until_next_event();
+                    trace!("park wake");
                 }
             },
         )
@@ -469,28 +481,49 @@ const ST_FAILED: i32 = 4;
 /// at least one byte. Browsers may open speculative/preconnect sockets and keep
 /// them idle; blocking on those sockets would stall later real requests on this
 /// single runtime thread.
+/// An accepted connection whose request bytes haven't arrived yet, plus its
+/// reactor watch (armed while waiting so the parked loop wakes on first
+/// bytes instead of polling; plan 103 U5).
+struct PendingConn {
+    stream: TcpStream,
+    watch: Option<u64>,
+}
+
 /// Move every connection with request bytes available into an off-thread
-/// request read (plan 103 U3). The read job returns the full request as
-/// owned data via `boundary::take_server_reads`; `handle_read_request`
+/// request read (plan 103 U3). Connections still waiting for bytes get a
+/// readable watch armed (plan 103 U5). The read job returns the full request
+/// as owned data via `boundary::take_server_reads`; `handle_read_request`
 /// finishes the dispatch on the main thread. `in_flight_reads` counts
 /// submitted-but-not-yet-handled reads so the loop's exit/idle conditions
 /// don't strand one.
 fn process_ready_connections(
-    pending_connections: &mut Vec<TcpStream>,
+    pending_connections: &mut Vec<PendingConn>,
     in_flight_reads: &mut usize,
 ) {
     let mut i = 0;
     while i < pending_connections.len() {
-        match connection_readiness(&pending_connections[i]) {
+        match connection_readiness(&pending_connections[i].stream) {
             ConnectionReadiness::Ready => {
-                let stream = pending_connections.swap_remove(i);
-                submit_request_read(stream, in_flight_reads);
+                let conn = pending_connections.swap_remove(i);
+                if let Some(watch) = conn.watch {
+                    super::reactor::unwatch(watch);
+                }
+                submit_request_read(conn.stream, in_flight_reads);
             }
             ConnectionReadiness::Pending => {
+                if pending_connections[i].watch.is_none() {
+                    use std::os::fd::AsRawFd;
+                    let fd = pending_connections[i].stream.as_raw_fd();
+                    pending_connections[i].watch =
+                        Some(super::reactor::watch_readable(fd));
+                }
                 i += 1;
             }
             ConnectionReadiness::Closed => {
-                let _ = pending_connections.swap_remove(i);
+                let conn = pending_connections.swap_remove(i);
+                if let Some(watch) = conn.watch {
+                    super::reactor::unwatch(watch);
+                }
             }
         }
     }

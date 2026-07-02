@@ -37,21 +37,6 @@ pub struct RegisteredUdpSocket {
     cancel: Arc<AtomicBool>,
 }
 
-pub struct TcpListenerWait {
-    pub listener: TcpListener,
-    pub cancel: Arc<AtomicBool>,
-}
-
-pub struct TcpStreamWait {
-    pub stream: TcpStream,
-    pub cancel: Arc<AtomicBool>,
-}
-
-pub struct UdpSocketWait {
-    pub socket: UdpSocket,
-    pub cancel: Arc<AtomicBool>,
-}
-
 impl SocketEntry {
     fn cancel(&self) {
         match self {
@@ -259,6 +244,158 @@ pub fn socket_close(handle: u32) -> Result<(), String> {
     })
 }
 
+// ── Readiness-driven non-blocking ops (plan 103 U5, unix) ────────────────
+//
+// The reactor reports "this handle's fd is readable"; the main thread then
+// performs the actual I/O through these `try_*` variants, which flip the
+// socket non-blocking for one attempt and restore it. `Ok(None)` means
+// WouldBlock — the caller re-arms its watch. Semantics mirror the retired
+// waiter-thread loops: a read returns whatever burst is available (possibly
+// "" on EOF), readLine consumes bytes only up to the newline.
+
+#[cfg(unix)]
+pub fn socket_raw_fd(handle: u32) -> Result<std::os::fd::RawFd, String> {
+    use std::os::fd::AsRawFd;
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid socket handle".to_string())?;
+        Ok(match entry {
+            SocketEntry::TcpListener(entry) => entry.listener.as_raw_fd(),
+            SocketEntry::TcpStream(entry) => entry.stream.as_raw_fd(),
+            SocketEntry::UdpSocket(entry) => entry.socket.as_raw_fd(),
+        })
+    })
+}
+
+fn nonblocking_attempt<S, T>(
+    sock: &S,
+    set: impl Fn(&S, bool) -> std::io::Result<()>,
+    op: impl FnOnce(&S) -> std::io::Result<T>,
+) -> Result<Option<T>, String> {
+    set(sock, true).map_err(|e| format!("set_nonblocking failed: {}", e))?;
+    let result = op(sock);
+    let _ = set(sock, false);
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(format!("socket op failed: {}", e)),
+    }
+}
+
+/// One non-blocking accept. `Ok(None)` = nothing pending (re-arm).
+pub fn try_tcp_accept(handle: u32) -> Result<Option<(TcpStream, String)>, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid TCP listener handle".to_string())?;
+        match entry {
+            SocketEntry::TcpListener(entry) => nonblocking_attempt(
+                &entry.listener,
+                TcpListener::set_nonblocking,
+                |l| l.accept(),
+            )
+            .map(|opt| opt.map(|(stream, addr)| (stream, addr.to_string()))),
+            _ => Err("handle is not a TCP listener".into()),
+        }
+    })
+}
+
+/// One non-blocking read burst (up to 8KiB). `Ok(None)` = re-arm;
+/// `Ok(Some(""))` = EOF (mirrors the blocking read's n=0).
+pub fn try_tcp_read(handle: u32) -> Result<Option<String>, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid TCP connection handle".to_string())?;
+        match entry {
+            SocketEntry::TcpStream(entry) => {
+                let mut buf = [0u8; 8192];
+                nonblocking_attempt(&entry.stream, TcpStream::set_nonblocking, |s| {
+                    (&mut &*s).read(&mut buf)
+                })
+                .map(|opt| opt.map(|n| String::from_utf8_lossy(&buf[..n]).into_owned()))
+            }
+            _ => Err("handle is not a TCP connection".into()),
+        }
+    })
+}
+
+/// The outcome of one readiness-driven readLine step.
+pub enum TryLineStep {
+    /// A full line (newline included) or the EOF-terminated remainder.
+    Line(String),
+    /// No newline yet; bytes so far are in `partial` — re-arm and continue.
+    Pending,
+    /// The socket errored.
+    Failed(String),
+}
+
+/// Consume available bytes one at a time (never past the newline) into
+/// `partial`. Returns `Line` on newline or EOF, `Pending` on WouldBlock.
+pub fn try_tcp_read_line(handle: u32, partial: &mut Vec<u8>) -> TryLineStep {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = match table.get_mut(handle) {
+            Some(e) => e,
+            None => return TryLineStep::Failed("invalid TCP connection handle".into()),
+        };
+        let stream = match entry {
+            SocketEntry::TcpStream(entry) => &mut entry.stream,
+            _ => return TryLineStep::Failed("handle is not a TCP connection".into()),
+        };
+        if stream.set_nonblocking(true).is_err() {
+            return TryLineStep::Failed("set_nonblocking failed".into());
+        }
+        let step = loop {
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => break TryLineStep::Line(String::from_utf8_lossy(partial).into_owned()),
+                Ok(_) => {
+                    partial.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break TryLineStep::Line(String::from_utf8_lossy(partial).into_owned());
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break TryLineStep::Pending
+                }
+                Err(e) => break TryLineStep::Failed(format!("readLine failed: {}", e)),
+            }
+        };
+        let _ = stream.set_nonblocking(false);
+        step
+    })
+}
+
+/// One non-blocking datagram receive. `Ok(None)` = re-arm.
+pub fn try_udp_receive(handle: u32) -> Result<Option<(Vec<u8>, String, u16)>, String> {
+    SOCKET_TABLE.with(|t| {
+        let mut table = t.borrow_mut();
+        let entry = table
+            .get_mut(handle)
+            .ok_or_else(|| "invalid UDP socket handle".to_string())?;
+        match entry {
+            SocketEntry::UdpSocket(entry) => {
+                let mut buf = vec![0u8; 65_535];
+                nonblocking_attempt(&entry.socket, UdpSocket::set_nonblocking, |s| {
+                    s.recv_from(&mut buf)
+                })
+                .map(|opt| {
+                    opt.map(|(n, addr)| {
+                        buf.truncate(n);
+                        (buf, addr.ip().to_string(), addr.port())
+                    })
+                })
+            }
+            _ => Err("handle is not a UDP socket".into()),
+        }
+    })
+}
+
 #[allow(dead_code)]
 pub fn socket_local_addr(handle: u32) -> Result<SocketAddr, String> {
     SOCKET_TABLE.with(|t| {
@@ -276,43 +413,7 @@ pub fn socket_local_addr(handle: u32) -> Result<SocketAddr, String> {
     })
 }
 
-pub fn clone_tcp_listener_for_wait(handle: u32) -> Result<TcpListenerWait, String> {
-    SOCKET_TABLE.with(|t| {
-        let mut table = t.borrow_mut();
-        let entry = table
-            .get_mut(handle)
-            .ok_or_else(|| "invalid TCP listener handle".to_string())?;
-        match entry {
-            SocketEntry::TcpListener(entry) => Ok(TcpListenerWait {
-                listener: entry
-                    .listener
-                    .try_clone()
-                    .map_err(|e| format!("clone listener failed: {}", e))?,
-                cancel: Arc::clone(&entry.cancel),
-            }),
-            _ => Err("handle is not a TCP listener".into()),
-        }
-    })
-}
 
-pub fn clone_tcp_stream_for_wait(handle: u32) -> Result<TcpStreamWait, String> {
-    SOCKET_TABLE.with(|t| {
-        let mut table = t.borrow_mut();
-        let entry = table
-            .get_mut(handle)
-            .ok_or_else(|| "invalid TCP connection handle".to_string())?;
-        match entry {
-            SocketEntry::TcpStream(entry) => Ok(TcpStreamWait {
-                stream: entry
-                    .stream
-                    .try_clone()
-                    .map_err(|e| format!("clone stream failed: {}", e))?,
-                cancel: Arc::clone(&entry.cancel),
-            }),
-            _ => Err("handle is not a TCP connection".into()),
-        }
-    })
-}
 
 // ── UDP ──────────────────────────────────────────────────────────────
 
@@ -385,21 +486,3 @@ pub fn udp_set_broadcast(handle: u32, enabled: bool) -> Result<(), String> {
     })
 }
 
-pub fn clone_udp_socket_for_wait(handle: u32) -> Result<UdpSocketWait, String> {
-    SOCKET_TABLE.with(|t| {
-        let mut table = t.borrow_mut();
-        let entry = table
-            .get_mut(handle)
-            .ok_or_else(|| "invalid UDP socket handle".to_string())?;
-        match entry {
-            SocketEntry::UdpSocket(entry) => Ok(UdpSocketWait {
-                socket: entry
-                    .socket
-                    .try_clone()
-                    .map_err(|e| format!("clone UDP socket failed: {}", e))?,
-                cancel: Arc::clone(&entry.cancel),
-            }),
-            _ => Err("handle is not a UDP socket".into()),
-        }
-    })
-}
