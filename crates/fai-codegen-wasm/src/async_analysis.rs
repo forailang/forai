@@ -123,6 +123,13 @@ thread_local! {
     /// under analysis — `let x = <one of these>(...)` is a suspension point.
     /// Populated at `analyze` entry; classification is shared with codegen via
     /// `crate::direct::extern_is_offloadable` so the two never diverge.
+    /// Checker-recorded UFCS rewrite sites `(location_key, line, col)` —
+    /// `recv.method(...)` calls that are really `method(recv, ...)`. Without
+    /// them, a UFCS call on a non-identifier receiver looks like a field
+    /// access and its target never becomes reachable (plan 103 fixture-audit
+    /// fix; the same set drives `AsyncResolve::is_ufcs_call` in codegen).
+    static UFCS_CALLS: std::cell::RefCell<HashSet<(String, u32, u32)>> =
+        std::cell::RefCell::new(HashSet::new());
     static OFFLOADABLE_EXTERN_NAMES: std::cell::RefCell<HashSet<String>> =
         std::cell::RefCell::new(HashSet::new());
 }
@@ -166,7 +173,7 @@ fn offloadable_extern_call_loc(expr: &Expression) -> Option<SourceLocation> {
 }
 
 pub fn analyze(ast: &fai_compiler::ast::Program, modules: &[DiscoveredModule]) -> AsyncAnalysis {
-    analyze_with_roots(ast, modules, &[])
+    analyze_with_ufcs(ast, modules, &[], &HashSet::new())
 }
 
 /// Like `analyze`, but with additional reachability roots beyond `main` —
@@ -178,6 +185,20 @@ pub fn analyze_with_roots(
     modules: &[DiscoveredModule],
     extra_roots: &[String],
 ) -> AsyncAnalysis {
+    analyze_with_ufcs(ast, modules, extra_roots, &HashSet::new())
+}
+
+/// Full-context analysis: extra reachability roots (test wrappers) plus the
+/// checker's UFCS rewrite sites, so `recv.method(...)` calls contribute call
+/// edges (reachability + async coloring) exactly as codegen will compile
+/// them.
+pub fn analyze_with_ufcs(
+    ast: &fai_compiler::ast::Program,
+    modules: &[DiscoveredModule],
+    extra_roots: &[String],
+    ufcs_calls: &HashSet<(String, u32, u32)>,
+) -> AsyncAnalysis {
+    UFCS_CALLS.with(|s| *s.borrow_mut() = ufcs_calls.clone());
     OFFLOADABLE_EXTERN_NAMES
         .with(|s| *s.borrow_mut() = collect_offloadable_extern_names(ast, modules));
     let module_function_exports = module_function_exports(modules);
@@ -799,6 +820,27 @@ fn resolve_call_target(
                     if known_functions.contains(&target) {
                         return Some((target, None));
                     }
+                }
+            }
+            // Checker-recorded UFCS rewrite (`recv.method(...)` →
+            // `method(recv, ...)`): the callee is a free function even when
+            // the receiver is a call/index/chain expression. Key convention
+            // mirrors the checker's `location_key` (file, else module, else
+            // empty for the entry program).
+            let key = node
+                .file
+                .clone()
+                .or_else(|| node.module.clone())
+                .unwrap_or_default();
+            let is_ufcs = UFCS_CALLS.with(|s| {
+                s.borrow()
+                    .contains(&(key, call.location.line, call.location.column))
+            });
+            if is_ufcs {
+                if let Some(target) =
+                    resolve_bare_function(&me.property, node, known_functions)
+                {
+                    return Some((target, None));
                 }
             }
             node.named_imports

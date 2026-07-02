@@ -200,7 +200,8 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
     is_test: bool,
     entry_file: Option<&str>,
 ) -> Result<Vec<u8>, LocatedBuildError> {
-    let async_analysis = async_analysis::analyze(ast, modules);
+    let async_analysis =
+        async_analysis::analyze_with_ufcs(ast, modules, &[], &checker.ufcs_calls);
     // Real async engine (R2+): handles the shapes it supports through the
     // guest scheduler + resumable lowering; unsupported shapes return None
     // and fall through.
@@ -221,7 +222,8 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
                 None => p.fn_name.clone(),
             })
             .collect();
-        let analysis_t = async_analysis::analyze_with_roots(&ast_t, &modules_t, &roots);
+        let analysis_t =
+            async_analysis::analyze_with_ufcs(&ast_t, &modules_t, &roots, &checker.ufcs_calls);
         if let Some(wasm) = direct::try_codegen_async_engine(
             &ast_t,
             &modules_t,
