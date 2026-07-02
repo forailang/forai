@@ -41,7 +41,8 @@ use crate::runtime::{
     IMPORT_TCP_CLOSE, IMPORT_TCP_CONNECT, IMPORT_TCP_LISTEN, IMPORT_TCP_READ, IMPORT_TCP_READ_LINE,
     IMPORT_TCP_WRITE, IMPORT_TRAP_REPORT, IMPORT_UDP_BIND, IMPORT_UDP_BROADCAST,
     IMPORT_UDP_RECEIVE, IMPORT_UDP_SEND, IMPORT_WRITE_FILE, INT_CHECK_MASK, METHOD_APPEND,
-    METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS, METHOD_INDEX_OF,
+    METHOD_APPEND_MOVE, METHOD_CONTAINS, METHOD_ENDS_WITH, METHOD_FIRST, METHOD_GET_KEYS,
+    METHOD_INDEX_OF,
     METHOD_IS_EMPTY, METHOD_JOIN, METHOD_LAST, METHOD_LENGTH, METHOD_REPEAT, METHOD_REPLACE,
     METHOD_REVERSE, METHOD_SERVER_GET, METHOD_SERVER_HTML, METHOD_SERVER_JSON,
     METHOD_SERVER_LISTEN, METHOD_SERVER_OK, METHOD_SERVER_POST, METHOD_SERVER_REDIRECT,
@@ -10936,8 +10937,14 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // borrowed, release-old, store at offset 8. A
                             // sibling closure that kept the old value has its
                             // own retain, so the release can't free under it.
+                            // (A kept old value also means rc > 1, so the
+                            // append-move fast path declines and copies.)
                             let result =
-                                self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                                match self.try_compile_append_move(&names[0], &a.value)? {
+                                    Some(r) => r,
+                                    None => self
+                                        .compile_expr_result_as(&a.value, ValueShape::Boxed)?,
+                                };
                             self.emit_cell_store(binding.local, result);
                         } else if binding.shape == ValueShape::Boxed
                             && self.is_owned_local(binding.local)
@@ -10947,7 +10954,11 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // the old value this slot owned, then store. The slot
                             // keeps owning exactly one ref.
                             let result =
-                                self.compile_expr_result_as(&a.value, ValueShape::Boxed)?;
+                                match self.try_compile_append_move(&names[0], &a.value)? {
+                                    Some(r) => r,
+                                    None => self
+                                        .compile_expr_result_as(&a.value, ValueShape::Boxed)?,
+                                };
                             self.assign_to_local_slot(binding, result);
                         } else {
                             // Borrowed slot (param) or primitive: plain overwrite.
@@ -14705,6 +14716,72 @@ impl<'a, 'c> Builder<'a, 'c> {
             })
             .collect();
         self.compile_native_method(method_id, arity, &call_args)
+    }
+
+    /// Assignment-position append: `xs = append(xs, x)` or
+    /// `xs = array.append(xs, x)` where the receiver is the same binding
+    /// being reassigned. The pre-call value is dead after the call, so the
+    /// runtime may append in place when the array is uniquely owned
+    /// (METHOD_APPEND_MOVE) instead of copying every element — turning
+    /// build-a-list-in-a-loop from O(n²) into amortized O(n). General-
+    /// position `append` keeps its copy semantics and never routes here.
+    ///
+    /// Matches the exact dispatch precedence of `compile_call`: the bare
+    /// `append` name is a global builtin (user functions don't shadow it),
+    /// and the module form requires the receiver identifier to be an
+    /// unshadowed alias of `std.array`. UFCS calls are left on the normal
+    /// path. Returns `Some(result)` with the call's value on the stack
+    /// when the pattern matched, `None` to let the caller compile the RHS
+    /// normally.
+    fn try_compile_append_move(
+        &mut self,
+        target: &str,
+        value: &Expression,
+    ) -> Result<Option<ExprResult>, BuildError> {
+        let Expression::CallExpression(ce) = value else {
+            return Ok(None);
+        };
+        if ce.args.len() != 2 || ce.args.iter().any(|a| a.label.is_some()) {
+            return Ok(None);
+        }
+        let Expression::IdentifierExpression(first) = &ce.args[0].value else {
+            return Ok(None);
+        };
+        if first.name != target {
+            return Ok(None);
+        }
+        let ufcs_key = (
+            self.module_key.clone(),
+            ce.location.line,
+            ce.location.column,
+        );
+        if self.checker().ufcs_calls.contains(&ufcs_key) {
+            return Ok(None);
+        }
+        let is_native_append = match &*ce.callee {
+            Expression::IdentifierExpression(id) => id.name == "append",
+            Expression::MemberExpression(me) => {
+                me.property == "append"
+                    && matches!(&*me.object, Expression::IdentifierExpression(obj)
+                        if self.resolve(&obj.name).is_none()
+                            && self
+                                .ctx
+                                .module_aliases
+                                .get(&obj.name)
+                                .map(String::as_str)
+                                == Some("std.array"))
+            }
+            _ => false,
+        };
+        if !is_native_append {
+            return Ok(None);
+        }
+        let args: Vec<&Expression> = ce.args.iter().map(|a| &a.value).collect();
+        self.compile_bare_native(&args, METHOD_APPEND_MOVE, 2)?;
+        Ok(Some(ExprResult {
+            shape: ValueShape::Boxed,
+            ownership: ExprOwnership::Owned,
+        }))
     }
 
     /// `all(e1, e2, ...)` — legacy direct path via IMPORT_RUN_ALL.

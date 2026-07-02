@@ -1,0 +1,35 @@
+# Guard for METHOD_APPEND_MOVE's rc == 1 check: when another binding still
+# owns the array (rc > 1), the assignment-position append must copy — the
+# sibling binding keeps its old value. Also re-pins general-position copy
+# semantics (`let ys = append(xs, ...)` leaves xs unchanged) alongside the
+# move form in one program.
+# expect: ok
+# stdout:
+#   2
+#   3
+#   2
+#   3
+# leak: flat
+# ownership: balanced
+
+use std.array
+
+def main
+    @return Void
+do
+    var xs = [
+        1
+        2
+    ]
+    let keep = xs
+    xs = array.append(xs, 3)
+    print(length(keep))
+    print(length(xs))
+    let ys = [
+        4
+        5
+    ]
+    let zs = append(ys, 6)
+    print(length(ys))
+    print(length(zs))
+end

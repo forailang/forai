@@ -1,0 +1,52 @@
+# METHOD_APPEND_MOVE on a cell-bound `var` (captured by a closure): the cell
+# owns its value, so a uniquely-owned array still appends in place via the
+# outer function's reassignment; the closure reads the var afterwards and
+# sees the updated value, same as the copy path.
+# expect: ok
+# stdout:
+#   3
+#   30
+# ownership: balanced
+#
+# No `leak: flat` gate: this program shape (closure in main) starts the async
+# scheduler, which holds one `sched_start_async` String at exit regardless of
+# what the body does — verified identical with the appends replaced by
+# `array.slice` literals. The append path itself is leak-gated by the sibling
+# append_move_loop / append_move_shared fixtures.
+
+use std.array
+
+type def Block
+    @return Void
+end
+
+# Run the block once.
+def runBlock
+    @param b Block
+    @return Void
+do
+    b()
+end
+
+test runBlock
+    it 'invokes'
+        var hit = false
+        runBlock do
+            hit = true
+        end
+        assert.isTrue(hit)
+    end
+end
+
+def main
+    @return Void
+do
+    var xs Int[] = []
+    xs = array.append(xs, 10)
+    xs = array.append(xs, 20)
+    xs = array.append(xs, 30)
+    print(length(xs))
+    runBlock do
+        print(xs[length(xs) - 1])
+    end
+end

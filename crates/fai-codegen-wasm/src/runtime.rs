@@ -152,6 +152,14 @@ pub const METHOD_TRIM_END: i32 = 54;
 pub const METHOD_FIRST: i32 = 55;
 /// `array.last(arr)` — last element, or `null` if empty.
 pub const METHOD_LAST: i32 = 56;
+/// Assignment-position append — emitted only for `xs = append(xs, x)` /
+/// `xs = array.append(xs, x)` where `xs` is the same owned local being
+/// reassigned, so the pre-call value is dead after the call. Appends in
+/// place when the array is uniquely owned (rc == 1) and its block has
+/// spare capacity; otherwise copies like METHOD_APPEND but over-allocates
+/// 2× so the following in-place appends are amortized O(1). Never emitted
+/// for general-position `append`, which keeps copy semantics.
+pub const METHOD_APPEND_MOVE: i32 = 57;
 /// `string.startsWith(text, prefix)` → Bool. Byte-level compare.
 pub const METHOD_STARTS_WITH: i32 = 29;
 /// `string.endsWith(text, suffix)` → Bool. Byte-level compare.
@@ -5044,6 +5052,196 @@ fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
         // appended one. Retain each (local 10 = loop index, n = count + 1), or
         // releasing the source array later deep-frees elements this array still
         // points at. RT_RETAIN's is_obj guard skips primitives.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I64Load(mem0()));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_APPEND_MOVE = 57 — assignment-position append. The codegen
+    // emits this only for `xs = append(xs, x)`-shaped reassignments of an
+    // owned binding, so the source value is dead once the call returns.
+    // Fast path (rc == 1, spare block capacity): write the element in
+    // place, bump count, retain the element (the array owns it) and the
+    // array itself (the owned return; the caller's release of the old
+    // binding drops it back to 1). Slow path (shared or full): copy like
+    // METHOD_APPEND but over-allocate the destination to
+    // max(2 × count, 4) elements so subsequent in-place appends are
+    // amortized O(1). RT_ALLOC stamps the over-allocated logical size at
+    // obj-4, which RT_RELEASE/RT_FREE already honor (same discipline as
+    // dict spare-capacity growth, plan 115).
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_APPEND_MOVE));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // src array addr
+
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // count
+
+        // needed = 8 (header) + (count + 1) * 8
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(12));
+
+        // fast = tag == ARRAY  &  rc == 1  &  needed <= stamped logical size
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load(mem0())); // rc word at obj-8
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load(mem0())); // logical size at obj-4
+        f.instruction(&Instruction::I32LeU);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // mem[src + 8 + count*8] = elem
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I64Store(MemArg {
+                offset: 8,
+                align: 0,
+                memory_index: 0,
+            }));
+            // count += 1
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store(MemArg {
+                offset: 4,
+                align: 0,
+                memory_index: 0,
+            }));
+            // The array owns the appended element (RT_RETAIN's is_obj
+            // guard skips primitives).
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Drop);
+            // Owned return: +1 on the array itself; RT_RETAIN returns
+            // the value, which is exactly the call's result.
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Return);
+        }
+        f.instruction(&Instruction::End);
+
+        // Slow path: copy into a block sized max(2 × count, 4) entries.
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(2));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9)); // dest addr
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // The new array co-owns every element it now holds — the `count`
+        // references shallow-copied from the source plus the appended one
+        // (same discipline as METHOD_APPEND; RC, plan 113 R1).
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(10));
         f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));

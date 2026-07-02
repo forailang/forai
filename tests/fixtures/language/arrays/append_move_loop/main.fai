@@ -1,0 +1,45 @@
+# Assignment-position append (`xs = append(xs, x)` / `xs = array.append(...)`)
+# routes through METHOD_APPEND_MOVE: in-place when uniquely owned, copy with
+# spare capacity otherwise. This fixture proves a build loop is correct end to
+# end — contents, order, and length — and that the over-allocated blocks
+# balance out (leak/ownership gates).
+# expect: ok
+# stdout:
+#   100
+#   0
+#   99
+#   4950
+#   3
+#   a
+#   c
+# leak: flat
+# ownership: balanced
+
+use std.array
+
+def main
+    @return Void
+do
+    var xs Int[] = []
+    var i = 0
+    while i < 100
+        xs = array.append(xs, i)
+        i = i + 1
+    end
+    print(length(xs))
+    print(xs[0])
+    print(xs[99])
+    var sum = 0
+    for n in xs
+        sum = sum + n
+    end
+    print(sum)
+    # Bare-call form with object elements (retain path).
+    var names String[] = []
+    names = append(names, 'a')
+    names = append(names, 'b')
+    names = append(names, 'c')
+    print(length(names))
+    print(names[0])
+    print(names[2])
+end
