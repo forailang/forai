@@ -179,6 +179,10 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.json", name: "requireString", builtin_name: "jsonRequireString", doc: "Extract a required string field from a JSON object." },
         BuiltinDoc { module: "std.json", name: "query",         builtin_name: "jsonQuery",         doc: "Select values from a JSON string with a jq-style path: '.a.b[].c', array indexes '[0]'/'[-1]', quoted keys, pipes '.a | .b', and '..' recursive descent. Parses host-side and materializes only the matches — use it instead of parse for large documents. Null on invalid JSON or a malformed path." },
         BuiltinDoc { module: "std.json", name: "queryPage",     builtin_name: "jsonQueryPage",     doc: "Like query, but returns one window of matches with the total count as { total: Int, items: [...] }. Offset/limit are clamped. Null on invalid JSON or a malformed path." },
+        BuiltinDoc { module: "std.json", name: "format",          builtin_name: "jsonFormat",          doc: "Pretty-print a JSON string with 2-space indent, one attribute per line. Returns String?; null on invalid JSON." },
+        BuiltinDoc { module: "std.json", name: "minify",          builtin_name: "jsonMinify",          doc: "Reserialize a JSON string compactly, stripping insignificant whitespace. Returns String?; null on invalid JSON." },
+        BuiltinDoc { module: "std.json", name: "valid",           builtin_name: "jsonValid",           doc: "Return true when the string parses as JSON. Cheap: nothing is materialized." },
+        BuiltinDoc { module: "std.json", name: "stringifyPretty", builtin_name: "jsonStringifyPretty", doc: "Serialize a value to pretty-printed JSON with 2-space indent." },
 
         // std.html
         BuiltinDoc { module: "std.html", name: "escape", builtin_name: "htmlEscape", doc: "Escape special HTML characters in a string." },

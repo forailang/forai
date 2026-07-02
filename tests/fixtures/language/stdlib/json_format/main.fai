@@ -1,0 +1,54 @@
+# std.json text-level helpers: format (pretty-print, 2-space indent, one
+# attribute per line), minify (strip insignificant whitespace), valid
+# (cheap parse probe), and stringifyPretty (stringify with pretty output).
+# format/minify return null for invalid JSON; valid returns a plain Bool.
+# (Indented output is compared via string equality — the harness's stdout
+# directive trims leading whitespace, so pretty JSON can't be asserted
+# line-by-line.)
+# expect: ok
+# stdout:
+#   format-ok
+#   {"items":[1,2],"name":"Brian"}
+#   true
+#   false
+#   pretty-ok
+#   invalid-format-null
+#   invalid-minify-null
+# leak: flat
+# ownership: balanced
+
+use std.json
+
+def main
+    @return Void
+do
+    let raw = '{ "name" : "Brian" ,  "items" : [ 1 , 2 ] }'
+    let expected = '{\n  "items": [\n    1,\n    2\n  ],\n  "name": "Brian"\n}'
+    if json.format(raw)! == expected
+        print('format-ok')
+    end
+    print(json.minify(raw)!)
+    print(json.valid(raw))
+    print(json.valid('{nope'))
+    # Bind the value first: a fresh literal passed directly as a boxed host
+    # import arg is the known arg-temp gap (see compile_simple_module_call)
+    # and would trip the leak gate for reasons unrelated to these helpers.
+    let payload = {
+        id: 7
+    }
+    if json.stringifyPretty(payload) == '{\n  "id": 7\n}'
+        print('pretty-ok')
+    end
+    let badFormat = json.format('{nope')
+    if badFormat?
+        print('unexpected')
+    else
+        print('invalid-format-null')
+    end
+    let badMinify = json.minify('{nope')
+    if badMinify?
+        print('unexpected')
+    else
+        print('invalid-minify-null')
+    end
+end

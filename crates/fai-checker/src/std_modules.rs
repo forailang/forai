@@ -132,6 +132,10 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("requireString", "jsonRequireString"),
             ("query", "jsonQuery"),
             ("queryPage", "jsonQueryPage"),
+            ("format", "jsonFormat"),
+            ("minify", "jsonMinify"),
+            ("valid", "jsonValid"),
+            ("stringifyPretty", "jsonStringifyPretty"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))

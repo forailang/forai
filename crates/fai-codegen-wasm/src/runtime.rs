@@ -584,7 +584,21 @@ pub const IMPORT_JSON_QUERY: u32 = 121;
 /// without materializing it. Null on invalid JSON; offset/limit are
 /// clamped host-side.
 pub const IMPORT_JSON_QUERY_PAGE: u32 = 122;
-pub const IMPORT_COUNT: u32 = 123;
+/// `env.json_format(ptr, len) -> i64` — reserialize a JSON string
+/// pretty-printed (2-space indent, one attribute per line). Null on
+/// invalid JSON. Native normalizes object key order (serde map);
+/// the browser twin preserves insertion order.
+pub const IMPORT_JSON_FORMAT: u32 = 123;
+/// `env.json_minify(ptr, len) -> i64` — reserialize a JSON string
+/// compact (no insignificant whitespace). Null on invalid JSON.
+pub const IMPORT_JSON_MINIFY: u32 = 124;
+/// `env.json_valid(ptr, len) -> i32` — 1 when the string parses as
+/// JSON, 0 otherwise. No guest values are materialized.
+pub const IMPORT_JSON_VALID: u32 = 125;
+/// `env.json_stringify_pretty(val) -> i64` — like json_stringify but
+/// pretty-printed with 2-space indent.
+pub const IMPORT_JSON_STRINGIFY_PRETTY: u32 = 126;
+pub const IMPORT_COUNT: u32 = 127;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -9631,6 +9645,26 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             ],
             vec![ValType::I64],
         ),
+        // IMPORT_JSON_FORMAT: (ptr, len) -> i64 (NaN-boxed String or null).
+        (
+            "json_format",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_JSON_MINIFY: (ptr, len) -> i64 (NaN-boxed String or null).
+        (
+            "json_minify",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_JSON_VALID: (ptr, len) -> i32 (0/1).
+        (
+            "json_valid",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        ),
+        // IMPORT_JSON_STRINGIFY_PRETTY: (val) -> i64 (NaN-boxed String).
+        ("json_stringify_pretty", vec![ValType::I64], vec![ValType::I64]),
     ]
 }
 

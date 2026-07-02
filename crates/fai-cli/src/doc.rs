@@ -304,6 +304,22 @@ let items Unknown[] = dictionary.get(page, 'items')!
 `queryPage` windows a large match set with `offset`/`limit` and reports the
 full match count as `total`, so tools can paginate without holding every
 match in memory.
+
+Text-level helpers reserialize host-side without materializing guest values:
+
+```fai
+let pretty = json.format('{"a":1,"items":[1,2]}')!   # 2-space indent,
+                                                     # one attribute per line
+let compact = json.minify(pretty!)!                  # '{"a":1,"items":[1,2]}'
+let ok = json.valid(compact)                         # true
+
+let payload = { id: 7 }
+let display = json.stringifyPretty(payload)          # stringify, pretty output
+```
+
+`format` and `minify` return `String?` — null on invalid JSON — and `valid`
+is a cheap probe for gating. On native builds object keys are normalized
+(sorted); browser builds preserve insertion order.
 "#,
         },
         StdlibModuleOverview {

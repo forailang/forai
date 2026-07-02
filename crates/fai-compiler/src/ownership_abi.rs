@@ -1042,6 +1042,27 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
     },
     HostImportRow {
         canon: "std.json",
+        method: "format",
+        import: "json_format",
+        ret: ROwn,
+        doc: "fresh pretty-printed string via wasm_alloc_str; null on parse error",
+    },
+    HostImportRow {
+        canon: "std.json",
+        method: "minify",
+        import: "json_minify",
+        ret: ROwn,
+        doc: "fresh compact string via wasm_alloc_str; null on parse error",
+    },
+    HostImportRow {
+        canon: "std.json",
+        method: "stringifyPretty",
+        import: "json_stringify_pretty",
+        ret: ROwn,
+        doc: "fresh pretty string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.json",
         method: "stringify",
         import: "json_stringify",
         ret: ROwn,
@@ -1847,7 +1868,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 104, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 107, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

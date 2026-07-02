@@ -18,6 +18,30 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("text", Type::String), p("path", Type::String)],
         &[optional_of(array_of(Type::Unknown))],
     );
+    // Text-level helpers: `jsonFormat` pretty-prints (2-space indent, one
+    // attribute per line), `jsonMinify` strips insignificant whitespace —
+    // both return null for invalid JSON. `jsonValid` is a cheap probe that
+    // materializes nothing. `jsonStringifyPretty` is `jsonStringify` with
+    // pretty output.
+    ins(
+        b,
+        "jsonFormat",
+        &[p("text", Type::String)],
+        &[optional_of(Type::String)],
+    );
+    ins(
+        b,
+        "jsonMinify",
+        &[p("text", Type::String)],
+        &[optional_of(Type::String)],
+    );
+    ins(b, "jsonValid", &[p("text", Type::String)], &[Type::Bool]);
+    ins(
+        b,
+        "jsonStringifyPretty",
+        &[p("value", Type::Unknown)],
+        &[Type::String],
+    );
     ins(
         b,
         "jsonQueryPage",

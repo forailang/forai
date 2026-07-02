@@ -217,6 +217,92 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.json_format(ptr, len) -> i64 — pretty-print a JSON string with
+    // 2-space indent (serde's pretty writer), one attribute per line.
+    // VAL_NULL on invalid JSON. Native normalizes object key order; the
+    // browser twin preserves insertion order.
+    linker
+        .func_wrap(
+            "env",
+            "json_format",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let text = {
+                    let data = mem.data(&caller);
+                    read_guest_str(data, ptr, len)
+                };
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => {
+                        let pretty = serde_json::to_string_pretty(&v)
+                            .unwrap_or_else(|_| v.to_string());
+                        wasm_alloc_str(&mut caller, &mem, &pretty)
+                    }
+                    Err(_) => VAL_NULL,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.json_minify(ptr, len) -> i64 — reserialize compactly. VAL_NULL
+    // on invalid JSON.
+    linker
+        .func_wrap(
+            "env",
+            "json_minify",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let text = {
+                    let data = mem.data(&caller);
+                    read_guest_str(data, ptr, len)
+                };
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => wasm_alloc_str(&mut caller, &mem, &v.to_string()),
+                    Err(_) => VAL_NULL,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.json_valid(ptr, len) -> i32 — 1 when the string parses as
+    // JSON. Nothing is materialized either host- or guest-side beyond
+    // the serde parse itself.
+    linker
+        .func_wrap(
+            "env",
+            "json_valid",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i32 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = mem.data(&caller);
+                let text = read_guest_str(data, ptr, len);
+                serde_json::from_str::<serde::de::IgnoredAny>(&text).is_ok() as i32
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.json_stringify_pretty(val) -> i64 — json_stringify with 2-space
+    // pretty output: walk the guest value into compact JSON (the existing
+    // stringify_value walker), then reserialize pretty via serde. Falls
+    // back to the compact form if the round-trip ever fails.
+    linker
+        .func_wrap(
+            "env",
+            "json_stringify_pretty",
+            |mut caller: Caller<'_, ()>, val: i64| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut compact = String::new();
+                {
+                    let data = mem.data(&caller);
+                    stringify_value(data, val as u64, &mut compact);
+                }
+                let pretty = serde_json::from_str::<serde_json::Value>(&compact)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                    .unwrap_or(compact);
+                wasm_alloc_str(&mut caller, &mem, &pretty)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
 }
 
