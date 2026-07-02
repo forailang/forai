@@ -1,0 +1,46 @@
+# Assignment-position concat (`s = s + x`) routes through RT_CONCAT_MOVE:
+# in-place append when the string is uniquely owned, copy-with-spare-capacity
+# otherwise. Proves a build loop is correct end to end (content and length),
+# that an owned-temp RHS (fresh toString result) is released after its bytes
+# are copied, and
+# that self-concat `s = s + s` doubles safely.
+# expect: ok
+# stdout:
+#   200
+#   ab
+#   ab
+#   x0x1x2
+#   yy
+#   yyyy
+# leak: flat
+# ownership: balanced
+
+use std.string
+
+def main
+    @return Void
+do
+    var s = ''
+    var i = 0
+    while i < 100
+        s = s + 'ab'
+        i = i + 1
+    end
+    print(length(s))
+    print(string.substring(s, 0, 2))
+    print(string.substring(s, 198, 200))
+    # Owned-temp RHS: the fresh toString string is released after the copy.
+    var t = ''
+    var j = 0
+    while j < 3
+        t = t + 'x'
+        t = t + toString(j)
+        j = j + 1
+    end
+    print(t)
+    # Self-concat: source and destination are the same block.
+    var d = 'yy'
+    d = d + d
+    print(string.substring(d, 0, 2))
+    print(d)
+end

@@ -10940,7 +10940,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // (A kept old value also means rc > 1, so the
                             // append-move fast path declines and copies.)
                             let result =
-                                match self.try_compile_append_move(&names[0], &a.value)? {
+                                match self.try_compile_move_form(&names[0], &a.value)? {
                                     Some(r) => r,
                                     None => self
                                         .compile_expr_result_as(&a.value, ValueShape::Boxed)?,
@@ -10954,7 +10954,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                             // the old value this slot owned, then store. The slot
                             // keeps owning exactly one ref.
                             let result =
-                                match self.try_compile_append_move(&names[0], &a.value)? {
+                                match self.try_compile_move_form(&names[0], &a.value)? {
                                     Some(r) => r,
                                     None => self
                                         .compile_expr_result_as(&a.value, ValueShape::Boxed)?,
@@ -14718,6 +14718,20 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.compile_native_method(method_id, arity, &call_args)
     }
 
+    /// Self-reassignment move forms: dispatch to the append or concat
+    /// fast path when the RHS is `append(target, x)` / `target + x`.
+    /// Returns `Some(result)` with the compiled value on the stack.
+    fn try_compile_move_form(
+        &mut self,
+        target: &str,
+        value: &Expression,
+    ) -> Result<Option<ExprResult>, BuildError> {
+        if let Some(r) = self.try_compile_append_move(target, value)? {
+            return Ok(Some(r));
+        }
+        self.try_compile_concat_move(target, value)
+    }
+
     /// Assignment-position append: `xs = append(xs, x)` or
     /// `xs = array.append(xs, x)` where the receiver is the same binding
     /// being reassigned. The pre-call value is dead after the call, so the
@@ -14778,6 +14792,67 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let args: Vec<&Expression> = ce.args.iter().map(|a| &a.value).collect();
         self.compile_bare_native(&args, METHOD_APPEND_MOVE, 2)?;
+        Ok(Some(ExprResult {
+            shape: ValueShape::Boxed,
+            ownership: ExprOwnership::Owned,
+        }))
+    }
+
+    /// Assignment-position string concat: `s = s + x` where the left operand
+    /// is the same binding being reassigned. The pre-call value is dead after
+    /// the call, so RT_CONCAT_MOVE may append `x`'s bytes in place when the
+    /// string is uniquely owned (rc == 1) with spare capacity — turning
+    /// build-a-string-in-a-loop from O(n²) into amortized O(n). The helper
+    /// falls back to RT_ADD for shared or non-string values, so this emits
+    /// for any boxed target; provably numeric operands stay on
+    /// compile_binary's native arithmetic paths. General-position `+` is
+    /// untouched. Returns `Some(result)` with the call's value on the stack
+    /// when the pattern matched.
+    fn try_compile_concat_move(
+        &mut self,
+        target: &str,
+        value: &Expression,
+    ) -> Result<Option<ExprResult>, BuildError> {
+        let Expression::BinaryExpression(be) = value else {
+            return Ok(None);
+        };
+        if be.operator != "+" {
+            return Ok(None);
+        }
+        let Expression::IdentifierExpression(lhs) = &*be.left else {
+            return Ok(None);
+        };
+        if lhs.name != target {
+            return Ok(None);
+        }
+        // Both operands provably numeric → leave the native int/float fast
+        // paths in compile_binary alone.
+        if self.numeric_shape_for_expr(&be.left).is_some()
+            && self.numeric_shape_for_expr(&be.right).is_some()
+        {
+            return Ok(None);
+        }
+        // Left is the target identifier — always a borrowed load. Right may
+        // be an owned temp (fresh literal / call result); stash and release
+        // it after the call, mirroring compile_binary's boxed-operand
+        // mop-up. RT_CONCAT_MOVE copies the bytes it needs, so the temp is
+        // dead once the call returns.
+        self.compile_expr_as(&be.left, ValueShape::Boxed)?;
+        self.compile_expr_as(&be.right, ValueShape::Boxed)?;
+        let right_stash = if self.expr_transfers_ownership(&be.right) {
+            let t = self.alloc_local();
+            self.emit(Instruction::LocalTee(t));
+            Some(t)
+        } else {
+            None
+        };
+        self.emit(Instruction::Call(
+            self.rt().base + crate::runtime::RT_CONCAT_MOVE,
+        ));
+        if let Some(stash) = right_stash {
+            self.emit(Instruction::LocalGet(stash));
+            self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+        }
         Ok(Some(ExprResult {
             shape: ValueShape::Boxed,
             ownership: ExprOwnership::Owned,

@@ -1,0 +1,26 @@
+# Guard for RT_CONCAT_MOVE's rc == 1 check: when another binding still owns
+# the string (rc > 1), the assignment-position concat must copy — the sibling
+# binding keeps its old value. Also re-pins general-position `+` copy
+# semantics (`let t = s + '!'` leaves s unchanged) next to the move form.
+# expect: ok
+# stdout:
+#   hi
+#   hi!
+#   ok
+#   ok?
+# leak: flat
+# ownership: balanced
+
+def main
+    @return Void
+do
+    var s = 'h' + 'i'
+    let keep = s
+    s = s + '!'
+    print(keep)
+    print(s)
+    let base = 'o' + 'k'
+    let t = base + '?'
+    print(base)
+    print(t)
+end

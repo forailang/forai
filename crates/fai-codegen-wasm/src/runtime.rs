@@ -79,7 +79,13 @@ pub const RT_RELEASE: u32 = 42;
 // count), so it's baked into this helper at emit time; the `__liveObjects()`
 // builtin calls it rather than hardcoding an index.
 pub const RT_LIVE_OBJECTS: u32 = 43;
-pub const RT_COUNT: u32 = 44;
+// Assignment-position string concat — emitted only for `s = s + x` where `s`
+// is the same owned local being reassigned (see direct.rs
+// try_compile_concat_move). Appends x's bytes in place when `s` is a uniquely
+// owned string (rc == 1) with spare block capacity; grows with 2× capacity
+// otherwise; falls back to RT_ADD semantics for non-string / shared values.
+pub const RT_CONCAT_MOVE: u32 = 44;
+pub const RT_COUNT: u32 = 45;
 
 // Object type tags for heap objects
 pub const OBJ_TAG_STRING: i32 = 0;
@@ -1072,6 +1078,7 @@ pub fn emit_all(
         emit_retain(base, bucket_base, import_remap), // rt_retain
         emit_release(base, bucket_base, import_remap), // rt_release
         emit_live_objects(live_count_global),      // rt_live_objects
+        emit_concat_move(base),                    // rt_concat_move
     ]
 }
 
@@ -3172,6 +3179,211 @@ fn emit_concat_fn(base: u32) -> Function {
     // Box as object
     f.instruction(&Instruction::LocalGet(6));
     f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+    f.instruction(&Instruction::End);
+    f
+}
+
+// ── $rt_concat_move(a: i64, b: i64) -> i64 ──
+// Assignment-position concat: the codegen emits this only for `s = s + x`
+// where `s` is the same owned (or cell-bound) local being reassigned, so the
+// pre-call value of `s` is dead once the call returns.
+//
+// Fast path — `a` is a uniquely owned string (rc == 1) whose block has spare
+// capacity (logical-size stamp at obj-4, the same discipline dict growth and
+// METHOD_APPEND_MOVE use): stringify `b`, memcpy its bytes onto the end of
+// `a`, bump the length, and return `a` retained (+1 owned result; the
+// caller's release of the old binding drops it back to 1).
+//
+// Grow path — unique string but full: allocate max(needed, 2 × stamp, 32),
+// copy both halves, return the fresh block. RT_ALLOC stamps the
+// over-allocated logical size, so subsequent in-place appends are amortized
+// O(1) and RT_FREE returns the block at its true size.
+//
+// Fallback — `a` is not a string or is shared (rc > 1): defer to RT_ADD,
+// which preserves the exact legacy semantics (numeric add, copy concat).
+// A stringified `b` temp (when `b` wasn't already a string) is released
+// after its bytes are copied on the fast/grow paths; the fallback keeps
+// RT_ADD's existing temp behavior.
+fn emit_concat_move(base: u32) -> Function {
+    // params: 0 = a (i64), 1 = b (i64)
+    // locals: 2=addr_a(i32), 3=len_a(i32), 4=addr_bs(i32), 5=len_b(i32),
+    //         6=cap-then-dst(i32), 7=needed(i32), 8=bs(i64)
+    let mut f = Function::new([(6, ValType::I32), (1, ValType::I64)]);
+    let empty = wasm_encoder::BlockType::Empty;
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
+    let bs_local: u32 = 8;
+
+    // a must be an object …
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+    f.instruction(&Instruction::If(empty));
+    {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(2)); // addr_a
+        // … tagged String, uniquely owned (rc at obj-8 == 1).
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(empty));
+        {
+            // bs = value_to_str(b) — b as-is when it is already a string,
+            // a fresh owned string otherwise.
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
+            f.instruction(&Instruction::LocalSet(bs_local));
+            f.instruction(&Instruction::LocalGet(bs_local));
+            f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+            f.instruction(&Instruction::LocalSet(4)); // addr_bs
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Load(off4));
+            f.instruction(&Instruction::LocalSet(3)); // len_a
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Load(off4));
+            f.instruction(&Instruction::LocalSet(5)); // len_b
+            // needed = 8 + len_a + len_b
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(7));
+
+            // Fast: needed fits the stamped logical size at obj-4.
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::I32Load(mem0()));
+            f.instruction(&Instruction::I32LeU);
+            f.instruction(&Instruction::If(empty));
+            {
+                // memcpy(addr_a + 8 + len_a, addr_bs + 8, len_b). memory.copy
+                // has memmove semantics, so `s = s + s` (addr_bs == addr_a,
+                // adjacent ranges) is safe; len_b was read before any write.
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(4));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(5));
+                f.instruction(&Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::LocalGet(5));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Store(off4));
+                // Release a freshly stringified temp; keep a borrowed b.
+                f.instruction(&Instruction::LocalGet(bs_local));
+                f.instruction(&Instruction::LocalGet(1));
+                f.instruction(&Instruction::I64Ne);
+                f.instruction(&Instruction::If(empty));
+                f.instruction(&Instruction::LocalGet(bs_local));
+                f.instruction(&Instruction::Call(base + RT_RELEASE));
+                f.instruction(&Instruction::End);
+                // Owned return: RT_RETAIN passes the value through.
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::Call(base + RT_RETAIN));
+                f.instruction(&Instruction::Return);
+            }
+            f.instruction(&Instruction::End);
+
+            // Grow: cap = max(needed, 2 × stamp, 32).
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::I32Load(mem0()));
+            f.instruction(&Instruction::I32Const(2));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::LocalSet(6)); // cap (reuse dst slot)
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalSet(6));
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I32Const(32));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::I32Const(32));
+            f.instruction(&Instruction::LocalSet(6));
+            f.instruction(&Instruction::End);
+
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::Call(base + RT_ALLOC));
+            f.instruction(&Instruction::LocalSet(6)); // dst
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+            f.instruction(&Instruction::I32Store(mem0()));
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store(off4));
+            // copy a's bytes, then b's.
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+            f.instruction(&Instruction::LocalGet(bs_local));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I64Ne);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::LocalGet(bs_local));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+            f.instruction(&Instruction::Return);
+        }
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::End);
+
+    // Fallback: exact legacy `+` semantics.
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::Call(base + RT_ADD));
     f.instruction(&Instruction::End);
     f
 }
@@ -8788,6 +9000,8 @@ pub fn type_signatures() -> Vec<(Vec<ValType>, Vec<ValType>)> {
         (vec![ValType::I64], vec![]),
         // RT_LIVE_OBJECTS: () -> i32 — read the live-object counter global.
         (vec![], vec![ValType::I32]),
+        // RT_CONCAT_MOVE: (i64, i64) -> i64
+        (vec![ValType::I64, ValType::I64], vec![ValType::I64]),
     ]
 }
 
@@ -9437,6 +9651,7 @@ pub fn rt_fn_names() -> [&'static str; RT_COUNT as usize] {
         "rt_retain",
         "rt_release",
         "rt_live_objects",
+        "rt_concat_move",
     ]
 }
 
