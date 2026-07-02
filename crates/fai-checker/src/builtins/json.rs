@@ -7,10 +7,11 @@ use std::collections::HashMap;
 pub(super) fn install(b: &mut HashMap<String, Type>) {
     ins(b, "jsonParse", &[p("text", Type::String)], &[Type::Unknown]);
     // Host-side selection: parse natively and materialize only the values a
-    // dot-path matches (`a.b[].c`; `seg[]` expands arrays, '' selects the
-    // root). `jsonQuery` returns every match; `jsonQueryPage` returns one
-    // window plus the total match count as `{ total: Int, items: [...] }`.
-    // Both return null for invalid JSON, like `jsonParse`.
+    // jq-style path matches (`.a.b[].c`, indexes `[0]`/`[-1]`, quoted keys,
+    // pipes, `..` descent; '' selects the root). `jsonQuery` returns every
+    // match; `jsonQueryPage` returns one window plus the total match count
+    // as `{ total: Int, items: [...] }`. Both return null for invalid JSON
+    // (like `jsonParse`) and for malformed paths.
     ins(
         b,
         "jsonQuery",

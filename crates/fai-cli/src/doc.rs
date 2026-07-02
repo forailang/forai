@@ -270,20 +270,33 @@ is a small convenience for extracting a required string field from a dictionary;
 it returns `String?`, so handle the missing case.
 
 For large documents, prefer `json.query` / `json.queryPage` over `parse`: they
-parse host-side and materialize only the values a dot-path matches, so cost
-scales with the matches instead of the document. Path segments are separated
-by `.`; a trailing `[]` expands an array (`items[].name` selects each item's
-`name`); an empty path selects the root. Missing fields and non-array
-expansions drop out silently; invalid JSON returns `null`.
+parse host-side and materialize only the values the path matches, so cost
+scales with the matches instead of the document. Paths use the jq selection
+subset:
+
+- `.a.b` or `a.b` — field chains (the leading `.` is optional)
+- `."key.with dots"` or `["key.with dots"]` — quoted field names
+- `.items[]` — every array element; on an object, every value
+- `.items[0]`, `.items[-1]` — array index, negative counts from the end
+- `.a | .b[]` — pipes compose like jq
+- `..` — recursive descent: the value plus every descendant
+  (`.. | .status?` finds `status` at any depth)
+- a `?` suffix is accepted and ignored — selection is always lenient:
+  missing fields and wrong-shape steps drop out silently
+
+Filters, slices, functions, and object construction are not supported.
+Invalid JSON and malformed paths both return `null`.
 
 ```fai
 use std.json
 use std.dictionary
 
 let body = '{"task":{"items":[{"name":"a"},{"name":"b"}]}}'
-let names = json.query(body, 'task.items[].name')   # ['a', 'b']
+let names = json.query(body, '.task.items[].name')   # ['a', 'b']
+let first = json.query(body, '.task.items[0].name')  # ['a']
+let all = json.query(body, '.. | .name?')            # ['a', 'b']
 
-let page = json.queryPage(body, 'task.items[]', 0, 20)
+let page = json.queryPage(body, '.task.items[]', 0, 20)
 let total = dictionary.getInt(page, 'total')!         # 2
 let items Unknown[] = dictionary.get(page, 'items')!
 ```

@@ -177,8 +177,8 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.json", name: "parse",         builtin_name: "jsonParse",         doc: "Parse a JSON string into a value." },
         BuiltinDoc { module: "std.json", name: "stringify",     builtin_name: "jsonStringify",     doc: "Serialize a value to a JSON string." },
         BuiltinDoc { module: "std.json", name: "requireString", builtin_name: "jsonRequireString", doc: "Extract a required string field from a JSON object." },
-        BuiltinDoc { module: "std.json", name: "query",         builtin_name: "jsonQuery",         doc: "Select values from a JSON string with a dot-path ('a.b[].c'; 'seg[]' expands arrays, '' selects the root). Parses host-side and materializes only the matches — use it instead of parse for large documents. Null on invalid JSON." },
-        BuiltinDoc { module: "std.json", name: "queryPage",     builtin_name: "jsonQueryPage",     doc: "Like query, but returns one window of matches with the total count as { total: Int, items: [...] }. Offset/limit are clamped. Null on invalid JSON." },
+        BuiltinDoc { module: "std.json", name: "query",         builtin_name: "jsonQuery",         doc: "Select values from a JSON string with a jq-style path: '.a.b[].c', array indexes '[0]'/'[-1]', quoted keys, pipes '.a | .b', and '..' recursive descent. Parses host-side and materializes only the matches — use it instead of parse for large documents. Null on invalid JSON or a malformed path." },
+        BuiltinDoc { module: "std.json", name: "queryPage",     builtin_name: "jsonQueryPage",     doc: "Like query, but returns one window of matches with the total count as { total: Int, items: [...] }. Offset/limit are clamped. Null on invalid JSON or a malformed path." },
 
         // std.html
         BuiltinDoc { module: "std.html", name: "escape", builtin_name: "htmlEscape", doc: "Escape special HTML characters in a string." },

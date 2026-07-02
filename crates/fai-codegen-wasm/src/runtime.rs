@@ -572,10 +572,11 @@ pub const IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: u32 = 119;
 /// FAI_DEBUG_FUNCTION_CALLS is enabled.
 pub const IMPORT_DEBUG_FUNCTION_CALL: u32 = 120;
 /// `env.json_query(json_ptr, json_len, path_ptr, path_len) -> i64` —
-/// host-side JSON selection: parse natively, evaluate a dot-path
-/// (`a.b[].c`; `seg[]` expands arrays, empty path selects the root), and
-/// materialize ONLY the matched values as a guest Array. Null on invalid
-/// JSON. Large documents never build a full guest tree.
+/// host-side JSON selection: parse natively, evaluate a jq-style
+/// selection path (`.a.b[].c`, indexes `[0]`/`[-1]`, quoted keys, pipes,
+/// `..` descent; empty path selects the root), and materialize ONLY the
+/// matched values as a guest Array. Null on invalid JSON or a malformed
+/// path. Large documents never build a full guest tree.
 pub const IMPORT_JSON_QUERY: u32 = 121;
 /// `env.json_query_page(json_ptr, json_len, path_ptr, path_len, offset,
 /// limit) -> i64` — windowed variant returning a Dict

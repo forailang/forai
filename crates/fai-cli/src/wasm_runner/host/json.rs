@@ -132,13 +132,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
 
     // env.json_query(json_ptr, json_len, path_ptr, path_len) -> i64.
     //
-    // Host-side JSON selection: parse with serde, evaluate the dot-path
-    // (`a.b[].c` — `seg[]` expands arrays, empty path selects the root),
-    // and materialize ONLY the matched values as a guest Array. The full
+    // Host-side JSON selection: parse with serde, evaluate a jq-style
+    // selection path (see `parse_json_path` for the grammar), and
+    // materialize ONLY the matched values as a guest Array. The full
     // document never becomes a guest tree, so multi-MB payloads cost
     // guest allocation proportional to the matches, not the document.
-    // Returns VAL_NULL on invalid JSON (same convention as json_parse).
-    // The browser runtime implements a JS twin with identical semantics.
+    // Returns VAL_NULL on invalid JSON (same convention as json_parse)
+    // and on malformed paths. The browser runtime's faiJsonQueryEval is
+    // the JS twin — keep the two grammars identical.
     linker
         .func_wrap(
             "env",
@@ -155,7 +156,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
                     return VAL_NULL;
                 };
-                let matches = eval_json_path(&root, &path);
+                let Some(matches) = eval_json_path(&root, &path) else {
+                    return VAL_NULL; // malformed path, same convention as bad JSON
+                };
                 let arr =
                     serde_json::Value::Array(matches.into_iter().cloned().collect());
                 build_value(&mut caller, &mem, &arr)
@@ -194,7 +197,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
                     return VAL_NULL;
                 };
-                let matches = eval_json_path(&root, &path);
+                let Some(matches) = eval_json_path(&root, &path) else {
+                    return VAL_NULL; // malformed path, same convention as bad JSON
+                };
                 let total = matches.len();
                 let start = (offset.max(0) as usize).min(total);
                 let take = limit.max(0) as usize;
@@ -225,47 +230,204 @@ fn read_guest_str(data: &[u8], ptr: i32, len: i32) -> String {
     }
 }
 
-/// Evaluate a bounded jq-like dot-path against a parsed document and
-/// return references to every match, in document order.
+/// One step of a parsed query path. The dialect is the pure *selection*
+/// subset of jq — no filters, functions, or object construction.
+#[derive(Debug, PartialEq)]
+enum PathStep {
+    /// `.name`, `."quoted name"`, or `["quoted name"]` — object field.
+    Field(String),
+    /// `[]` — every element of an array, or every value of an object.
+    IterateAll,
+    /// `[n]` — one array element; negative indexes from the end.
+    Index(i64),
+    /// `..` — the value itself plus every descendant, pre-order.
+    Descend,
+}
+
+/// Parse a jq-style selection path into steps. `None` means the path is
+/// malformed (unclosed quote/bracket, slice syntax, stray character) —
+/// callers surface that as a null result, mirroring invalid JSON.
 ///
-/// Dialect: segments are separated by `.`; a segment `name` selects that
-/// object field (objects lacking the field drop out silently); a trailing
-/// `[]` on a segment expands the selected array into its elements
-/// (non-arrays drop out); a bare `[]` segment expands the current values;
-/// an empty path (or only empty segments) selects the root. A leading
-/// `.` (jq style, `.a.b`) is tolerated via the empty-segment skip.
-fn eval_json_path<'v>(root: &'v serde_json::Value, path: &str) -> Vec<&'v serde_json::Value> {
-    let mut current: Vec<&'v serde_json::Value> = vec![root];
-    for raw in path.split('.') {
-        let segment = raw.trim();
-        if segment.is_empty() {
+/// Grammar: steps separated by `.` or `|` (a leading `.` is optional and
+/// `|` composes like jq's pipe); bare or double-quoted field names
+/// (`.a`, `."has.dots"`); bracket forms `[]`, `[n]`, `[-n]`, `["key"]`;
+/// `..` for recursive descent; a `?` suffix is accepted and ignored
+/// (selection is already lenient — non-matching values drop out).
+fn parse_json_path(path: &str) -> Option<Vec<PathStep>> {
+    let b: Vec<char> = path.chars().collect();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut steps: Vec<PathStep> = Vec::new();
+
+    // Read a double-quoted name starting at `b[at] == '"'`; returns the
+    // unescaped text and the index just past the closing quote.
+    let quoted = |at: usize| -> Option<(String, usize)> {
+        let mut j = at + 1;
+        let mut out = String::new();
+        while j < n {
+            match b[j] {
+                '"' => return Some((out, j + 1)),
+                '\\' if j + 1 < n => {
+                    out.push(b[j + 1]);
+                    j += 2;
+                }
+                c => {
+                    out.push(c);
+                    j += 1;
+                }
+            }
+        }
+        None // unclosed quote
+    };
+
+    while i < n {
+        let c = b[i];
+        if c.is_whitespace() || c == '|' || c == '?' {
+            i += 1;
             continue;
         }
-        let expands = segment.ends_with("[]");
-        let field = if expands {
-            &segment[..segment.len() - 2]
-        } else {
-            segment
-        };
-        let mut next: Vec<&'v serde_json::Value> = Vec::new();
-        for value in current {
-            let selected = if field.is_empty() {
-                Some(value)
+        if c == '.' {
+            if i + 1 < n && b[i + 1] == '.' {
+                steps.push(PathStep::Descend);
+                i += 2;
             } else {
-                value.get(field)
-            };
-            let Some(selected) = selected else { continue };
-            if expands {
-                if let serde_json::Value::Array(items) = selected {
-                    next.extend(items.iter());
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            let (name, next) = quoted(i)?;
+            steps.push(PathStep::Field(name));
+            i = next;
+            continue;
+        }
+        if c == '[' {
+            i += 1;
+            while i < n && b[i].is_whitespace() {
+                i += 1;
+            }
+            if i < n && b[i] == ']' {
+                steps.push(PathStep::IterateAll);
+                i += 1;
+                continue;
+            }
+            if i < n && b[i] == '"' {
+                let (name, next) = quoted(i)?;
+                i = next;
+                while i < n && b[i].is_whitespace() {
+                    i += 1;
                 }
-            } else {
-                next.push(selected);
+                if i >= n || b[i] != ']' {
+                    return None;
+                }
+                steps.push(PathStep::Field(name));
+                i += 1;
+                continue;
+            }
+            let start = i;
+            if i < n && b[i] == '-' {
+                i += 1;
+            }
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits: String = b[start..i].iter().collect();
+            let idx: i64 = digits.parse().ok()?; // "", "-", "1:2" → malformed
+            while i < n && b[i].is_whitespace() {
+                i += 1;
+            }
+            if i >= n || b[i] != ']' {
+                return None; // unclosed bracket or slice/filter syntax
+            }
+            steps.push(PathStep::Index(idx));
+            i += 1;
+            continue;
+        }
+        if c == ']' {
+            return None; // stray close bracket
+        }
+        // Bare field name: up to the next structural character.
+        let start = i;
+        while i < n
+            && !matches!(b[i], '.' | '|' | '[' | ']' | '?' | '"')
+            && !b[i].is_whitespace()
+        {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        steps.push(PathStep::Field(b[start..i].iter().collect()));
+    }
+    Some(steps)
+}
+
+/// Evaluate a jq-style selection path against a parsed document and
+/// return references to every match, in document order. `None` means the
+/// path itself is malformed.
+///
+/// Selection is lenient like jq's `?` everywhere: a field on a non-object
+/// or a missing key, an index/iterate on the wrong shape — the value
+/// drops out silently instead of erroring. An empty path selects the
+/// root. `..` enumerates a value and all of its descendants pre-order
+/// (arrays by position; objects by serde_json's key order).
+fn eval_json_path<'v>(
+    root: &'v serde_json::Value,
+    path: &str,
+) -> Option<Vec<&'v serde_json::Value>> {
+    use serde_json::Value;
+    let steps = parse_json_path(path)?;
+    let mut current: Vec<&'v Value> = vec![root];
+    for step in &steps {
+        let mut next: Vec<&'v Value> = Vec::new();
+        match step {
+            PathStep::Field(name) => {
+                for value in current {
+                    if let Some(selected) = value.get(name.as_str()) {
+                        next.push(selected);
+                    }
+                }
+            }
+            PathStep::IterateAll => {
+                for value in current {
+                    match value {
+                        Value::Array(items) => next.extend(items.iter()),
+                        Value::Object(map) => next.extend(map.values()),
+                        _ => {}
+                    }
+                }
+            }
+            PathStep::Index(idx) => {
+                for value in current {
+                    if let Value::Array(items) = value {
+                        let k = if *idx < 0 {
+                            items.len() as i64 + idx
+                        } else {
+                            *idx
+                        };
+                        if k >= 0 && (k as usize) < items.len() {
+                            next.push(&items[k as usize]);
+                        }
+                    }
+                }
+            }
+            PathStep::Descend => {
+                for value in current {
+                    let mut stack = vec![value];
+                    while let Some(v) = stack.pop() {
+                        next.push(v);
+                        match v {
+                            Value::Array(items) => stack.extend(items.iter().rev()),
+                            Value::Object(map) => stack.extend(map.values().rev()),
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         current = next;
     }
-    current
+    Some(current)
 }
 
 #[cfg(test)]
@@ -273,45 +435,121 @@ mod eval_json_path_tests {
     use super::eval_json_path;
     use serde_json::json;
 
+    fn eval<'v>(
+        doc: &'v serde_json::Value,
+        path: &str,
+    ) -> Vec<&'v serde_json::Value> {
+        eval_json_path(doc, path).expect("path should parse")
+    }
+
     #[test]
     fn empty_path_selects_root() {
         let doc = json!({"a": 1});
-        let m = eval_json_path(&doc, "");
-        assert_eq!(m, vec![&doc]);
+        assert_eq!(eval(&doc, ""), vec![&doc]);
+        assert_eq!(eval(&doc, "."), vec![&doc]);
     }
 
     #[test]
     fn field_chain_selects_nested_value() {
         let doc = json!({"a": {"b": {"c": 42}}});
-        let m = eval_json_path(&doc, "a.b.c");
-        assert_eq!(m, vec![&json!(42)]);
-    }
-
-    #[test]
-    fn leading_dot_is_tolerated() {
-        let doc = json!({"a": 1});
-        assert_eq!(eval_json_path(&doc, ".a"), vec![&json!(1)]);
+        assert_eq!(eval(&doc, "a.b.c"), vec![&json!(42)]);
+        assert_eq!(eval(&doc, ".a.b.c"), vec![&json!(42)]);
     }
 
     #[test]
     fn expansion_fans_out_and_selects_each() {
         let doc = json!({"items": [{"s": "x"}, {"s": "y"}, {"n": 3}]});
-        let m = eval_json_path(&doc, "items[].s");
-        assert_eq!(m, vec![&json!("x"), &json!("y")]);
+        assert_eq!(eval(&doc, "items[].s"), vec![&json!("x"), &json!("y")]);
+        assert_eq!(eval(&doc, ".items[].s"), vec![&json!("x"), &json!("y")]);
     }
 
     #[test]
     fn bare_expansion_expands_root_array() {
         let doc = json!([1, 2, 3]);
-        let m = eval_json_path(&doc, "[]");
-        assert_eq!(m, vec![&json!(1), &json!(2), &json!(3)]);
+        assert_eq!(eval(&doc, "[]"), vec![&json!(1), &json!(2), &json!(3)]);
+        assert_eq!(eval(&doc, ".[]"), vec![&json!(1), &json!(2), &json!(3)]);
     }
 
     #[test]
     fn missing_field_and_non_array_expansion_drop_out() {
         let doc = json!({"a": {"b": 1}, "s": "text"});
-        assert!(eval_json_path(&doc, "a.missing").is_empty());
-        assert!(eval_json_path(&doc, "s[]").is_empty());
+        assert!(eval(&doc, "a.missing").is_empty());
+        assert!(eval(&doc, "s[]").is_empty());
+        assert!(eval(&doc, "a[3]").is_empty());
+    }
+
+    #[test]
+    fn iterate_all_yields_object_values() {
+        let doc = json!({"a": 1, "b": 2});
+        assert_eq!(eval(&doc, "[]"), vec![&json!(1), &json!(2)]);
+    }
+
+    #[test]
+    fn indexes_select_by_position_and_from_the_end() {
+        let doc = json!({"ns": [10, 20, 30]});
+        assert_eq!(eval(&doc, "ns[0]"), vec![&json!(10)]);
+        assert_eq!(eval(&doc, ".ns[1]"), vec![&json!(20)]);
+        assert_eq!(eval(&doc, "ns[-1]"), vec![&json!(30)]);
+        assert!(eval(&doc, "ns[3]").is_empty());
+        assert!(eval(&doc, "ns[-4]").is_empty());
+    }
+
+    #[test]
+    fn quoted_fields_allow_dots_and_brackets_in_keys() {
+        let doc = json!({"a.b": {"c d": 1}, "plain": 2});
+        assert_eq!(eval(&doc, "\"a.b\".\"c d\""), vec![&json!(1)]);
+        assert_eq!(eval(&doc, "[\"a.b\"][\"c d\"]"), vec![&json!(1)]);
+        assert_eq!(eval(&doc, ".\"a.b\".\"c d\""), vec![&json!(1)]);
+    }
+
+    #[test]
+    fn pipes_compose_like_dots() {
+        let doc = json!({"a": {"items": [1, 2]}});
+        assert_eq!(eval(&doc, ".a | .items | .[]"), vec![&json!(1), &json!(2)]);
+    }
+
+    #[test]
+    fn optional_marker_is_accepted_and_ignored() {
+        let doc = json!({"a": {"b": 5}});
+        assert_eq!(eval(&doc, ".a?.b?"), vec![&json!(5)]);
+        assert!(eval(&doc, ".a.b[]?").is_empty());
+    }
+
+    #[test]
+    fn descend_enumerates_self_then_descendants_preorder() {
+        let doc = json!({"x": [1, {"y": 2}]});
+        let m = eval(&doc, "..");
+        assert_eq!(
+            m,
+            vec![
+                &doc,
+                &json!([1, {"y": 2}]),
+                &json!(1),
+                &json!({"y": 2}),
+                &json!(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn descend_then_field_finds_matches_at_any_depth() {
+        let doc = json!({"a": {"status": "plan", "sub": {"status": "done"}}, "list": [{"status": "x"}]});
+        let m = eval(&doc, ".. | .status?");
+        assert_eq!(m, vec![&json!("plan"), &json!("done"), &json!("x")]);
+        // Sugar form without the pipe.
+        assert_eq!(eval(&doc, "..status"), m);
+    }
+
+    #[test]
+    fn malformed_paths_are_rejected_not_guessed() {
+        let doc = json!({"a": [1, 2, 3]});
+        for bad in ["a[", "a[1", "a[1:2]", "a[\"x]", "\"unclosed", "a]", "a[b]"] {
+            assert!(
+                eval_json_path(&doc, bad).is_none(),
+                "expected malformed: {}",
+                bad
+            );
+        }
     }
 }
 
