@@ -8105,6 +8105,17 @@ pub fn try_codegen_async_engine(
         } else {
             None
         },
+        // Native keeps guest-owned promotion (O_WAKE + now_ms in poll) but
+        // reports each deadline to the host so the driver's park wakes when
+        // the nearest timer is due, not at the backstop (plan 103 U4).
+        set_timer_hint: if matches!(target, Some("wasm") | Some("wasm-html")) {
+            None
+        } else {
+            import_remap
+                .get(crate::runtime::IMPORT_HOST_SET_TIMER as usize)
+                .copied()
+                .flatten()
+        },
         trap_report: import_remap
             .get(crate::runtime::IMPORT_TRAP_REPORT as usize)
             .copied()

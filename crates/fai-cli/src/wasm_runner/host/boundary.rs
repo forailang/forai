@@ -70,6 +70,32 @@ pub(crate) const DETACHED_JOB_ID: i32 = -1;
 /// An HTTP server request read: the completion payload is routed to the
 /// server loop via `take_server_reads`, never to the guest scheduler.
 pub(crate) const SERVER_READ_JOB_ID: i32 = -2;
+/// A reactor readiness event (plan 103 U4): the payload is the fired watch id
+/// (u64), routed to `take_readiness`. Pushed by the reactor thread through a
+/// `CompletionSink`, so an fd becoming readable wakes the parked driver
+/// through the same condvar as a finished job.
+pub(crate) const REACTOR_EVENT_JOB_ID: i32 = -3;
+
+/// A cloneable, `Send` handle that lets another thread (the reactor) push
+/// completions into this boundary's queue and wake the parked driver.
+/// Pushes count as in-flight until drained so the inflight counter stays
+/// symmetric with `drain_completions`'s decrement.
+#[derive(Clone)]
+pub(crate) struct CompletionSink {
+    completions: Arc<Completions>,
+    inflight: Arc<AtomicUsize>,
+}
+
+impl CompletionSink {
+    pub(crate) fn push(&self, task_id: i32, result: JobResult) {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut q = self.completions.queue.lock().unwrap();
+            q.push_back(Completion { task_id, result });
+        }
+        self.completions.ready.notify_one();
+    }
+}
 
 /// A unit of blocking work plus the guest task it belongs to.
 type Job = (i32, Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>);
@@ -251,6 +277,14 @@ impl Boundary {
     pub(crate) fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Relaxed)
     }
+
+    /// A `Send + Clone` handle for pushing completions from another thread.
+    pub(crate) fn sink(&self) -> CompletionSink {
+        CompletionSink {
+            completions: Arc::clone(&self.completions),
+            inflight: Arc::clone(&self.inflight),
+        }
+    }
 }
 
 impl Drop for Boundary {
@@ -336,6 +370,8 @@ thread_local! {
     /// Completed HTTP-server request reads (SERVER_READ_JOB_ID), awaiting the
     /// server loop's `take_server_reads`.
     static SERVER_READS: RefCell<Vec<JobResult>> = const { RefCell::new(Vec::new()) };
+    /// Fired reactor watch ids (REACTOR_EVENT_JOB_ID), awaiting `take_readiness`.
+    static READINESS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Drain every finished job from the worker pool into the per-task ready map and
@@ -359,6 +395,13 @@ pub(crate) fn pump_ready() -> Vec<i32> {
             match c.task_id {
                 SERVER_READ_JOB_ID => {
                     SERVER_READS.with(|q| q.borrow_mut().push(c.result));
+                }
+                REACTOR_EVENT_JOB_ID => {
+                    if let Ok(boxed) = c.result {
+                        if let Ok(watch_id) = boxed.downcast::<u64>() {
+                            READINESS.with(|q| q.borrow_mut().push(*watch_id));
+                        }
+                    }
                 }
                 DETACHED_JOB_ID => {} // fire-and-forget: result discarded
                 id if id < 0 => {
@@ -405,6 +448,23 @@ where
 /// Drain completed server request reads (populated by `pump_ready`).
 pub(crate) fn take_server_reads() -> Vec<JobResult> {
     SERVER_READS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+/// Drain fired reactor watch ids (populated by `pump_ready`).
+pub(crate) fn take_readiness() -> Vec<u64> {
+    READINESS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+/// True once this thread's boundary exists (some job or sink was created).
+/// Lets a park pick condvar-wait vs plain sleep without spawning the pool.
+pub(crate) fn boundary_exists() -> bool {
+    try_with_boundary(|_| ()).is_some()
+}
+
+/// A completion sink for cross-thread pushes (creates the boundary on first
+/// use — the reactor needs a queue to push into).
+pub(crate) fn completion_sink() -> CompletionSink {
+    with_boundary(|b| b.sink())
 }
 
 /// True if any job is still running or waiting to be drained — lets a driver

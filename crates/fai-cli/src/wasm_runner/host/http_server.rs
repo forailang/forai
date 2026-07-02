@@ -804,12 +804,7 @@ fn describe_guest_error(caller: &mut Caller<'_, ()>, mem: &Memory, val: i64) -> 
 // pending timer clamped to [1ms, 250ms], so even with no boundary work in flight
 // the loop sleeps until that deadline rather than a fixed fine cadence.
 fn park_until_next_event() {
-    let timeout = super::async_ops::next_poll_timeout();
-    if super::boundary::has_inflight() {
-        let _ = super::boundary::wait_for_ready(timeout);
-    } else {
-        std::thread::sleep(timeout);
-    }
+    super::async_ops::park_for_next_event();
 }
 
 /// Drain router-owned guest handles for test teardown and finite run cleanup.

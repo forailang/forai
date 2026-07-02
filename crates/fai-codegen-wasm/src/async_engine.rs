@@ -149,6 +149,12 @@ pub struct SchedLayout {
     /// busy-poll: the task parks with `O_WAKE < 0` (poll won't promote it) and
     /// the host calls `__fai_resume_task` after `ms`. `None` → native busy-poll.
     pub set_timer: Option<u32>,
+    /// Optional `host_set_timer(task_id, ms)` import index used as a pure
+    /// *deadline hint* (native, plan 103 U4). Unlike `set_timer`, the guest
+    /// still parks with `O_WAKE = now+ms` and self-promotes in `poll`; the
+    /// call only tells the host driver how long it may park before the next
+    /// timer is due. Exactly one of `set_timer` / `set_timer_hint` is set.
+    pub set_timer_hint: Option<u32>,
     /// Optional `__fai_trap_report(code, a, b)` import index (post-remap).
     /// When set, scheduler guards report a structured reason before
     /// trapping (plan 116); `None` → bare `unreachable`.
@@ -471,6 +477,15 @@ fn emit_sleep(l: &SchedLayout) -> Function {
         f.instruction(&Instruction::I32Const(1));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::GlobalSet(l.g_timer_waiting));
+        if let Some(hint) = l.set_timer_hint {
+            // Tell the host driver when this timer is due so its park can
+            // wake exactly then instead of at the 250ms backstop (plan 103
+            // U4). Purely advisory: promotion still happens in guest poll.
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32TruncF64S);
+            f.instruction(&Instruction::Call(hint));
+        }
     }
     f.instruction(&Instruction::End);
     f
@@ -1169,6 +1184,7 @@ mod tests {
             root_frame_size: 16,
             module_init: None,
             set_timer: None,
+            set_timer_hint: None,
             trap_report: None,
         };
 

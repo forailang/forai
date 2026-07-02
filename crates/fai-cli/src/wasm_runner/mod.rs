@@ -297,18 +297,12 @@ pub fn run_wasm_with_externs_opts(
             };
             host::prune_fired_timers();
             if status != 2 && status != 3 {
-                if host::boundary::has_inflight() {
-                    // Parked on an outbound call / FFI offload: block on its
-                    // completion (woken immediately), bounded by the nearest timer
-                    // / backstop, instead of re-polling every 1ms for the whole
-                    // duration. This is the busy-wait that pegged a core.
-                    let _ = host::boundary::wait_for_ready(host::next_poll_timeout());
-                } else {
-                    // No offloaded work: keep a prompt re-poll so the cooperative
-                    // scheduler can advance runnable tasks (a "working" poll does
-                    // not guarantee every task is parked).
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                // Nothing runnable after the poll (the guest scheduler drains
+                // its ready queue to quiescence): park until the next wake —
+                // a boundary completion (outbound call, FFI offload, reactor
+                // readiness) via the condvar, or the nearest timer deadline
+                // via the timeout (plan 103 U4 — retires the 1ms re-poll).
+                host::park_for_next_event();
             }
         }
         if status == 3 {

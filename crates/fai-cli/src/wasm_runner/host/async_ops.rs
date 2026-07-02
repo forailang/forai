@@ -69,6 +69,21 @@ pub(crate) fn next_poll_timeout() -> Duration {
     }
 }
 
+/// The single way a driver loop parks when nothing is runnable (plan 103 U4):
+/// block until the next wake — a boundary completion (job, detached write,
+/// server read, reactor readiness event) via the condvar, or the nearest
+/// timer deadline via the timeout. Falls back to a plain sleep only when no
+/// boundary exists yet (then timers are the only possible wake source, so a
+/// condvar would add nothing but a worker pool).
+pub(crate) fn park_for_next_event() {
+    let timeout = next_poll_timeout();
+    if super::boundary::boundary_exists() {
+        let _ = super::boundary::wait_for_ready(timeout);
+    } else {
+        std::thread::sleep(timeout);
+    }
+}
+
 /// Drop timers whose deadline has passed: the guest scheduler resumes their tasks
 /// on the next poll, so the host need not wake for them again. Keeps the map
 /// bounded over a long-running server.

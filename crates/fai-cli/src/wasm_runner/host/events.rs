@@ -14,7 +14,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
 use wasmtime::*;
 
 use super::super::heap::{decode_closure_header, wasm_alloc_str};
@@ -770,11 +769,9 @@ fn drive_async_handler(caller: &mut Caller<'_, ()>, handler_val: i64, arg: i64) 
             scheduler.free_task(caller, task_id);
             return result;
         }
-        if super::boundary::has_inflight() {
-            let _ = super::boundary::wait_for_ready(Duration::from_millis(1));
-        } else {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // Nothing runnable: park until a boundary completion or the nearest
+        // timer deadline (plan 103 U4 — replaces the 1ms busy-poll).
+        super::async_ops::park_for_next_event();
     }
 }
 

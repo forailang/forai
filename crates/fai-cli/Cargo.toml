@@ -32,6 +32,7 @@ base64 = "0.21"
 subtle = "2"
 rsa = "0.9"
 ureq = { workspace = true, optional = true }
+mio = { workspace = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 serde.workspace = true
