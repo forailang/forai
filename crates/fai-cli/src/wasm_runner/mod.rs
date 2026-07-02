@@ -530,6 +530,142 @@ pub fn run_wasm_tests(
     )
 }
 
+/// How one `(suite, case)` executes: the legacy synchronous dispatcher, or
+/// spawn-and-drive on the guest scheduler (plan 103 U7 — engine test builds).
+enum CaseRunner {
+    Sync(TypedFunc<(i32, i32), ()>),
+    Engine(EngineCaseRunner),
+}
+
+struct EngineCaseRunner {
+    spawn: TypedFunc<(i32, i32), i32>,
+    poll: TypedFunc<(), i32>,
+    resume: TypedFunc<i32, i32>,
+    status: TypedFunc<i32, i32>,
+    result: TypedFunc<i32, i64>,
+    free: TypedFunc<i32, ()>,
+    /// `__dbg_live` — live-task count, read to drain leaked tasks per case.
+    live: Global,
+}
+
+/// Task-status values from `fai-codegen-wasm::async_engine`.
+const TASK_ST_COMPLETE: i32 = 3;
+const TASK_ST_FAILED: i32 = 4;
+
+impl CaseRunner {
+    fn run_case(
+        &self,
+        instance: &Instance,
+        store: &mut Store<()>,
+        suite: i32,
+        case: i32,
+    ) -> Result<(), wasmtime::Error> {
+        match self {
+            CaseRunner::Sync(f) => f.call(&mut *store, (suite, case)),
+            CaseRunner::Engine(r) => r.run_case(instance, store, suite, case),
+        }
+    }
+}
+
+impl EngineCaseRunner {
+    /// One pump-resume-poll turn of the scheduler (mirrors the async run
+    /// loop). A trap inside `poll` propagates as the case's error, exactly
+    /// like a trap inside the legacy `_fai_run_test` call.
+    fn turn(&self, store: &mut Store<()>) -> Result<(), wasmtime::Error> {
+        for task_id in host::boundary::pump_ready() {
+            let _ = self.resume.call(&mut *store, task_id)?;
+        }
+        let mut fired = host::boundary::take_readiness();
+        for task_id in host::dispatch_socket_readiness(&mut fired) {
+            let _ = self.resume.call(&mut *store, task_id)?;
+        }
+        let _ = self.poll.call(&mut *store, ())?;
+        host::prune_fired_timers();
+        Ok(())
+    }
+
+    fn live_count(&self, store: &mut Store<()>) -> i32 {
+        match self.live.get(&mut *store) {
+            Val::I32(n) => n,
+            _ => 0,
+        }
+    }
+
+    fn run_case(
+        &self,
+        instance: &Instance,
+        store: &mut Store<()>,
+        suite: i32,
+        case: i32,
+    ) -> Result<(), wasmtime::Error> {
+        let id = self.spawn.call(&mut *store, (suite, case))?;
+        if id < 0 {
+            return Err(wasmtime::Error::msg(format!(
+                "unknown test case (suite {suite}, case {case})"
+            )));
+        }
+        // Per-case watchdog: an engine case that never completes (a lost
+        // wakeup, a task parked forever) must fail the case, not hang the
+        // whole run the way a stuck synchronous call would.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let final_status = loop {
+            self.turn(&mut *store)?;
+            let st = self.status.call(&mut *store, id)?;
+            if st >= TASK_ST_COMPLETE {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(wasmtime::Error::msg(
+                    "test case timed out after 60s on the scheduler",
+                ));
+            }
+            host::park_for_next_event();
+        };
+        // A failed task carries the thrown error value; render it as the
+        // case's failure message (assertion errors arrive this way — they
+        // are guest throws, not traps, under the engine).
+        let failure: Option<String> = if final_status == TASK_ST_FAILED {
+            let err_val = self.result.call(&mut *store, id)?;
+            Some(
+                print::format_return_value(err_val, instance, &mut *store)
+                    .unwrap_or_else(|| "<unprintable test error>".to_string()),
+            )
+        } else {
+            None
+        };
+        self.free.call(&mut *store, id)?;
+        // Drain the scheduler so nothing leaks into the next case (plan 103
+        // R9): a `nowait` task or live timer left behind keeps running here,
+        // bounded by a grace period, after which it fails THIS case with a
+        // leak diagnostic naming the count.
+        let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let live = self.live_count(store);
+            if live == 0 && !host::boundary::has_inflight() {
+                break;
+            }
+            if std::time::Instant::now() >= drain_deadline {
+                let leak = format!(
+                    "case leaked {live} live scheduler task(s) past its end"
+                );
+                return Err(match failure {
+                    Some(msg) => wasmtime::Error::msg(format!("{msg}; {leak}")),
+                    None => wasmtime::Error::msg(leak),
+                });
+            }
+            self.turn(&mut *store)?;
+            if self.live_count(store) == 0 && !host::boundary::has_inflight() {
+                break;
+            }
+            host::park_for_next_event();
+        }
+        match failure {
+            Some(msg) => Err(wasmtime::Error::msg(msg)),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Same as [`run_wasm_tests`] but populates the extern-function table
 /// the host's `call_ffi` import reads. Pass an empty `Vec` when the
 /// guest has no `extern` blocks.
@@ -575,13 +711,29 @@ pub fn run_wasm_tests_with_externs(
         .instantiate(&mut store, &module)
         .map_err(|e| fmt_err("WASM instantiation error", e))?;
 
+    // Engine test module (plan 103 U7): cases are spawned as scheduler
+    // tasks via `_fai_spawn_test` and driven by the host. Legacy modules
+    // keep the synchronous `_fai_run_test` dispatcher.
+    let spawn_test = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "_fai_spawn_test")
+        .ok();
+
     // Run the top-level script so globals / module init effects land.
-    let start = instance
-        .get_typed_func::<(), i64>(&mut store, "_start")
-        .map_err(|e| fmt_err("missing _start export", e))?;
-    let _ = start
-        .call(&mut store, ())
-        .map_err(|e| fmt_err("script init error", e))?;
+    if spawn_test.is_some() {
+        let start_async = instance
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .map_err(|e| fmt_err("missing _start_async export", e))?;
+        let _ = start_async
+            .call(&mut store, ())
+            .map_err(|e| fmt_err("script init error", e))?;
+    } else {
+        let start = instance
+            .get_typed_func::<(), i64>(&mut store, "_start")
+            .map_err(|e| fmt_err("missing _start export", e))?;
+        let _ = start
+            .call(&mut store, ())
+            .map_err(|e| fmt_err("script init error", e))?;
+    }
 
     // Library files with no `test` blocks have no `_fai_run_test`
     // export — the assembler only emits it when there are cases to
@@ -594,9 +746,34 @@ pub fn run_wasm_tests_with_externs(
         return Ok(summary);
     }
 
-    let run_test = instance
-        .get_typed_func::<(i32, i32), ()>(&mut store, "_fai_run_test")
-        .map_err(|e| fmt_err("missing _fai_run_test export", e))?;
+    let run_test = match spawn_test {
+        Some(spawn) => CaseRunner::Engine(EngineCaseRunner {
+            spawn,
+            poll: instance
+                .get_typed_func::<(), i32>(&mut store, "__fai_poll")
+                .map_err(|e| fmt_err("missing __fai_poll export", e))?,
+            resume: instance
+                .get_typed_func::<i32, i32>(&mut store, "__fai_resume_task")
+                .map_err(|e| fmt_err("missing __fai_resume_task export", e))?,
+            status: instance
+                .get_typed_func::<i32, i32>(&mut store, "__fai_task_status")
+                .map_err(|e| fmt_err("missing __fai_task_status export", e))?,
+            result: instance
+                .get_typed_func::<i32, i64>(&mut store, "__fai_task_result")
+                .map_err(|e| fmt_err("missing __fai_task_result export", e))?,
+            free: instance
+                .get_typed_func::<i32, ()>(&mut store, "__fai_free_task")
+                .map_err(|e| fmt_err("missing __fai_free_task export", e))?,
+            live: instance
+                .get_global(&mut store, "__dbg_live")
+                .ok_or_else(|| "missing __dbg_live export".to_string())?,
+        }),
+        None => CaseRunner::Sync(
+            instance
+                .get_typed_func::<(i32, i32), ()>(&mut store, "_fai_run_test")
+                .map_err(|e| fmt_err("missing _fai_run_test export", e))?,
+        ),
+    };
 
     // Per-case leak deltas (plan 118 U2): when armed, snapshot the
     // ledger around each `_fai_run_test` call. The case wrapper bakes
@@ -628,7 +805,7 @@ pub fn run_wasm_tests_with_externs(
         if test.has_before_all {
             reset_retained_host_state(&instance, &mut store)?;
             run_test
-                .call(&mut store, (suite_i as i32, TEST_HOOK_BEFORE_ALL_CASE_IDX))
+                .run_case(&instance, &mut store, suite_i as i32, TEST_HOOK_BEFORE_ALL_CASE_IDX)
                 .map_err(|e| fmt_err(&format!("beforeAll failed in '{}'", test.suite_name), e))?;
         }
         for (case_i, desc) in test.case_descriptions.iter().enumerate() {
@@ -648,7 +825,8 @@ pub fn run_wasm_tests_with_externs(
             } else {
                 None
             };
-            let mut res = run_test.call(&mut store, (suite_i as i32, case_i as i32));
+            let mut res =
+                run_test.run_case(&instance, &mut store, suite_i as i32, case_i as i32);
             if let Err(e) = reset_retained_host_state(&instance, &mut store) {
                 if res.is_ok() {
                     res = Err(wasmtime::Error::msg(e));
@@ -728,7 +906,7 @@ pub fn run_wasm_tests_with_externs(
         if test.has_after_all {
             reset_retained_host_state(&instance, &mut store)?;
             run_test
-                .call(&mut store, (suite_i as i32, TEST_HOOK_AFTER_ALL_CASE_IDX))
+                .run_case(&instance, &mut store, suite_i as i32, TEST_HOOK_AFTER_ALL_CASE_IDX)
                 .map_err(|e| fmt_err(&format!("afterAll failed in '{}'", test.suite_name), e))?;
             reset_retained_host_state(&instance, &mut store)?;
         }

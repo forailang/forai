@@ -155,6 +155,10 @@ pub struct SchedLayout {
     /// call only tells the host driver how long it may park before the next
     /// timer is due. Exactly one of `set_timer` / `set_timer_hint` is set.
     pub set_timer_hint: Option<u32>,
+    /// Spawn `main` as the root task in `_start_async` (normal runs). Test
+    /// builds set false: init runs, but cases are spawned individually by the
+    /// host through `_fai_spawn_test` (plan 103 U6).
+    pub spawn_root: bool,
     /// Optional `__fai_trap_report(code, a, b)` import index (post-remap).
     /// When set, scheduler guards report a structured reason before
     /// trapping (plan 116); `None` → bare `unreachable`.
@@ -723,6 +727,14 @@ fn emit_start_async(l: &SchedLayout) -> Function {
         f.instruction(&Instruction::Call(mi));
         f.instruction(&Instruction::Drop);
     }
+    if !l.spawn_root {
+        // Test build: the table is reserved and module init has run; each
+        // case is spawned by the host via `_fai_spawn_test`. Report
+        // "complete" — there is no root task to poll (plan 103 U6).
+        f.instruction(&Instruction::I32Const(2));
+        f.instruction(&Instruction::End);
+        return f;
+    }
     f.instruction(&Instruction::I32Const(l.main_resume_table_idx));
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(l.spawn));
@@ -737,6 +749,61 @@ fn emit_start_async(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(-2));
     f.instruction(&Instruction::I32Store(ma(O_WAITER)));
     f.instruction(&Instruction::Call(l.poll));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// One `(suite, case)` → spawnable wrapper mapping for `_fai_spawn_test`.
+pub struct SpawnTestCase {
+    pub suite: u16,
+    pub case: u16,
+    pub table_idx: u32,
+    pub frame_size: i32,
+}
+
+/// `_fai_spawn_test(suite, case) -> task_id` (plan 103 U6): spawn the
+/// matching test-case wrapper as a host-driven task (like `main`: the slot
+/// is not recycled at completion, so the runner reads pass/fail via
+/// `__fai_task_result` and frees it with `__fai_free_task`). Returns -1 for
+/// an unknown (suite, case) pair.
+pub fn emit_spawn_test(l: &SchedLayout, cases: &[SpawnTestCase]) -> Function {
+    // params: suite = 0, case = 1; locals: frame = 2, id = 3
+    let mut f = Function::new([(2, ValType::I32)]);
+    for c in cases {
+        // if suite == c.suite && case == c.case { spawn; return id }
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(c.suite as i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(c.case as i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        // frame = alloc(frame_size), zeroed (plan 115: unwritten slots must
+        // read 0 so completion's release pass is a no-op on them).
+        f.instruction(&Instruction::I32Const(c.frame_size));
+        f.instruction(&Instruction::Call(l.alloc));
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(c.frame_size));
+        f.instruction(&Instruction::MemoryFill(0));
+        f.instruction(&Instruction::I32Const(c.table_idx as i32));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Call(l.spawn));
+        f.instruction(&Instruction::LocalSet(3));
+        // Record frame size for completion reclaim; mark host-driven.
+        rec_addr_local(&mut f, l, 3);
+        f.instruction(&Instruction::I32Const(c.frame_size));
+        f.instruction(&Instruction::I32Store(ma(O_FRAME_SIZE)));
+        rec_addr_local(&mut f, l, 3);
+        f.instruction(&Instruction::I32Const(-2));
+        f.instruction(&Instruction::I32Store(ma(O_WAITER)));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::I32Const(-1));
     f.instruction(&Instruction::End);
     f
 }
@@ -1185,6 +1252,7 @@ mod tests {
             module_init: None,
             set_timer: None,
             set_timer_hint: None,
+            spawn_root: true,
             trap_report: None,
         };
 

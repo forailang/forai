@@ -166,6 +166,18 @@ fn offloadable_extern_call_loc(expr: &Expression) -> Option<SourceLocation> {
 }
 
 pub fn analyze(ast: &fai_compiler::ast::Program, modules: &[DiscoveredModule]) -> AsyncAnalysis {
+    analyze_with_roots(ast, modules, &[])
+}
+
+/// Like `analyze`, but with additional reachability roots beyond `main` —
+/// synthesized test-case wrappers are roots the runner spawns directly
+/// (plan 103 U6), so their callees must stay reachable and their bodies
+/// async-colorable even though nothing in the program calls them.
+pub fn analyze_with_roots(
+    ast: &fai_compiler::ast::Program,
+    modules: &[DiscoveredModule],
+    extra_roots: &[String],
+) -> AsyncAnalysis {
     OFFLOADABLE_EXTERN_NAMES
         .with(|s| *s.borrow_mut() = collect_offloadable_extern_names(ast, modules));
     let module_function_exports = module_function_exports(modules);
@@ -267,18 +279,20 @@ pub fn analyze(ast: &fai_compiler::ast::Program, modules: &[DiscoveredModule]) -
         }
     }
 
-    out.reachable_functions = compute_reachable_functions("main", &body_effects);
+    let mut roots: Vec<String> = vec!["main".to_string()];
+    roots.extend(extra_roots.iter().cloned());
+    out.reachable_functions = compute_reachable_functions(&roots, &body_effects);
 
     out
 }
 
 fn compute_reachable_functions(
-    root: &str,
+    roots: &[String],
     body_effects: &HashMap<String, BodyEffects>,
 ) -> HashSet<String> {
     let debug = std::env::var_os("FAI_ASYNC_DEBUG").is_some();
     let mut reachable = HashSet::new();
-    let mut stack = vec![root.to_string()];
+    let mut stack: Vec<String> = roots.to_vec();
     while let Some(name) = stack.pop() {
         if !reachable.insert(name.clone()) {
             continue;

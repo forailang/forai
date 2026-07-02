@@ -18,6 +18,7 @@ mod async_wait_codegen;
 pub mod debug_info;
 pub mod direct;
 mod program;
+pub mod test_surface;
 mod runtime;
 
 // Trap-report codes (plan 116): shared with the CLI runner, which
@@ -201,11 +202,39 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
 ) -> Result<Vec<u8>, LocatedBuildError> {
     let async_analysis = async_analysis::analyze(ast, modules);
     // Real async engine (R2+): handles the shapes it supports through the
-    // guest scheduler + resumable lowering. Only runs for non-test builds
-    // for now; unsupported shapes return None and fall through to the
-    // facade below.
+    // guest scheduler + resumable lowering; unsupported shapes return None
+    // and fall through.
     let mut async_engine_error = None;
-    if !is_test {
+    if is_test {
+        // Test builds run on the same engine as production (plan 103 U6/U8):
+        // each (suite, case) becomes a wrapper function injected before
+        // analysis, spawned by the runner via `_fai_spawn_test` and driven on
+        // the guest scheduler. Shapes the engine can't lower fall through
+        // silently to the legacy synchronous test path below — losing
+        // engine-scheduling for that file, never the test itself
+        // (FAI_ASYNC_DEBUG surfaces the reason).
+        let (ast_t, modules_t, plans) = test_surface::inject_test_wrappers(ast, modules);
+        let roots: Vec<String> = plans
+            .iter()
+            .map(|p| match &p.module {
+                Some(m) => format!("{}.{}", m, p.fn_name),
+                None => p.fn_name.clone(),
+            })
+            .collect();
+        let analysis_t = async_analysis::analyze_with_roots(&ast_t, &modules_t, &roots);
+        if let Some(wasm) = direct::try_codegen_async_engine(
+            &ast_t,
+            &modules_t,
+            checker,
+            target,
+            &analysis_t,
+            entry_file,
+            Some(&plans),
+        ) {
+            return Ok(wasm);
+        }
+        let _ = direct::take_last_async_engine_error();
+    } else {
         if let Some(wasm) = direct::try_codegen_async_engine(
             ast,
             modules,
@@ -213,6 +242,7 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
             target,
             &async_analysis,
             entry_file,
+            None,
         ) {
             return Ok(wasm);
         }

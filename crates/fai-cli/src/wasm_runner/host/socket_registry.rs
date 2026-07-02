@@ -330,8 +330,9 @@ pub enum TryLineStep {
     Line(String),
     /// No newline yet; bytes so far are in `partial` — re-arm and continue.
     Pending,
-    /// The socket errored.
-    Failed(String),
+    /// The socket errored. The message is diagnostic-only today (the op
+    /// resolves to Null); kept for future error surfacing.
+    Failed(#[allow(dead_code)] String),
 }
 
 /// Consume available bytes one at a time (never past the newline) into

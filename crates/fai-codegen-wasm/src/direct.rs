@@ -2088,8 +2088,6 @@ pub struct TestCaseEntry {
     pub function_index: usize,
 }
 
-const TEST_HOOK_BEFORE_ALL_CASE_IDX: u16 = u16::MAX;
-const TEST_HOOK_AFTER_ALL_CASE_IDX: u16 = u16::MAX - 1;
 
 /// Try compiling every top-level function in `ast` through the
 /// direct builder. Returns `Ok(BuiltProgram)` when every function
@@ -2772,22 +2770,7 @@ pub fn build_program_full(
         }
 
         for (suite_idx, (td, ctx_mod, ctx_file)) in test_specs.iter().enumerate() {
-            if let Some(before_all) = &td.before_all {
-                let mut body: Vec<fai_compiler::ast::Statement> = td.setup.clone();
-                body.extend(before_all.clone());
-                let wrapper = fai_compiler::ast::FunctionDeclaration {
-                    name: format!("<test-before-all:{}>", td.name),
-                    type_params: Vec::new(),
-                    params: Vec::new(),
-                    return_types: Vec::new(),
-                    body,
-                    doc: None,
-                    is_private: None,
-                    is_abstract: false,
-                    is_remote: false,
-                    location: td.location.clone(),
-                    doc_comment: None,
-                };
+            for (wrapper, case_idx) in crate::test_surface::suite_wrappers(td) {
                 let info = FunctionInfo {
                     name: wrapper.name.clone(),
                     param_count: 0,
@@ -2828,138 +2811,7 @@ pub fn build_program_full(
                 test_cases.push(TestCaseEntry {
                     suite_name: td.name.clone(),
                     suite_idx: suite_idx as u16,
-                    case_idx: TEST_HOOK_BEFORE_ALL_CASE_IDX,
-                    function_index,
-                });
-            }
-
-            for (case_idx, case) in td.cases.iter().enumerate() {
-                // Build a zero-arg FunctionDeclaration. The body
-                // is `setup ++ before_each ++ case.body ++ after_each`
-                // so the wrapper is self-contained per case.
-                let mut body: Vec<fai_compiler::ast::Statement> = td.setup.clone();
-                if let Some(before) = &td.before_each {
-                    body.extend(before.clone());
-                }
-                body.extend(case.body.clone());
-                if let Some(after) = &td.after_each {
-                    body.extend(after.clone());
-                }
-                let wrapper = fai_compiler::ast::FunctionDeclaration {
-                    name: format!("<test:{}#{}>", td.name, case_idx),
-                    type_params: Vec::new(),
-                    params: Vec::new(),
-                    return_types: Vec::new(),
-                    body,
-                    doc: None,
-                    is_private: None,
-                    is_abstract: false,
-                    is_remote: false,
-                    location: case.location.clone(),
-                    doc_comment: None,
-                };
-                let info = FunctionInfo {
-                    name: wrapper.name.clone(),
-                    param_count: 0,
-                    type_param_count: 0,
-                    param_names: Vec::new(),
-                    include_in_coverage: false,
-                    param_defaults: Vec::new(),
-                    source_line: wrapper.location.line,
-                    ..Default::default()
-                };
-                let result = build_function_with_spy_and_offset(
-                    &wrapper,
-                    rt,
-                    &infos,
-                    checker,
-                    fai_func_type_indices,
-                    &module_aliases,
-                    &extern_fn_indices,
-                    import_remap,
-                    &strings,
-                    &enum_members,
-                    &type_fields,
-                    &named_imports,
-                    &mocked_fn_ids,
-                    &std_method_fn_ids,
-                    closures.len() as u32,
-                    ctx_mod.as_deref(),
-                    &module_constants,
-                    &extern_out_params,
-                    &module_vars,
-                    &ownership_sites,
-                    ctx_file.as_deref(),
-                    None,
-                )?;
-                let function_index = functions.len();
-                functions.push((info, result.main));
-                closures.extend(result.closures);
-                test_cases.push(TestCaseEntry {
-                    suite_name: td.name.clone(),
-                    suite_idx: suite_idx as u16,
-                    case_idx: case_idx as u16,
-                    function_index,
-                });
-            }
-
-            if let Some(after_all) = &td.after_all {
-                let mut body: Vec<fai_compiler::ast::Statement> = td.setup.clone();
-                body.extend(after_all.clone());
-                let wrapper = fai_compiler::ast::FunctionDeclaration {
-                    name: format!("<test-after-all:{}>", td.name),
-                    type_params: Vec::new(),
-                    params: Vec::new(),
-                    return_types: Vec::new(),
-                    body,
-                    doc: None,
-                    is_private: None,
-                    is_abstract: false,
-                    is_remote: false,
-                    location: td.location.clone(),
-                    doc_comment: None,
-                };
-                let info = FunctionInfo {
-                    name: wrapper.name.clone(),
-                    param_count: 0,
-                    type_param_count: 0,
-                    param_names: Vec::new(),
-                    include_in_coverage: false,
-                    param_defaults: Vec::new(),
-                    source_line: wrapper.location.line,
-                    ..Default::default()
-                };
-                let result = build_function_with_spy_and_offset(
-                    &wrapper,
-                    rt,
-                    &infos,
-                    checker,
-                    fai_func_type_indices,
-                    &module_aliases,
-                    &extern_fn_indices,
-                    import_remap,
-                    &strings,
-                    &enum_members,
-                    &type_fields,
-                    &named_imports,
-                    &mocked_fn_ids,
-                    &std_method_fn_ids,
-                    closures.len() as u32,
-                    ctx_mod.as_deref(),
-                    &module_constants,
-                    &extern_out_params,
-                    &module_vars,
-                    &ownership_sites,
-                    ctx_file.as_deref(),
-                    None,
-                )?;
-                let function_index = functions.len();
-                functions.push((info, result.main));
-                closures.extend(result.closures);
-                test_cases.push(TestCaseEntry {
-                    suite_name: td.name.clone(),
-                    suite_idx: suite_idx as u16,
-                    case_idx: TEST_HOOK_AFTER_ALL_CASE_IDX,
+                    case_idx,
                     function_index,
                 });
             }
@@ -4209,9 +4061,13 @@ fn indirect_closure_call<'a>(
         // closure value) corrupts the scheduler. This mirrors `compile_call`'s
         // routing, which only falls through to the closure path here.
         Expression::MemberExpression(me) => {
+            // `assert` is magically in scope inside test blocks with no `use`
+            // statement, so the alias map never carries it — but its calls
+            // are namespace dispatches, not closure fields (plan 103 U6).
             let obj_is_module_alias = matches!(
                 &*me.object,
-                Expression::IdentifierExpression(id) if fns.aliases.contains_key(&id.name)
+                Expression::IdentifierExpression(id)
+                    if fns.aliases.contains_key(&id.name) || id.name == "assert"
             );
             !fns.is_ufcs_call(call) && !obj_is_module_alias
         }
@@ -7618,10 +7474,11 @@ pub fn try_codegen_async_engine(
     target: Option<&str>,
     analysis: &crate::async_analysis::AsyncAnalysis,
     entry_file: Option<&str>,
+    test_plans: Option<&[crate::test_surface::TestWrapperPlan]>,
 ) -> Option<Vec<u8>> {
     use crate::async_engine::{self, SchedLayout};
     use crate::runtime::{self, IMPORT_NOW_MS, RT_ALLOC, RT_COUNT, RT_FREE};
-    use std::collections::{HashMap as Map, HashSet as Set};
+    use std::collections::HashMap as Map;
     use wasm_encoder::{
         CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
         ExportSection, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection,
@@ -7640,6 +7497,21 @@ pub fn try_codegen_async_engine(
     if analysis.is_empty() {
         return None;
     }
+    // Test build (plan 103 U6): the caller injected one wrapper function per
+    // (suite, case) via `test_surface::inject_test_wrappers`; each becomes a
+    // spawnable root task reachable through `_fai_spawn_test`.
+    let is_test = test_plans.is_some();
+    let wrapper_roots: Vec<(String, u16, u16)> = test_plans
+        .unwrap_or(&[])
+        .iter()
+        .map(|p| {
+            let name = match &p.module {
+                Some(m) => format!("{}.{}", m, p.fn_name),
+                None => p.fn_name.clone(),
+            };
+            (name, p.suite_idx, p.case_idx)
+        })
+        .collect();
     // Gather every user function from the entry AST and every module. Module
     // functions are name-prefixed `{module}.{fn}` exactly as `build_program_full`
     // and `async_analysis` do, so the analysis' qualified async set and the
@@ -7889,6 +7761,9 @@ pub fn try_codegen_async_engine(
     if all_user_fns.contains("main") {
         reachable_functions.insert("main".to_string());
     }
+    for (name, _, _) in &wrapper_roots {
+        reachable_functions.insert(name.clone());
+    }
     if let Some(name) = &master_init_name {
         reachable_functions.insert(name.clone());
         for (fd, _, _) in &decls {
@@ -7923,10 +7798,11 @@ pub fn try_codegen_async_engine(
         async_set.extend(targets);
     }
     async_set.retain(|name| reachable_functions.contains(name));
-    // main must exist and take no arguments. Resolved against `decls` here — the
-    // borrowing `all_fns` view is rebuilt after the A-normalization rewrite
-    // below (which needs `&mut decls`).
-    {
+    // main must exist and take no arguments — except in a test build, where
+    // the roots are the case wrappers and `main` (if present) is just another
+    // function.
+    let has_main = decls.iter().any(|(fd, _, _)| fd.name == "main");
+    if !is_test {
         let main_decl = decls.iter().find(|(fd, _, _)| fd.name == "main")?;
         if !main_decl.0.params.is_empty() {
             return None; // root takes no arguments
@@ -7936,7 +7812,14 @@ pub fn try_codegen_async_engine(
     // root task, whether or not its own body suspends. (Pure-sync programs
     // never reach here: the `analysis.is_empty()` early-out above sends them to
     // the fast path.)
-    async_set.insert("main".to_string());
+    if has_main {
+        async_set.insert("main".to_string());
+    }
+    // Every case wrapper is spawned as a task by the runner, so it must be a
+    // resume fn even when its body never suspends (mirrors spawn targets).
+    for (name, _, _) in &wrapper_roots {
+        async_set.insert(name.clone());
+    }
 
     // ── A-normalize async calls ──
     // The CFG's await lowering only recognizes an async call when it is the
@@ -7966,7 +7849,11 @@ pub fn try_codegen_async_engine(
     }
 
     let all_fns: Vec<&FunctionDeclaration> = decls.iter().map(|(fd, _, _)| fd).collect();
-    let main = *all_fns.iter().find(|fd| fd.name == "main")?;
+    let main: Option<&FunctionDeclaration> = match all_fns.iter().find(|fd| fd.name == "main") {
+        Some(m) => Some(*m),
+        None if is_test => None,
+        None => return None,
+    };
     for fd in &all_fns {
         if !reachable_functions.contains(&fd.name) {
             continue;
@@ -7979,8 +7866,11 @@ pub fn try_codegen_async_engine(
     }
 
     // Proto order = wasm function order: each user fn sits at
-    // `import_count + RT_COUNT + proto`. `main` is first.
-    let mut ordered: Vec<&FunctionDeclaration> = vec![main];
+    // `import_count + RT_COUNT + proto`. `main` is first (when present).
+    let mut ordered: Vec<&FunctionDeclaration> = Vec::new();
+    if let Some(m) = main {
+        ordered.push(m);
+    }
     let mut rest: Vec<&FunctionDeclaration> = all_fns
         .iter()
         .copied()
@@ -8021,10 +7911,28 @@ pub fn try_codegen_async_engine(
     }
     let nasync = tpos;
     let nuser = ordered.len() as u32;
-    let root_frame_size = frames.get("main").map(|f| f.size)?;
+    // Test wrappers must all have resume-table slots by now; map each
+    // (suite, case) to its wrapper's table index + frame size for
+    // `_fai_spawn_test` (plan 103 U6).
+    let mut spawn_cases: Vec<async_engine::SpawnTestCase> = Vec::new();
+    for (name, suite, case) in &wrapper_roots {
+        let table_idx = *fn_table_idx.get(name)?;
+        let frame_size = *frame_sizes.get(name)?;
+        spawn_cases.push(async_engine::SpawnTestCase {
+            suite: *suite,
+            case: *case,
+            table_idx,
+            frame_size,
+        });
+    }
+    let root_frame_size = match frames.get("main") {
+        Some(f) => f.size,
+        None if is_test => 0, // no root spawn in test builds (spawn_root=false)
+        None => return None,
+    };
 
     // ── module-level index layout ──
-    let import_available = runtime::available_imports_with_test_flag(target, false);
+    let import_available = runtime::available_imports_with_test_flag(target, is_test);
     let (import_remap, actual_import_count) = runtime::build_import_remap(&import_available);
     let now_ms_idx = import_remap
         .get(IMPORT_NOW_MS as usize)
@@ -8120,6 +8028,8 @@ pub fn try_codegen_async_engine(
             .get(crate::runtime::IMPORT_TRAP_REPORT as usize)
             .copied()
             .flatten(),
+        // Test builds spawn cases individually via `_fai_spawn_test`.
+        spawn_root: !is_test,
     };
     let start_async_idx = sb + 8;
 
@@ -8130,8 +8040,6 @@ pub fn try_codegen_async_engine(
     let fai_type_indices = direct_fai_func_type_indices();
     let strings = RefCell::new(StringInterner::default());
     let closures = RefCell::new(Vec::new());
-    let empty_mock: Set<u32> = Set::new();
-    let empty_std: Map<(String, String), u32> = Map::new();
 
     // ── context maps from entry + every module (mirror build_program_full) ──
     let mut enum_members: HashMap<String, Vec<String>> = HashMap::new();
@@ -8231,6 +8139,29 @@ pub fn try_codegen_async_engine(
             source_line: fd.location.line,
         })
         .collect();
+    // Spy/mock instrumentation (plan 103 U6): in test builds, functions that
+    // a `test` block mocks or spies get the `spy_check_call` preamble via
+    // `build_function_with_spy_and_offset` (sync fns). Async (resume-fn)
+    // targets are NOT instrumented yet — mocking an async function under the
+    // engine is a known v1 gap surfaced by the fixture audit.
+    let function_by_name: Map<String, u32> = infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| (info.name.clone(), i as u32))
+        .collect();
+    let spy_targets: SpyTargets = if is_test {
+        collect_spy_targets(
+            ast,
+            modules,
+            &function_by_name,
+            &module_aliases,
+            &named_imports,
+        )
+    } else {
+        SpyTargets::default()
+    };
+    let mocked_fn_ids = spy_targets.fn_ids;
+    let std_method_fn_ids = spy_targets.std_method_fn_ids;
     let ownership_sites = RefCell::new(Vec::new());
     let ctx = BuildContext {
         rt,
@@ -8243,8 +8174,8 @@ pub fn try_codegen_async_engine(
         enum_members: &enum_members,
         type_fields: &type_fields,
         named_imports: &named_imports,
-        mocked_fn_ids: &empty_mock,
-        std_method_fn_ids: &empty_std,
+        mocked_fn_ids: &mocked_fn_ids,
+        std_method_fn_ids: &std_method_fn_ids,
         // Closures created inside async resume fns get table slots after the
         // async resume fns (which occupy 0..nasync).
         closure_offset_base: nasync,
@@ -8332,8 +8263,8 @@ pub fn try_codegen_async_engine(
             &enum_members,
             &type_fields,
             &named_imports,
-            &empty_mock,
-            &empty_std,
+            &mocked_fn_ids,
+            &std_method_fn_ids,
             nasync + async_closure_count + sync_closures.len() as u32,
             mctx,
             &module_constants,
@@ -8467,6 +8398,9 @@ pub fn try_codegen_async_engine(
     funcs.function(t_i64i64_i64); // __fai_spawn_queued_closure (i64,i64)->i64
     funcs.function(t_i32_i32); // __fai_task_status (i32)->i32
     funcs.function(t_i32_void); // __fai_free_task (i32)->()
+    if is_test {
+        funcs.function(t_i32i32_i32); // _fai_spawn_test (i32,i32)->i32
+    }
     module.section(&funcs);
 
     // Table = [async resume fns (0..nasync)] ++ [sync-fn closures (nasync..)].
@@ -8585,6 +8519,9 @@ pub fn try_codegen_async_engine(
     );
     exports.export("__fai_task_status", ExportKind::Func, task_status_idx);
     exports.export("__fai_free_task", ExportKind::Func, free_task_idx);
+    if is_test {
+        exports.export("_fai_spawn_test", ExportKind::Func, free_task_idx + 1);
+    }
     // Host-callable refcount helpers: lets the host retain guest handles it
     // stores and reclaim per-request guest objects it owns (the request/response
     // dicts it built) after writing the response, so a long-running server
@@ -8704,6 +8641,9 @@ pub fn try_codegen_async_engine(
     code.function(&async_engine::emit_spawn_queued_closure(&layout));
     code.function(&async_engine::emit_task_status(&layout));
     code.function(&async_engine::emit_free_task(&layout));
+    if is_test {
+        code.function(&async_engine::emit_spawn_test(&layout, &spawn_cases));
+    }
     module.section(&code);
 
     if !extended.is_empty() {
@@ -23321,6 +23261,88 @@ mod tests {
                 user_body_import_call_count(&wasm, direct_import),
                 0,
                 "{direct_import} should not be called directly by blocking stdlib lowering"
+            );
+        }
+    }
+
+    /// Plan 103 U8 mirror of the production assertion: test builds compile
+    /// through the async engine too, so blocking test bodies never touch the
+    /// legacy synchronous imports (`sleep_ms`, `run_all`, direct
+    /// `process_run`) and the module carries the spawn-per-case test surface.
+    #[test]
+    fn test_builds_route_blocking_test_bodies_through_the_engine() {
+        let src = concat!(
+            "use std.process\n",
+            "\n",
+            "def main\n",
+            "    @return Void\n",
+            "do\n",
+            "  print('x')\n",
+            "end\n",
+            "\n",
+            "private:\n",
+            "\n",
+            "# Sleeps, shells out, returns 1.\n",
+            "def worker\n",
+            "    @return Int\n",
+            "do\n",
+            "  sleep(10)\n",
+            "  let _ = process.run('printf ok', '.', '{}', 5000, 65536)\n",
+            "  1\n",
+            "end\n",
+            "\n",
+            "test worker\n",
+            "  it 'overlaps'\n",
+            "    let a, b = all(worker(), worker())\n",
+            "    assert.equals(a + b, 2)\n",
+            "  end\n",
+            "end\n",
+        );
+        let prepared = fai_compiler::prepare_source(src, None).expect("prepare");
+        let mut checker = fai_checker::Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checker");
+        let info = CheckerInfo {
+            ufcs_calls: checker.ufcs_calls,
+            named_param_reorder: checker.named_param_reorder,
+            expression_types: checker.expression_types,
+            generic_type_args: checker.generic_type_args,
+            array_int_index_sites: checker.array_int_index_sites,
+            record_field_read_sites: checker.record_field_read_sites,
+        };
+        let wasm = crate::codegen_direct_full_reasoned_with_entry_file(
+            &prepared.serde_ast,
+            &prepared.modules,
+            &info,
+            None,
+            true,
+            None,
+        )
+        .expect("test build should compile through the async engine");
+
+        // Engine test-surface exports present.
+        let mut export_names: Vec<String> = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let wasmparser::Payload::ExportSection(section) = payload.expect("payload") {
+                for e in section {
+                    export_names.push(e.expect("export").name.to_string());
+                }
+            }
+        }
+        for required in ["_fai_spawn_test", "_start_async", "__fai_poll", "__fai_task_status"] {
+            assert!(
+                export_names.iter().any(|n| n == required),
+                "test build missing engine export `{required}` — fell back to the legacy path? exports: {export_names:?}"
+            );
+        }
+
+        // No legacy blocking imports reachable from user bodies.
+        for legacy in ["sleep_ms", "run_all", "process_run"] {
+            assert_eq!(
+                user_body_import_call_count(&wasm, legacy),
+                0,
+                "{legacy} should be unreachable from an engine test build"
             );
         }
     }
