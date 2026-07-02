@@ -8,7 +8,7 @@ use super::super::heap::wasm_alloc_str;
 use super::super::nan_box::{ADDR_MASK, OBJ_TAG_DICT, QNAN, SIGN_BIT, VAL_NULL};
 #[cfg(feature = "http-client")]
 use super::events::{alloc_dict, write_global_i32, write_global_i64};
-use super::host_ops::{read_string_value, submit_host_op, HostOpResult};
+use super::host_ops::{read_string_value, submit_host_op, submit_host_wait, HostOpResult};
 
 #[cfg(feature = "http-client")]
 const HTTP_CLIENT_TIMEOUT_SECS: u64 = 120;
@@ -208,7 +208,8 @@ pub(super) fn begin_http_request_host_op(
         .get(min_args)
         .map(|headers_val| read_headers_arg(&mem, caller, *headers_val))
         .unwrap_or_default();
-    submit_host_op(task_id, move || {
+    // Wait class: server-paced, held for the whole request (plan 103 KTD2).
+    submit_host_wait(task_id, move || {
         match do_verb_owned(method, &url, body.as_deref(), &headers) {
             Some(value) => HostOpResult::Json(value),
             None => HostOpResult::Null,
@@ -696,8 +697,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         .into_owned(),
                     )
                 };
-                // Offload the blocking request to the boundary worker pool and
-                // leave the task parked (plan 101 U2/U6). The async lowering
+                // Offload the blocking request to a boundary waiter thread
+                // (Wait: server-paced, held for the full request; plan 103
+                // KTD2) and leave the task parked (plan 101 U2/U6). The async
+                // lowering
                 // suspended this task right after the call; the driver loop
                 // pumps the boundary completion and resumes it via
                 // `__fai_resume_task`, then `remote_result` reads the value. The
@@ -705,7 +708,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // the Store. (The browser implements `remote_begin` in JS with
                 // async `fetch`, so this native change doesn't affect it.)
                 super::boundary::with_boundary(|b| {
-                    b.submit(task_id, move || {
+                    b.submit(task_id, super::boundary::JobClass::Wait, move || {
                         Box::new(rpc_request_owned(url, fn_name, args_json, hash))
                             as Box<dyn std::any::Any + Send>
                     });

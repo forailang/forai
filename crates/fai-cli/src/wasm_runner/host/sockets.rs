@@ -26,7 +26,7 @@ use wasmtime::*;
 
 use super::super::heap::{build_value, wasm_alloc_str};
 use super::super::nan_box::VAL_NULL;
-use super::host_ops::{read_int_value, read_string_arg, submit_host_op, HostOpResult};
+use super::host_ops::{read_int_value, read_string_arg, submit_host_op, submit_host_wait, HostOpResult};
 use super::socket_registry as reg;
 
 const SOCKET_WAIT_POLL: Duration = Duration::from_millis(20);
@@ -256,7 +256,7 @@ pub(super) fn begin_socket_host_op(
             };
             match reg::clone_tcp_listener_for_wait(handle as u32) {
                 Ok(wait) => {
-                    submit_host_op(task_id, move || match wait_tcp_accept(wait) {
+                    submit_host_wait(task_id, move || match wait_tcp_accept(wait) {
                         Some((stream, address)) => HostOpResult::TcpAccepted { stream, address },
                         None => HostOpResult::Null,
                     });
@@ -274,7 +274,7 @@ pub(super) fn begin_socket_host_op(
                 submit_socket_int(task_id, -1);
                 return true;
             };
-            submit_host_op(task_id, move || {
+            submit_host_wait(task_id, move || {
                 let addr = format!("{}:{}", host, port as u16);
                 match TcpStream::connect(&addr) {
                     Ok(stream) => HostOpResult::TcpConnected(stream),
@@ -290,7 +290,7 @@ pub(super) fn begin_socket_host_op(
             };
             match reg::clone_tcp_stream_for_wait(handle as u32) {
                 Ok(wait) => {
-                    submit_host_op(task_id, move || match wait_tcp_read(wait) {
+                    submit_host_wait(task_id, move || match wait_tcp_read(wait) {
                         Some(data) => HostOpResult::String(data),
                         None => HostOpResult::Null,
                     });
@@ -306,7 +306,7 @@ pub(super) fn begin_socket_host_op(
             };
             match reg::clone_tcp_stream_for_wait(handle as u32) {
                 Ok(wait) => {
-                    submit_host_op(task_id, move || match wait_tcp_read_line(wait) {
+                    submit_host_wait(task_id, move || match wait_tcp_read_line(wait) {
                         Some(data) => HostOpResult::String(data),
                         None => HostOpResult::Null,
                     });
@@ -322,7 +322,7 @@ pub(super) fn begin_socket_host_op(
             };
             match reg::clone_udp_socket_for_wait(handle as u32) {
                 Ok(wait) => {
-                    submit_host_op(task_id, move || match wait_udp_receive(wait) {
+                    submit_host_wait(task_id, move || match wait_udp_receive(wait) {
                         Some((data, host, port)) => {
                             let data_str = String::from_utf8_lossy(&data).into_owned();
                             HostOpResult::Json(serde_json::json!({

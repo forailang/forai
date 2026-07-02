@@ -578,6 +578,9 @@ pub const HOST_OP_TCP_CONNECT: i32 = 12;
 pub const HOST_OP_TCP_READ: i32 = 13;
 pub const HOST_OP_TCP_READ_LINE: i32 = 14;
 pub const HOST_OP_UDP_RECEIVE: i32 = 15;
+/// `process.write(session, input)` — child-paced (a full stdin pipe blocks
+/// until the child reads), so it crosses the boundary as a Wait (plan 103 U2).
+pub const HOST_OP_PROCESS_WRITE: i32 = 16;
 
 // ── Trap-report codes (first arg of `__fai_trap_report`) ──────────
 // The host renders these into human-readable trap reasons. Keep in

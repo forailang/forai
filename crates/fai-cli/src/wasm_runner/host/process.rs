@@ -16,7 +16,7 @@ use serde_json::json;
 use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
-use super::host_ops::{read_int_value, read_string_arg, submit_host_op, HostOpResult};
+use super::host_ops::{read_int_value, read_string_arg, submit_host_op, submit_host_wait, HostOpResult};
 
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -25,7 +25,12 @@ static SESSIONS: OnceLock<Mutex<HashMap<String, ShellSession>>> = OnceLock::new(
 
 struct ShellSession {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// Shared with in-flight `process.write` waiter jobs: a write holds only
+    /// this mutex (never the `SESSIONS` map lock), so a writer blocked on a
+    /// full pipe cannot stall `read`/`stop` on other sessions, and `stop` on
+    /// this session unsticks it by killing the child (the pipe breaks and the
+    /// blocked `write_all` errors out).
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     stdout: SharedBuffer,
     stderr: SharedBuffer,
     started: Instant,
@@ -40,6 +45,9 @@ pub(super) fn begin_process_host_op(
     op_kind: i32,
     args: &[i64],
 ) -> bool {
+    if op_kind == fai_codegen_wasm::HOST_OP_PROCESS_WRITE {
+        return begin_process_write(caller, task_id, args);
+    }
     if op_kind != fai_codegen_wasm::HOST_OP_PROCESS_RUN {
         return false;
     }
@@ -60,9 +68,26 @@ pub(super) fn begin_process_host_op(
     let env_json = read_string_arg(caller, args, 2).unwrap_or_default();
     let timeout_ms = clamp_timeout_ms(timeout_ms);
     let max_output_bytes = clamp_output_bytes(max_output_bytes);
-    submit_host_op(task_id, move || {
+    submit_host_wait(task_id, move || {
         let result = run_command(&command, &cwd, &env_json, timeout_ms, max_output_bytes);
         HostOpResult::Json(serde_json::Value::String(result))
+    });
+    true
+}
+
+/// `process.write(session, input)` as a boundary Wait: `write_all` to a full
+/// stdin pipe blocks until the child reads, so it must never run on the
+/// scheduler thread (plan 103 U2 / R2).
+fn begin_process_write(caller: &mut Caller<'_, ()>, task_id: i32, args: &[i64]) -> bool {
+    if args.len() != 2 {
+        submit_host_op(task_id, || HostOpResult::Null);
+        return true;
+    }
+    let session_id = read_string_arg(caller, args, 0).unwrap_or_default();
+    let input = read_string_arg(caller, args, 1).unwrap_or_default();
+    cleanup_expired_sessions();
+    submit_host_wait(task_id, move || {
+        HostOpResult::Json(serde_json::Value::String(write_session(&session_id, &input)))
     });
     true
 }
@@ -311,7 +336,7 @@ fn start_session(command: &str, cwd: &str, env_json: &str, lifetime_ms: u64) -> 
     if let Some(err) = child.stderr.take() {
         spawn_reader(err, stderr.clone());
     }
-    let stdin = child.stdin.take();
+    let stdin = Arc::new(Mutex::new(child.stdin.take()));
     let id = format!("bash-{}", NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
     let now = Instant::now();
     sessions().lock().unwrap().insert(
@@ -338,12 +363,20 @@ fn start_session(command: &str, cwd: &str, env_json: &str, lifetime_ms: u64) -> 
 }
 
 fn write_session(session_id: &str, input: &str) -> String {
-    let mut guard = sessions().lock().unwrap();
-    let Some(session) = guard.get_mut(session_id) else {
-        return json!({ "ok": false, "sessionId": session_id, "error": "session not found" })
-            .to_string();
+    // Clone the session's stdin handle and release the map lock before
+    // writing: `write_all` can block on a full pipe until the child reads
+    // (or dies), and holding the `SESSIONS` lock across that would stall
+    // every other session's `read`/`write`/`stop`.
+    let stdin = {
+        let guard = sessions().lock().unwrap();
+        let Some(session) = guard.get(session_id) else {
+            return json!({ "ok": false, "sessionId": session_id, "error": "session not found" })
+                .to_string();
+        };
+        Arc::clone(&session.stdin)
     };
-    match session.stdin.as_mut() {
+    let mut slot = stdin.lock().unwrap();
+    match slot.as_mut() {
         Some(stdin) => match stdin
             .write_all(input.as_bytes())
             .and_then(|_| stdin.flush())

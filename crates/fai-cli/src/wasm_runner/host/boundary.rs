@@ -33,6 +33,29 @@ use std::time::Duration;
 /// the main-thread consumer downcasts it when marshalling back (U2).
 pub(crate) type JobResult = Result<Box<dyn Any + Send>, String>;
 
+/// How a job occupies the boundary (plan 103 U1).
+///
+/// The bounded pool exists as backpressure for *work* — short, resource-bound
+/// jobs (file I/O, FFI calls) where running too many at once helps nothing.
+/// A *wait* is the opposite profile: peer- or child-paced, unbounded duration,
+/// ~zero CPU (a socket read parked on a silent peer, a `process.run` waiting
+/// on a child, an outbound HTTP call against a slow server). Waits parked on
+/// pool threads starve every later job; they get dedicated waiter threads
+/// instead, so the pool bound only ever applies to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobClass {
+    /// Short, resource-bound work. Runs on the bounded pool.
+    Work,
+    /// Peer-paced wait of unbounded duration. Runs on its own waiter thread;
+    /// never occupies a pool slot.
+    Wait,
+}
+
+/// Runaway backstop for waiter threads, far above any sane concurrent-wait
+/// count. At the cap a `Wait` job degrades to the pool queue (today's
+/// behavior) rather than failing.
+const WAITER_CAP: usize = 512;
+
 /// A unit of blocking work plus the guest task it belongs to.
 type Job = (i32, Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>);
 
@@ -70,11 +93,22 @@ pub(crate) struct Boundary {
     /// Jobs submitted but not yet drained as completions. Lets the driver loop
     /// know whether it is waiting on outstanding work.
     inflight: Arc<AtomicUsize>,
+    /// Live waiter threads (Wait-class jobs). Only read/written on the
+    /// submitting (main) thread for the cap check; decremented by the waiter
+    /// itself on exit.
+    live_waiters: Arc<AtomicUsize>,
+    /// Cap on live waiter threads; above it Wait jobs degrade to the pool.
+    waiter_cap: usize,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Boundary {
     pub(crate) fn new(pool_size: usize) -> Self {
+        Self::with_waiter_cap(pool_size, WAITER_CAP)
+    }
+
+    /// Test seam: a small waiter cap makes the degrade-to-pool path reachable.
+    fn with_waiter_cap(pool_size: usize, waiter_cap: usize) -> Self {
         let pool_size = pool_size.max(1);
         let shared = Arc::new(Shared {
             queue: Mutex::new(JobQueue {
@@ -103,22 +137,77 @@ impl Boundary {
             shared,
             completions,
             inflight: Arc::new(AtomicUsize::new(0)),
+            live_waiters: Arc::new(AtomicUsize::new(0)),
+            waiter_cap,
             workers,
         }
     }
 
-    /// Submit blocking `work` for `task_id`. `work` runs on a worker thread and
-    /// must touch only owned `Send` data — never the `Store` or guest memory.
-    pub(crate) fn submit<F>(&self, task_id: i32, work: F)
+    /// Submit blocking `work` for `task_id`. `work` runs off the main thread
+    /// and must touch only owned `Send` data — never the `Store` or guest
+    /// memory. `Work` runs on the bounded pool; `Wait` gets a dedicated waiter
+    /// thread so a long-lived wait can never starve the pool (plan 103 R1).
+    pub(crate) fn submit<F>(&self, task_id: i32, class: JobClass, work: F)
     where
         F: FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     {
         self.inflight.fetch_add(1, Ordering::Relaxed);
+        // Cap check happens here, not in spawn_waiter: submissions only occur
+        // on the main thread (the boundary is thread-local), so load-then-add
+        // cannot race another submitter. A waiter's decrement racing the load
+        // can only undercount, never overshoot the cap. At the cap a Wait job
+        // degrades to the pool queue (today's behavior) rather than failing.
+        if class == JobClass::Wait && self.live_waiters.load(Ordering::SeqCst) < self.waiter_cap {
+            self.spawn_waiter(task_id, work);
+            return;
+        }
         {
             let mut q = self.shared.queue.lock().unwrap();
             q.jobs.push_back((task_id, Box::new(work)));
         }
         self.shared.available.notify_one();
+    }
+
+    /// Run `work` on a fresh waiter thread. Waiter threads are detached: they
+    /// hold only the completion side, push their result like a pool worker,
+    /// and exit. A waiter stuck in an uncancellable syscall at shutdown is
+    /// left to the OS rather than joined — the same exposure a stuck pool
+    /// worker has today, without wedging teardown. `thread::spawn` consumes
+    /// the closure even when it fails, so a (OOM-level) spawn failure is
+    /// surfaced as a failed completion — the parked task still resumes.
+    fn spawn_waiter<F>(&self, task_id: i32, work: F)
+    where
+        F: FnOnce() -> Box<dyn Any + Send> + Send + 'static,
+    {
+        self.live_waiters.fetch_add(1, Ordering::SeqCst);
+        let live = Arc::clone(&self.live_waiters);
+        let completions = Arc::clone(&self.completions);
+        let spawned = thread::Builder::new()
+            .name(format!("fai-wait-{task_id}"))
+            .spawn(move || {
+                let result: JobResult = match catch_unwind(AssertUnwindSafe(work)) {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err("boundary job panicked".to_string()),
+                };
+                {
+                    let mut q = completions.queue.lock().unwrap();
+                    q.push_back(Completion { task_id, result });
+                }
+                completions.ready.notify_one();
+                live.fetch_sub(1, Ordering::SeqCst);
+            })
+            .is_ok();
+        if !spawned {
+            self.live_waiters.fetch_sub(1, Ordering::SeqCst);
+            {
+                let mut q = self.completions.queue.lock().unwrap();
+                q.push_back(Completion {
+                    task_id,
+                    result: Err("failed to spawn boundary waiter thread".to_string()),
+                });
+            }
+            self.completions.ready.notify_one();
+        }
     }
 
     /// Drain every completion ready so far without blocking. Each drained
@@ -308,7 +397,9 @@ mod tests {
     fn runs_jobs_and_returns_owned_results() {
         let b = Boundary::new(2);
         for n in 0..5i64 {
-            b.submit(n as i32, move || Box::new(n * 10) as Box<dyn Any + Send>);
+            b.submit(n as i32, JobClass::Work, move || {
+                Box::new(n * 10) as Box<dyn Any + Send>
+            });
         }
         let got = drain_until(&b, 5, |c| c.len() == 5);
         let mut by_task: Vec<(i32, i64)> = got
@@ -329,7 +420,7 @@ mod tests {
         for n in 0..12i32 {
             let live = Arc::clone(&live);
             let peak = Arc::clone(&peak);
-            b.submit(n, move || {
+            b.submit(n, JobClass::Work, move || {
                 let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(20));
@@ -349,7 +440,7 @@ mod tests {
         let b = Boundary::new(1);
         // Nothing submitted yet: wait should time out (no completion).
         assert!(!b.wait(Duration::from_millis(50)));
-        b.submit(7, || {
+        b.submit(7, JobClass::Work, || {
             thread::sleep(Duration::from_millis(30));
             Box::new(99i64) as Box<dyn Any + Send>
         });
@@ -363,13 +454,102 @@ mod tests {
     #[test]
     fn panicking_job_becomes_failed_completion() {
         let b = Boundary::new(1);
-        b.submit(3, || panic!("boom"));
+        b.submit(3, JobClass::Work, || panic!("boom"));
         // Pool survives and a later job still runs.
-        b.submit(4, || Box::new(1i64) as Box<dyn Any + Send>);
+        b.submit(4, JobClass::Work, || Box::new(1i64) as Box<dyn Any + Send>);
         let got = drain_until(&b, 2, |c| c.len() == 2);
         let failed = got.iter().find(|c| c.task_id == 3).unwrap();
         assert!(failed.result.is_err());
         let ok = got.iter().find(|c| c.task_id == 4).unwrap();
         assert!(ok.result.is_ok());
+    }
+
+    /// Plan 103 R1: long-lived waits must not starve the bounded pool. With
+    /// every pool slot's worth of Wait jobs (and more) parked, a Work job
+    /// still completes promptly.
+    #[test]
+    fn wait_jobs_do_not_starve_work_jobs() {
+        const POOL: usize = 2;
+        let b = Boundary::with_waiter_cap(POOL, WAITER_CAP);
+        let release = Arc::new(AtomicUsize::new(0));
+        for n in 0..(POOL as i32 + 4) {
+            let release = Arc::clone(&release);
+            b.submit(n, JobClass::Wait, move || {
+                // Peer-paced wait: parked until the test releases it.
+                while release.load(Ordering::SeqCst) == 0 {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Box::new(()) as Box<dyn Any + Send>
+            });
+        }
+        let started = Instant::now();
+        b.submit(100, JobClass::Work, || Box::new(42i64) as Box<dyn Any + Send>);
+        // The Work job must complete while every Wait job is still parked.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut work_done = false;
+        while Instant::now() < deadline && !work_done {
+            b.wait(Duration::from_millis(50));
+            work_done = b.drain_completions().iter().any(|c| c.task_id == 100);
+        }
+        let elapsed = started.elapsed();
+        release.store(1, Ordering::SeqCst);
+        assert!(
+            work_done,
+            "Work job starved behind parked Wait jobs ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Work job took {elapsed:?} behind parked Wait jobs"
+        );
+        drain_until(&b, POOL + 4, |c| c.len() == POOL + 4);
+        assert_eq!(b.inflight(), 0);
+    }
+
+    /// A panicking Wait job becomes a failed completion, like a pool job.
+    #[test]
+    fn panicking_wait_job_becomes_failed_completion() {
+        let b = Boundary::new(1);
+        b.submit(9, JobClass::Wait, || panic!("boom"));
+        let got = drain_until(&b, 1, |c| c.len() == 1);
+        assert_eq!(got[0].task_id, 9);
+        assert!(got[0].result.is_err());
+    }
+
+    /// At the waiter cap, Wait jobs degrade to the pool queue (still complete,
+    /// never fail) — the runaway backstop keeps correctness.
+    #[test]
+    fn wait_jobs_degrade_to_pool_at_cap() {
+        let b = Boundary::with_waiter_cap(2, 1);
+        for n in 0..4i32 {
+            b.submit(n, JobClass::Wait, move || {
+                thread::sleep(Duration::from_millis(10));
+                Box::new(n as i64) as Box<dyn Any + Send>
+            });
+        }
+        let got = drain_until(&b, 4, |c| c.len() == 4);
+        let mut ids: Vec<i32> = got.iter().map(|c| c.task_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(b.inflight(), 0);
+    }
+
+    /// Waiter threads decrement the live count on exit so the cap recovers.
+    #[test]
+    fn waiter_count_recovers_after_completion() {
+        let b = Boundary::with_waiter_cap(1, 2);
+        for round in 0..3 {
+            for n in 0..2i32 {
+                b.submit(round * 10 + n, JobClass::Wait, || {
+                    Box::new(()) as Box<dyn Any + Send>
+                });
+            }
+            drain_until(&b, 2, |c| c.len() == 2);
+            // Give exiting waiters a beat to decrement.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while b.live_waiters.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(b.live_waiters.load(Ordering::SeqCst), 0);
+        }
     }
 }

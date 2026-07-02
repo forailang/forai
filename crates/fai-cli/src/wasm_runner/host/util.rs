@@ -61,7 +61,7 @@ impl Drop for ExternGuard {
 fn submit_ffi_error(task_id: i32, msg: &str) {
     let msg = msg.to_string();
     super::boundary::with_boundary(|b| {
-        b.submit(task_id, move || {
+        b.submit(task_id, super::boundary::JobClass::Work, move || {
             Box::new(Err::<(fai_ffi::RawReturn, FfiType), String>(msg))
                 as Box<dyn std::any::Any + Send>
         });
@@ -408,7 +408,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     )
                 });
                 super::boundary::with_boundary(|b| {
-                    b.submit(task_id, move || {
+                    b.submit(task_id, super::boundary::JobClass::Work, move || {
                         // Worker thread: run only the raw C call. On a prepare
                         // failure (e.g. missing symbol) surface the error string;
                         // ffi_result turns it into null so the task still resumes.

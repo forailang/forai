@@ -885,6 +885,13 @@ pub(crate) fn stdlib_scheduling(module: &str, method: &str) -> Option<StdlibSche
             op_kind: crate::runtime::HOST_OP_PROCESS_RUN,
             arity: HostOpArity::Exact(5),
         }),
+        // `write` blocks until the child drains its stdin pipe — child-paced,
+        // so it must cross the boundary like `run` (plan 103 U2).
+        ("std.process", "write") => Some(AwaitHostOp {
+            await_kind: AwaitHostOpKind::BlockingIo,
+            op_kind: crate::runtime::HOST_OP_PROCESS_WRITE,
+            arity: HostOpArity::Exact(2),
+        }),
         ("std.file", "read") => Some(AwaitHostOp {
             await_kind: AwaitHostOpKind::BlockingIo,
             op_kind: crate::runtime::HOST_OP_FILE_READ,
@@ -942,7 +949,7 @@ pub(crate) fn stdlib_scheduling(module: &str, method: &str) -> Option<StdlibSche
         ("std.file", "exists")
         | ("std.env", "get")
         | ("std.net", "available")
-        | ("std.process", "available" | "start" | "write" | "read" | "stop")
+        | ("std.process", "available" | "start" | "read" | "stop")
         | ("std.net.tcp", "listen" | "write" | "close" | "address")
         | ("std.net.udp", "bind" | "send" | "broadcast")
         | ("std.crypto", "available" | "constantTimeEquals") => Some(DirectHostImport),
@@ -23264,6 +23271,8 @@ mod tests {
             "do\n",
             "  let _http = request.get('file:///tmp/fai-missing')\n",
             "  let _proc = process.run('printf ok', '.', '{}', 5000, 65536)\n",
+            "  let sess = process.start('cat', '.', '{}', 5000)\n",
+            "  let _sent = process.write(sess, 'hello')\n",
             "  let _read = file.read('/tmp/fai-missing')\n",
             "  let _write = file.write('/tmp/fai-out', 'x')\n",
             "  let _list = file.list('/tmp')\n",
@@ -23280,12 +23289,13 @@ mod tests {
         .expect("blocking stdlib program should compile through async host ops");
 
         assert!(
-            user_body_import_call_count(&wasm, "host_op_begin") >= 11,
+            user_body_import_call_count(&wasm, "host_op_begin") >= 12,
             "blocking stdlib calls should lower to host_op_begin"
         );
         for direct_import in [
             "http_request_get",
             "process_run",
+            "process_write",
             "file_read_str",
             "write_file",
             "file_list",

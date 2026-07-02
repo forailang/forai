@@ -35,13 +35,31 @@ pub(crate) enum HostOpResult {
     Error(String),
 }
 
-/// Submit generic host-operation work to the blocking boundary.
+/// Submit generic host-operation *work* (short, resource-bound: file I/O,
+/// instant error results) to the blocking boundary's bounded pool.
 pub(crate) fn submit_host_op<F>(task_id: i32, work: F)
 where
     F: FnOnce() -> HostOpResult + Send + 'static,
 {
+    submit_host_class(task_id, super::boundary::JobClass::Work, work)
+}
+
+/// Submit a generic host-operation *wait* (peer/child-paced, unbounded
+/// duration: socket waits, process runs, outbound HTTP). Runs on a dedicated
+/// waiter thread so it can never starve the bounded pool (plan 103 KTD2).
+pub(crate) fn submit_host_wait<F>(task_id: i32, work: F)
+where
+    F: FnOnce() -> HostOpResult + Send + 'static,
+{
+    submit_host_class(task_id, super::boundary::JobClass::Wait, work)
+}
+
+fn submit_host_class<F>(task_id: i32, class: super::boundary::JobClass, work: F)
+where
+    F: FnOnce() -> HostOpResult + Send + 'static,
+{
     super::boundary::with_boundary(|b| {
-        b.submit(task_id, move || {
+        b.submit(task_id, class, move || {
             Box::new(work()) as Box<dyn std::any::Any + Send>
         });
     });
