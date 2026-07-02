@@ -261,17 +261,20 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // dereferences object pointers as host pointers. Other
                 // param types (Int, Bool, Double, Pointer handles, Null,
                 // OutPtr) are word-sized or don't touch the heap, so
-                // pass through.
-                let data_snapshot = mem.data(&caller).to_vec();
-                let values: Vec<fai_core::value::Value> = raw_args
-                    .iter()
-                    .zip(
-                        info.param_types
-                            .iter()
-                            .chain(std::iter::repeat(&FfiType::Int)),
-                    )
-                    .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, &data_snapshot))
-                    .collect();
+                // pass through. Decode borrows guest memory in place —
+                // only the referenced string bytes are copied out.
+                let values: Vec<fai_core::value::Value> = {
+                    let data = mem.data(&caller);
+                    raw_args
+                        .iter()
+                        .zip(
+                            info.param_types
+                                .iter()
+                                .chain(std::iter::repeat(&FfiType::Int)),
+                        )
+                        .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, data))
+                        .collect()
+                };
 
                 // The extern's declared `param_types.len()` is the
                 // "fixed" arg count; anything past that is variadic.
@@ -389,13 +392,18 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     }
                 }
                 // Decode + marshal on the main thread: strings need guest memory,
-                // pointer handles need PTR_TRACKER.
-                let data_snapshot = mem.data(&caller).to_vec();
-                let values: Vec<fai_core::value::Value> = raw_args
-                    .iter()
-                    .zip(info.param_types.iter())
-                    .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, &data_snapshot))
-                    .collect();
+                // pointer handles need PTR_TRACKER. Decode borrows guest memory
+                // in place — only the referenced string bytes are copied out,
+                // and the resulting `Value`s own host-heap data, so nothing the
+                // worker thread sees points into wasm linear memory.
+                let values: Vec<fai_core::value::Value> = {
+                    let data = mem.data(&caller);
+                    raw_args
+                        .iter()
+                        .zip(info.param_types.iter())
+                        .map(|(&bits, ty)| decode_wasm_value_for_ffi(bits as u64, ty, data))
+                        .collect()
+                };
                 let prepared = PTR_TRACKER.with(|t| {
                     let mut tracker = t.borrow_mut();
                     fai_ffi::prepare_offload(
