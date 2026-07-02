@@ -241,6 +241,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mut accepted: u64 = 0;
                 let mut pending_connections: Vec<TcpStream> = Vec::new();
                 let mut pending = PendingRequests::default();
+                // Request reads submitted to the boundary but not yet handed
+                // back by take_server_reads (plan 103 U3).
+                let mut in_flight_reads: usize = 0;
                 let scheduler = super::guest_scheduler::GuestScheduler::new(&mut caller);
                 let _ = listener.set_nonblocking(true);
                 // Test-only: count guest-scheduler polls so a regression test can
@@ -248,6 +251,15 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 // awaits a long call. Reported on loop exit when the env var is set.
                 let count_polls = std::env::var("FAI_DEBUG_SERVER_POLLS").is_ok();
                 let mut poll_count: u64 = 0;
+                let trace_loop = std::env::var("FAI_TRACE_LOOP").is_ok();
+                let loop_t0 = std::time::Instant::now();
+                macro_rules! trace {
+                    ($($arg:tt)*) => {
+                        if trace_loop {
+                            eprintln!("[loop {:>8.1}ms] {}", loop_t0.elapsed().as_secs_f64()*1000.0, format!($($arg)*));
+                        }
+                    };
+                }
                 loop {
                     let accepting = max_requests.map_or(true, |m| accepted < m);
 
@@ -256,6 +268,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         loop {
                             match listener.accept() {
                                 Ok((stream, _)) => {
+                                    trace!("accepted connection");
                                     pending_connections.push(stream);
                                     accepted += 1;
                                 }
@@ -264,17 +277,17 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                             }
                         }
                     }
-                    process_ready_connections(
-                        &mut caller,
-                        id as u32,
-                        &scheduler,
-                        &mut pending_connections,
-                        &mut pending,
-                    );
+                    let ifr_before = in_flight_reads;
+                    process_ready_connections(&mut pending_connections, &mut in_flight_reads);
+                    if in_flight_reads != ifr_before { trace!("submitted read job (in_flight={})", in_flight_reads); }
 
                     // 2. Request cap reached and all in-flight work drained →
                     // exit the server loop so the program can terminate.
-                    if !accepting && pending_connections.is_empty() && pending.is_empty() {
+                    if !accepting
+                        && pending_connections.is_empty()
+                        && pending.is_empty()
+                        && in_flight_reads == 0
+                    {
                         if count_polls {
                             output::stderr_line(&format!("__server_polls={}", poll_count));
                         }
@@ -285,6 +298,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // rather than spinning, then loop back to the drain.
                     if pending_connections.is_empty()
                         && pending.is_empty()
+                        && in_flight_reads == 0
                         && scheduler.live_count(&mut caller) <= 1
                     {
                         let _ = listener.set_nonblocking(false);
@@ -303,6 +317,27 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // etc.), then write responses for tasks that completed.
                     for task_id in super::boundary::pump_ready() {
                         scheduler.resume_task(&mut caller, task_id);
+                    }
+                    // Requests whose off-thread read finished (routed out of
+                    // the completion queue by the pump_ready above): build the
+                    // guest request and dispatch (spawn or inline). Must drain
+                    // after pump_ready and before the park — a read left in
+                    // the thread-local queue would not re-signal the condvar,
+                    // stalling the request until the timer backstop.
+                    for read in super::boundary::take_server_reads() {
+                        in_flight_reads = in_flight_reads.saturating_sub(1);
+                        trace!("handling completed read");
+                        if let Ok(boxed) = read {
+                            if let Ok(done) = boxed.downcast::<ServerReadDone>() {
+                                handle_read_request(
+                                    &mut caller,
+                                    id as u32,
+                                    &scheduler,
+                                    *done,
+                                    &mut pending,
+                                );
+                            }
+                        }
                     }
                     let _ = scheduler.poll(&mut caller);
                     poll_count += 1;
@@ -349,15 +384,21 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     // connection (bounded by the backstop in next_poll_timeout).
                     // This is what stops a server with always-live background
                     // `nowait` loops from spinning ~40x/sec while otherwise idle.
-                    if !pending.is_empty() {
+                    if !pending.is_empty() || in_flight_reads > 0 {
+                        // An in-flight off-thread request read counts as
+                        // boundary work, so its completion wakes this park.
+                        trace!("park A (pending={} reads={})", pending.len(), in_flight_reads);
                         park_until_next_event();
+                        trace!("park A wake");
                     } else if !pending_connections.is_empty() {
                         // A connection is accepted but the client hasn't sent its
                         // request bytes yet — there is no timer/boundary event for
                         // "socket became readable", so poll it at a short cadence.
                         std::thread::sleep(Duration::from_millis(1));
                     } else if scheduler.live_count(&mut caller) > 1 {
+                        trace!("park B (live tasks)");
                         park_until_next_event();
+                        trace!("park B wake");
                     }
                 }
             },
@@ -428,19 +469,22 @@ const ST_FAILED: i32 = 4;
 /// at least one byte. Browsers may open speculative/preconnect sockets and keep
 /// them idle; blocking on those sockets would stall later real requests on this
 /// single runtime thread.
+/// Move every connection with request bytes available into an off-thread
+/// request read (plan 103 U3). The read job returns the full request as
+/// owned data via `boundary::take_server_reads`; `handle_read_request`
+/// finishes the dispatch on the main thread. `in_flight_reads` counts
+/// submitted-but-not-yet-handled reads so the loop's exit/idle conditions
+/// don't strand one.
 fn process_ready_connections(
-    caller: &mut Caller<'_, ()>,
-    router_id: u32,
-    scheduler: &super::guest_scheduler::GuestScheduler,
     pending_connections: &mut Vec<TcpStream>,
-    pending: &mut PendingRequests,
+    in_flight_reads: &mut usize,
 ) {
     let mut i = 0;
     while i < pending_connections.len() {
         match connection_readiness(&pending_connections[i]) {
             ConnectionReadiness::Ready => {
                 let stream = pending_connections.swap_remove(i);
-                accept_connection(caller, router_id, scheduler, stream, pending);
+                submit_request_read(stream, in_flight_reads);
             }
             ConnectionReadiness::Pending => {
                 i += 1;
@@ -450,6 +494,18 @@ fn process_ready_connections(
             }
         }
     }
+}
+
+/// Read the request off-thread. A slow client (drip-fed request line, stalled
+/// body) now costs a waiter thread up to the 5s read timeout instead of
+/// stalling every other connection on the scheduler thread.
+fn submit_request_read(stream: TcpStream, in_flight_reads: &mut usize) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    *in_flight_reads += 1;
+    super::boundary::submit_server_read(move || {
+        let request = read_request_owned(&stream);
+        ServerReadDone { stream, request }
+    });
 }
 
 fn connection_readiness(stream: &TcpStream) -> ConnectionReadiness {
@@ -466,37 +522,38 @@ fn connection_readiness(stream: &TcpStream) -> ConnectionReadiness {
     }
 }
 
-/// Accept one connection. OPTIONS preflight and static files are served inline.
-/// Otherwise the request is parsed; an async handler is spawned as a scheduler
-/// task (its response written later, when the task completes), while a sync
-/// handler or a 404 resolves inline exactly as before.
-fn accept_connection(
+/// Finish one request whose bytes arrived from an off-thread read (plan 103
+/// U3). OPTIONS preflight and static files are answered from the owned data;
+/// otherwise the request is materialized on the guest heap and dispatched —
+/// an async handler is spawned as a scheduler task (its response written
+/// later, when the task completes), while a sync handler or a 404 resolves
+/// inline exactly as before.
+fn handle_read_request(
     caller: &mut Caller<'_, ()>,
     router_id: u32,
     scheduler: &super::guest_scheduler::GuestScheduler,
-    stream: std::net::TcpStream,
+    done: ServerReadDone,
     pending: &mut PendingRequests,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    if is_options_request(&stream) {
-        drain_request(&stream);
+    let ServerReadDone { stream, request } = done;
+    let Some(req) = request else {
+        // Closed / timed out / malformed: nothing to answer.
+        return;
+    };
+    if req.method == "OPTIONS" {
         write_cors_preflight(stream);
         return;
     }
     // Static files first (binary-safe direct serving); else the WASM handler.
-    let method_buf = peek_request_method_path(&stream);
-    if let Some((method, path)) = &method_buf {
-        if method == "GET" {
-            if let Some(static_response) = try_serve_static_from_router(router_id, path) {
-                drain_request(&stream);
-                write_raw_response(stream, static_response);
-                return;
-            }
+    if req.method == "GET" {
+        if let Some(static_response) = try_serve_static_from_router(router_id, &req.path) {
+            write_raw_response(stream, static_response);
+            return;
         }
     }
     let request_val = {
         let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-        parse_http_request_into_guest(caller, &mem, &stream)
+        build_request_into_guest(caller, &mem, &req)
     };
     super::events::dispatch_event(caller, "http:beforeRequest", request_val);
 
@@ -769,57 +826,6 @@ pub(crate) fn drain_retained_values() -> Vec<i64> {
     })
 }
 
-/// Peek at the request line (method + path) without consuming the stream.
-/// Returns None if peeking fails.
-fn peek_request_method_path(stream: &TcpStream) -> Option<(String, String)> {
-    let mut buf = [0u8; 512];
-    let n = stream.peek(&mut buf).ok()?;
-    let line = std::str::from_utf8(&buf[..n]).ok()?;
-    let first_line = line.lines().next()?;
-    let mut parts = first_line.splitn(3, ' ');
-    let method = parts.next()?.to_string();
-    let raw_path = parts.next()?;
-    let (path, _) = raw_path.split_once('?').unwrap_or((raw_path, ""));
-    Some((method, path.to_string()))
-}
-
-/// Consume the request line, headers, and any declared body off the
-/// stream so the kernel's receive buffer is empty by the time the
-/// response writer closes the socket. Required for the static-file
-/// and CORS-preflight paths — they don't otherwise read the request,
-/// and on Linux `close()` on a socket with unread receive-buffer data
-/// sends a RST instead of a FIN. Behind Fly's edge proxy that RST
-/// arrives mid-stream and the client sees a truncated body with a
-/// Content-Length mismatch (Chrome: `ERR_HTTP2_PROTOCOL_ERROR`).
-/// Errors are ignored — we're only draining to clean up TCP, the
-/// response has already been resolved at the call site.
-fn drain_request(stream: &TcpStream) {
-    let mut reader = BufReader::new(stream);
-    let mut content_length: usize = 0;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(_) => return,
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-    if content_length > 0 {
-        let mut body = vec![0u8; content_length];
-        let _ = reader.read_exact(&mut body);
-    }
-}
-
 /// Look up static file for the given request path in the router's serveFiles dir.
 /// Returns the raw response bytes (headers + body) if a file is found.
 fn try_serve_static_from_router(router_id: u32, path: &str) -> Option<Vec<u8>> {
@@ -851,9 +857,9 @@ fn try_serve_static_from_router(router_id: u32, path: &str) -> Option<Vec<u8>> {
     Some(response)
 }
 
-/// Write a raw byte response directly to the TCP stream.
+/// Write a raw byte response to the TCP stream (off the scheduler thread).
 fn write_raw_response(stream: TcpStream, response: Vec<u8>) {
-    finish_response(stream, &response);
+    send_response(stream, response);
 }
 
 // Per-request reclamation (plan 115/116): release host-built guest graphs
@@ -1114,16 +1120,6 @@ fn build_http_error(caller: &mut Caller<'_, ()>, request_val: i64, message: &str
     )
 }
 
-/// Peek at the first 7 bytes of the stream to detect an OPTIONS
-/// preflight. Matches the VM's `is_options_request`.
-fn is_options_request(stream: &TcpStream) -> bool {
-    let mut buf = [0u8; 7];
-    match stream.peek(&mut buf) {
-        Ok(n) if n >= 7 => &buf[..7] == b"OPTIONS",
-        _ => false,
-    }
-}
-
 fn write_cors_preflight(stream: TcpStream) {
     let resp = "HTTP/1.1 204 No Content\r\n\
         Access-Control-Allow-Origin: *\r\n\
@@ -1132,24 +1128,42 @@ fn write_cors_preflight(stream: TcpStream) {
         Access-Control-Max-Age: 86400\r\n\
         Content-Length: 0\r\n\
         Connection: close\r\n\r\n";
-    finish_response(stream, resp.as_bytes());
+    send_response(stream, resp.as_bytes().to_vec());
 }
 
-/// Parse the incoming request into a `{method, path, body, headers, query}`
-/// Dict on the guest heap. Mirrors VM's `parse_http_request`.
-fn parse_http_request_into_guest(
-    caller: &mut Caller<'_, ()>,
-    mem: &Memory,
-    stream: &TcpStream,
-) -> i64 {
+/// A fully read request as owned data — produced on a boundary waiter thread
+/// (plan 103 U3), consumed on the main thread by `build_request_into_guest`.
+/// Reading off-thread means a slow client (drip-fed headers, a stalled body)
+/// costs a waiter, never the scheduler.
+pub(crate) struct OwnedRequest {
+    method: String,
+    path: String,
+    query_string: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+/// A finished server-side request read, handed back to the server loop via
+/// `boundary::take_server_reads`. `request` is None for a connection that
+/// closed, timed out, or sent a malformed request line.
+struct ServerReadDone {
+    stream: TcpStream,
+    request: Option<OwnedRequest>,
+}
+
+/// Read one full request (request line + headers + Content-Length body) into
+/// owned data. Pure socket I/O and parsing — no `Store`, no guest memory —
+/// so it can run on a waiter thread. Bounded by the stream's read timeout
+/// (set by the caller) per read call.
+fn read_request_owned(stream: &TcpStream) -> Option<OwnedRequest> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
-        return VAL_NULL;
+        return None;
     }
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     if parts.len() < 2 {
-        return VAL_NULL;
+        return None;
     }
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
@@ -1181,7 +1195,31 @@ fn parse_http_request_into_guest(
     if content_length > 0 {
         let _ = reader.read_exact(&mut body_bytes);
     }
-    let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    Some(OwnedRequest {
+        method,
+        path,
+        query_string,
+        headers,
+        body,
+    })
+}
+
+/// Build the `{method, path, body, headers, query}` Dict on the guest heap
+/// from an owned request. Main thread only (touches guest memory). Mirrors
+/// VM's `parse_http_request`.
+fn build_request_into_guest(
+    caller: &mut Caller<'_, ()>,
+    mem: &Memory,
+    req: &OwnedRequest,
+) -> i64 {
+    let OwnedRequest {
+        method,
+        path,
+        query_string,
+        headers,
+        body: body_str,
+    } = req;
 
     // Build sub-dicts for headers + query on the guest heap.
     let header_entries: Vec<(i64, i64)> = headers
@@ -1241,9 +1279,10 @@ fn write_http_response(caller: &mut Caller<'_, ()>, stream: TcpStream, response_
     let val = response_val as u64;
     // Must be an object pointer.
     if (val & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
-        finish_response(
+        send_response(
             stream,
-            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
         );
         return;
     }
@@ -1282,7 +1321,15 @@ fn write_http_response(caller: &mut Caller<'_, ()>, stream: TcpStream, response_
     }
     response.push_str("\r\n");
     response.push_str(&body);
-    finish_response(stream, response.as_bytes());
+    send_response(stream, response.into_bytes());
+}
+
+/// Write `response` to the client from a boundary waiter thread (plan 103
+/// U3): the bytes are fully owned by now, so a slow-to-read client costs a
+/// waiter, never the scheduler. `finish_response` keeps the graceful-FIN
+/// shutdown semantics.
+fn send_response(stream: TcpStream, response: Vec<u8>) {
+    super::boundary::submit_detached(move || finish_response(stream, &response));
 }
 
 fn status_text(status: i32) -> &'static str {
@@ -1811,13 +1858,13 @@ mod tests {
     }
 
     #[test]
-    fn drain_request_consumes_headers_so_close_sends_fin_not_rst() {
+    fn read_request_consumes_headers_so_close_sends_fin_not_rst() {
         // The root truncation bug: static-file responses never read
         // the request bytes, so on Linux close(2) saw unread data in
         // the recv buffer and sent RST instead of FIN. Fly's edge
         // proxy treats RST as "abort the stream" and stops forwarding
-        // bytes to the client mid-body. Drain the request first and
-        // close becomes graceful.
+        // bytes to the client mid-body. `read_request_owned` consumes
+        // the full request (plan 103 U3), so close stays graceful.
         let (server, mut client) = loopback_pair();
 
         // Simulate Fly's proxy: send a normal HTTP request then read
@@ -1832,7 +1879,9 @@ mod tests {
             )
             .expect("write request");
 
-        drain_request(&server);
+        let req = read_request_owned(&server).expect("parse request");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/fai-runtime.js");
         // Imitate the static-file path: write a large body then
         // shutdown(Write).
         let payload = vec![b'A'; 64 * 1024];
@@ -1844,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_request_handles_post_body() {
+    fn read_request_consumes_post_body() {
         let (server, mut client) = loopback_pair();
         client
             .write_all(
@@ -1854,7 +1903,9 @@ mod tests {
                   hello world",
             )
             .expect("write request");
-        drain_request(&server);
+        let req = read_request_owned(&server).expect("parse request");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.body, "hello world");
         finish_response(server, b"ok");
         let mut buf = Vec::new();
         client.read_to_end(&mut buf).expect("read_to_end");

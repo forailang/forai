@@ -56,6 +56,21 @@ pub(crate) enum JobClass {
 /// behavior) rather than failing.
 const WAITER_CAP: usize = 512;
 
+// ── Host-internal completion ids (plan 103 U3) ────────────────────────────
+//
+// Completions whose task_id is negative are NOT guest tasks: `pump_ready`
+// routes them by id instead of queuing them for `__fai_resume_task`. This is
+// the same queue/condvar the driver already parks on, so host-internal work
+// (a detached response write, an HTTP request read) wakes the driver exactly
+// like a task completion — no second wake primitive.
+
+/// Fire-and-forget job: the result is discarded on drain. Used for work with
+/// no consumer, e.g. writing an HTTP response to a (possibly slow) client.
+pub(crate) const DETACHED_JOB_ID: i32 = -1;
+/// An HTTP server request read: the completion payload is routed to the
+/// server loop via `take_server_reads`, never to the guest scheduler.
+pub(crate) const SERVER_READ_JOB_ID: i32 = -2;
+
 /// A unit of blocking work plus the guest task it belongs to.
 type Job = (i32, Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>);
 
@@ -318,12 +333,18 @@ thread_local! {
     /// keyed by the task that parked on the job. Populated by `pump_ready`,
     /// drained by `take_ready` (e.g. `remote_result`).
     static READY: RefCell<HashMap<i32, JobResult>> = RefCell::new(HashMap::new());
+    /// Completed HTTP-server request reads (SERVER_READ_JOB_ID), awaiting the
+    /// server loop's `take_server_reads`.
+    static SERVER_READS: RefCell<Vec<JobResult>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Drain every finished job from the worker pool into the per-task ready map and
 /// return the task ids now ready to resume. The driver loop calls this each
-/// iteration, then `__fai_resume_task`s each returned id. Cheap no-op (empty
-/// vec) when no boundary exists or nothing finished.
+/// iteration, then `__fai_resume_task`s each returned id. Host-internal
+/// completions (negative ids) are routed to their own queues and never
+/// returned — resuming a guest task with a sentinel id would corrupt the
+/// scheduler. Cheap no-op (empty vec) when no boundary exists or nothing
+/// finished.
 pub(crate) fn pump_ready() -> Vec<i32> {
     let Some(completions) = try_with_boundary(|b| b.drain_completions()) else {
         return Vec::new();
@@ -335,11 +356,55 @@ pub(crate) fn pump_ready() -> Vec<i32> {
     READY.with(|r| {
         let mut map = r.borrow_mut();
         for c in completions {
-            ids.push(c.task_id);
-            map.insert(c.task_id, c.result);
+            match c.task_id {
+                SERVER_READ_JOB_ID => {
+                    SERVER_READS.with(|q| q.borrow_mut().push(c.result));
+                }
+                DETACHED_JOB_ID => {} // fire-and-forget: result discarded
+                id if id < 0 => {
+                    debug_assert!(false, "unknown host-internal completion id {id}");
+                }
+                id => {
+                    ids.push(id);
+                    map.insert(id, c.result);
+                }
+            }
         }
     });
     ids
+}
+
+/// Submit fire-and-forget blocking work (no guest task to resume). Runs on a
+/// waiter thread; the completion only serves to wake the parked driver.
+pub(crate) fn submit_detached<F>(work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    with_boundary(|b| {
+        b.submit(DETACHED_JOB_ID, JobClass::Wait, move || {
+            work();
+            Box::new(()) as Box<dyn Any + Send>
+        });
+    });
+}
+
+/// Submit an HTTP-server request read. The owned payload the job returns is
+/// handed back to the server loop through `take_server_reads`.
+pub(crate) fn submit_server_read<F, R>(work: F)
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    with_boundary(|b| {
+        b.submit(SERVER_READ_JOB_ID, JobClass::Wait, move || {
+            Box::new(work()) as Box<dyn Any + Send>
+        });
+    });
+}
+
+/// Drain completed server request reads (populated by `pump_ready`).
+pub(crate) fn take_server_reads() -> Vec<JobResult> {
+    SERVER_READS.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
 /// True if any job is still running or waiting to be drained — lets a driver
@@ -369,6 +434,9 @@ pub(crate) fn shutdown_boundary() {
     });
     READY.with(|map| {
         map.borrow_mut().clear();
+    });
+    SERVER_READS.with(|q| {
+        q.borrow_mut().clear();
     });
 }
 
