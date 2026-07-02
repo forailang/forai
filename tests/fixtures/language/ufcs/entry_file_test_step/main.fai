@@ -1,7 +1,6 @@
 # expect: ok
 # stdout: 3
 # skip: ISSUES.md "test-mode codegen: UFCS call in an entry file fails the test step" — UnknownIdentifier at the test-step compile while check and run-step pass
-
 def main
     @return Void
 do
