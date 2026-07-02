@@ -43,7 +43,7 @@ fn project_main(port: u16) -> String {
         "use std.http.server\n\
          use std.events\n\
          use std.string\n\
-         use {{ open, query }} from Forsqlite\n\
+         use {{ open, exec, exec_params, query, query_params }} from Forsqlite\n\
          \n\
          var beforeValue = ''\n\
          \n\
@@ -51,6 +51,7 @@ fn project_main(port: u16) -> String {
          \x20   @return Void\n\
          do\n\
          \x20 let shared = open(':memory:')\n\
+         \x20 exec(shared, 'CREATE TABLE hits (label TEXT)')\n\
          \x20 let eventDb = open(':memory:')\n\
          \x20 let router = server.router()\n\
          \x20 let _before = events.on('http:beforeRequest') do with e Event\n\
@@ -70,6 +71,11 @@ fn project_main(port: u16) -> String {
          \x20 end\n\
          \x20 server.get(router, '/shared') do with req HttpRequest\n\
          \x20   let rows = query(shared, '{q}')\n\
+         \x20   server.text(200, toString(getInt(rows[0], 'n')!))\n\
+         \x20 end\n\
+         \x20 server.get(router, '/write') do with req HttpRequest\n\
+         \x20   exec_params(shared, 'INSERT INTO hits (label) VALUES (?)', ['hit'])\n\
+         \x20   let rows = query_params(shared, 'SELECT COUNT(*) AS n FROM hits WHERE label = ?', ['hit'])\n\
          \x20   server.text(200, toString(getInt(rows[0], 'n')!))\n\
          \x20 end\n\
          \x20 server.listen(router, {port})\n\
@@ -222,6 +228,31 @@ fn concurrent_queries_on_shared_connection_stay_correct() {
             "shared-connection query wrong/corrupted:\n{resp}"
         );
     }
+}
+
+#[test]
+fn concurrent_parameterized_writes_on_shared_connection_stay_correct() {
+    let Some(forsqlite) = forsqlite_dir() else {
+        eprintln!("skipping: forsqlite checkout not found");
+        return;
+    };
+    let server = boot_server(&forsqlite);
+    let p = server.port;
+    let handles: Vec<_> = (0..8)
+        .map(|_| thread::spawn(move || get_path(p, "/write")))
+        .collect();
+    for h in handles {
+        let resp = h.join().unwrap();
+        assert!(
+            resp.contains("200"),
+            "shared-connection write failed:\n{resp}"
+        );
+    }
+    let final_resp = get_path(p, "/write");
+    assert!(
+        final_resp.contains("\r\n\r\n9"),
+        "expected all writes to persist; got:\n{final_resp}"
+    );
 }
 
 #[test]

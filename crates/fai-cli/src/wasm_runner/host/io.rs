@@ -1,12 +1,122 @@
 //! I/O host imports: `print`, `read_file`, `write_file`, `set_html`,
 //! `set_html_at`, `file_exists`, `log_*`, `path_*`, `html_escape`.
 
+use std::cell::Cell;
+use std::fs::File;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
 use super::super::nan_box::VAL_NULL;
 use super::super::output;
 use super::host_ops::{read_string_arg, submit_host_op, HostOpResult};
+
+thread_local! {
+    static DEBUG_FUNCTION_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+static DEBUG_FUNCTION_CALL_WRITER: OnceLock<Mutex<DebugFunctionCallWriter>> = OnceLock::new();
+
+struct DebugFunctionCallWriter {
+    path: Option<String>,
+    file: Option<File>,
+}
+
+impl DebugFunctionCallWriter {
+    fn new() -> Self {
+        Self {
+            path: None,
+            file: None,
+        }
+    }
+
+    fn write_line(&mut self, line: &str) {
+        let path = std::env::var("FAI_DEBUG_FUNCTION_CALLS_FILE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        match path {
+            Some(path) => {
+                if self.path.as_deref() != Some(path.as_str()) || self.file.is_none() {
+                    self.file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .ok();
+                    self.path = Some(path);
+                }
+                if let Some(file) = self.file.as_mut() {
+                    let _ = writeln!(file, "{}", line);
+                    return;
+                }
+                eprintln!("{}", line);
+            }
+            None => {
+                self.path = None;
+                self.file = None;
+                eprintln!("{}", line);
+            }
+        }
+    }
+}
+
+fn debug_function_calls_env_enabled() -> bool {
+    let Some(value) = std::env::var_os("FAI_DEBUG_FUNCTION_CALLS") else {
+        return false;
+    };
+    let value = value.to_string_lossy();
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty() && normalized != "0" && normalized != "false"
+}
+
+fn debug_function_call_timestamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() % 86_400_000)
+        .unwrap_or(0);
+    let hours = millis / 3_600_000;
+    let minutes = (millis / 60_000) % 60;
+    let seconds = (millis / 1_000) % 60;
+    let millis = millis % 1_000;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+}
+
+fn write_debug_function_call_line(line: &str) {
+    let writer =
+        DEBUG_FUNCTION_CALL_WRITER.get_or_init(|| Mutex::new(DebugFunctionCallWriter::new()));
+    if let Ok(mut writer) = writer.lock() {
+        writer.write_line(line);
+    } else {
+        eprintln!("{}", line);
+    }
+}
+
+fn log_debug_function_call(name: &str, event: i32) {
+    if !debug_function_calls_env_enabled() {
+        return;
+    }
+    DEBUG_FUNCTION_CALL_DEPTH.with(|depth| {
+        let current = depth.get();
+        let (label, line_depth) = if event == 0 {
+            depth.set(current.saturating_add(1));
+            ("START", current)
+        } else {
+            let next = current.saturating_sub(1);
+            depth.set(next);
+            ("END", next)
+        };
+        let indent = "  ".repeat(line_depth);
+        let line = format!(
+            "{} {}{} {}()",
+            debug_function_call_timestamp(),
+            indent,
+            label,
+            name
+        );
+        write_debug_function_call_line(&line);
+    });
+}
 
 pub(super) fn begin_file_host_op(
     caller: &mut Caller<'_, ()>,
@@ -68,6 +178,27 @@ pub(super) fn begin_file_host_op(
 }
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
+    linker
+        .func_wrap(
+            "env",
+            "__fai_debug_function_call",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32, event: i32| {
+                if !debug_function_calls_env_enabled() {
+                    return;
+                }
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = mem.data(&caller);
+                let start = ptr.max(0) as usize;
+                let end = start.saturating_add(len.max(0) as usize);
+                if end > data.len() {
+                    return;
+                }
+                let name = std::str::from_utf8(&data[start..end]).unwrap_or("<invalid utf8>");
+                log_debug_function_call(name, event);
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.print(ptr, len) — write string to stdout
     linker
         .func_wrap(

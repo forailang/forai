@@ -313,8 +313,14 @@ mod tests {
         set_deadline(3, 9000);
         let t = next_timer_timeout().expect("a timer is pending");
         // Nearest is task 2 (~200ms); allow a little scheduling slack.
-        assert!(t <= Duration::from_millis(200), "expected <=200ms, got {t:?}");
-        assert!(t >= Duration::from_millis(100), "expected >=100ms, got {t:?}");
+        assert!(
+            t <= Duration::from_millis(200),
+            "expected <=200ms, got {t:?}"
+        );
+        assert!(
+            t >= Duration::from_millis(100),
+            "expected >=100ms, got {t:?}"
+        );
         clear_timer_requests();
     }
 

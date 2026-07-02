@@ -553,7 +553,11 @@ pub const IMPORT_HOST_OP_BEGIN: u32 = 117;
 pub const IMPORT_HOST_OP_RESULT: u32 = 118;
 /// `env.crypto_rs256_sign_base64_url(key_ptr, key_len, msg_ptr, msg_len) -> i64`.
 pub const IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: u32 = 119;
-pub const IMPORT_COUNT: u32 = 120;
+/// `env.__fai_debug_function_call(name_ptr, name_len, event) -> void`.
+/// Event 0 is START; event 1 is END. Declared only when
+/// FAI_DEBUG_FUNCTION_CALLS is enabled.
+pub const IMPORT_DEBUG_FUNCTION_CALL: u32 = 120;
+pub const IMPORT_COUNT: u32 = 121;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -712,6 +716,42 @@ impl Drop for OwnershipCheckGuard {
     }
 }
 
+// ── Function-call debug tracing ────────────────────────────────────────
+//
+// When enabled, user function bodies emit a tiny START/END host call with
+// the compiled function name. Default builds declare no import and emit no
+// calls so ordinary hosts keep their current import surface.
+thread_local! {
+    static DEBUG_FUNCTION_CALLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable function-call debug tracing for this thread.
+pub fn set_debug_function_calls(on: bool) {
+    DEBUG_FUNCTION_CALLS.with(|c| c.set(on));
+}
+
+/// Whether this build should declare and emit function-call debug events.
+pub fn debug_function_calls_enabled() -> bool {
+    DEBUG_FUNCTION_CALLS.with(|c| c.get()) || std::env::var_os("FAI_DEBUG_FUNCTION_CALLS").is_some()
+}
+
+/// RAII guard enabling function-call debug tracing for the current thread.
+pub struct DebugFunctionCallsGuard;
+
+impl DebugFunctionCallsGuard {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        set_debug_function_calls(true);
+        DebugFunctionCallsGuard
+    }
+}
+
+impl Drop for DebugFunctionCallsGuard {
+    fn drop(&mut self) {
+        set_debug_function_calls(false);
+    }
+}
+
 // --- Checked mode (plan 116) -------------------------------------------
 //
 // `--checked` bundles the cheap, always-safe corruption guards that have
@@ -774,6 +814,9 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     // gate. Default/native/browser builds keep their old import surface.
     if !ownership_check_enabled() {
         avail[IMPORT_OWNERSHIP_EVENT as usize] = false;
+    }
+    if !debug_function_calls_enabled() {
+        avail[IMPORT_DEBUG_FUNCTION_CALL as usize] = false;
     }
     match target {
         Some("wasm-html") | Some("wasm") => {
@@ -9133,6 +9176,12 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             "crypto_rs256_sign_base64_url",
             vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             vec![ValType::I64],
+        ),
+        // IMPORT_DEBUG_FUNCTION_CALL: (name_ptr, name_len, event) -> void.
+        (
+            "__fai_debug_function_call",
+            vec![ValType::I32, ValType::I32, ValType::I32],
+            vec![],
         ),
     ]
 }

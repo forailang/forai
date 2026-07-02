@@ -18,6 +18,11 @@ pub struct FunctionInfo {
     /// Number of hidden generic `@type` parameters prepended before
     /// source-level parameters in the wasm signature.
     pub type_param_count: u16,
+    /// Source-level parameter names, excluding hidden generic `@type`
+    /// parameters. Direct codegen uses these to recover declaration-order
+    /// argument mapping for labelled calls if checker side-table metadata is
+    /// unavailable for a call site.
+    pub param_names: Vec<String>,
     /// CLI coverage-tracking flag. Set by the compiler when the
     /// function should count toward the "every public function needs a
     /// test" rule enforced by the CLI test runner.

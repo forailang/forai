@@ -354,8 +354,7 @@ fn loaded_library_exposes_dependency_symbols_globally() {
     crate::get_library("sqlite3").expect("libsqlite3 should be loadable");
 
     // dlopen(NULL) yields a handle over the process-global symbol scope.
-    let global =
-        unsafe { Library::open(None::<&str>, RTLD_NOW) }.expect("global symbol handle");
+    let global = unsafe { Library::open(None::<&str>, RTLD_NOW) }.expect("global symbol handle");
     let sqrtf: Result<libloading::os::unix::Symbol<*const std::os::raw::c_void>, _> =
         unsafe { global.get(b"sqrtf\0") };
     assert!(

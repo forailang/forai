@@ -37,6 +37,9 @@ pub use runtime::{
 // Check-leaks codegen gate (plan 116 phase 5): the CLI flips this
 // before compiling a `--check-leaks` run; tests use the guard.
 pub use runtime::{check_leaks_enabled, set_check_leaks, CheckLeaksGuard};
+pub use runtime::{
+    debug_function_calls_enabled, set_debug_function_calls, DebugFunctionCallsGuard,
+};
 pub use runtime::{ownership_check_enabled, set_ownership_check, OwnershipCheckGuard};
 // Checked-mode codegen gate (plan 116): `fai test --checked` flips this
 // before compiling to enable the cheap alloc-guard + index-store guards.

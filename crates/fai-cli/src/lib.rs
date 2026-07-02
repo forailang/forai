@@ -160,6 +160,10 @@ fn print_usage() {
     eprintln!("                      itemized live set at exit/trap, grouped by alloc site.");
     eprintln!("  FAI_OWNERSHIP_CHECK Helper ownership event stream (same as");
     eprintln!("                      'run/test --check-ownership').");
+    eprintln!("  FAI_DEBUG_FUNCTION_CALLS");
+    eprintln!("                      Trace FAI function START/END calls with timestamps.");
+    eprintln!("  FAI_DEBUG_FUNCTION_CALLS_FILE=<path>");
+    eprintln!("                      Append function-call trace lines to a file.");
     eprintln!("  FAI_TRACE_TESTS     Print each test case's name on stderr before it runs,");
     eprintln!("                      so a trap/hang is attributable to the exact case.");
     eprintln!("  FAI_ABI_CHECK       Compile-time only: log '[abi-check] DIVERGENCE' when");
@@ -1822,6 +1826,9 @@ fn step_build(args: &[String], project: Option<&str>, reporter: &Reporter) {
     if std::env::var_os("FAI_OWNERSHIP_CHECK").is_some() {
         fai_codegen_wasm::set_ownership_check(true);
         fai_codegen_wasm::set_check_leaks(true);
+    }
+    if std::env::var_os("FAI_DEBUG_FUNCTION_CALLS").is_some() {
+        fai_codegen_wasm::set_debug_function_calls(true);
     }
 
     // Find which sub-project's `main` matches this entry path so we
@@ -3732,7 +3739,8 @@ const env = {{
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
   __fai_free_event(){{}},
-  __fai_ownership_event(){{}}
+  __fai_ownership_event(){{}},
+  __fai_debug_function_call(){{}}
 }};
 let instance;
 let asyncRootDone = false;
@@ -3892,7 +3900,8 @@ const env={{
   __fai_trap_report(code,a,b){{console.error('FAI trap report',{{code,a,b}})}},
   __fai_alloc_event(){{}},
   __fai_free_event(){{}},
-  __fai_ownership_event(){{}}
+  __fai_ownership_event(){{}},
+  __fai_debug_function_call(){{}}
 }};
 fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})).then(r=>{{
   instance=r.instance;window.__fai_live_objects=function(){{return instance&&instance.exports.__live_objects?instance.exports.__live_objects.value:null}};debugLog('FAI wasm instantiated', Object.keys(instance.exports));startFai();
@@ -4257,6 +4266,7 @@ var env={{
   __fai_alloc_event:function(addr,size){{faiLeakAlloc(addr>>>0,size>>>0,false);faiOwnershipAlloc(addr>>>0)}},
   __fai_free_event:function(addr,size){{faiLeakFree(addr>>>0,size>>>0);faiOwnershipFree(addr>>>0)}},
   __fai_ownership_event:function(op,site,value,aux){{faiOwnershipEvent(op|0,site|0,BigInt.asIntN(64,BigInt(value)),aux|0)}},
+  __fai_debug_function_call:function(){{}},
   __fai_set_trap_msg:function(p,l){{var m=readStr(p,l);window.__FAI_TRAP_MSG=m;console.error('FAI trap:',m)}},
   __fai_trap_report:function(code,a,b){{
     // Plan 116: structured trap reason, mirrored from the native host

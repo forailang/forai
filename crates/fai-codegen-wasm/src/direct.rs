@@ -1319,6 +1319,13 @@ fn param_defaults_for(
     defaults
 }
 
+/// Source-level parameter names for direct call lowering. Hidden generic
+/// `@type` parameters are deliberately excluded; they are injected separately
+/// before source arguments.
+fn param_names_for(fd: &fai_compiler::ast::FunctionDeclaration) -> Vec<String> {
+    fd.params.iter().map(|p| p.name.clone()).collect()
+}
+
 /// Pre-pass: identify `var` bindings in this function's body that
 /// are referenced inside a nested closure (do...end block). Such vars
 /// must share one heap cell between the outer scope and every
@@ -2661,6 +2668,7 @@ pub fn build_program_full(
             source_line: fd.location.line,
             param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
             type_param_count: fd.type_params.len() as u16,
+            param_names: param_names_for(fd),
             include_in_coverage: fd.name != "main",
             param_defaults: param_defaults_for(fd),
         })
@@ -2777,6 +2785,7 @@ pub fn build_program_full(
                     name: wrapper.name.clone(),
                     param_count: 0,
                     type_param_count: 0,
+                    param_names: Vec::new(),
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
                     source_line: wrapper.location.line,
@@ -2846,6 +2855,7 @@ pub fn build_program_full(
                     name: wrapper.name.clone(),
                     param_count: 0,
                     type_param_count: 0,
+                    param_names: Vec::new(),
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
                     source_line: wrapper.location.line,
@@ -2906,6 +2916,7 @@ pub fn build_program_full(
                     name: wrapper.name.clone(),
                     param_count: 0,
                     type_param_count: 0,
+                    param_names: Vec::new(),
                     include_in_coverage: false,
                     param_defaults: Vec::new(),
                     source_line: wrapper.location.line,
@@ -4010,6 +4021,12 @@ struct AsyncResolve<'a> {
     module_key: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct AsyncCallArg<'a> {
+    label: Option<&'a str>,
+    value: &'a Expression,
+}
+
 impl<'a> AsyncResolve<'a> {
     /// Whether this call site was rewritten via UFCS by the checker.
     fn is_ufcs_call(&self, call: &CallExpression) -> bool {
@@ -4075,6 +4092,23 @@ impl<'a> AsyncResolve<'a> {
     }
 }
 
+fn async_call_args<'a>(call: &'a CallExpression, fns: &AsyncResolve<'_>) -> Vec<AsyncCallArg<'a>> {
+    let mut args: Vec<AsyncCallArg<'a>> = Vec::with_capacity(call.args.len() + 1);
+    if fns.is_ufcs_call(call) {
+        if let Expression::MemberExpression(me) = &*call.callee {
+            args.push(AsyncCallArg {
+                label: None,
+                value: &me.object,
+            });
+        }
+    }
+    args.extend(call.args.iter().map(|a| AsyncCallArg {
+        label: a.label.as_deref(),
+        value: &a.value,
+    }));
+    args
+}
+
 /// If `expr` is a call to an *async* user function, return its canonical name
 /// and arg expressions. Sync user calls and builtins return `None` (they flow
 /// through `compile_call` as plain direct calls).
@@ -4083,7 +4117,7 @@ fn user_callee<'a>(
     fns: &AsyncResolve<'_>,
 ) -> Option<(
     String,
-    Vec<&'a Expression>,
+    Vec<AsyncCallArg<'a>>,
     &'a fai_compiler::ast::SourceLocation,
 )> {
     let Expression::CallExpression(call) = expr else {
@@ -4093,15 +4127,7 @@ fn user_callee<'a>(
     if !fns.is_async(&resolved) {
         return None;
     }
-    // UFCS prepends the receiver: `recv.method(a)` → `method(recv, a)`.
-    let mut args: Vec<&'a Expression> = Vec::with_capacity(call.args.len() + 1);
-    if fns.is_ufcs_call(call) {
-        if let Expression::MemberExpression(me) = &*call.callee {
-            args.push(&me.object);
-        }
-    }
-    args.extend(call.args.iter().map(|a| &a.value));
-    Some((resolved, args, &call.location))
+    Some((resolved, async_call_args(call, fns), &call.location))
 }
 
 /// Async-closure compilation context, threaded into `BuildContext` so a
@@ -4422,7 +4448,7 @@ fn from_dict_binding<'a>(stmt: &'a Statement) -> Option<(&'a str, &'a str, &'a E
 /// not a user function.
 type AllChild<'a> = (
     String,
-    Vec<&'a Expression>,
+    Vec<AsyncCallArg<'a>>,
     &'a fai_compiler::ast::SourceLocation,
 );
 
@@ -4440,7 +4466,7 @@ fn all_call<'a>(expr: &'a Expression, fns: &AsyncResolve<'_>) -> Option<Vec<AllC
     for a in &call.args {
         let (callee, args, loc) = user_callee(&a.value, fns)?;
         // No nested user calls in a child's own args (v1).
-        if args.iter().any(|x| expr_has_user_call(x, fns)) {
+        if args.iter().any(|x| expr_has_user_call(x.value, fns)) {
             return None;
         }
         children.push((callee, args, loc));
@@ -4554,7 +4580,7 @@ enum Term<'a> {
     /// `await callee(args)` then resume at `next` (which binds the result).
     Await {
         callee: String,
-        args: Vec<&'a Expression>,
+        args: Vec<AsyncCallArg<'a>>,
         /// Call-site location for generic type-arg lookup.
         loc: &'a fai_compiler::ast::SourceLocation,
         next: usize,
@@ -4967,6 +4993,10 @@ impl<'a> CfgBuilder<'a> {
         !args.iter().any(|a| expr_has_user_call(a, self.fns))
     }
 
+    fn async_args_ok(&self, args: &[AsyncCallArg<'a>]) -> bool {
+        !args.iter().any(|a| expr_has_user_call(a.value, self.fns))
+    }
+
     /// Lower `stmts` starting at `entry`. `is_tail` marks that the last
     /// statement's value is the function's result. Returns where control
     /// continues, or `Diverged` if the sequence always completes/returns.
@@ -5037,7 +5067,7 @@ impl<'a> CfgBuilder<'a> {
             let Some((_, args, _)) = user_callee(&nw.expression, self.fns) else {
                 return Err(());
             };
-            if !self.args_ok(&args) {
+            if !self.async_args_ok(&args) {
                 return Err(());
             }
             self.push_inline_stmt(cur, stmt)?;
@@ -5130,7 +5160,7 @@ impl<'a> CfgBuilder<'a> {
                 return Ok(Flow::Continue(next));
             }
             if let Some((callee, args, loc)) = user_callee(value, self.fns) {
-                if !self.args_ok(&args) {
+                if !self.async_args_ok(&args) {
                     return Err(());
                 }
                 let on_error = self.handler();
@@ -5269,7 +5299,7 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
             if let Some((callee, args, loc)) = user_callee(&es.expression, self.fns) {
-                if !self.args_ok(&args) {
+                if !self.async_args_ok(&args) {
                     return Err(());
                 }
                 let on_error = self.handler();
@@ -5378,7 +5408,7 @@ impl<'a> CfgBuilder<'a> {
                         };
                         self.blocks[next].term = Term::CompleteHostOp { on_error };
                     } else if let Some((callee, args, loc)) = user_callee(v, self.fns) {
-                        if !self.args_ok(&args) {
+                        if !self.async_args_ok(&args) {
                             return Err(());
                         }
                         let next = self.new_block();
@@ -5825,7 +5855,7 @@ fn compile_async_segment_stmt(
 fn emit_spawn_child(
     b: &mut Builder,
     callee: &str,
-    args: &[&Expression],
+    args: &[AsyncCallArg<'_>],
     loc: &fai_compiler::ast::SourceLocation,
     frame_sizes: &std::collections::HashMap<String, i32>,
     fn_table_idx: &std::collections::HashMap<String, u32>,
@@ -5884,15 +5914,70 @@ fn emit_spawn_child(
     // null` leaves a zero-initialized frame slot and a downstream `loader !=
     // null` guard wrongly succeeds (forking `doLoad` with a null loader →
     // `call_indirect` on garbage). Mirrors `compile_call`'s default fill.
-    let (real_param_count, defaults) = match b.function_by_name.get(callee).copied() {
+    let (real_param_count, defaults, param_names) = match b.function_by_name.get(callee).copied() {
         Some(p) => {
             let fi = &b.functions()[p as usize];
             (
                 (fi.param_count as usize).saturating_sub(tpc),
                 fi.param_defaults.clone(),
+                fi.param_names.clone(),
             )
         }
-        None => (args.len(), Vec::new()),
+        None => (
+            args.len(),
+            Vec::new(),
+            args.iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", i))
+                .collect(),
+        ),
+    };
+    let labelled_order = if args.iter().any(|a| a.label.is_some()) {
+        if param_names.len() != real_param_count {
+            return Err(BuildError::UnsupportedExpression(
+                "async-spawn-label-param-shape-mismatch",
+            ));
+        }
+        let mut order: Vec<Option<usize>> = vec![None; real_param_count];
+        let mut positional_idx = 0usize;
+        let mut seen_named = false;
+        for (arg_idx, arg) in args.iter().enumerate() {
+            if let Some(label) = arg.label {
+                seen_named = true;
+                let Some(param_idx) = param_names.iter().position(|p| p == label) else {
+                    return Err(BuildError::UnsupportedExpression(
+                        "async-spawn-unknown-labelled-arg",
+                    ));
+                };
+                if order[param_idx].is_some() {
+                    return Err(BuildError::UnsupportedExpression(
+                        "async-spawn-duplicate-labelled-arg",
+                    ));
+                }
+                order[param_idx] = Some(arg_idx);
+            } else {
+                if seen_named {
+                    return Err(BuildError::UnsupportedExpression(
+                        "async-spawn-positional-after-labelled",
+                    ));
+                }
+                if positional_idx >= real_param_count {
+                    return Err(BuildError::UnsupportedExpression(
+                        "async-spawn-positional-out-of-range",
+                    ));
+                }
+                if order[positional_idx].is_some() {
+                    return Err(BuildError::UnsupportedExpression(
+                        "async-spawn-duplicate-positional-arg",
+                    ));
+                }
+                order[positional_idx] = Some(arg_idx);
+                positional_idx += 1;
+            }
+        }
+        Some(order)
+    } else {
+        None
     };
     for i in 0..real_param_count {
         b.emit(Instruction::LocalGet(childframe_l));
@@ -5902,9 +5987,21 @@ fn emit_spawn_child(
         // spawner's owned arg temps (a fresh closure / dict / concat
         // passed to an async fn) had no release point and leaked one ref
         // per call: forui's per-render view-builder closures, exactly.
-        if let Some(arg) = args.get(i) {
-            let result = b.compile_expr_result_as(arg, ValueShape::Boxed)?;
+        if let Some(arg_idx) = labelled_order.as_ref().and_then(|order| order[i]) {
+            let result = b.compile_expr_result_as(args[arg_idx].value, ValueShape::Boxed)?;
             b.prepare_stack_for_owning_store(result);
+        } else if labelled_order.is_none() {
+            if let Some(arg) = args.get(i) {
+                let result = b.compile_expr_result_as(arg.value, ValueShape::Boxed)?;
+                b.prepare_stack_for_owning_store(result);
+            } else if let Some(Some(default_expr)) = defaults.get(i + tpc) {
+                let result = b.compile_expr_result_as(default_expr, ValueShape::Boxed)?;
+                b.prepare_stack_for_owning_store(result);
+            } else {
+                return Err(BuildError::UnsupportedExpression(
+                    "async-spawn-arg-count-mismatch",
+                ));
+            }
         } else if let Some(Some(default_expr)) = defaults.get(i + tpc) {
             let result = b.compile_expr_result_as(default_expr, ValueShape::Boxed)?;
             b.prepare_stack_for_owning_store(result);
@@ -8103,6 +8200,7 @@ pub fn try_codegen_async_engine(
             name: fd.name.clone(),
             param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
             type_param_count: fd.type_params.len() as u16,
+            param_names: param_names_for(fd),
             include_in_coverage: false,
             param_defaults: param_defaults_for(fd),
             // Same fallback policy as `build_program_full`: entry-AST
@@ -9161,6 +9259,37 @@ impl<'a, 'c> Builder<'a, 'c> {
             .is_some()
     }
 
+    fn debug_function_calls_enabled(&self) -> bool {
+        self.ctx
+            .import_remap
+            .get(crate::runtime::IMPORT_DEBUG_FUNCTION_CALL as usize)
+            .copied()
+            .flatten()
+            .is_some()
+    }
+
+    fn emit_debug_function_event(&mut self, event: i32) {
+        if !self.debug_function_calls_enabled() {
+            return;
+        }
+        let (off, len) = {
+            let mut strings = self.ctx.strings.borrow_mut();
+            strings.intern(&self.fd.name)
+        };
+        self.emit(Instruction::I32Const(off as i32));
+        self.emit(Instruction::I32Const(len as i32));
+        self.emit(Instruction::I32Const(event));
+        self.emit_import_call(crate::runtime::IMPORT_DEBUG_FUNCTION_CALL);
+    }
+
+    fn emit_debug_function_start(&mut self) {
+        self.emit_debug_function_event(0);
+    }
+
+    fn emit_debug_function_end(&mut self) {
+        self.emit_debug_function_event(1);
+    }
+
     fn current_source_file(&self) -> Option<String> {
         if let Some(file) = self.ctx.file_path {
             return Some(file.to_string());
@@ -9874,6 +10003,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.emit(Instruction::I64Const(VAL_VOID));
             }
         }
+        self.emit_debug_function_end();
         self.emit(Instruction::Return);
         Ok(())
     }
@@ -9905,6 +10035,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Empty bodies return Void. Matches the legacy compiler's
     /// "last statement is tail position" convention.
     fn compile_body(&mut self) -> Result<(), BuildError> {
+        self.emit_debug_function_start();
         // Spy/mock preamble: emit only for top-level functions that
         // were referenced by `mock()` / `assert.*` in a test block.
         // `function_by_name` is keyed by the fully-qualified name
@@ -9918,6 +10049,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit_typed_param_prelude()?;
         if self.fd.body.is_empty() {
             self.emit(Instruction::I64Const(VAL_VOID));
+            self.emit_debug_function_end();
             self.emit(Instruction::Return);
             return Ok(());
         }
@@ -9946,6 +10078,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                         self.emit(Instruction::LocalSet(saved));
                         self.emit_import_call(crate::runtime::IMPORT_EVENT_DRAIN);
                         self.emit(Instruction::LocalGet(saved));
+                        self.emit_debug_function_end();
                         self.emit(Instruction::Return);
                     } else {
                         // `<__start__>` bodies are always built from
@@ -10026,6 +10159,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::I32Const(8));
         self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
         self.emit(Instruction::LocalGet(mocked_value));
+        self.emit_debug_function_end();
         self.emit(Instruction::Return);
         self.emit_close();
         self.emit(Instruction::LocalGet(args_ptr));
@@ -10235,6 +10369,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // No branch matched and no default — tail-context
                 // demands a return value. Push Void.
                 self.emit(Instruction::I64Const(VAL_VOID));
+                self.emit_debug_function_end();
                 self.emit(Instruction::Return);
             }
             return Ok(());
@@ -10490,6 +10625,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             // Placeholder return value — the caller throws it away
             // as soon as it sees the flag set.
             self.emit(Instruction::I64Const(0));
+            self.emit_debug_function_end();
             self.emit(Instruction::Return);
         }
         Ok(())
@@ -10550,6 +10686,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit(Instruction::GlobalGet(async_ctx.layout.g_current));
                     self.emit(Instruction::LocalGet(err_local));
                     self.emit(Instruction::Call(async_ctx.layout.fail));
+                    self.emit_debug_function_end();
                     self.emit(Instruction::Return);
                 }
             }
@@ -10572,6 +10709,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.release_owned_arg_stashes(owned_arg_stashes);
             self.emit_cleanup_to_depth(0);
             self.emit(Instruction::LocalGet(result_local));
+            self.emit_debug_function_end();
             self.emit(Instruction::Return);
         }
         self.emit_close();
@@ -11163,6 +11301,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // Return, so this is unreachable code that wasm's
                 // polymorphic-Return rules let us emit safely.
                 self.emit(Instruction::I64Const(VAL_VOID));
+                self.emit_debug_function_end();
                 self.emit(Instruction::Return);
                 Ok(())
             }
@@ -11175,6 +11314,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 // polymorphic-Return rules let the trailer land
                 // safely after the structured If tower.
                 self.emit(Instruction::I64Const(VAL_VOID));
+                self.emit_debug_function_end();
                 self.emit(Instruction::Return);
                 Ok(())
             }
@@ -11186,6 +11326,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.compile_stmt(stmt)?;
                 self.emit_all_active_drops();
                 self.emit(Instruction::I64Const(VAL_VOID));
+                self.emit_debug_function_end();
                 self.emit(Instruction::Return);
                 Ok(())
             }
@@ -11198,6 +11339,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     fn compile_stmts_as_tail(&mut self, stmts: &[Statement]) -> Result<(), BuildError> {
         if stmts.is_empty() {
             self.emit(Instruction::I64Const(VAL_VOID));
+            self.emit_debug_function_end();
             self.emit(Instruction::Return);
             return Ok(());
         }
@@ -11226,6 +11368,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.pop_scope();
             } else {
                 self.emit(Instruction::I64Const(VAL_VOID));
+                self.emit_debug_function_end();
                 self.emit(Instruction::Return);
             }
             return Ok(());
@@ -11594,6 +11737,75 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// Labelled args without a reorder entry are accepted if they
     /// already appear in declaration order; otherwise the builder
     /// refuses with an actionable direct-codegen error.
+    fn label_order_for_user_call(
+        &self,
+        ce: &CallExpression,
+        param_names: &[String],
+        real_param_count: usize,
+        ordered_arg_count: usize,
+        is_ufcs: bool,
+    ) -> Result<Vec<Option<usize>>, BuildError> {
+        if param_names.len() != real_param_count {
+            return Err(BuildError::UnsupportedExpression(
+                "CallExpression/label-param-shape-mismatch",
+            ));
+        }
+        let mut order: Vec<Option<usize>> = vec![None; real_param_count];
+        let mut positional_idx = 0usize;
+        if is_ufcs {
+            if real_param_count == 0 || ordered_arg_count == 0 {
+                return Err(BuildError::UnsupportedExpression(
+                    "CallExpression/ufcs-label-shape-mismatch",
+                ));
+            }
+            order[0] = Some(0);
+            positional_idx = 1;
+        }
+        let ordered_offset = if is_ufcs { 1usize } else { 0usize };
+        let mut seen_named = false;
+        for (source_idx, arg) in ce.args.iter().enumerate() {
+            let ordered_idx = source_idx + ordered_offset;
+            if ordered_idx >= ordered_arg_count {
+                return Err(BuildError::UnsupportedExpression(
+                    "CallExpression/label-arg-out-of-range",
+                ));
+            }
+            if let Some(label) = &arg.label {
+                seen_named = true;
+                let Some(param_idx) = param_names.iter().position(|p| p == label) else {
+                    return Err(BuildError::UnsupportedExpression(
+                        "CallExpression/unknown-labelled-arg",
+                    ));
+                };
+                if order[param_idx].is_some() {
+                    return Err(BuildError::UnsupportedExpression(
+                        "CallExpression/duplicate-labelled-arg",
+                    ));
+                }
+                order[param_idx] = Some(ordered_idx);
+            } else {
+                if seen_named {
+                    return Err(BuildError::UnsupportedExpression(
+                        "CallExpression/positional-after-labelled",
+                    ));
+                }
+                if positional_idx >= real_param_count {
+                    return Err(BuildError::UnsupportedExpression(
+                        "CallExpression/label-positional-out-of-range",
+                    ));
+                }
+                if order[positional_idx].is_some() {
+                    return Err(BuildError::UnsupportedExpression(
+                        "CallExpression/duplicate-positional-arg",
+                    ));
+                }
+                order[positional_idx] = Some(ordered_idx);
+                positional_idx += 1;
+            }
+        }
+        Ok(order)
+    }
+
     fn compile_call(&mut self, ce: &CallExpression) -> Result<(), BuildError> {
         let ufcs_key = (
             self.module_key.clone(),
@@ -11870,12 +12082,38 @@ impl<'a, 'c> Builder<'a, 'c> {
         let type_param_count = self.functions()[proto_idx as usize].type_param_count as usize;
         let real_param_count = expected - type_param_count;
         let defaults = self.functions()[proto_idx as usize].param_defaults.clone();
+        let param_names = self.functions()[proto_idx as usize].param_names.clone();
         // Named-param reorder: if the checker recorded a reorder map
         // for this call site, use it to pull caller args into
         // declaration order. Missing slots are filled from default
         // parameter expressions when available.
         let reorder_key = ufcs_key.clone();
-        if let Some(order) = self.checker().named_param_reorder.get(&reorder_key) {
+        let checker_order = self
+            .checker()
+            .named_param_reorder
+            .get(&reorder_key)
+            .cloned();
+        let label_order = if ce.args.iter().any(|a| a.label.is_some()) {
+            match self.label_order_for_user_call(
+                ce,
+                &param_names,
+                real_param_count,
+                ordered_args.len(),
+                is_ufcs,
+            ) {
+                Ok(order) => Some(order),
+                Err(e) => {
+                    if checker_order.is_some() {
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(order) = label_order.or(checker_order) {
             if order.len() != real_param_count {
                 return Err(BuildError::UnsupportedExpression(
                     "CallExpression/reorder-shape-mismatch",
@@ -11940,16 +12178,6 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
             }
             return Ok(());
-        }
-
-        // No reorder recorded — labelled args only work if they happen
-        // to be in declaration order already. In that case the
-        // checker didn't emit a reorder. Treat them as positional.
-        if ce.args.iter().any(|a| a.label.is_some()) && !is_ufcs {
-            // No checker reorder and still labelled — means either
-            // the labels match declaration order (safe) or we need
-            // bytecode-path handling. Accept; the expected-count
-            // check below catches mismatches.
         }
 
         // Positional call: hidden generic `@type` args are injected
@@ -15688,6 +15916,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                 name: format!("<closure@{}:{}>", fd.location.line, fd.location.column),
                 param_count,
                 type_param_count: fd.type_params.len() as u16,
+                param_names: param_names_for(fd),
                 include_in_coverage: false,
                 param_defaults: param_defaults_for(fd),
                 source_file: self.current_source_file(),
@@ -16450,6 +16679,7 @@ mod tests {
             name: main.name.clone(),
             param_count: main.params.len() as u16 + main.type_params.len() as u16,
             type_param_count: main.type_params.len() as u16,
+            param_names: param_names_for(&main),
             include_in_coverage: false,
             param_defaults: param_defaults_for(&main),
             ..Default::default()
@@ -17064,6 +17294,7 @@ mod tests {
                 name: fd.name.clone(),
                 param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
                 type_param_count: fd.type_params.len() as u16,
+                param_names: param_names_for(fd),
                 include_in_coverage: fd.name != "main",
                 param_defaults: param_defaults_for(fd),
                 source_line: fd.location.line,
@@ -18353,6 +18584,7 @@ mod tests {
                     name: fd.name.clone(),
                     param_count: fd.params.len() as u16 + fd.type_params.len() as u16,
                     type_param_count: fd.type_params.len() as u16,
+                    param_names: param_names_for(fd),
                     include_in_coverage: fd.name != "main",
                     param_defaults: param_defaults_for(fd),
                     ..Default::default()
@@ -23223,6 +23455,36 @@ mod tests {
 
     /// Compile an entry source with multiple synthetic user modules.
     fn try_compile_with_modules(entry_src: &str, modules: Vec<(&str, &str)>) -> Option<Vec<u8>> {
+        try_compile_with_modules_with(entry_src, modules, false)
+    }
+
+    /// Compile an entry source with multiple synthetic user modules, optionally
+    /// dropping named-param reorder metadata to exercise direct codegen's
+    /// label-based fallback.
+    fn try_compile_with_modules_with(
+        entry_src: &str,
+        modules: Vec<(&str, &str)>,
+        clear_named_reorder: bool,
+    ) -> Option<Vec<u8>> {
+        try_compile_with_modules_config(entry_src, modules, clear_named_reorder, None)
+    }
+
+    /// Compile with a forced named-param reorder entry. This simulates stale or
+    /// wrong checker metadata while keeping the source labels intact.
+    fn try_compile_with_modules_with_forced_named_reorder(
+        entry_src: &str,
+        modules: Vec<(&str, &str)>,
+        forced_order: Vec<Option<usize>>,
+    ) -> Option<Vec<u8>> {
+        try_compile_with_modules_config(entry_src, modules, false, Some(forced_order))
+    }
+
+    fn try_compile_with_modules_config(
+        entry_src: &str,
+        modules: Vec<(&str, &str)>,
+        clear_named_reorder: bool,
+        forced_order: Option<Vec<Option<usize>>>,
+    ) -> Option<Vec<u8>> {
         let prepared = fai_compiler::prepare_source_with_synthetic(
             entry_src,
             None,
@@ -23247,6 +23509,18 @@ mod tests {
         checker
             .check_with_modules(&prepared.serde_ast.statements, &prepared_modules)
             .expect("checker");
+        if clear_named_reorder {
+            checker.named_param_reorder.clear();
+        }
+        if let Some(order) = forced_order {
+            let key = checker
+                .named_param_reorder
+                .keys()
+                .next()
+                .cloned()
+                .expect("forced reorder test needs one labelled call");
+            checker.named_param_reorder.insert(key, order);
+        }
         let info = CheckerInfo {
             ufcs_calls: checker.ufcs_calls,
             named_param_reorder: checker.named_param_reorder,
@@ -23896,6 +24170,601 @@ mod tests {
     }
 
     #[test]
+    fn production_direct_named_import_call_fills_skipped_defaults() {
+        // Mirrors calls like `TextInput('Message', signalValue: input)`.
+        // The named argument is in declaration order, but it skips an
+        // earlier defaulted parameter. Direct codegen must still use the
+        // checker's named-argument reorder map so the skipped parameter gets
+        // its default and the labelled value lands in the right slot.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { pick } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  pick(1, c: 42)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "# Pick c.\ndef pick\n",
+                    "    @param a Int\n",
+                    "    @param b Int, default: 20\n",
+                    "    @param c Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  c\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("named import call with skipped defaults should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_labelled_call_recovers_without_checker_reorder() {
+        // A missing named-param side-table entry must not silently turn
+        // `c: 42` into the second positional argument. Codegen has the callee
+        // parameter names available, so it should rebuild the declaration-order
+        // mapping and fill skipped defaults itself.
+        let wasm = try_compile_with_modules_with(
+            concat!(
+                "use { pick } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  pick(1, c: 42)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "# Pick c.\ndef pick\n",
+                    "    @param a Int\n",
+                    "    @param b Int, default: 20\n",
+                    "    @param c Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  c\n",
+                    "end\n",
+                ),
+            )],
+            true,
+        )
+        .expect("direct should recover labelled calls without checker reorder metadata");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_labelled_call_prefers_source_labels_over_stale_reorder() {
+        // If checker metadata is stale relative to the function being compiled,
+        // blindly trusting the side table can map a labelled argument into the
+        // wrong parameter slot. Source labels plus the compiled callee's
+        // `param_names` are authoritative.
+        let wasm = try_compile_with_modules_with_forced_named_reorder(
+            concat!(
+                "use { pick } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  pick(1, c: 42)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "# Pick c.\ndef pick\n",
+                    "    @param a Int\n",
+                    "    @param b Int, default: 20\n",
+                    "    @param c Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  c\n",
+                    "end\n",
+                ),
+            )],
+            vec![Some(0), Some(1), None],
+        )
+        .expect("direct should prefer source labels over stale checker metadata");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_optional_named_object_not_equal_null_is_true() {
+        // Mirrors `if signalValue != null` in Forui.TextInput. The value is a
+        // heap object wrapped in an optional parameter; direct codegen must not
+        // treat non-null boxed objects as null.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { Signal, hasSignal } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  hasSignal(signalValue: Signal(value: 7))\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "type Signal\n",
+                    "  value Int\n",
+                    "end\n",
+                    "\n",
+                    "# Has signal.\ndef hasSignal\n",
+                    "    @param text String?, default: null\n",
+                    "    @param signalValue Signal?, default: null\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  if signalValue != null\n",
+                    "    42\n",
+                    "  else\n",
+                    "    0\n",
+                    "  end\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("optional named heap object comparison should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_named_import_resume_call_fills_skipped_defaults() {
+        // TextInput is compiled as a resume function because it creates a
+        // closure that captures `signalValue`. The async/resume call path must
+        // apply the same named-argument reorder/default-fill logic as the sync
+        // user-call path.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { capture } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  capture(signalValue: 42)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "# Capture.\ndef capture\n",
+                    "    @param text Int, default: 20\n",
+                    "    @param signalValue Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  let cb = do\n",
+                    "    signalValue\n",
+                    "  end\n",
+                    "  cb()\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("resume named import call with skipped defaults should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_async_caller_named_import_resume_call_fills_skipped_defaults() {
+        // ChatComposer is itself compiled as a resume function, so its
+        // `TextInput('Message', signalValue: input)` call goes through the
+        // async child-frame spawn path rather than `compile_call`. That path
+        // must preserve source labels and fill skipped defaults too.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { capture } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  caller()\n",
+                "end\n",
+                "\n",
+                "# Call capture.\n",
+                "def caller\n",
+                "    @return Int\n",
+                "do\n",
+                "  capture(signalValue: 42)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "# Capture.\ndef capture\n",
+                    "    @param text Int, default: 20\n",
+                    "    @param signalValue Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  let cb = do\n",
+                    "    signalValue\n",
+                    "  end\n",
+                    "  cb()\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("async caller should pass labelled args to async callee in declaration order");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_async_closure_named_import_resume_call_fills_skipped_defaults() {
+        // The chat composer calls TextInput from inside a view-builder closure.
+        // TextInput itself is async because its registered input handler closure
+        // calls async signal code. That means the labelled TextInput call is
+        // lowered by the async closure's spawn path, not the sync call path.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { capture } from widgets\n",
+                "\n",
+                "type def Children\n",
+                "    @return Int\n",
+                "end\n",
+                "\n",
+                "# Run children.\n",
+                "def run\n",
+                "    @param children Children\n",
+                "    @return Int\n",
+                "do\n",
+                "  children()\n",
+                "end\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  run do\n",
+                "    capture(signalValue: 42)\n",
+                "  end\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "type def Handler\n",
+                    "    @return Void\n",
+                    "end\n",
+                    "\n",
+                    "# Async leaf.\n",
+                    "def asyncLeaf\n",
+                    "    @return Void\n",
+                    "do\n",
+                    "  sleep(1)\n",
+                    "end\n",
+                    "\n",
+                    "# Register handler.\n",
+                    "def registerHandler\n",
+                    "    @param handler Handler\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  7\n",
+                    "end\n",
+                    "\n",
+                    "# Capture.\ndef capture\n",
+                    "    @param text Int, default: 20\n",
+                    "    @param signalValue Int, default: 30\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  let changeId = registerHandler do\n",
+                    "    asyncLeaf()\n",
+                    "  end\n",
+                    "  signalValue\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("async closure should pass labelled args to async callee in declaration order");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_text_input_signal_shape_sets_change_handler_key() {
+        // Minimal reproduction of Forui.TextInput's signal branch without the
+        // view layer. The web build was rendering TextInput without
+        // `changeHandlerId`, which means this branch or dictionary update was
+        // not surviving direct codegen.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { Signal, textInputLike } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  textInputLike('Message', signalValue: Signal(value: 'draft'))\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "type Signal\n",
+                    "  value String\n",
+                    "end\n",
+                    "\n",
+                    "type def ChangeAction\n",
+                    "  @param newValue String\n",
+                    "  @return Void\n",
+                    "end\n",
+                    "\n",
+                    "# Register change handler.\ndef registerChangeHandler\n",
+                    "    @param handler ChangeAction\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  7\n",
+                    "end\n",
+                    "\n",
+                    "# Text input like.\ndef textInputLike\n",
+                    "    @param placeholder String\n",
+                    "    @param text String?, default: null\n",
+                    "    @param signalValue Signal?, default: null\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  var props = set({}, 'placeholder', placeholder)\n",
+                    "  if signalValue != null\n",
+                    "    props = set(props, 'value', signalValue!.value)\n",
+                    "    let changeId = registerChangeHandler do with newValue String\n",
+                    "      let _ = signalValue!.value\n",
+                    "    end\n",
+                    "    props = set(props, 'changeHandlerId', changeId)\n",
+                    "  end\n",
+                    "  if hasKey(props, 'changeHandlerId')\n",
+                    "    42\n",
+                    "  else\n",
+                    "    0\n",
+                    "  end\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("TextInput-like signal branch should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_text_input_signal_from_generic_use_signal() {
+        // Same shape as Brain's composer:
+        //
+        //   var input = useSignal('')
+        //   TextInput('Message', signalValue: input)
+        //
+        // This exercises the generic `useSignal` call, the optional Signal
+        // parameter, UFCS reads/writes through `signalValue!`, and the closure
+        // capture that makes TextInput compile as a resume function.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { textInputLike, useSignal } from widgets\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  var input = useSignal('')\n",
+                "  textInputLike('Message', signalValue: input)\n",
+                "end\n",
+            ),
+            vec![(
+                "widgets",
+                concat!(
+                    "type def Loader\n",
+                    "  @return $T\n",
+                    "end\n",
+                    "\n",
+                    "type Signal\n",
+                    "  id Int\n",
+                    "  _value $T\n",
+                    "  loader Loader?\n",
+                    "end\n",
+                    "\n",
+                    "type def ChangeAction\n",
+                    "  @param newValue String\n",
+                    "  @return Void\n",
+                    "end\n",
+                    "\n",
+                    "# Create signal.\ndef createSignal\n",
+                    "    @type T\n",
+                    "    @param initialValue $T\n",
+                    "    @param loader Loader?, default: null\n",
+                    "    @return Signal\n",
+                    "do\n",
+                    "  Signal(id: 1, _value: copy(initialValue), loader: loader)\n",
+                    "end\n",
+                    "\n",
+                    "# Use signal.\ndef useSignal\n",
+                    "    @type T\n",
+                    "    @param initialValue $T\n",
+                    "    @param loader Loader?, default: null\n",
+                    "    @return Signal\n",
+                    "do\n",
+                    "  createSignal(initialValue, loader)\n",
+                    "end\n",
+                    "\n",
+                    "# Value.\ndef value\n",
+                    "    @type T\n",
+                    "    @param signal Signal\n",
+                    "    @return $T\n",
+                    "do\n",
+                    "  copy(signal._value)\n",
+                    "end\n",
+                    "\n",
+                    "# Set value.\ndef setValue\n",
+                    "    @param signal Signal, mutable\n",
+                    "    @param newValue $T\n",
+                    "    @return Void\n",
+                    "do\n",
+                    "  signal._value = copy(newValue)\n",
+                    "end\n",
+                    "\n",
+                    "# Register change handler.\ndef registerChangeHandler\n",
+                    "    @param handler ChangeAction\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  7\n",
+                    "end\n",
+                    "\n",
+                    "# Text input like.\ndef textInputLike\n",
+                    "    @param placeholder String\n",
+                    "    @param text String?, default: null\n",
+                    "    @param signalValue Signal?, default: null\n",
+                    "    @return Int\n",
+                    "do\n",
+                    "  var props = set({}, 'placeholder', placeholder)\n",
+                    "  if signalValue != null\n",
+                    "    props = set(props, 'value', signalValue!.value())\n",
+                    "    let changeId = registerChangeHandler do with newValue String\n",
+                    "      signalValue!.setValue(newValue)\n",
+                    "    end\n",
+                    "    props = set(props, 'changeHandlerId', changeId)\n",
+                    "  end\n",
+                    "  if hasKey(props, 'changeHandlerId')\n",
+                    "    42\n",
+                    "  else\n",
+                    "    0\n",
+                    "  end\n",
+                    "end\n",
+                ),
+            )],
+        )
+        .expect("TextInput-like generic signal path should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn production_direct_package_named_import_call_fills_skipped_defaults() {
+        // Brain imports `TextInput` from `Forui.view` and `useSignal` from
+        // `Forui.signal`. A missing named-param reorder entry at that
+        // package-qualified call site makes `signalValue: input` behave like
+        // the second positional `text` parameter, leaving the real
+        // `signalValue` slot null and dropping the change handler.
+        let wasm = try_compile_with_modules(
+            concat!(
+                "use { TextInput } from Forui.view\n",
+                "use { useSignal } from Forui.signal\n",
+                "\n",
+                "def main\n",
+                "    @return Int\n",
+                "do\n",
+                "  var input = useSignal('')\n",
+                "  TextInput('Message', signalValue: input)\n",
+                "end\n",
+            ),
+            vec![
+                (
+                    "Forui.signal",
+                    concat!(
+                        "type def Loader\n",
+                        "  @return $T\n",
+                        "end\n",
+                        "\n",
+                        "type Signal\n",
+                        "  id Int\n",
+                        "  _value $T\n",
+                        "  loader Loader?\n",
+                        "end\n",
+                        "\n",
+                        "# Create signal.\ndef createSignal\n",
+                        "    @type T\n",
+                        "    @param initialValue $T\n",
+                        "    @param loader Loader?, default: null\n",
+                        "    @return Signal\n",
+                        "do\n",
+                        "  Signal(id: 1, _value: copy(initialValue), loader: loader)\n",
+                        "end\n",
+                        "\n",
+                        "# Use signal.\ndef useSignal\n",
+                        "    @type T\n",
+                        "    @param initialValue $T\n",
+                        "    @param loader Loader?, default: null\n",
+                        "    @return Signal\n",
+                        "do\n",
+                        "  createSignal(initialValue, loader)\n",
+                        "end\n",
+                        "\n",
+                        "# Value.\ndef value\n",
+                        "    @type T\n",
+                        "    @param signal Signal\n",
+                        "    @return $T\n",
+                        "do\n",
+                        "  copy(signal._value)\n",
+                        "end\n",
+                        "\n",
+                        "# Set value.\ndef setValue\n",
+                        "    @param signal Signal, mutable\n",
+                        "    @param newValue $T\n",
+                        "    @return Void\n",
+                        "do\n",
+                        "  signal._value = copy(newValue)\n",
+                        "end\n",
+                    ),
+                ),
+                (
+                    "Forui.view",
+                    concat!(
+                        "use { Signal, value, setValue } from signal\n",
+                        "\n",
+                        "type def ChangeAction\n",
+                        "  @param newValue String\n",
+                        "  @return Void\n",
+                        "end\n",
+                        "\n",
+                        "# Register change handler.\ndef registerChangeHandler\n",
+                        "    @param handler ChangeAction\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  7\n",
+                        "end\n",
+                        "\n",
+                        "# Text input.\ndef TextInput\n",
+                        "    @param placeholder String\n",
+                        "    @param text String?, default: null\n",
+                        "    @param signalValue Signal?, default: null\n",
+                        "    @return Int\n",
+                        "do\n",
+                        "  var props = set({}, 'placeholder', placeholder)\n",
+                        "  if signalValue != null\n",
+                        "    props = set(props, 'value', signalValue!.value())\n",
+                        "    let changeId = registerChangeHandler do with newValue String\n",
+                        "      signalValue!.setValue(newValue)\n",
+                        "    end\n",
+                        "    props = set(props, 'changeHandlerId', changeId)\n",
+                        "  end\n",
+                        "  if hasKey(props, 'changeHandlerId')\n",
+                        "    42\n",
+                        "  else\n",
+                        "    0\n",
+                        "  end\n",
+                        "end\n",
+                    ),
+                ),
+            ],
+        )
+        .expect("package named import call with skipped defaults should compile via direct");
+        let result = run_module(&wasm) as u64;
+        let expected = (runtime::QNAN as u64) | (runtime::TAG_INT as u64) | 42;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn production_direct_ufcs_in_user_module_uses_module_key() {
         // The checker keys UFCS rewrites by `(module, line, column)`.
         // Direct codegen must use the discovered module's canonical
@@ -24042,6 +24911,48 @@ mod tests {
                 .iter()
                 .any(|n| n == "__fai_ownership_event"),
             "checked browser build should declare ownership event import",
+        );
+    }
+
+    #[test]
+    fn debug_function_call_import_is_gated_on_native_and_browser() {
+        let src = concat!("def main\n", "    @return Int\n", "do\n", "  42\n", "end\n",);
+
+        let native_default =
+            try_compile_via_production_for_target(src, None).expect("native compile");
+        assert!(
+            !wasm_import_names(&native_default)
+                .iter()
+                .any(|n| n == "__fai_debug_function_call"),
+            "default native build must not require debug function-call import",
+        );
+
+        let browser_default =
+            try_compile_via_production_for_target(src, Some("wasm-html")).expect("browser compile");
+        assert!(
+            !wasm_import_names(&browser_default)
+                .iter()
+                .any(|n| n == "__fai_debug_function_call"),
+            "default browser build must not require debug function-call import",
+        );
+
+        let _guard = crate::runtime::DebugFunctionCallsGuard::new();
+        let native_debug =
+            try_compile_via_production_for_target(src, None).expect("debug native compile");
+        assert!(
+            wasm_import_names(&native_debug)
+                .iter()
+                .any(|n| n == "__fai_debug_function_call"),
+            "debug native build should declare function-call debug import",
+        );
+
+        let browser_debug = try_compile_via_production_for_target(src, Some("wasm-html"))
+            .expect("debug browser compile");
+        assert!(
+            wasm_import_names(&browser_debug)
+                .iter()
+                .any(|n| n == "__fai_debug_function_call"),
+            "debug browser build should declare function-call debug import",
         );
     }
 
