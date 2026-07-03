@@ -254,6 +254,21 @@ fn import_name(idx: u32) -> &'static str {
     })
 }
 
+/// Sync host imports that may raise through the `__error_flag` /
+/// `__error_value` channel (`signal_host_error` on the fai-cli side).
+/// Each gets the same post-call propagation check as a user function
+/// call, so a host failure lands in the nearest `try`/`catch` (or
+/// propagates to the caller) instead of flowing onward as a silent
+/// null / false / empty value. Grown import-by-import as sync imports
+/// migrate onto the channel; hosts that never set the flag (e.g. the
+/// browser runtime's stubs) are unaffected — the check sees flag=0.
+fn import_signals_errors(import_idx: u32) -> bool {
+    matches!(
+        import_idx,
+        IMPORT_FILE_READ_STR | IMPORT_WRITE_FILE | IMPORT_FILE_LIST
+    )
+}
+
 /// `[abi-check] MISSING-SIGNATURE` sentinel, once per import name per
 /// thread (plan 119 U2) — the unchecked-build form of the coverage error.
 fn report_missing_signature_once(name: &'static str) {
@@ -3279,10 +3294,11 @@ fn collect_spy_targets(
 }
 
 /// Max `FaiFunc(N)` arity the module assembler pre-allocates type
-/// slots for. Covers top-level functions and closures. Overflow here
-/// means a genuinely enormous arity — in practice forai programs
-/// don't even approach this.
-pub const MAX_DIRECT_ARITY: u16 = 16;
+/// slots for. Covers top-level functions and closures. The checker
+/// rejects declarations over this limit (`fai_checker::MAX_FUNCTION_ARITY`
+/// is the single source of truth), so overflow here means a declaration
+/// bypassed the checker — an internal invariant violation.
+pub const MAX_DIRECT_ARITY: u16 = fai_checker::MAX_FUNCTION_ARITY as u16;
 
 /// Compute the `FaiFunc(N) → type_index` map the builder expects.
 /// Type indices are a function of the type-section layout (which
@@ -6932,11 +6948,18 @@ fn build_resume_fn(
             } => {
                 // Bind the thrown value to the catch name, then jump to the
                 // catch handler (within this invocation — no reload needed).
+                // Non-dict values are wrapped into `{message: toString(v)}`
+                // first so `e.message` in the handler is always a valid
+                // read (the wrap allocates fresh, so the catch var's
+                // borrowed convention leaks the wrapper — safe, and only
+                // on the bare-value throw path).
                 b.compile_expr_as(value, ValueShape::Boxed)?;
                 let l = *var_local
                     .get(err_var)
                     .ok_or(BuildError::UnsupportedExpression("async-unknown-catch"))?;
                 b.emit(Instruction::LocalSet(l));
+                let owned = b.expr_transfers_ownership(value);
+                b.emit_wrap_bare_throw(l, owned);
                 emit_store_current_rstate(&mut b, layout, *catch_blk as i32);
                 b.emit(Instruction::Br(loop_depth));
             }
@@ -6944,10 +6967,17 @@ fn build_resume_fn(
                 // `fail` is a completion: the error escapes to the awaiter's
                 // `catch` (read from this task's O_ERROR), so retain-if-borrowed
                 // before releasing the owned frame bindings — same +1 convention
-                // as a normal `complete`.
+                // as a normal `complete`. Bare (non-dict) values are wrapped
+                // into `{message: toString(v)}` so the awaiter's `e.message`
+                // is always a valid read.
                 if release_names.is_empty() {
-                    b.emit(Instruction::GlobalGet(layout.g_current));
                     b.compile_expr_as(value, ValueShape::Boxed)?;
+                    let saved = b.alloc_local();
+                    b.emit(Instruction::LocalSet(saved));
+                    let owned = b.expr_transfers_ownership(value);
+                    b.emit_wrap_bare_throw(saved, owned);
+                    b.emit(Instruction::GlobalGet(layout.g_current));
+                    b.emit(Instruction::LocalGet(saved));
                     b.emit(Instruction::Call(layout.fail));
                 } else {
                     b.compile_expr_as(value, ValueShape::Boxed)?;
@@ -6956,6 +6986,7 @@ fn build_resume_fn(
                     }
                     let saved = b.alloc_local();
                     b.emit(Instruction::LocalSet(saved));
+                    b.emit_wrap_bare_throw(saved, true);
                     emit_async_drops(
                         &mut b,
                         &release_names,
@@ -10559,6 +10590,102 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// either deliver the error to its enclosing `try` or propagate
     /// further up. This is the unwind path that makes
     /// cross-function throw + catch work.
+    /// Ensure the boxed value in `thrown_local` is safe to catch: a caught
+    /// `e` is consumed through `e.message` (a dict field read), so throwing
+    /// anything that is not a dict — a bare string, an Int, null — used to
+    /// hand the catch site a value whose bytes were then dereferenced as
+    /// dict entries (the ISSUES.md wasm-OOB `e.message` corruption). Any
+    /// non-dict thrown value is replaced with `{message: toString(value)}`,
+    /// the same shape `Error(msg)` builds; dicts (Error values and thrown
+    /// records — records are dicts at runtime) pass through untouched.
+    ///
+    /// `thrown_owned` says whether `thrown_local` holds a +1 the throw path
+    /// owns. When owned, the original's +1 is consumed into the wrapper
+    /// (with the `RT_VALUE_TO_STR` string-alias case given its own retained
+    /// ref first, mirroring `emit_to_string_owned`). When borrowed, the
+    /// original is left untouched and only the message ref is retained.
+    fn emit_wrap_bare_throw(&mut self, thrown_local: u32, thrown_owned: bool) {
+        let needs_wrap = self.alloc_i32_local();
+        self.emit(Instruction::I32Const(1));
+        self.emit(Instruction::LocalSet(needs_wrap));
+        self.emit(Instruction::LocalGet(thrown_local));
+        self.emit(Instruction::Call(self.rt().base + RT_IS_OBJ));
+        self.emit_open(Instruction::If(BlockType::Empty));
+        self.emit(Instruction::LocalGet(thrown_local));
+        self.emit(Instruction::Call(self.rt().base + RT_OBJ_ADDR));
+        self.emit(Instruction::I32Load(mem0()));
+        self.emit(Instruction::I32Const(OBJ_TAG_DICT));
+        self.emit(Instruction::I32Eq);
+        self.emit_open(Instruction::If(BlockType::Empty));
+        self.emit(Instruction::I32Const(0));
+        self.emit(Instruction::LocalSet(needs_wrap));
+        self.emit_close();
+        self.emit_close();
+
+        self.emit(Instruction::LocalGet(needs_wrap));
+        self.emit_open(Instruction::If(BlockType::Empty));
+        {
+            // msg = toString(thrown), uniformly owned: value_to_str is the
+            // identity on a String, so the alias case retains.
+            let msg_local = self.alloc_local();
+            self.emit(Instruction::LocalGet(thrown_local));
+            self.emit(Instruction::Call(self.rt().base + RT_VALUE_TO_STR));
+            self.emit(Instruction::LocalSet(msg_local));
+            self.emit(Instruction::LocalGet(msg_local));
+            self.emit(Instruction::LocalGet(thrown_local));
+            self.emit(Instruction::I64Eq);
+            self.emit_open(Instruction::If(BlockType::Empty));
+            self.emit(Instruction::LocalGet(msg_local));
+            self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            self.emit(Instruction::Drop);
+            self.emit_close();
+            if thrown_owned {
+                // Consume the original's +1 (no-op on primitives; for the
+                // string-alias case the msg ref above keeps it alive).
+                // Discard event mirrors `release_stash` so the checker's
+                // ledger for the original value balances.
+                self.emit_ownership_event_for_local(
+                    OwnershipOp::Discard,
+                    OWNERSHIP_SITE_UNKNOWN,
+                    thrown_local,
+                    0,
+                );
+                self.emit(Instruction::LocalGet(thrown_local));
+                self.emit(Instruction::Call(self.rt().base + RT_RELEASE));
+            }
+
+            // {message: msg} — same 24-byte layout as `Error(msg)`
+            // (see compile_error_construct).
+            let (key_off, key_len) = self.ctx.strings.borrow_mut().intern("message");
+            let dict_addr = self.alloc_i32_local();
+            self.emit(Instruction::I32Const(24));
+            self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
+            self.emit(Instruction::LocalSet(dict_addr));
+            self.emit(Instruction::LocalGet(dict_addr));
+            self.emit(Instruction::I32Const(OBJ_TAG_DICT));
+            self.emit(Instruction::I32Store(mem0()));
+            self.emit(Instruction::LocalGet(dict_addr));
+            self.emit(Instruction::I32Const(1));
+            self.emit(Instruction::I32Store(mem_off(4)));
+            self.emit(Instruction::LocalGet(dict_addr));
+            self.emit(Instruction::I32Const(key_off as i32));
+            self.emit(Instruction::I32Const(key_len as i32));
+            self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
+            self.emit(Instruction::I64Store(mem_off(8)));
+            self.emit(Instruction::LocalGet(dict_addr));
+            self.emit(Instruction::LocalGet(msg_local));
+            self.emit(Instruction::I64Store(mem_off(16)));
+            self.emit(Instruction::LocalGet(dict_addr));
+            self.emit(Instruction::Call(self.rt().base + RT_MAKE_OBJ));
+            // Transfer event: the wrapper dict is the owned thrown value
+            // from here on (mirrors compile_throw's Owned handling), so
+            // the catch scope's eventual Cleanup of it matches.
+            self.emit_ownership_event_for_stack(OwnershipOp::Transfer, OWNERSHIP_SITE_UNKNOWN, 0);
+            self.emit(Instruction::LocalSet(thrown_local));
+        }
+        self.emit_close();
+    }
+
     fn compile_throw(&mut self, s: &ThrowStatement) -> Result<(), BuildError> {
         let result = self.compile_expr_result_as(&s.expression, ValueShape::Boxed)?;
         match result.ownership {
@@ -10577,6 +10704,7 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let thrown_local = self.alloc_local();
         self.emit(Instruction::LocalSet(thrown_local));
+        self.emit_wrap_bare_throw(thrown_local, true);
         if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
             self.emit_cleanup_to_depth(frame.cleanup_depth);
@@ -12055,6 +12183,19 @@ impl<'a, 'c> Builder<'a, 'c> {
             }
         }
         let Some(proto_idx) = proto_idx else {
+            // `from_dict` has no expression-level lowering: tail/return
+            // positions are desugared into the typed-binding form before
+            // codegen (fai-compiler::desugar), so reaching here means an
+            // unsupported position (argument, non-named return type, …).
+            // A dedicated error keeps this off the UnknownIdentifier
+            // path, whose best-effort location walk finds the *first*
+            // `from_dict` anywhere in the program — historically an
+            // unrelated module (the ISSUES.md misattribution).
+            if name == "from_dict" {
+                return Err(BuildError::UnsupportedExpression(
+                    "from_dict-without-typed-binding",
+                ));
+            }
             return Err(BuildError::UnknownIdentifier(name));
         };
         let _ = resolved_name; // kept for future diagnostics
@@ -12975,6 +13116,9 @@ impl<'a, 'c> Builder<'a, 'c> {
             ResultShape::Void => {
                 self.emit(Instruction::I64Const(VAL_VOID));
             }
+        }
+        if import_signals_errors(import_idx) {
+            self.emit_post_call_propagation(&[]);
         }
         Ok(())
     }

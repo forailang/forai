@@ -1,0 +1,38 @@
+# expect: ok
+# stdout:
+#   hello from string
+#   hello from string
+# leak: flat
+# ownership: balanced
+
+use std.string
+
+# Throws a bare string to exercise non-Error throw semantics.
+def boomString
+    @return Void
+do
+    throw 'hello from string'
+end
+
+def main
+    @return Void
+do
+    try
+        boomString()
+    catch e
+        print(e.message)
+        print(string.trim(e.message))
+    end
+end
+
+test boomString
+    it 'throws a catchable error whose message is the thrown string'
+        var caught = ''
+        try
+            boomString()
+        catch e
+            caught = e.message
+        end
+        assert.equals(caught, 'hello from string')
+    end
+end

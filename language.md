@@ -584,6 +584,9 @@ end
 ```
 
 - `throw` works across function boundaries — the call stack unwinds to the nearest `catch`
+- Throwing a non-Error value (`throw 'oops'`, `throw 42`) boxes it into an
+  error object whose `message` is the value's string form — a caught
+  `e.message` is always a valid String. `throw Error(...)` remains the idiom.
 - `Error('message')` or `error.Error('message')` constructs an error object
 - `message(err)` / `error.message(err)` returns the message string
 - `kind(err)` / `error.kind(err)` returns the error kind when present, otherwise `null`

@@ -4,8 +4,11 @@
 # Plan 115 Part 1: the throw/fail path is a completion too. A task that allocates
 # locals and then throws must still release those owned locals (the `fail`
 # terminator releases the frame bindings, retaining the error). After the thrown
-# error is caught, the live count returns to the pre-call baseline — `boom`'s
-# frame and its scratch array were reclaimed on the failing path, not leaked.
+# error is caught, the live count returns to the pre-call baseline plus the
+# caught error itself — since 2026-07-03 a bare (non-Error) throw is boxed into
+# `{message: toString(v)}` (dict + key string + message string = 3 objects),
+# which is legitimately live while `e` is in scope. `boom`'s frame and its
+# scratch array must still be reclaimed on the failing path, not leaked.
 def main
     @return Void
 do
@@ -24,7 +27,7 @@ do
         let n = boom()
         n > 0
     catch e
-        __liveObjects() == base
+        __liveObjects() == base + 3
     end
 end
 

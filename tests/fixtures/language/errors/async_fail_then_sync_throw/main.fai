@@ -1,0 +1,58 @@
+# expect: ok
+# stdout:
+#   caught: x
+#   rethrow: original
+# skip: ISSUES.md "async engine: sync throw after catching a failed async task hangs the scheduler" — main parks forever on the second throw; pre-existing, found 2026-07-03 while fixing bare-string throw
+# Awaits, then fails to the awaiter.
+def boom
+    @return Void
+do
+    sleep(1)
+    throw Error('x')
+end
+
+# Throws synchronously.
+def rethrow
+    @return Void
+do
+    throw Error('original')
+end
+
+def main
+    @return Void
+do
+    try
+        boom()
+    catch e
+        print('caught: ' + e.message)
+    end
+    try
+        rethrow()
+    catch e
+        print('rethrow: ' + e.message)
+    end
+end
+
+test boom
+    it 'fails to the awaiter'
+        var m = ''
+        try
+            boom()
+        catch e
+            m = e.message
+        end
+        assert.equals(m, 'x')
+    end
+end
+
+test rethrow
+    it 'throws'
+        var m = ''
+        try
+            rethrow()
+        catch e
+            m = e.message
+        end
+        assert.equals(m, 'original')
+    end
+end

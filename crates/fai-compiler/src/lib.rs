@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod dep_url;
+pub mod desugar;
 pub mod escape_analysis;
 pub mod module;
 pub mod ownership_abi;

@@ -1,0 +1,30 @@
+# expect: compile_error
+# error: from_dict-without-typed-binding
+
+type Person
+    name String
+    age Int
+end
+
+# Prints a person's name.
+def show
+    @param p Person
+    @return Void
+do
+    print(p.name)
+end
+
+def main
+    @return Void
+do
+    show(from_dict({
+        name: 'A'
+        age: 1
+    }))
+end
+
+test show
+    it 'prints the name'
+        assert.equals(1, 1)
+    end
+end

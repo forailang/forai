@@ -1361,11 +1361,14 @@ mod tests {
             nan_box::classify_return_value(task_result.call(&mut store, 1).unwrap() as u64),
             nan_box::ReturnKind::Int(11)
         );
-        // The failed background task's error (7) is in its result slot.
-        assert_eq!(
+        // The failed background task's error is in its result slot. A bare
+        // `throw 7` is boxed into an Error-shaped `{message: '7'}` dict at
+        // the throw site (so a catcher's `e.message` is always a valid
+        // String), hence an Object here rather than the raw Int.
+        assert!(matches!(
             nan_box::classify_return_value(task_result.call(&mut store, 2).unwrap() as u64),
-            nan_box::ReturnKind::Int(7)
-        );
+            nan_box::ReturnKind::Object(_)
+        ));
     }
 
     #[test]

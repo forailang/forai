@@ -1,0 +1,50 @@
+# expect: ok
+# stdout:
+#   inner async
+
+use std.string
+
+# Async-colored: awaits, then throws a bare string inside its own try.
+def catchesInside
+    @return String
+do
+    try
+        sleep(1)
+        throw 'inner async'
+    catch e
+        return string.trim(e.message)
+    end
+    'unreachable'
+end
+
+# Async-colored: awaits, then throws a bare string to the awaiter.
+def escapes
+    @return Void
+do
+    sleep(1)
+    throw 'escaped async'
+end
+
+def main
+    @return Void
+do
+    print(catchesInside())
+end
+
+test catchesInside
+    it 'binds a valid message for a bare-string throw'
+        assert.equals(catchesInside(), 'inner async')
+    end
+end
+
+test escapes
+    it 'delivers a valid message to the awaiting catch'
+        var m = ''
+        try
+            escapes()
+        catch e
+            m = string.trim(e.message)
+        end
+        assert.equals(m, 'escaped async')
+    end
+end

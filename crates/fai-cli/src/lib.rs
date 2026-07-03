@@ -5846,6 +5846,13 @@ fn codegen_error_suggestion(err: &fai_codegen_wasm::direct::BuildError) -> Strin
     use fai_codegen_wasm::direct::BuildError;
 
     match err {
+        BuildError::UnsupportedExpression("from_dict-without-typed-binding") => {
+            "`from_dict` needs a target type codegen can see. Bind it as \
+             `let x T = from_dict(d)` (or return it from a function whose \
+             `@return` is a plain named type). Argument position and \
+             optional/array/generic target types are not supported."
+                .to_string()
+        }
         BuildError::UnsupportedExpression(kind) => format!(
             "the direct wasm backend does not lower `{}` here yet. If this code should be unreachable for the current target, check the target's imports/reachability; otherwise reduce the construct or add backend support.",
             kind

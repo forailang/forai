@@ -5,7 +5,7 @@ use crate::ast as s;
 use fai_parser::ast as n;
 
 pub fn convert_program(p: &n::Program) -> s::Program {
-    s::Program {
+    let mut program = s::Program {
         kind: "Program".into(),
         statements: p
             .statements
@@ -13,7 +13,11 @@ pub fn convert_program(p: &n::Program) -> s::Program {
             .filter(|s| !matches!(s, n::Statement::Comment(_)))
             .map(convert_statement)
             .collect(),
-    }
+    };
+    // Every consumer (checker, sync and async codegen) works from this
+    // converted form, so desugaring here keeps them all in agreement.
+    crate::desugar::desugar_program(&mut program);
+    program
 }
 
 fn convert_statement(stmt: &n::Statement) -> s::Statement {

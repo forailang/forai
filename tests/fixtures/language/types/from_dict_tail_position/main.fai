@@ -1,0 +1,31 @@
+# expect: ok
+# stdout:
+#   Alice
+# Builds a Person via from_dict in tail position, relying on @return for the target type.
+def makePerson
+    @return Person
+do
+    let d = {
+        name: 'Alice'
+        age: 30
+    }
+    from_dict(d)
+end
+
+def main
+    @return Void
+do
+    let p = makePerson()
+    print(p.name)
+end
+
+type Person
+    name String
+    age Int
+end
+
+test makePerson
+    it 'builds a Person from a dict in tail position'
+        assert.equals(makePerson().name, 'Alice')
+    end
+end
