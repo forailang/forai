@@ -569,9 +569,14 @@ fn handle_read_request(
     pending: &mut PendingRequests,
 ) {
     let ServerReadDone { stream, request } = done;
-    let Some(req) = request else {
-        // Closed / timed out / malformed: nothing to answer.
-        return;
+    let req = match request {
+        ReadOutcome::Request(req) => req,
+        ReadOutcome::TooLarge => {
+            write_payload_too_large(stream);
+            return;
+        }
+        // Closed / timed out / malformed / short body: nothing to answer.
+        ReadOutcome::Aborted => return,
     };
     if req.method == "OPTIONS" {
         write_cors_preflight(stream);
@@ -1148,6 +1153,13 @@ fn build_http_error(caller: &mut Caller<'_, ()>, request_val: i64, message: &str
     )
 }
 
+fn write_payload_too_large(stream: TcpStream) {
+    let resp = "HTTP/1.1 413 Payload Too Large\r\n\
+        Content-Length: 0\r\n\
+        Connection: close\r\n\r\n";
+    send_response(stream, resp.as_bytes().to_vec());
+}
+
 fn write_cors_preflight(stream: TcpStream) {
     let resp = "HTTP/1.1 204 No Content\r\n\
         Access-Control-Allow-Origin: *\r\n\
@@ -1172,26 +1184,51 @@ pub(crate) struct OwnedRequest {
 }
 
 /// A finished server-side request read, handed back to the server loop via
-/// `boundary::take_server_reads`. `request` is None for a connection that
-/// closed, timed out, or sent a malformed request line.
+/// `boundary::take_server_reads`.
 struct ServerReadDone {
     stream: TcpStream,
-    request: Option<OwnedRequest>,
+    request: ReadOutcome,
+}
+
+/// Result of reading one request off a connection.
+enum ReadOutcome {
+    Request(OwnedRequest),
+    /// Content-Length over `max_body_bytes()` — answer 413 and close.
+    /// The body is deliberately not read; the connection closes anyway.
+    TooLarge,
+    /// Closed, timed out, malformed, or the body came up short — nothing
+    /// trustworthy to answer.
+    Aborted,
+}
+
+/// Largest request body the server will buffer. Uncapped, a single request
+/// header could make the host allocate arbitrary memory. Override with
+/// `FAI_HTTP_MAX_BODY_BYTES` (read once per process).
+const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn max_body_bytes() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FAI_HTTP_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_BODY_BYTES)
+    })
 }
 
 /// Read one full request (request line + headers + Content-Length body) into
 /// owned data. Pure socket I/O and parsing — no `Store`, no guest memory —
 /// so it can run on a waiter thread. Bounded by the stream's read timeout
 /// (set by the caller) per read call.
-fn read_request_owned(stream: &TcpStream) -> Option<OwnedRequest> {
+fn read_request_owned(stream: &TcpStream) -> ReadOutcome {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
-        return None;
+        return ReadOutcome::Aborted;
     }
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
     if parts.len() < 2 {
-        return None;
+        return ReadOutcome::Aborted;
     }
     let method = parts[0].to_string();
     let raw_path = parts[1].to_string();
@@ -1214,17 +1251,25 @@ fn read_request_owned(stream: &TcpStream) -> Option<OwnedRequest> {
             let key = k.trim().to_lowercase();
             let val = v.trim().to_string();
             if key == "content-length" {
-                content_length = val.parse().unwrap_or(0);
+                content_length = match val.parse() {
+                    Ok(n) => n,
+                    Err(_) => return ReadOutcome::Aborted,
+                };
             }
             headers.push((key, val));
         }
     }
+    if content_length > max_body_bytes() {
+        return ReadOutcome::TooLarge;
+    }
     let mut body_bytes = vec![0u8; content_length];
-    if content_length > 0 {
-        let _ = reader.read_exact(&mut body_bytes);
+    if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
+        // Short body: the client lied about Content-Length or hung up.
+        // Zero-padding it would hand the handler a fabricated body.
+        return ReadOutcome::Aborted;
     }
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
-    Some(OwnedRequest {
+    ReadOutcome::Request(OwnedRequest {
         method,
         path,
         query_string,
@@ -1907,7 +1952,9 @@ mod tests {
             )
             .expect("write request");
 
-        let req = read_request_owned(&server).expect("parse request");
+        let ReadOutcome::Request(req) = read_request_owned(&server) else {
+            panic!("parse request");
+        };
         assert_eq!(req.method, "GET");
         assert_eq!(req.path, "/fai-runtime.js");
         // Imitate the static-file path: write a large body then
@@ -1931,13 +1978,61 @@ mod tests {
                   hello world",
             )
             .expect("write request");
-        let req = read_request_owned(&server).expect("parse request");
+        let ReadOutcome::Request(req) = read_request_owned(&server) else {
+            panic!("parse request");
+        };
         assert_eq!(req.method, "POST");
         assert_eq!(req.body, "hello world");
         finish_response(server, b"ok");
         let mut buf = Vec::new();
         client.read_to_end(&mut buf).expect("read_to_end");
         assert_eq!(buf, b"ok");
+    }
+
+    #[test]
+    fn read_request_rejects_oversized_content_length() {
+        // A huge Content-Length must not make the host allocate the
+        // claimed size — the read stops at the headers and reports
+        // TooLarge (answered with a 413 by the server loop).
+        let (server, mut client) = loopback_pair();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\n\
+                  Host: x\r\n\
+                  Content-Length: 999999999999\r\n\r\n",
+            )
+            .expect("write request");
+        assert!(matches!(read_request_owned(&server), ReadOutcome::TooLarge));
+    }
+
+    #[test]
+    fn read_request_aborts_on_short_body() {
+        // Client claims 50 bytes but sends 5 then closes: the request
+        // must be dropped, not zero-padded into a fabricated body.
+        let (server, mut client) = loopback_pair();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\n\
+                  Host: x\r\n\
+                  Content-Length: 50\r\n\r\n\
+                  hello",
+            )
+            .expect("write request");
+        drop(client);
+        assert!(matches!(read_request_owned(&server), ReadOutcome::Aborted));
+    }
+
+    #[test]
+    fn read_request_aborts_on_malformed_content_length() {
+        let (server, mut client) = loopback_pair();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\n\
+                  Host: x\r\n\
+                  Content-Length: banana\r\n\r\n",
+            )
+            .expect("write request");
+        assert!(matches!(read_request_owned(&server), ReadOutcome::Aborted));
     }
 
     #[test]
