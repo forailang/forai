@@ -895,10 +895,16 @@ pub(super) fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u
             f.instruction(&Instruction::End); // block
         };
 
-    // STRING → no children; size = 8 + count(len)
+    // STRING or SECRET → no children; size = 8 + count(len). A SECRET
+    // (plan 132) is string-shaped: its payload is only the secret NAME's
+    // bytes, laid out exactly like a string body.
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
     f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_SECRET));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(empty));
     f.instruction(&Instruction::I32Const(8));
     f.instruction(&Instruction::LocalGet(3));

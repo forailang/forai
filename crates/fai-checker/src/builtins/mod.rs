@@ -22,6 +22,7 @@ mod json;
 mod math;
 mod net;
 mod process;
+mod secrets;
 mod storage;
 mod string;
 mod test;
@@ -45,6 +46,7 @@ pub fn install_builtins() -> HashMap<String, Type> {
     net::install(&mut b);
     crypto::install(&mut b);
     process::install(&mut b);
+    secrets::install(&mut b);
     storage::install(&mut b);
     test::install(&mut b);
     ffi::install(&mut b);
@@ -215,6 +217,10 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.path", name: "basename", builtin_name: "pathBasename", doc: "Return the filename portion of a path." },
         BuiltinDoc { module: "std.path", name: "extname",  builtin_name: "pathExtname",  doc: "Return the file extension, including the leading dot." },
 
+        // std.secrets
+        BuiltinDoc { module: "std.secrets", name: "get", builtin_name: "secretsGet", doc: "Return an opaque Secret handle for a declared secret name. The plaintext never enters guest memory; the host resolves it at egress. Undeclared names raise a catchable error when a [secrets] manifest exists." },
+        BuiltinDoc { module: "std.secrets", name: "has", builtin_name: "secretsHas", doc: "Return true when the active secrets backend can resolve the name. Never returns the value." },
+        BuiltinDoc { module: "std.secrets", name: "available", builtin_name: "secretsAvailable", doc: "Return true on the native/server host. std.secrets is server-side only; browser code uses secrets indirectly through remote def RPC." },
         // std.env
         BuiltinDoc { module: "std.env", name: "get",  builtin_name: "envGet",  doc: "Read a process environment variable, or null if unset." },
         BuiltinDoc { module: "std.env", name: "load", builtin_name: "envLoad", doc: "Parse a dotenv-style file and merge its entries into the process environment. Returns true on success, false if the file is missing or unreadable." },

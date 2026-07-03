@@ -33,6 +33,9 @@ pub(crate) const OBJ_TAG_ARRAY: i32 = 1;
 pub(crate) const OBJ_TAG_TUPLE: i32 = 2;
 pub(crate) const OBJ_TAG_DICT: i32 = 3;
 pub(crate) const OBJ_TAG_CLOSURE: i32 = 4;
+/// Opaque secret handle (plan 132): string-shaped payload holding only the
+/// secret NAME. Mirrors `fai-codegen-wasm::runtime::abi::OBJ_TAG_SECRET`.
+pub(crate) const OBJ_TAG_SECRET: i32 = 9;
 
 /// Classified result of a top-level `_start` return.
 #[derive(Debug, PartialEq)]

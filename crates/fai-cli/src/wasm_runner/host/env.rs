@@ -97,7 +97,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     Ok(())
 }
 
-fn read_slice(data: &[u8], ptr: i32, len: i32) -> String {
+pub(super) fn read_slice(data: &[u8], ptr: i32, len: i32) -> String {
     let start = ptr as usize;
     let end = start.saturating_add(len as usize);
     if end > data.len() {

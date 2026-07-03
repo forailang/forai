@@ -2,7 +2,9 @@
 
 use wasmtime::*;
 
-use super::nan_box::{encode_object, OBJ_TAG_ARRAY, OBJ_TAG_CLOSURE, OBJ_TAG_DICT, OBJ_TAG_STRING};
+use super::nan_box::{
+    encode_object, OBJ_TAG_ARRAY, OBJ_TAG_CLOSURE, OBJ_TAG_DICT, OBJ_TAG_SECRET, OBJ_TAG_STRING,
+};
 
 /// Read the current `__heap_ptr` global as a u32.
 fn heap_ptr(caller: &mut Caller<'_, ()>) -> u32 {
@@ -160,6 +162,21 @@ pub(crate) fn wasm_alloc_str(caller: &mut Caller<'_, ()>, mem: &Memory, s: &str)
     let addr = reserve(caller, mem, 8 + bytes.len()) as usize;
     let data = mem.data_mut(&mut *caller);
     data[addr..addr + 4].copy_from_slice(&OBJ_TAG_STRING.to_le_bytes());
+    data[addr + 4..addr + 8].copy_from_slice(&(bytes.len() as i32).to_le_bytes());
+    data[addr + 8..addr + 8 + bytes.len()].copy_from_slice(bytes);
+    encode_object(addr as u32)
+}
+
+/// Allocate an opaque Secret handle on the guest heap (plan 132).
+///
+/// Layout mirrors a string — `[tag:i32=OBJ_TAG_SECRET][len:i32][name bytes...]`
+/// — but the payload is only the secret NAME. Plaintext is never written to
+/// guest memory; the host resolves the handle at egress.
+pub(crate) fn wasm_alloc_secret(caller: &mut Caller<'_, ()>, mem: &Memory, name: &str) -> i64 {
+    let bytes = name.as_bytes();
+    let addr = reserve(caller, mem, 8 + bytes.len()) as usize;
+    let data = mem.data_mut(&mut *caller);
+    data[addr..addr + 4].copy_from_slice(&OBJ_TAG_SECRET.to_le_bytes());
     data[addr + 4..addr + 8].copy_from_slice(&(bytes.len() as i32).to_le_bytes());
     data[addr + 8..addr + 8 + bytes.len()].copy_from_slice(bytes);
     encode_object(addr as u32)

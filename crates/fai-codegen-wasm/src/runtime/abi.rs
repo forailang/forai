@@ -96,8 +96,14 @@ pub const OBJ_TAG_INSTANCE: i32 = 7;
 /// object. The enclosing scope and each capturing closure co-own it;
 /// `RT_RELEASE` frees the held value and the block at rc 0.
 pub const OBJ_TAG_CELL: i32 = 8;
+/// Opaque secret handle (plan 132): `[tag@0][name_len@4][name bytes@8..]`,
+/// string-shaped so release/copy reuse the string size logic. The payload is
+/// only the declared secret NAME — plaintext never enters guest memory; the
+/// host resolves the handle at egress. Constructed exclusively by the
+/// `secrets_get` host import, never by guest codegen.
+pub const OBJ_TAG_SECRET: i32 = 9;
 /// Debug poison written into a freed object's tag slot under the RC checked-mode
-/// (`FAI_RC_CHECK`, plan 113 R2). Not a valid tag (real tags are 0..=8), so any
+/// (`FAI_RC_CHECK`, plan 113 R2). Not a valid tag (real tags are 0..=9), so any
 /// RC op that observes it in a freed block traps loudly. Overwritten when the
 /// block is reused by a later alloc.
 pub const OBJ_TAG_POISON: i32 = 0x7E_DEAD;
@@ -593,7 +599,19 @@ pub const IMPORT_JSON_VALID: u32 = 125;
 /// `env.json_stringify_pretty(val) -> i64` — like json_stringify but
 /// pretty-printed with 2-space indent.
 pub const IMPORT_JSON_STRINGIFY_PRETTY: u32 = 126;
-pub const IMPORT_COUNT: u32 = 127;
+/// `env.secrets_get(name_ptr, name_len) -> i64` — NaN-boxed opaque Secret
+/// handle (OBJ_TAG_SECRET) carrying only the name (plan 132). The host
+/// validates the name against the declared `[secrets]` manifest when one
+/// exists; an undeclared name raises a catchable runtime error. Plaintext
+/// is never returned — resolution happens host-side at egress.
+pub const IMPORT_SECRETS_GET: u32 = 127;
+/// `env.secrets_has(name_ptr, name_len) -> i32` — 1 when the active
+/// backend can resolve the name, 0 otherwise. Never returns the value.
+pub const IMPORT_SECRETS_HAS: u32 = 128;
+/// `env.secrets_available() -> i32` — availability probe: 1 on the native
+/// host, 0 in the browser (std.secrets is server-side only by design).
+pub const IMPORT_SECRETS_AVAILABLE: u32 = 129;
+pub const IMPORT_COUNT: u32 = 130;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1416,6 +1434,20 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_JSON_STRINGIFY_PRETTY: (val) -> i64 (NaN-boxed String).
         ("json_stringify_pretty", vec![ValType::I64], vec![ValType::I64]),
+        // IMPORT_SECRETS_GET: (name_ptr, name_len) -> i64 (boxed Secret handle).
+        (
+            "secrets_get",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_SECRETS_HAS: (name_ptr, name_len) -> i32 (0/1).
+        (
+            "secrets_has",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        ),
+        // IMPORT_SECRETS_AVAILABLE: () -> i32 (1 native, 0 browser).
+        ("secrets_available", vec![], vec![ValType::I32]),
     ]
 }
 

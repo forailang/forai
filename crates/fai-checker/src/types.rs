@@ -37,6 +37,11 @@ pub enum Type {
     TypeConstructor(std::string::String),
     /// Opaque FFI pointer type (e.g., sqlite3 Db handle).
     Ptr(std::string::String),
+    /// Opaque secret handle (plan 132). Carries only a secret NAME at
+    /// runtime; the host resolves plaintext at egress. The checker forbids
+    /// interpolation, concatenation, comparison, and case dispatch so the
+    /// value cannot leak through guest-visible channels.
+    Secret,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +195,7 @@ pub fn same_type(left: &Type, right: &Type) -> bool {
         (Type::ModuleNamespace { name: a, .. }, Type::ModuleNamespace { name: b, .. }) => a == b,
         (Type::TypeConstructor(a), Type::TypeConstructor(b)) => a == b,
         (Type::Ptr(a), Type::Ptr(b)) => a == b,
+        (Type::Secret, Type::Secret) => true,
         _ => false,
     }
 }
@@ -320,6 +326,7 @@ pub fn describe_type(ty: &Type) -> std::string::String {
         Type::ModuleNamespace { name, .. } => format!("{} module", name),
         Type::TypeConstructor(name) => format!("{} constructor", name),
         Type::Ptr(name) => name.clone(),
+        Type::Secret => "Secret".to_string(),
     }
 }
 

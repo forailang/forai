@@ -503,6 +503,16 @@ impl Checker {
     ) -> Result<Type, CheckError> {
         let value_type = self.check_expression(&cs.value, env)?;
 
+        // Secrets are opaque (plan 132): case dispatch on one would probe
+        // its identity byte-by-byte, so it is rejected like ==/ordering.
+        if matches!(value_type, Type::Secret) {
+            return Err(CheckError::new(
+                "Cannot use a Secret as a case value. Secrets are opaque \
+                 handles; pass one to an egress position (e.g. an HTTP \
+                 header) or use secrets.reveal(...) at a trusted sink",
+            ));
+        }
+
         if cs.default_branch.is_none() {
             for branch in &cs.when_branches {
                 let match_type = self.check_expression(&branch.match_expr, env)?;

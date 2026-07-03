@@ -128,7 +128,17 @@ impl Checker {
                 if let Expression::TemplateStringExpression(ts) = expr {
                     for part in &ts.parts {
                         if let TemplateStringPart::Expression { expression } = part {
-                            self.check_expression(expression, env)?;
+                            let part_ty = self.check_expression(expression, env)?;
+                            // Secrets are opaque (plan 132): interpolating one
+                            // would only ever render the redaction, so reject
+                            // it at check time and point at the safe paths.
+                            if matches!(part_ty, Type::Secret) {
+                                return Err(CheckError::new(
+                                    "Secret values cannot be interpolated into strings. \
+                                     Pass the Secret to an egress position (e.g. an HTTP \
+                                     header) or use secrets.reveal(...) at a trusted sink",
+                                ));
+                            }
                         }
                     }
                 }
@@ -790,6 +800,25 @@ impl Checker {
             }
             let arg_expr = &arg.unwrap().value;
             let actual = self.check_expression(arg_expr, env)?;
+            // A Secret flows only into Secret-typed parameters plus a small
+            // redaction-safe allowlist (plan 132). Without this, any
+            // Unknown-typed parameter (length, json.stringify, user helpers)
+            // would be a laundering channel around the opacity rules.
+            // `print`/`toString` render only the redaction `«secret NAME»`.
+            if matches!(actual, Type::Secret) {
+                let param_takes_secret = matches!(param.ty, Type::Secret)
+                    || matches!(&param.ty, Type::Optional(inner) if matches!(**inner, Type::Secret));
+                let redaction_safe =
+                    matches!(sig.name.as_str(), "print" | "toString" | "typeOf" | "copy");
+                if !param_takes_secret && !redaction_safe {
+                    return Err(CheckError::new(format!(
+                        "Argument '{}' for '{}' cannot be a Secret. Secrets are \
+                         opaque handles accepted only by Secret-typed parameters, \
+                         std.secrets functions, and declared egress positions",
+                        param.name, sig.name
+                    )));
+                }
+            }
             if !self.accept_builtin_special_case(&sig.name, i, &actual, ce, env) {
                 if !self.bind_and_check_assignable(&actual, &param.ty, &mut generic_bindings) {
                     let expected = apply_generic_bindings(&param.ty, &generic_bindings);
@@ -981,6 +1010,18 @@ impl Checker {
     ) -> Result<Type, CheckError> {
         let left = self.check_expression(&be.left, env)?;
         let right = self.check_expression(&be.right, env)?;
+
+        // Secrets are opaque (plan 132): no concatenation, no equality, no
+        // ordering. This guard runs before the Unknown-deferral paths below
+        // so a Secret can't slip through an erased-type operand.
+        if matches!(left, Type::Secret) || matches!(right, Type::Secret) {
+            return Err(CheckError::new(format!(
+                "Operator '{}' cannot be applied to a Secret. Secrets are \
+                 opaque handles; pass one to an egress position (e.g. an HTTP \
+                 header) or use secrets.reveal(...) at a trusted sink",
+                be.operator
+            )));
+        }
 
         match be.operator.as_str() {
             "and" | "or" => {

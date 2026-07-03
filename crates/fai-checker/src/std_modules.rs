@@ -215,6 +215,18 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
     );
 
     m.insert(
+        "std.secrets".into(),
+        vec![
+            ("get", "secretsGet"),
+            ("has", "secretsHas"),
+            ("available", "secretsAvailable"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.into(), b.into()))
+        .collect(),
+    );
+
+    m.insert(
         "std.events".into(),
         vec![
             ("on", "eventOn"),

@@ -184,10 +184,15 @@ pub(super) fn emit_copy_deep(base: u32) -> Function {
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalSet(5));
     };
-    // STRING → 8 + count*1
+    // STRING||SECRET → 8 + count*1 (a SECRET body is its name's bytes,
+    // string-shaped; copying yields an equally opaque handle)
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
     f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_SECRET));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(empty));
     set_size(&mut f, 8, 1);
     f.instruction(&Instruction::End);
@@ -236,10 +241,14 @@ pub(super) fn emit_copy_deep(base: u32) -> Function {
     f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::I32Store(off4));
 
-    // STRING → byte-copy `count` bytes (src+8 → dst+8)
+    // STRING||SECRET → byte-copy `count` bytes (src+8 → dst+8)
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
     f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_SECRET));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::If(empty));
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::LocalSet(4));
@@ -1373,8 +1382,13 @@ pub(super) fn emit_set_field(base: u32, import_remap: &[Option<u32>]) -> Functio
 
 // ── $rt_value_to_str(val: i64) -> i64 ──
 pub(super) fn emit_value_to_str(base: u32, ks: &KnownStrings, import_remap: &[Option<u32>]) -> Function {
-    // locals: 1=addr(i32), 2=len(i32)
-    let mut f = Function::new([(1, ValType::I32), (1, ValType::I32)]);
+    // locals: 1=addr(i32), 2=len(i32), 3=dst(i32), 4=i(i32)
+    let mut f = Function::new([(4, ValType::I32)]);
+    let off4 = MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    };
 
     // If already a string object, return as-is
     f.instruction(&Instruction::LocalGet(0));
@@ -1383,12 +1397,114 @@ pub(super) fn emit_value_to_str(base: u32, ks: &KnownStrings, import_remap: &[Op
     {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Load(mem0()));
         f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // SECRET (plan 132): render the redaction `«secret NAME»`. The
+        // handle's payload IS the name, so this is the only rendering —
+        // redaction is the default, not an option. Layout of the fresh
+        // String: 9 prefix bytes (« = C2 AB, then "secret ") + name
+        // bytes + 2 suffix bytes (» = C2 BB) = name_len + 11.
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_SECRET));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // len = name byte count
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Load(off4));
+            f.instruction(&Instruction::LocalSet(2));
+            // dst = rt_alloc(8 + 11 + len)
+            f.instruction(&Instruction::I32Const(19));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::Call(base + RT_ALLOC));
+            f.instruction(&Instruction::LocalSet(3));
+            // header: tag STRING, len = name_len + 11
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+            f.instruction(&Instruction::I32Store(mem0()));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Const(11));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store(off4));
+            // prefix bytes: « s e c r e t ␠
+            for (i, b) in [0xC2u8, 0xAB, b's', b'e', b'c', b'r', b'e', b't', b' ']
+                .iter()
+                .enumerate()
+            {
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::I32Const(*b as i32));
+                f.instruction(&Instruction::I32Store8(MemArg {
+                    offset: 8 + i as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            // copy name bytes: dst[17 + i] = src[8 + i]
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(4));
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Load8U(MemArg {
+                offset: 8,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::I32Store8(MemArg {
+                offset: 17,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(4));
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+            // suffix » at dst + 17 + len
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(4));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(0xC2));
+            f.instruction(&Instruction::I32Store8(MemArg {
+                offset: 17,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(0xBB));
+            f.instruction(&Instruction::I32Store8(MemArg {
+                offset: 18,
+                align: 0,
+                memory_index: 0,
+            }));
+            // return make_obj(dst)
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+            f.instruction(&Instruction::Return);
+        }
         f.instruction(&Instruction::End);
     }
     f.instruction(&Instruction::End);

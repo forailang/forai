@@ -528,6 +528,38 @@ stubs, so server/native code should own environment-dependent behavior.
 "#,
         },
         StdlibModuleOverview {
+            name: "secrets",
+            doc: r#"
+`std.secrets` provides opaque secret handles. `secrets.get(name)` returns a
+`Secret` — a handle carrying only the NAME. The plaintext value stays on the
+host side of the wasm boundary and is resolved at egress; it never enters
+guest memory. Printing a Secret renders the redaction `«secret NAME»`.
+
+```fai
+use std.secrets
+
+let key = secrets.get('STRIPE_KEY')
+print(key)                       # prints «secret STRIPE_KEY»
+if secrets.has('STRIPE_KEY')
+    # the active backend can resolve it
+end
+```
+
+The checker forbids interpolating, concatenating, comparing, and
+case-dispatching a Secret, and a Secret argument is accepted only by
+Secret-typed parameters (plus `print`/`toString`, which render only the
+redaction). Prefer passing Secrets to egress positions (HTTP auth headers,
+child process env). `secrets.reveal(...)` — the single greppable audit
+anchor — is for trusted non-HTTP sinks that need real bytes.
+
+Backends are configured in `fai.toml` under `[secrets]` (`env`, `dotenvx`,
+`aws`); the same program runs against different backends with no source
+change. `std.secrets` is server/native only: browser builds get stubs
+(`secrets.available()` returns `false`), and client code uses secrets
+indirectly through `remote def` RPC.
+"#,
+        },
+        StdlibModuleOverview {
             name: "file",
             doc: r#"
 `std.file` reads, writes, checks, and lists files relative to the process

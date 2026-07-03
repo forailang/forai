@@ -937,6 +937,29 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: RPrim,
         doc: "encoded bool; host copies dotenv path string",
     },
+    // std.secrets (plan 132) — `get` allocates a fresh opaque Secret handle
+    // (name-only payload) via wasm_alloc_secret; probes are primitives.
+    HostImportRow {
+        canon: "std.secrets",
+        method: "get",
+        import: "secrets_get",
+        ret: ROwn,
+        doc: "fresh Secret handle via wasm_alloc_secret; host copies name string",
+    },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "has",
+        import: "secrets_has",
+        ret: RPrim,
+        doc: "encoded bool; host copies name string, never returns the value",
+    },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "available",
+        import: "secrets_available",
+        ret: RPrim,
+        doc: "encoded bool availability probe",
+    },
     // std.events — the subscription dict is host-built fresh (heap::reserve
     // in build_subscription). Handler retention is the separate, pinned
     // phase-6 issue and does not change the RESULT's ownership.
@@ -1868,7 +1891,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 107, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 110, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

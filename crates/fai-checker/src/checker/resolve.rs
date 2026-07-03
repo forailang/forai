@@ -72,6 +72,7 @@ impl Checker {
             "Error" => Ok(Type::Error),
             "Void" => Ok(Type::Void),
             "Ptr" => Ok(Type::Ptr("Ptr".to_string())),
+            "Secret" => Ok(Type::Secret),
             // Built-in named types (not user-defined, not extern)
             "HttpRequest" | "HttpResponse" | "Router" | "Event" | "Subscription" | "Cookie"
             | "RequestResponse" | "ServerStarted" | "HttpError" | "RpcCall" | "RpcResult"

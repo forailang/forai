@@ -3544,6 +3544,7 @@ impl<'a, 'c> Builder<'a, 'c> {
                     (OBJ_TAG_CLOSURE, "closure"),
                     (crate::runtime::OBJ_TAG_MODULE, "module"),
                     (crate::runtime::OBJ_TAG_INSTANCE, "record"),
+                    (crate::runtime::OBJ_TAG_SECRET, "secret"),
                 ];
                 for (t, name) in tags {
                     self.emit(Instruction::LocalGet(tag));

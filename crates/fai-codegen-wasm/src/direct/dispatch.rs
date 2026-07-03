@@ -400,6 +400,14 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
             RS::Boxed,
         ),
 
+        // std.secrets — opaque secret handles (plan 132). `get` returns a
+        // NaN-boxed OBJ_TAG_SECRET handle carrying only the name; the host
+        // resolves plaintext at egress, never in guest memory. `has` probes
+        // the active backend; `available` is the server/native probe.
+        ("std.secrets", "get") => (IMPORT_SECRETS_GET, &[AS::String], RS::Boxed),
+        ("std.secrets", "has") => (IMPORT_SECRETS_HAS, &[AS::String], RS::MakeBool),
+        ("std.secrets", "available") => (IMPORT_SECRETS_AVAILABLE, &[], RS::MakeBool),
+
         // std.net / std.ffi — availability checks.
         ("std.net", "available") => (IMPORT_NET_AVAILABLE, &[], RS::MakeBool),
 

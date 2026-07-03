@@ -4,7 +4,8 @@ use wasmtime::*;
 
 use super::super::heap::{build_value, wasm_alloc_str};
 use super::super::nan_box::{
-    ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, OBJ_TAG_STRING, QNAN, SIGN_BIT, TAG_BOOL, TAG_INT,
+    ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, OBJ_TAG_SECRET, OBJ_TAG_STRING, QNAN, SIGN_BIT,
+    TAG_BOOL, TAG_INT,
     TAG_MASK, TAG_NULL, TAG_VOID, VAL_NULL,
 };
 
@@ -760,6 +761,20 @@ fn stringify_object(data: &[u8], addr: usize, out: &mut String) {
                 stringify_value(data, v, out);
             }
             out.push('}');
+        }
+        t if t == OBJ_TAG_SECRET => {
+            // Secret handle (plan 132): serialize the redaction, never a
+            // value. Secrets are not serializable by design — this keeps
+            // stringify from being a laundering channel while making the
+            // mistake visible in the output.
+            let end = addr.saturating_add(8).saturating_add(count);
+            let bytes = if end <= data.len() {
+                &data[addr + 8..end]
+            } else {
+                &[][..]
+            };
+            let name = String::from_utf8_lossy(bytes);
+            write_json_string(&format!("«secret {}»", name), out);
         }
         _ => {
             out.push_str("null");

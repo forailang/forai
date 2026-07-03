@@ -16,6 +16,7 @@ mod json;
 mod net;
 mod process;
 pub(crate) mod reactor;
+mod secrets;
 mod socket_registry;
 mod sockets;
 mod spy;
@@ -55,6 +56,7 @@ pub(super) fn install_all(linker: &mut Linker<()>) -> Result<(), String> {
     http_server::install(linker)?;
     storage::install(linker)?;
     env::install(linker)?;
+    secrets::install(linker)?;
     events::install(linker)?;
     array::install(linker)?;
     crypto::install(linker)?;

@@ -1174,6 +1174,16 @@ fn describe_boxed_value(data: &[u8], v: u64) -> String {
         }
         4 => format!("Closure(table slot {}{})", count, rc_suffix),
         6 => format!("NativeFn(method {}{})", count, rc_suffix),
+        9 => {
+            // Secret handle (plan 132): the payload is only the NAME —
+            // render it like print does, never any resolved value.
+            let len = count.max(0) as usize;
+            let name = data
+                .get(addr + 8..addr + 8 + len)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            format!("«secret {}»{}", name, rc_suffix)
+        }
         t if t == OBJ_TAG_POISON => format!("freed object (poisoned{})", rc_suffix),
         t => format!("<object tag {} at 0x{:x}{}>", t, addr, rc_suffix),
     }
