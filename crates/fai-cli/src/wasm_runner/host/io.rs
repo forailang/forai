@@ -8,7 +8,6 @@ use std::sync::{Mutex, OnceLock};
 use wasmtime::*;
 
 use super::super::heap::wasm_alloc_str;
-use super::super::nan_box::VAL_NULL;
 use super::super::output;
 use super::host_ops::{read_string_arg, submit_host_op, HostOpResult};
 
@@ -127,12 +126,16 @@ pub(super) fn begin_file_host_op(
     match op_kind {
         fai_codegen_wasm::HOST_OP_FILE_READ => {
             let Some(path) = read_string_arg(caller, args, 0) else {
-                submit_host_op(task_id, || HostOpResult::Null);
+                submit_host_op(task_id, || {
+                    HostOpResult::Error("file.read: invalid path argument".to_string())
+                });
                 return true;
             };
             submit_host_op(task_id, move || match std::fs::read_to_string(&path) {
                 Ok(content) => HostOpResult::Json(serde_json::Value::String(content)),
-                Err(_) => HostOpResult::Null,
+                // A catchable throw with the path and OS reason — never a
+                // silent null in a non-optional String.
+                Err(e) => HostOpResult::Error(format!("file.read '{}' failed: {}", path, e)),
             });
             true
         }
@@ -142,34 +145,40 @@ pub(super) fn begin_file_host_op(
                 read_string_arg(caller, args, 1),
             ) else {
                 submit_host_op(task_id, || {
-                    HostOpResult::Json(serde_json::Value::Bool(false))
+                    HostOpResult::Error("file.write: invalid arguments".to_string())
                 });
                 return true;
             };
-            submit_host_op(task_id, move || {
-                HostOpResult::Json(serde_json::Value::Bool(
-                    std::fs::write(&path, &content).is_ok(),
-                ))
+            submit_host_op(task_id, move || match std::fs::write(&path, &content) {
+                Ok(()) => HostOpResult::Json(serde_json::Value::Bool(true)),
+                // Callers historically ignore the Bool result — surface a
+                // catchable error instead of a silent false.
+                Err(e) => HostOpResult::Error(format!("file.write '{}' failed: {}", path, e)),
             });
             true
         }
         fai_codegen_wasm::HOST_OP_FILE_LIST => {
             let Some(path) = read_string_arg(caller, args, 0) else {
                 submit_host_op(task_id, || {
-                    HostOpResult::Json(serde_json::Value::Array(Vec::new()))
+                    HostOpResult::Error("file.list: invalid path argument".to_string())
                 });
                 return true;
             };
-            submit_host_op(task_id, move || {
-                let names = std::fs::read_dir(&path)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|entries| entries.flatten())
-                    .map(|entry| {
-                        serde_json::Value::String(entry.file_name().to_string_lossy().into_owned())
-                    })
-                    .collect();
-                HostOpResult::Json(serde_json::Value::Array(names))
+            submit_host_op(task_id, move || match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    let names = entries
+                        .flatten()
+                        .map(|entry| {
+                            serde_json::Value::String(
+                                entry.file_name().to_string_lossy().into_owned(),
+                            )
+                        })
+                        .collect();
+                    HostOpResult::Json(serde_json::Value::Array(names))
+                }
+                // A missing or unreadable directory is a catchable error,
+                // not indistinguishable from an empty one.
+                Err(e) => HostOpResult::Error(format!("file.list '{}' failed: {}", path, e)),
             });
             true
         }
@@ -263,8 +272,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     // env.file_read_str(path_ptr, path_len) -> i64 — NaN-boxed String with
-    // the full file contents (host-allocated, any size), or VAL_NULL on
-    // failure. Replaces the fixed-buffer `read_file` ABI above.
+    // the full file contents (host-allocated, any size). Replaces the
+    // fixed-buffer `read_file` ABI above. On failure it raises a
+    // guest-catchable error (error channel + post-call propagation) so a
+    // missing file or permission problem is a throw with the path and OS
+    // reason, never a silent null in a non-optional String.
     linker
         .func_wrap(
             "env",
@@ -275,7 +287,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     let data = mem.data(&caller);
                     let end = (path_ptr + path_len) as usize;
                     if end > data.len() {
-                        return VAL_NULL;
+                        return super::host_ops::signal_host_error(
+                            &mut caller,
+                            "io",
+                            "file.read: path out of bounds",
+                        );
                     }
                     std::str::from_utf8(&data[path_ptr as usize..end])
                         .unwrap_or("")
@@ -283,7 +299,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 };
                 match std::fs::read_to_string(&path) {
                     Ok(content) => wasm_alloc_str(&mut caller, &mem, &content),
-                    Err(_) => VAL_NULL,
+                    Err(e) => super::host_ops::signal_host_error(
+                        &mut caller,
+                        "io",
+                        &format!("file.read '{}' failed: {}", path, e),
+                    ),
                 }
             },
         )
@@ -342,7 +362,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     .to_string();
                 match std::fs::write(&path, &content) {
                     Ok(_) => 1,
-                    Err(_) => 0,
+                    Err(e) => {
+                        // Raise a catchable error instead of a silent
+                        // `false` — callers historically ignore the Bool.
+                        super::host_ops::signal_host_error(
+                            &mut caller,
+                            "io",
+                            &format!("file.write '{}' failed: {}", path, e),
+                        );
+                        0
+                    }
                 }
             },
         )
@@ -515,9 +544,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
-    // env.file_list(ptr, len) -> i64 (Array<String> | null). Reads the
+    // env.file_list(ptr, len) -> i64 (Array<String>). Reads the
     // directory, collects entry file names, and allocates a NaN-boxed
-    // Array<String> on the guest heap. Returns VAL_NULL on I/O error.
+    // Array<String> on the guest heap. Raises a guest-catchable error
+    // on I/O failure.
     linker
         .func_wrap(
             "env",
@@ -541,10 +571,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                         );
                         super::super::heap::build_value(&mut caller, &mem, &json_arr)
                     }
-                    Err(_) => {
-                        let json_arr = serde_json::Value::Array(Vec::new());
-                        super::super::heap::build_value(&mut caller, &mem, &json_arr)
-                    }
+                    // A missing or unreadable directory is a catchable
+                    // error, not indistinguishable from an empty one.
+                    Err(e) => super::host_ops::signal_host_error(
+                        &mut caller,
+                        "io",
+                        &format!("file.list '{}' failed: {}", path, e),
+                    ),
                 }
             },
         )

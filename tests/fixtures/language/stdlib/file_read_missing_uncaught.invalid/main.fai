@@ -1,0 +1,11 @@
+# expect: runtime_error
+# error: file.read '/fai-fixture/no/such/file.txt' failed
+
+use std.file
+
+def main
+    @return Void
+do
+    let content = file.read('/fai-fixture/no/such/file.txt')
+    print(content)
+end

@@ -1,0 +1,38 @@
+# expect: ok
+# stdout:
+#   read: file.read failed
+#   write: file.write failed
+#   list: file.list failed
+
+use std.file
+
+use std.string
+
+def main
+    @return Void
+do
+    try
+        let content = file.read('/fai-fixture/no/such/file.txt')
+        print('read ok: ' + content)
+    catch e
+        if string.contains(e.message, "file.read '/fai-fixture/no/such/file.txt' failed")
+            print('read: file.read failed')
+        end
+    end
+    try
+        file.write('/fai-fixture/no/such/dir/out.txt', 'x')
+        print('write ok')
+    catch e
+        if string.contains(e.message, 'file.write')
+            print('write: file.write failed')
+        end
+    end
+    try
+        let entries = file.list('/fai-fixture/no/such/dir')
+        print('list ok')
+    catch e
+        if string.contains(e.message, 'file.list')
+            print('list: file.list failed')
+        end
+    end
+end

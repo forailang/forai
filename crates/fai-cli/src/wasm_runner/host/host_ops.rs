@@ -123,10 +123,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 match super::boundary::take_ready(task_id) {
                     Some(Ok(boxed)) => match boxed.downcast::<HostOpResult>() {
                         Ok(result) => marshal_result(&mut caller, &mem, *result),
-                        Err(_) => signal_host_op_error(&mut caller, "host op result type mismatch"),
+                        Err(_) => signal_host_error(&mut caller, "host_op", "host op result type mismatch"),
                     },
-                    Some(Err(msg)) => signal_host_op_error(&mut caller, &msg),
-                    None => signal_host_op_error(&mut caller, "missing host op result"),
+                    Some(Err(msg)) => signal_host_error(&mut caller, "host_op", &msg),
+                    None => signal_host_error(&mut caller, "host_op", "missing host op result"),
                 }
             },
         )
@@ -243,7 +243,7 @@ fn marshal_result(caller: &mut Caller<'_, ()>, mem: &Memory, result: HostOpResul
             }
             build_value(caller, mem, &Value::Bool(ok))
         }
-        HostOpResult::Error(msg) => signal_host_op_error(caller, &msg),
+        HostOpResult::Error(msg) => signal_host_error(caller, "host_op", &msg),
     }
 }
 
@@ -251,14 +251,20 @@ fn encode_int(value: i32) -> i64 {
     (QNAN | TAG_INT | (value as u32 as u64)) as i64
 }
 
-fn signal_host_op_error(caller: &mut Caller<'_, ()>, message: &str) -> i64 {
+/// Raise a guest-catchable error from a host import: box `{message, kind}`
+/// on the guest heap and set `__error_flag`/`__error_value`. The generated
+/// code's post-call propagation check turns it into a forai throw at the
+/// call site — but only for imports codegen marks as error-signaling
+/// (see `import_signals_errors` in fai-codegen-wasm). Returns VAL_NULL as
+/// the import's (discarded) result value.
+pub(crate) fn signal_host_error(caller: &mut Caller<'_, ()>, kind: &str, message: &str) -> i64 {
     let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
         return VAL_NULL;
     };
     let key_message = wasm_alloc_str(caller, &mem, "message");
     let key_kind = wasm_alloc_str(caller, &mem, "kind");
     let v_message = wasm_alloc_str(caller, &mem, message);
-    let v_kind = wasm_alloc_str(caller, &mem, "host_op");
+    let v_kind = wasm_alloc_str(caller, &mem, kind);
     let err_box = alloc_dict(
         caller,
         &mem,

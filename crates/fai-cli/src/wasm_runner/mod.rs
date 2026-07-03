@@ -1217,19 +1217,30 @@ mod tests {
 
     #[test]
     fn test_run_wasm_file_read() {
-        // Exercises env.read_file (returns -1 for non-existent path)
+        // Reading a missing path raises a catchable error carrying the
+        // path and OS reason (error-channel migration; was a silent null).
         let src = concat!(
             "use std.file\n",
             "\n",
             "def main\n",
             "    @return Void\n",
             "do\n",
-            "  let contents = file.read('/tmp/nonexistent_fai_test')\n",
-            "  print('ok')\n",
+            "  try\n",
+            "    let contents = file.read('/tmp/nonexistent_fai_test')\n",
+            "    print('unexpected: ' + contents)\n",
+            "  catch e\n",
+            "    print(e.message)\n",
+            "  end\n",
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        assert!(run_wasm(&wasm).is_ok());
+        let out = run_wasm_capturing(&wasm).expect("caught read error should run ok");
+        assert!(
+            out.stdout
+                .contains("file.read '/tmp/nonexistent_fai_test' failed"),
+            "want path+reason in e.message, got: {}",
+            out.stdout
+        );
     }
 
     #[test]
@@ -2246,20 +2257,30 @@ mod tests {
 
     #[test]
     fn test_run_wasm_file_write_invalid_path() {
-        // Writing to a path whose parent directory doesn't exist → write_file Err path
+        // Writing to a path whose parent directory doesn't exist raises a
+        // catchable error (error-channel migration; was a silent false).
         let src = concat!(
             "use std.file\n",
             "\n",
             "def main\n",
             "    @return Void\n",
             "do\n",
-            "  file.write('/nonexistent_dir_xyz/file.txt', 'content')\n",
-            "  print('ok')\n",
+            "  try\n",
+            "    file.write('/nonexistent_dir_xyz/file.txt', 'content')\n",
+            "    print('unexpected write ok')\n",
+            "  catch e\n",
+            "    print(e.message)\n",
+            "  end\n",
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        // The write fails silently (returns -1), program continues and prints ok
-        assert!(run_wasm(&wasm).is_ok());
+        let out = run_wasm_capturing(&wasm).expect("caught write error should run ok");
+        assert!(
+            out.stdout
+                .contains("file.write '/nonexistent_dir_xyz/file.txt' failed"),
+            "want path+reason in e.message, got: {}",
+            out.stdout
+        );
     }
 
     // ── json.parse with array → exercises build_value Array case ────────
@@ -2921,20 +2942,31 @@ mod tests {
     }
 
     #[test]
-    fn test_run_wasm_file_list_missing_dir_returns_empty_array() {
+    fn test_run_wasm_file_list_missing_dir_raises_catchable_error() {
+        // A missing directory is a catchable error, distinguishable from
+        // an empty one (error-channel migration; was a silent []).
         let src = concat!(
             "use std.file\n",
             "\n",
             "def main\n",
-            "    @return Int\n",
+            "    @return Void\n",
             "do\n",
-            "  let entries = file.list('/tmp/fai_definitely_missing_dir_xyz')\n",
-            "  length(entries)\n",
+            "  try\n",
+            "    let entries = file.list('/tmp/fai_definitely_missing_dir_xyz')\n",
+            "    print('unexpected: {{length(entries)}}')\n",
+            "  catch e\n",
+            "    print(e.message)\n",
+            "  end\n",
             "end\n",
         );
         let wasm = compile_to_wasm(src);
-        let out = run_wasm_capturing(&wasm).expect("run failed");
-        assert_eq!(out.stdout, "0\n");
+        let out = run_wasm_capturing(&wasm).expect("caught list error should run ok");
+        assert!(
+            out.stdout
+                .contains("file.list '/tmp/fai_definitely_missing_dir_xyz' failed"),
+            "want path+reason in e.message, got: {}",
+            out.stdout
+        );
     }
 
     #[test]
