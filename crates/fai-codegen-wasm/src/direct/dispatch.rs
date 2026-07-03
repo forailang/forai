@@ -419,6 +419,7 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
             RS::Boxed,
         ),
         ("std.secrets", "header") => (IMPORT_SECRETS_HEADER, &[AS::Boxed], RS::Boxed),
+        ("std.secrets", "refresh") => (IMPORT_SECRETS_REFRESH, &[], RS::MakeInt),
 
         // std.net / std.ffi — availability checks.
         ("std.net", "available") => (IMPORT_NET_AVAILABLE, &[], RS::MakeBool),

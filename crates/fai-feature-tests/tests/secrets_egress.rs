@@ -40,9 +40,8 @@ fn capture_server() -> (u16, thread::JoinHandle<String>) {
     (port, handle)
 }
 
-/// Materialize a throwaway project with a [secrets] manifest and the
-/// given main.fai body.
-fn write_project(tag: &str, main_body: &str) -> std::path::PathBuf {
+/// Materialize a throwaway project with the given fai.toml and main.fai.
+fn write_project_with_toml(tag: &str, toml: &str, main_body: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
         "fai_secrets_egress_{}_{}",
         tag,
@@ -50,14 +49,19 @@ fn write_project(tag: &str, main_body: &str) -> std::path::PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).expect("mkdir project");
-    std::fs::write(
-        root.join("fai.toml"),
-        "[project]\nname = \"SecretsEgress\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
-         [secrets]\nEGRESS_TOKEN = { required = true }\n",
-    )
-    .expect("write fai.toml");
+    std::fs::write(root.join("fai.toml"), toml).expect("write fai.toml");
     std::fs::write(root.join("src/main.fai"), main_body).expect("write main.fai");
     root
+}
+
+/// Materialize a throwaway project with the default env-backend manifest.
+fn write_project(tag: &str, main_body: &str) -> std::path::PathBuf {
+    write_project_with_toml(
+        tag,
+        "[project]\nname = \"SecretsEgress\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
+         [secrets]\nEGRESS_TOKEN = { required = true }\n",
+        main_body,
+    )
 }
 
 fn run_project(root: &std::path::Path, port: u16) -> std::process::Output {
@@ -116,6 +120,110 @@ fn secret_header_resolves_at_egress_without_entering_guest_memory() {
             .to_lowercase()
             .contains(&format!("authorization: bearer {}", SECRET_VALUE.to_lowercase())),
         "resolved bearer header did not reach the wire.\nrequest: {}",
+        request
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// AWS backend end-to-end through `fai run`: the manifest's [secrets.aws]
+/// endpoint points at a mock Secrets Manager; startup validation fetches
+/// the declared secret with a SigV4-signed GetSecretValue, and
+/// `secrets.reveal` returns the cached value.
+#[test]
+fn aws_backend_fetches_through_mock_secrets_manager() {
+    // Mock Secrets Manager: one signed GetSecretValue request.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sm");
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            collected.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&collected);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_length = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if collected.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let body = r#"{"Name":"app/AWS_TEST_TOKEN","SecretString":"aws-mock-value"}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-amz-json-1.1\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        String::from_utf8_lossy(&collected).into_owned()
+    });
+
+    let toml = format!(
+        "[project]\nname = \"SecretsAws\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
+         [secrets]\nbackend = \"aws\"\nAWS_TEST_TOKEN = {{ required = true }}\n\n\
+         [secrets.aws]\nregion = \"us-east-1\"\nprefix = \"app/\"\n\
+         endpoint = \"http://127.0.0.1:{}\"\n",
+        port
+    );
+    let root = write_project_with_toml(
+        "aws",
+        &toml,
+        "use std.secrets\n\
+         \n\
+         def main\n\
+         \x20   @return Void\n\
+         do\n\
+         \x20   print(secrets.reveal(secrets.get('AWS_TEST_TOKEN')))\n\
+         end\n",
+    );
+
+    let out = Command::new(fai_binary())
+        .arg("run")
+        .current_dir(&root)
+        .env("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+        .env("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+        .output()
+        .expect("spawn fai run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "fai run failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("aws-mock-value"),
+        "reveal should return the fetched value.\nstdout: {}",
+        stdout
+    );
+
+    let request = server.join().expect("mock sm thread");
+    assert!(
+        request.contains(r#"{"SecretId":"app/AWS_TEST_TOKEN"}"#),
+        "prefix mapping missing.\nrequest: {}",
+        request
+    );
+    assert!(
+        request
+            .to_lowercase()
+            .contains("authorization: aws4-hmac-sha256 credential=akidexample/"),
+        "sigv4 header missing.\nrequest: {}",
         request
     );
 

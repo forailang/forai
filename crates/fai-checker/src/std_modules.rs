@@ -224,6 +224,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("bearer", "secretsBearer"),
             ("basic", "secretsBasic"),
             ("header", "secretsHeader"),
+            ("refresh", "secretsRefresh"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))

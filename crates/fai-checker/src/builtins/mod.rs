@@ -225,6 +225,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.secrets", name: "bearer", builtin_name: "secretsBearer", doc: "Tag a Secret for Bearer authentication. Put the result in an HTTP headers dict; the host renders `Bearer <value>` at egress — the plaintext never enters guest memory." },
         BuiltinDoc { module: "std.secrets", name: "basic", builtin_name: "secretsBasic", doc: "Tag a Secret for HTTP Basic authentication with the given user name. The host renders `Basic base64(user:<value>)` at egress." },
         BuiltinDoc { module: "std.secrets", name: "header", builtin_name: "secretsHeader", doc: "Explicitly mark a Secret's raw value for use as an HTTP header value, resolved host-side at egress. Equivalent to passing the handle itself; exists to make intent greppable." },
+        BuiltinDoc { module: "std.secrets", name: "refresh", builtin_name: "secretsRefresh", doc: "Blocking refetch of every declared secret through the active backend (aws rotation point). Returns the count refetched; env/dotenvx backends return 0. Steady-state freshness comes from the TTL cache, so call this only at explicit rotation moments." },
         // std.env
         BuiltinDoc { module: "std.env", name: "get",  builtin_name: "envGet",  doc: "Read a process environment variable, or null if unset." },
         BuiltinDoc { module: "std.env", name: "load", builtin_name: "envLoad", doc: "Parse a dotenv-style file and merge its entries into the process environment. Returns true on success, false if the file is missing or unreadable." },

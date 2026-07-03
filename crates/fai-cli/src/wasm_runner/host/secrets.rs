@@ -62,6 +62,7 @@ impl SecretsGuard {
 impl Drop for SecretsGuard {
     fn drop(&mut self) {
         CURRENT_MANIFEST.with(|slot| *slot.borrow_mut() = None);
+        crate::aws_secrets::clear();
     }
 }
 
@@ -88,12 +89,17 @@ fn undeclared(name: &str) -> bool {
 /// must never be exposed to the guest as a return value outside
 /// `secrets_reveal` (phase 2) and declared egress positions (phase 3).
 ///
-/// Backend-resolved values (installed on the manifest at startup —
-/// dotenvx decryption, aws fetch) win over the process environment; the
-/// env fallback covers the `env` backend and lets a dotenvx/aws manifest
-/// still work in dev with exported variables.
+/// Backend-resolved values win over the process environment: dotenvx
+/// decrypts into the manifest's `resolved` map at startup; the aws
+/// backend resolves through its host-side TTL cache
+/// (stale-while-revalidate — no I/O on this thread). The env fallback
+/// covers the `env` backend and lets a dotenvx/aws manifest still work
+/// in dev with exported variables.
 pub(crate) fn resolve_secret(name: &str) -> Option<String> {
     if let Some(v) = with_manifest(|m| m.and_then(|m| m.resolved.get(name).cloned())) {
+        return Some(v);
+    }
+    if let Some(v) = crate::aws_secrets::resolve(name) {
         return Some(v);
     }
     std::env::var(name).ok()
@@ -227,6 +233,16 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.secrets_available() -> i32 (always 1 on the native host)
     linker
         .func_wrap("env", "secrets_available", || -> i32 { 1 })
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.secrets_refresh() -> i32 (count refetched). Blocking refetch
+    // of every declared secret — an explicit rotation point for the aws
+    // backend (TTL + stale-while-revalidate covers steady state). The
+    // env/dotenvx backends have nothing to refetch and return 0.
+    linker
+        .func_wrap("env", "secrets_refresh", || -> i32 {
+            crate::aws_secrets::refresh_all()
+        })
         .map_err(|e| format!("linker error: {}", e))?;
 
     // Egress combinators (plan 132 D1b): pure handle→handle transforms

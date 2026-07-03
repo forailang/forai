@@ -223,10 +223,16 @@ pub(crate) fn prepare_secrets(
         }
     });
 
+    let decls = cfg.declarations_for_target(active_target);
+
     // Values pre-resolved host-side by the backend. These ride the
-    // manifest into the runner and stay host-side.
+    // manifest into the runner and stay host-side. (The aws backend
+    // resolves through its own TTL cache instead — see below.)
     let mut resolved: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+
+    // A previous run in this process may have installed aws state.
+    crate::aws_secrets::clear();
 
     match cfg.backend.as_str() {
         "env" | "" => {
@@ -298,19 +304,58 @@ pub(crate) fn prepare_secrets(
                 }
             }
         }
+        "aws" => {
+            // AWS Secrets Manager (plan 132 phase 5): fetch every declared
+            // secret at startup into the host-side TTL cache. Blocking is
+            // fine here — the module hasn't started; after this, egress
+            // resolution is cache-only (stale-while-revalidate keeps the
+            // scheduler free of I/O).
+            let opts = cfg.backend_options.get("aws");
+            let region = opts
+                .and_then(|o| o.get("region"))
+                .cloned()
+                .ok_or_else(|| "aws backend: [secrets.aws] region is required".to_string())?;
+            let prefix = opts
+                .and_then(|o| o.get("prefix"))
+                .cloned()
+                .unwrap_or_default();
+            let endpoint = opts.and_then(|o| o.get("endpoint")).cloned();
+            let ttl_secs = opts
+                .and_then(|o| o.get("ttl"))
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(crate::aws_secrets::DEFAULT_TTL_SECS);
+            let credentials = crate::aws_secrets::AwsCredentials::from_env()?;
+            let field_map = decls
+                .iter()
+                .filter_map(|d| d.key.as_ref().map(|k| (d.name.clone(), k.clone())))
+                .collect();
+            crate::aws_secrets::configure(
+                crate::aws_secrets::AwsConfig {
+                    region,
+                    prefix,
+                    endpoint,
+                    ttl: std::time::Duration::from_secs(ttl_secs),
+                    field_map,
+                },
+                credentials,
+                decls.iter().map(|d| d.name.clone()).collect(),
+            )?;
+        }
         other => {
             return Err(format!(
-                "unknown secrets backend '{}' (supported: env, dotenvx)",
+                "unknown secrets backend '{}' (supported: env, dotenvx, aws)",
                 other
             ));
         }
     }
 
-    let decls = cfg.declarations_for_target(active_target);
     let missing: Vec<String> = decls
         .iter()
         .filter(|d| {
-            d.required && !resolved.contains_key(&d.name) && std::env::var_os(&d.name).is_none()
+            d.required
+                && !resolved.contains_key(&d.name)
+                && crate::aws_secrets::resolve(&d.name).is_none()
+                && std::env::var_os(&d.name).is_none()
         })
         .map(|d| format!("'{}'", d.name))
         .collect();

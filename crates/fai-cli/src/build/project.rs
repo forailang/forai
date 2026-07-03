@@ -80,6 +80,9 @@ pub(crate) struct SecretDecl {
     /// `targets = ["server"]` — restrict the declaration (and its
     /// startup validation) to the named sub-projects. Empty = all.
     pub(crate) targets: Vec<String>,
+    /// `key = "field"` — pluck one field from a JSON secret value
+    /// (aws backend).
+    pub(crate) key: Option<String>,
 }
 
 /// The `[secrets]` manifest (plan 132): backend selection is config,
@@ -670,11 +673,13 @@ pub(crate) fn parse_project_info(content: &str) -> ProjectInfo {
                         name: k.to_string(),
                         required: false,
                         targets: Vec::new(),
+                        key: None,
                     };
                     for (ik, iv) in parse_inline_table(v) {
                         match ik.as_str() {
                             "required" => decl.required = iv == "true",
                             "targets" => decl.targets = parse_string_array(&iv),
+                            "key" => decl.key = Some(iv.trim_matches('"').to_string()),
                             _ => {}
                         }
                     }

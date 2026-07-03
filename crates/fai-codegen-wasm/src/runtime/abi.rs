@@ -630,7 +630,12 @@ pub const IMPORT_SECRETS_BASIC: u32 = 132;
 /// `env.secrets_header(handle) -> i64` — egress combinator: fresh copy of
 /// the same handle, the explicit "raw value as this header" marker.
 pub const IMPORT_SECRETS_HEADER: u32 = 133;
-pub const IMPORT_COUNT: u32 = 134;
+/// `env.secrets_refresh() -> i32` — blocking refetch of every declared
+/// secret through the active backend's cache (aws); env/dotenvx return 0.
+/// Returns the count refetched. An explicit rotation point; the TTL cache
+/// with stale-while-revalidate covers steady state.
+pub const IMPORT_SECRETS_REFRESH: u32 = 134;
+pub const IMPORT_COUNT: u32 = 135;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1479,6 +1484,8 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_SECRETS_HEADER: (handle) -> i64 (fresh copy).
         ("secrets_header", vec![ValType::I64], vec![ValType::I64]),
+        // IMPORT_SECRETS_REFRESH: () -> i32 (count refetched).
+        ("secrets_refresh", vec![], vec![ValType::I32]),
     ]
 }
 

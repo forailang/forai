@@ -30,6 +30,9 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[Type::Secret],
     );
     ins(b, "secretsHeader", &[p("secret", Type::Secret)], &[Type::Secret]);
+    // Blocking refetch through the active backend's cache (aws rotation
+    // point); env/dotenvx return 0.
+    ins(b, "secretsRefresh", &[], &[Type::Int]);
 }
 
 #[cfg(test)]

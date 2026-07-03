@@ -14,6 +14,7 @@
 
 use std::env;
 
+mod aws_secrets;
 mod build;
 mod doc;
 mod dotenvx;
