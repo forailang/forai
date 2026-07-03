@@ -1529,20 +1529,6 @@
         assert!(html.contains("startFai()"));
     }
 
-    #[test]
-    fn test_generate_html_loader_old_contains_filename() {
-        let html = generate_html_loader_old("bundle.wasm");
-        assert!(html.contains("bundle.wasm"));
-        assert!(html.contains("<!DOCTYPE html>"));
-        assert!(html.contains("WebAssembly"));
-        assert!(html.contains("_start_async"));
-        assert!(html.contains("__fai_poll"));
-        assert!(html.contains("__fai_task_result"));
-        assert!(html.contains("__fai_resume_task"));
-        assert!(html.contains("pumpAsync()"));
-        assert!(html.contains("startFai()"));
-    }
-
     // ── require_file_arg ─────────────────────────────────────────────
 
     #[test]
