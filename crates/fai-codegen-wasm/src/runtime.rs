@@ -1355,7 +1355,8 @@ fn emit_idiv(base: u32) -> Function {
 // ── $rt_mod ───────────────────────────────────────────────────────
 
 fn emit_mod_op(base: u32) -> Function {
-    let mut f = Function::new([]);
+    // Extra locals 2=a(f64), 3=b(f64) for the float path.
+    let mut f = Function::new([(2, ValType::F64)]);
     // Both int? use i32 remainder. Else float.
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(base + RT_IS_INT));
@@ -1375,28 +1376,24 @@ fn emit_mod_op(base: u32) -> Function {
     }
     f.instruction(&Instruction::Else);
     {
-        // float mod: a - floor(a/b) * b
-        // Use local variables for the computation
-        // Actually, there's no f64.rem in WASM, so we compute manually:
-        // a - trunc(a/b) * b
+        // Float mod. WASM has no f64.rem, so compute a - trunc(a/b) * b —
+        // the truncated remainder, matching the i32.rem_s semantics of the
+        // int path (sign follows the dividend; b == 0 yields NaN).
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::LocalSet(2));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
-        // Stack: [a_f64, b_f64]
-        // We need: a - trunc(a/b) * b
-        // But we can't easily dup on WASM stack without locals.
-        // Simpler: convert to ints via floor, compute int mod, box as float.
-        // Actually for M1 float mod is rare. Let's do: convert both to f64,
-        // compute a - floor(a/b) * b using extra locals.
-        // We need 2 extra locals. Let's use a simpler approach:
-        // just convert to int, mod, and return as int.
+        f.instruction(&Instruction::LocalSet(3));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::F64Div);
-        f.instruction(&Instruction::F64Floor);
-        f.instruction(&Instruction::I32TruncF64S);
-        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
-        // This is wrong for float mod, but M1 only handles int mod properly.
-        // TODO: proper float mod in M2
+        f.instruction(&Instruction::F64Trunc);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::F64Mul);
+        f.instruction(&Instruction::F64Sub);
+        f.instruction(&Instruction::Call(base + RT_MAKE_FLOAT));
     }
     f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);

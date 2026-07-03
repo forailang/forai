@@ -1,0 +1,22 @@
+# expect: ok
+# stdout:
+#   1.5
+#   -1.5
+#   1.5
+#   1.5
+#   1
+#   -1
+#   0
+#   NaN
+def main
+    @return Void
+do
+    print(7.5 % 2.0)
+    print(-7.5 % 2.0)
+    print(7.5 % -2.0)
+    print(7.5 % 2)
+    print(7 % 3)
+    print(-7 % 3)
+    print(0.0 % 2.0)
+    print(7.5 % 0.0)
+end
