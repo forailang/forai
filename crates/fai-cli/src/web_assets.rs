@@ -128,18 +128,7 @@ fetch('/{}').then(r=>r.arrayBuffer()).then(b=>WebAssembly.instantiate(b,{{env}})
 }
 
 pub(crate) fn generate_html_page() -> String {
-    r#"<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>FAI</title>
-<link rel="stylesheet" href="forui.css">
-</head>
-<body>
-<div id="app"></div>
-<pre id="output" style="display:none"></pre>
-<script src="fai-runtime.js"></script>
-</body>
-</html>"#
-        .to_string()
+    include_str!("../templates/html_page.html").to_string()
 }
 
 /// Default forui stylesheet. Shipped alongside the runtime JS by
@@ -151,132 +140,7 @@ pub(crate) fn generate_html_page() -> String {
 /// modifier styles (padding/background/foreground/...) remain inline
 /// and override these defaults by CSS specificity (inline > class).
 pub(crate) fn generate_forui_css() -> String {
-    r#"/* forui default stylesheet — iOS-leaning defaults. */
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:#f2f2f7;color:#1c1c1e;font-size:16px;display:flex;justify-content:center;padding:0}
-#app{width:100%;min-width:280px}
-
-/* ── Layout primitives ──────────────────────────────────────── */
-.fai-vstack{display:flex;flex-direction:column;align-items:center;gap:12px;width:100%}
-.fai-hstack{display:flex;flex-direction:row;align-items:center;gap:8px;width:100%}
-.fai-zstack{position:relative;display:grid}
-.fai-zstack>*{grid-area:1/1}
-.fai-scrollview{overflow:auto}
-.fai-spacer{flex:1}
-.fai-view{}
-
-/* ── Typography ─────────────────────────────────────────────── */
-.fai-label{line-height:1.4}
-.fai-paragraph{display:block;align-self:stretch;line-height:1.6;text-align:left}
-.fai-heading{display:block;align-self:stretch;line-height:1.15;font-weight:700;text-align:left}
-
-/* ── Controls ───────────────────────────────────────────────── */
-.fai-button{
-  padding:10px 20px;
-  border:1px solid #d0d0d0;
-  border-radius:8px;
-  background:#fff;
-  color:#1c1c1e;
-  cursor:pointer;
-  font-size:17px;
-  font-family:inherit;
-  transition:background 0.1s,opacity 0.1s;
-}
-.fai-button:hover{background:#f5f5f7}
-.fai-button:active{opacity:0.7}
-
-.fai-textinput,
-.fai-textarea{
-  padding:10px 14px;
-  border:1px solid #d0d0d0;
-  border-radius:8px;
-  background:#fff;
-  font-size:16px;
-  font-family:inherit;
-  width:100%;
-  box-sizing:border-box;
-  outline:none;
-  transition:border-color 0.1s;
-}
-.fai-textarea{
-  min-height:96px;
-  resize:vertical;
-  line-height:1.4;
-}
-.fai-textinput:focus,
-.fai-textarea:focus{border-color:#007aff}
-
-/* ── Toggle (iOS-style switch) ──────────────────────────────── */
-.fai-toggle{
-  --w:51px;
-  --h:31px;
-  --pad:2px;
-  position:relative;
-  width:var(--w);
-  height:var(--h);
-  border:none;
-  border-radius:calc(var(--h)/2);
-  background:#e9e9eb;
-  cursor:pointer;
-  padding:0;
-  transition:background 0.2s;
-  flex-shrink:0;
-}
-.fai-toggle[data-on="true"]{background:#34c759}
-.fai-toggle::after{
-  content:"";
-  position:absolute;
-  top:var(--pad);
-  left:var(--pad);
-  width:calc(var(--h) - 2*var(--pad));
-  height:calc(var(--h) - 2*var(--pad));
-  border-radius:50%;
-  background:#fff;
-  box-shadow:0 2px 4px rgba(0,0,0,0.2);
-  transition:transform 0.2s;
-}
-.fai-toggle[data-on="true"]::after{transform:translateX(calc(var(--w) - var(--h)))}
-
-/* ── Divider ────────────────────────────────────────────────── */
-.fai-divider{
-  width:100%;
-  height:1px;
-  border:none;
-  background:#d0d0d5;
-  margin:0;
-}
-
-/* ── SegmentedControl (iOS-style) ───────────────────────────── */
-.fai-segmented{
-  display:inline-flex;
-  padding:2px;
-  background:#e9e9eb;
-  border-radius:9px;
-  gap:2px;
-  font-size:14px;
-}
-.fai-segment{
-  padding:6px 14px;
-  border:none;
-  background:transparent;
-  border-radius:7px;
-  color:#1c1c1e;
-  cursor:pointer;
-  font-family:inherit;
-  font-size:inherit;
-  font-weight:500;
-  transition:background 0.15s,box-shadow 0.15s;
-  min-width:60px;
-}
-.fai-segment[data-selected="true"]{
-  background:#fff;
-  box-shadow:0 1px 2px rgba(0,0,0,0.08),0 0 0 0.5px rgba(0,0,0,0.04);
-  font-weight:600;
-}
-
-/* ── Image ──────────────────────────────────────────────────── */
-.fai-image{max-width:100%;display:block}
-"#.to_string()
+    include_str!("../templates/forui.css").to_string()
 }
 
 /// Pull the raw `fai-dbg` custom-section payload (JSON) out of a wasm
