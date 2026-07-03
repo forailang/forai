@@ -37,6 +37,9 @@ flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+k256 = "0.13.4"
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [features]
 default = ["http-client"]

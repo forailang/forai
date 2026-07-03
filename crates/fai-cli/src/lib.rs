@@ -16,6 +16,7 @@ use std::env;
 
 mod build;
 mod doc;
+mod dotenvx;
 mod format;
 pub mod interface;
 mod mcp;

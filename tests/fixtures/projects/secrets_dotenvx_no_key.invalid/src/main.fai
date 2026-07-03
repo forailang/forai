@@ -1,0 +1,10 @@
+# expect: runtime_error
+# error: no DOTENV_PRIVATE_KEY
+
+use std.secrets
+
+def main
+    @return Void
+do
+    print(secrets.has('DOTENVX_FIXTURE_TOKEN'))
+end

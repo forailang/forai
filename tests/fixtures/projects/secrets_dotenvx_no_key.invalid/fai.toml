@@ -1,0 +1,8 @@
+[project]
+name = "SecretsDotenvxNoKey"
+version = "0.1.0"
+source_root = "src"
+
+[secrets]
+backend = "dotenvx"
+DOTENVX_FIXTURE_TOKEN = { required = true }

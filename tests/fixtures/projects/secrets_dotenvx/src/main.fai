@@ -1,0 +1,24 @@
+# expect: ok
+# stdout:
+#   «secret DOTENVX_FIXTURE_TOKEN»
+#   true
+#   fixture-secret-hunter2
+#   second value with spaces
+#   null
+
+use std.secrets
+
+use std.env
+
+def main
+    @return Void
+do
+    let key = secrets.get('DOTENVX_FIXTURE_TOKEN')
+    print(key)
+    print(secrets.has('DOTENVX_FIXTURE_TOKEN'))
+    print(secrets.reveal(key))
+    print(secrets.reveal(secrets.get('DOTENVX_FIXTURE_SECOND')))
+    # dotenvx values decrypt into the host-side store only — the process
+    # environment stays clean (unlike the env backend).
+    print(env.get('DOTENVX_FIXTURE_TOKEN'))
+end

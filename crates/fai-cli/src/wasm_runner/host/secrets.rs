@@ -33,6 +33,11 @@ pub(crate) struct SecretsManifest {
     pub(crate) backend: String,
     /// Declared secret names visible to this run's target.
     pub(crate) declared: Vec<String>,
+    /// Values pre-resolved host-side by a non-env backend (dotenvx
+    /// decryption, aws fetch) at startup validation. Never handed to the
+    /// guest except through `secrets_reveal` and the egress points.
+    /// Checked before the process environment in [`resolve_secret`].
+    pub(crate) resolved: std::collections::HashMap<String, String>,
 }
 
 thread_local! {
@@ -83,10 +88,14 @@ fn undeclared(name: &str) -> bool {
 /// must never be exposed to the guest as a return value outside
 /// `secrets_reveal` (phase 2) and declared egress positions (phase 3).
 ///
-/// Backends beyond `env` land in later phases (dotenvx: phase 4, aws:
-/// phase 5); until then every backend name resolves via process env so a
-/// dotenvx/aws manifest still works in dev with exported variables.
+/// Backend-resolved values (installed on the manifest at startup —
+/// dotenvx decryption, aws fetch) win over the process environment; the
+/// env fallback covers the `env` backend and lets a dotenvx/aws manifest
+/// still work in dev with exported variables.
 pub(crate) fn resolve_secret(name: &str) -> Option<String> {
+    if let Some(v) = with_manifest(|m| m.and_then(|m| m.resolved.get(name).cloned())) {
+        return Some(v);
+    }
     std::env::var(name).ok()
 }
 

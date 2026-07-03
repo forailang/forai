@@ -212,34 +212,106 @@ pub(crate) fn prepare_secrets(
         return Ok(None);
     };
 
-    // Merge `.env` beside fai.toml (mirror read_project_info_full's
-    // fai.toml discovery: source_root itself, else its parent).
-    if let Some(root) = source_root {
+    // Project dir = where fai.toml lives (mirror read_project_info_full's
+    // discovery: source_root itself, else its parent).
+    let project_dir = source_root.map(|root| {
         let root = std::path::Path::new(root);
-        let project_dir = if root.join("fai.toml").exists() {
-            root
+        if root.join("fai.toml").exists() {
+            root.to_path_buf()
         } else {
-            root.parent().unwrap_or(root)
-        };
-        if let Ok(content) = std::fs::read_to_string(project_dir.join(".env")) {
-            for (key, value) in wasm_runner::parse_dotenv(&content) {
-                if std::env::var_os(&key).is_none() {
-                    // SAFETY: same single-threaded-before-run argument as
-                    // `env.load` in host/env.rs — validation runs before
-                    // the module (and any worker) starts.
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        std::env::set_var(key, value);
+            root.parent().unwrap_or(root).to_path_buf()
+        }
+    });
+
+    // Values pre-resolved host-side by the backend. These ride the
+    // manifest into the runner and stay host-side.
+    let mut resolved: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    match cfg.backend.as_str() {
+        "env" | "" => {
+            // Merge `.env` beside fai.toml into the process environment
+            // (real env wins) so declared secrets in a local dotenv file
+            // resolve both here and at egress.
+            if let Some(dir) = &project_dir {
+                if let Ok(content) = std::fs::read_to_string(dir.join(".env")) {
+                    for (key, value) in wasm_runner::parse_dotenv(&content) {
+                        if std::env::var_os(&key).is_none() {
+                            // SAFETY: same single-threaded-before-run
+                            // argument as `env.load` in host/env.rs —
+                            // validation runs before the module (and any
+                            // worker) starts.
+                            #[allow(unused_unsafe)]
+                            unsafe {
+                                std::env::set_var(key, value);
+                            }
+                        }
                     }
                 }
             }
+        }
+        "dotenvx" => {
+            // Encrypted `.env` (plan 132 phase 4): values decrypt into
+            // the HOST-SIDE resolved map only — nothing is merged into
+            // the process environment, so child processes inherit
+            // nothing and plaintext exposure stays at the egress points.
+            let dir = project_dir
+                .as_ref()
+                .ok_or_else(|| "dotenvx backend: no project directory found".to_string())?;
+            let env_path = dir.join(".env");
+            let content = std::fs::read_to_string(&env_path).map_err(|_| {
+                "dotenvx backend: missing .env beside fai.toml".to_string()
+            })?;
+            // Private key: real environment first, then `.env.keys`
+            // (never committed) beside fai.toml. Comma-separated list
+            // supports dotenvx key rotation.
+            let private_keys = std::env::var("DOTENV_PRIVATE_KEY").ok().or_else(|| {
+                std::fs::read_to_string(dir.join(".env.keys"))
+                    .ok()
+                    .and_then(|keys| {
+                        wasm_runner::parse_dotenv(&keys)
+                            .into_iter()
+                            .find(|(k, _)| k == "DOTENV_PRIVATE_KEY")
+                            .map(|(_, v)| v)
+                    })
+            });
+            for (key, value) in wasm_runner::parse_dotenv(&content) {
+                if key == "DOTENV_PUBLIC_KEY" {
+                    continue;
+                }
+                if value.starts_with(crate::dotenvx::ENCRYPTED_PREFIX) {
+                    let Some(keys) = &private_keys else {
+                        return Err(format!(
+                            "dotenvx backend: '{}' is encrypted but no \
+                             DOTENV_PRIVATE_KEY is set (environment or .env.keys)",
+                            key
+                        ));
+                    };
+                    let plain =
+                        crate::dotenvx::decrypt_value_multi(keys, &value).map_err(|e| {
+                            format!("dotenvx backend: cannot decrypt '{}': {}", key, e)
+                        })?;
+                    resolved.insert(key, plain);
+                } else {
+                    // dotenvx keeps non-secret entries plaintext.
+                    resolved.insert(key, value);
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown secrets backend '{}' (supported: env, dotenvx)",
+                other
+            ));
         }
     }
 
     let decls = cfg.declarations_for_target(active_target);
     let missing: Vec<String> = decls
         .iter()
-        .filter(|d| d.required && std::env::var_os(&d.name).is_none())
+        .filter(|d| {
+            d.required && !resolved.contains_key(&d.name) && std::env::var_os(&d.name).is_none()
+        })
         .map(|d| format!("'{}'", d.name))
         .collect();
     if !missing.is_empty() {
@@ -254,6 +326,7 @@ pub(crate) fn prepare_secrets(
     Ok(Some(wasm_runner::SecretsManifest {
         backend: cfg.backend.clone(),
         declared: decls.iter().map(|d| d.name.clone()).collect(),
+        resolved,
     }))
 }
 
