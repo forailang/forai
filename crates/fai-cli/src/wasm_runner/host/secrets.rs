@@ -112,9 +112,44 @@ pub(crate) fn undeclared_message(name: &str) -> String {
     )
 }
 
+/// Resolve a Secret handle payload to its egress value (plan 132 phase 3).
+/// Payload grammar (built by the `secrets.bearer`/`basic`/`header`
+/// combinators; a plain `secrets.get` handle is just the name):
+///   "NAME"            → value
+///   "bearer:NAME"     → "Bearer " + value
+///   "basic:USER:NAME" → "Basic " + base64("USER:" + value)
+/// `None` when the underlying name cannot be resolved by the backend.
+pub(crate) fn resolve_secret_payload(payload: &str) -> Option<String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    if let Some(name) = payload.strip_prefix("bearer:") {
+        return resolve_secret(name).map(|v| format!("Bearer {}", v));
+    }
+    if let Some(rest) = payload.strip_prefix("basic:") {
+        // The NAME is after the LAST colon — user names may contain ':'.
+        let (user, name) = rest.rsplit_once(':')?;
+        let value = resolve_secret(name)?;
+        return Some(format!(
+            "Basic {}",
+            STANDARD.encode(format!("{}:{}", user, value))
+        ));
+    }
+    resolve_secret(payload)
+}
+
+/// If `text` is a rendered Secret redaction (`«secret PAYLOAD»`), return
+/// the payload. The child-process env egress uses this: guest code embeds
+/// a Secret in its env dict, stringify serializes only the redaction, and
+/// the host swaps in the resolved value right before spawn. Resolution is
+/// name-based and manifest-gated, so a hand-built redaction string grants
+/// nothing an ordinary `secrets.get` would not.
+pub(crate) fn redaction_payload(text: &str) -> Option<&str> {
+    text.strip_prefix("«secret ")?.strip_suffix('»')
+}
+
 /// Decode a NaN-boxed value as a Secret handle and return its name.
 /// `None` when the value isn't an object or isn't tagged SECRET.
-fn read_secret_name(data: &[u8], val: i64) -> Option<String> {
+pub(super) fn read_secret_name(data: &[u8], val: i64) -> Option<String> {
     let bits = val as u64;
     if (bits & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
         return None;
@@ -185,6 +220,84 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap("env", "secrets_available", || -> i32 { 1 })
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // Egress combinators (plan 132 D1b): pure handle→handle transforms
+    // that tag INTENT into the payload — the headers dict stays
+    // Secret-valued and the host renders the final header bytes at
+    // egress. No plaintext is touched here.
+    // env.secrets_bearer(handle) -> i64 ("bearer:NAME" handle)
+    linker
+        .func_wrap(
+            "env",
+            "secrets_bearer",
+            |mut caller: Caller<'_, ()>, handle: i64| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let name = {
+                    let data = mem.data(&caller);
+                    read_secret_name(data, handle)
+                };
+                let Some(name) = name else {
+                    return signal_host_error(
+                        &mut caller,
+                        "secrets",
+                        "secrets.bearer expects a Secret handle from secrets.get",
+                    );
+                };
+                wasm_alloc_secret(&mut caller, &mem, &format!("bearer:{}", name))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.secrets_basic(user_ptr, user_len, handle) -> i64
+    // ("basic:USER:NAME" handle)
+    linker
+        .func_wrap(
+            "env",
+            "secrets_basic",
+            |mut caller: Caller<'_, ()>, user_ptr: i32, user_len: i32, handle: i64| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let (user, name) = {
+                    let data = mem.data(&caller);
+                    (
+                        read_slice(data, user_ptr, user_len),
+                        read_secret_name(data, handle),
+                    )
+                };
+                let Some(name) = name else {
+                    return signal_host_error(
+                        &mut caller,
+                        "secrets",
+                        "secrets.basic expects a Secret handle from secrets.get",
+                    );
+                };
+                wasm_alloc_secret(&mut caller, &mem, &format!("basic:{}:{}", user, name))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.secrets_header(handle) -> i64 (fresh copy of the same handle —
+    // the explicit "use the raw value as this header" marker)
+    linker
+        .func_wrap(
+            "env",
+            "secrets_header",
+            |mut caller: Caller<'_, ()>, handle: i64| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let name = {
+                    let data = mem.data(&caller);
+                    read_secret_name(data, handle)
+                };
+                let Some(name) = name else {
+                    return signal_host_error(
+                        &mut caller,
+                        "secrets",
+                        "secrets.header expects a Secret handle from secrets.get",
+                    );
+                };
+                wasm_alloc_secret(&mut caller, &mem, &name)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.secrets_reveal(handle) -> i64 (fresh plaintext String). THE
     // audit anchor (plan 132 phase 2): the only import that moves secret
     // plaintext into guest memory. Failure paths raise catchable errors
@@ -251,6 +364,55 @@ mod tests {
         unsafe {
             std::env::remove_var(name);
         }
+    }
+
+    #[test]
+    fn payload_grammar_resolves_schemes() {
+        let name = "FAI_TEST_SECRET_PAYLOAD";
+        let value = "tok-123";
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        assert_eq!(
+            resolve_secret_payload(name).as_deref(),
+            Some("tok-123"),
+            "plain handle resolves to the raw value"
+        );
+        assert_eq!(
+            resolve_secret_payload(&format!("bearer:{}", name)).as_deref(),
+            Some("Bearer tok-123")
+        );
+        // basic: base64("user:tok-123")
+        assert_eq!(
+            resolve_secret_payload(&format!("basic:user:{}", name)).as_deref(),
+            Some("Basic dXNlcjp0b2stMTIz")
+        );
+        // user names may contain ':' — the NAME is after the LAST colon.
+        assert_eq!(
+            resolve_secret_payload(&format!("basic:a:b:{}", name)).as_deref(),
+            Some("Basic YTpiOnRvay0xMjM=")
+        );
+        assert_eq!(resolve_secret_payload("FAI_TEST_SECRET_PAYLOAD_UNSET"), None);
+        assert_eq!(
+            resolve_secret_payload("bearer:FAI_TEST_SECRET_PAYLOAD_UNSET"),
+            None
+        );
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn redaction_payload_roundtrip() {
+        assert_eq!(redaction_payload("«secret API_KEY»"), Some("API_KEY"));
+        assert_eq!(
+            redaction_payload("«secret bearer:API_KEY»"),
+            Some("bearer:API_KEY")
+        );
+        assert_eq!(redaction_payload("plain value"), None);
+        assert_eq!(redaction_payload("«secret unterminated"), None);
     }
 
     #[test]

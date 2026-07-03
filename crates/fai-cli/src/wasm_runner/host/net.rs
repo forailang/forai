@@ -8,7 +8,9 @@ use super::super::heap::wasm_alloc_str;
 use super::super::nan_box::{ADDR_MASK, OBJ_TAG_DICT, QNAN, SIGN_BIT, VAL_NULL};
 #[cfg(feature = "http-client")]
 use super::events::{alloc_dict, write_global_i32, write_global_i64};
-use super::host_ops::{read_string_value, submit_host_op, submit_host_wait, HostOpResult};
+use super::host_ops::{
+    read_string_value, signal_host_error, submit_host_op, submit_host_wait, HostOpResult,
+};
 
 #[cfg(feature = "http-client")]
 const HTTP_CLIENT_TIMEOUT_SECS: u64 = 120;
@@ -204,10 +206,18 @@ pub(super) fn begin_http_request_host_op(
     } else {
         None
     };
-    let headers = args
-        .get(min_args)
-        .map(|headers_val| read_headers_arg(&mem, caller, *headers_val))
-        .unwrap_or_default();
+    let headers = match args.get(min_args) {
+        Some(headers_val) => match read_headers_arg(&mem, caller, *headers_val) {
+            Ok(headers) => headers,
+            Err(msg) => {
+                // Unresolvable Secret header — surface as the standard
+                // catchable await-point error (value-free message).
+                submit_host_op(task_id, move || HostOpResult::Error(msg));
+                return true;
+            }
+        },
+        None => Vec::new(),
+    };
     // Wait class: server-paced, held for the whole request (plan 103 KTD2).
     submit_host_wait(task_id, move || {
         match do_verb_owned(method, &url, body.as_deref(), &headers) {
@@ -319,19 +329,19 @@ fn read_headers_arg(
     mem: &Memory,
     caller: &mut Caller<'_, ()>,
     headers_val: i64,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let v = headers_val as u64;
     if v == VAL_NULL as u64 || (v & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let addr = (v & ADDR_MASK) as usize;
     let data = mem.data(&*caller);
     if addr + 8 > data.len() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().unwrap_or([0; 4]));
     if tag != OBJ_TAG_DICT {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let count = i32::from_le_bytes(data[addr + 4..addr + 8].try_into().unwrap_or([0; 4])) as usize;
     let mut headers = Vec::new();
@@ -345,12 +355,33 @@ fn read_headers_arg(
         let Some(name) = read_string_value(data, key) else {
             continue;
         };
-        let Some(header_value) = read_string_value(data, value) else {
+        if let Some(header_value) = read_string_value(data, value) {
+            headers.push((name.to_string(), header_value.to_string()));
             continue;
-        };
-        headers.push((name.to_string(), header_value.to_string()));
+        }
+        // Plan 132 phase 3 — the HTTP header egress point. A Secret
+        // handle in value position resolves HOST-SIDE right before the
+        // bytes leave: the plaintext is spliced into the outgoing
+        // request and never enters guest memory. Failure is a catchable,
+        // value-free error naming the header and backend.
+        if let Some(payload) = super::secrets::read_secret_name(data, value) {
+            match super::secrets::resolve_secret_payload(&payload) {
+                Some(resolved) => {
+                    headers.push((name.to_string(), resolved));
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "http: secret for header '{}' could not be resolved (backend {})",
+                        name,
+                        super::secrets::active_backend()
+                    ));
+                }
+            }
+        }
+        // Non-string, non-secret values keep the old skip semantics.
     }
-    headers
+    Ok(headers)
 }
 
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
@@ -434,7 +465,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32, headers_val: i64| -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
-                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
                 do_verb(&mut caller, &mem, "GET", &url, None, &headers)
             },
         )
@@ -455,7 +489,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
                 do_verb(&mut caller, &mem, "POST", &url, Some(&body), &headers)
             },
         )
@@ -476,7 +513,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
                 do_verb(&mut caller, &mem, "PUT", &url, Some(&body), &headers)
             },
         )
@@ -497,7 +537,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
                 let body = read_str(&mem, &caller, body_ptr, body_len);
-                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
                 do_verb(&mut caller, &mem, "PATCH", &url, Some(&body), &headers)
             },
         )
@@ -511,7 +554,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, url_ptr: i32, url_len: i32, headers_val: i64| -> i64 {
                 let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
                 let url = read_str(&mem, &caller, url_ptr, url_len);
-                let headers = read_headers_arg(&mem, &mut caller, headers_val);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
                 do_verb(&mut caller, &mem, "DELETE", &url, None, &headers)
             },
         )

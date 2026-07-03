@@ -334,6 +334,7 @@ pub fn run_wasm_with_externs_opts(
         reset_retained_host_state(&instance, &mut store)?;
         report_check_leaks(&instance, &mut store, &dbg);
         report_ownership_check();
+        assert_needle_absent(&instance, &mut store)?;
         return Ok(());
     }
 
@@ -352,7 +353,43 @@ pub fn run_wasm_with_externs_opts(
     report_leak_check(&instance, &mut store);
     report_check_leaks(&instance, &mut store, &dbg);
     report_ownership_check();
+    assert_needle_absent(&instance, &mut store)?;
 
+    Ok(())
+}
+
+/// Plan 132 phase 3 proof hook. When `FAI_ASSERT_NOT_IN_GUEST_MEMORY` is
+/// set, scan the guest's ENTIRE linear memory for the needle bytes after
+/// the program completes and fail the run if found. This is a raw byte
+/// scan — even freed-but-not-overwritten plaintext is caught — so a
+/// passing run means the value never entered guest memory at any point
+/// that survived to exit, the never-in-guest-memory property the secrets
+/// egress tests assert mechanically.
+fn assert_needle_absent(
+    instance: &wasmtime::Instance,
+    store: &mut wasmtime::Store<()>,
+) -> Result<(), String> {
+    let Some(needle) = std::env::var_os("FAI_ASSERT_NOT_IN_GUEST_MEMORY") else {
+        return Ok(());
+    };
+    let needle = needle.to_string_lossy().into_owned();
+    if needle.is_empty() {
+        return Ok(());
+    }
+    let Some(mem) = instance.get_memory(&mut *store, "memory") else {
+        return Ok(());
+    };
+    let data = mem.data(&*store);
+    if data
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+    {
+        return Err(format!(
+            "[assert-not-in-guest-memory] needle present in guest linear memory \
+             ({} bytes scanned)",
+            data.len()
+        ));
+    }
     Ok(())
 }
 

@@ -967,6 +967,27 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: ROwn,
         doc: "fresh plaintext string via wasm_alloc_str; the plan-132 audit anchor",
     },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "bearer",
+        import: "secrets_bearer",
+        ret: ROwn,
+        doc: "fresh Secret handle via wasm_alloc_secret (bearer: payload)",
+    },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "basic",
+        import: "secrets_basic",
+        ret: ROwn,
+        doc: "fresh Secret handle via wasm_alloc_secret (basic: payload); host copies user string",
+    },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "header",
+        import: "secrets_header",
+        ret: ROwn,
+        doc: "fresh Secret handle via wasm_alloc_secret (copied payload)",
+    },
     // std.events — the subscription dict is host-built fresh (heap::reserve
     // in build_subscription). Handler retention is the separate, pinned
     // phase-6 issue and does not change the RESULT's ownership.
@@ -1898,7 +1919,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 111, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 114, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

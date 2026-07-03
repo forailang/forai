@@ -20,6 +20,16 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // The single audit anchor: the only API that moves plaintext into
     // guest memory. `grep reveal` = the complete exposure audit.
     ins(b, "secretsReveal", &[p("secret", Type::Secret)], &[Type::String]);
+    // Egress combinators (D1b): Secret → Secret intent tags. The host
+    // renders the final header bytes at egress; plaintext stays host-side.
+    ins(b, "secretsBearer", &[p("secret", Type::Secret)], &[Type::Secret]);
+    ins(
+        b,
+        "secretsBasic",
+        &[p("user", Type::String), p("secret", Type::Secret)],
+        &[Type::Secret],
+    );
+    ins(b, "secretsHeader", &[p("secret", Type::Secret)], &[Type::Secret]);
 }
 
 #[cfg(test)]

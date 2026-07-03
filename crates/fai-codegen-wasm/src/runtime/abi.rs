@@ -619,7 +619,18 @@ pub const IMPORT_SECRETS_AVAILABLE: u32 = 129;
 /// Unresolvable name or non-Secret argument raises a catchable error
 /// naming the secret and backend — never a value.
 pub const IMPORT_SECRETS_REVEAL: u32 = 130;
-pub const IMPORT_COUNT: u32 = 131;
+/// `env.secrets_bearer(handle) -> i64` — egress combinator (plan 132 D1b):
+/// returns a fresh Secret handle whose payload is `bearer:NAME`, rendered
+/// host-side at egress as `Bearer <value>`. No plaintext is touched.
+pub const IMPORT_SECRETS_BEARER: u32 = 131;
+/// `env.secrets_basic(user_ptr, user_len, handle) -> i64` — egress
+/// combinator: payload `basic:USER:NAME`, rendered at egress as
+/// `Basic base64(USER:<value>)`.
+pub const IMPORT_SECRETS_BASIC: u32 = 132;
+/// `env.secrets_header(handle) -> i64` — egress combinator: fresh copy of
+/// the same handle, the explicit "raw value as this header" marker.
+pub const IMPORT_SECRETS_HEADER: u32 = 133;
+pub const IMPORT_COUNT: u32 = 134;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1458,6 +1469,16 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ("secrets_available", vec![], vec![ValType::I32]),
         // IMPORT_SECRETS_REVEAL: (handle) -> i64 (fresh plaintext String).
         ("secrets_reveal", vec![ValType::I64], vec![ValType::I64]),
+        // IMPORT_SECRETS_BEARER: (handle) -> i64 (fresh "bearer:" handle).
+        ("secrets_bearer", vec![ValType::I64], vec![ValType::I64]),
+        // IMPORT_SECRETS_BASIC: (user_ptr, user_len, handle) -> i64.
+        (
+            "secrets_basic",
+            vec![ValType::I32, ValType::I32, ValType::I64],
+            vec![ValType::I64],
+        ),
+        // IMPORT_SECRETS_HEADER: (handle) -> i64 (fresh copy).
+        ("secrets_header", vec![ValType::I64], vec![ValType::I64]),
     ]
 }
 

@@ -410,6 +410,15 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         // `reveal` is the single audit anchor: the only API that moves
         // plaintext into guest memory. Errors are catchable and value-free.
         ("std.secrets", "reveal") => (IMPORT_SECRETS_REVEAL, &[AS::Boxed], RS::Boxed),
+        // Egress combinators (D1b): handle→handle intent tags rendered
+        // host-side at the HTTP header / child-env egress point.
+        ("std.secrets", "bearer") => (IMPORT_SECRETS_BEARER, &[AS::Boxed], RS::Boxed),
+        ("std.secrets", "basic") => (
+            IMPORT_SECRETS_BASIC,
+            &[AS::String, AS::Boxed],
+            RS::Boxed,
+        ),
+        ("std.secrets", "header") => (IMPORT_SECRETS_HEADER, &[AS::Boxed], RS::Boxed),
 
         // std.net / std.ffi — availability checks.
         ("std.net", "available") => (IMPORT_NET_AVAILABLE, &[], RS::MakeBool),

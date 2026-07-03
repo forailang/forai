@@ -538,12 +538,20 @@ guest memory. Printing a Secret renders the redaction `«secret NAME»`.
 ```fai
 use std.secrets
 
+use std.http.request
+
 let key = secrets.get('STRIPE_KEY')
 print(key)                       # prints «secret STRIPE_KEY»
-if secrets.has('STRIPE_KEY')
-    # the active backend can resolve it
-end
+let r = request.post(url, body, {
+    'Authorization': secrets.bearer(key)   # resolved host-side at egress
+})
 ```
+
+Egress positions accept Secret values directly: HTTP header dicts (tag
+intent with `secrets.bearer(s)`, `secrets.basic(user, s)`, or
+`secrets.header(s)`) and child-process env dicts passed through
+`json.stringify` to `process.run`/`process.start`. The host splices the
+plaintext into the outgoing bytes at the boundary.
 
 The checker forbids interpolating, concatenating, comparing, and
 case-dispatching a Secret, and a Secret argument is accepted only by

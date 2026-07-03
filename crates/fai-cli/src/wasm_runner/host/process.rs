@@ -242,26 +242,27 @@ fn run_command(
     max_output_bytes: usize,
 ) -> String {
     let started = Instant::now();
-    let mut child = match command_builder(command, cwd, env_json)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let spawn_error = |message: String, started: &Instant| {
+        json!({
+            "ok": false,
+            "command": command,
+            "cwd": cwd,
+            "exitCode": null,
+            "stdout": "",
+            "stderr": message,
+            "timedOut": false,
+            "durationMs": duration_ms(*started),
+            "truncated": false
+        })
+        .to_string()
+    };
+    let mut builder = match command_builder(command, cwd, env_json) {
+        Ok(builder) => builder,
+        Err(msg) => return spawn_error(msg, &started),
+    };
+    let mut child = match builder.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(child) => child,
-        Err(e) => {
-            return json!({
-                "ok": false,
-                "command": command,
-                "cwd": cwd,
-                "exitCode": null,
-                "stdout": "",
-                "stderr": e.to_string(),
-                "timedOut": false,
-                "durationMs": duration_ms(started),
-                "truncated": false
-            })
-            .to_string();
-        }
+        Err(e) => return spawn_error(e.to_string(), &started),
     };
 
     let stdout = Arc::new(Mutex::new(Vec::new()));
@@ -309,23 +310,28 @@ fn run_command(
 }
 
 fn start_session(command: &str, cwd: &str, env_json: &str, lifetime_ms: u64) -> String {
-    let mut child = match command_builder(command, cwd, env_json)
+    let session_error = |message: String| {
+        json!({
+            "ok": false,
+            "sessionId": "",
+            "command": command,
+            "cwd": cwd,
+            "error": message
+        })
+        .to_string()
+    };
+    let mut builder = match command_builder(command, cwd, env_json) {
+        Ok(builder) => builder,
+        Err(msg) => return session_error(msg),
+    };
+    let mut child = match builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => {
-            return json!({
-                "ok": false,
-                "sessionId": "",
-                "command": command,
-                "cwd": cwd,
-                "error": e.to_string()
-            })
-            .to_string();
-        }
+        Err(e) => return session_error(e.to_string()),
     };
 
     let stdout = Arc::new(Mutex::new(Vec::new()));
@@ -439,7 +445,7 @@ fn stop_session(session_id: &str) -> String {
     .to_string()
 }
 
-fn command_builder(command: &str, cwd: &str, env_json: &str) -> Command {
+fn command_builder(command: &str, cwd: &str, env_json: &str) -> Result<Command, String> {
     let mut cmd = Command::new("bash");
     cmd.arg("-lc").arg(command);
     // An empty cwd means "inherit the host cwd"; passing "" to
@@ -451,12 +457,37 @@ fn command_builder(command: &str, cwd: &str, env_json: &str) -> Command {
         if let Some(obj) = value.as_object() {
             for (key, value) in obj {
                 if let Some(text) = value.as_str() {
-                    cmd.env(key, text);
+                    // Plan 132 phase 3 — the child-process env egress
+                    // point. A Secret embedded in the guest's env dict
+                    // serializes as its redaction (`«secret NAME»`);
+                    // the host swaps in the resolved value right before
+                    // spawn, so the plaintext never enters guest memory.
+                    // Resolution is name-based and manifest-gated.
+                    match super::secrets::redaction_payload(text) {
+                        Some(payload) => {
+                            match super::secrets::resolve_secret_payload(payload) {
+                                Some(resolved) => {
+                                    cmd.env(key, resolved);
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "process: secret for env '{}' could not be \
+                                         resolved (backend {})",
+                                        key,
+                                        super::secrets::active_backend()
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            cmd.env(key, text);
+                        }
+                    }
                 }
             }
         }
     }
-    cmd
+    Ok(cmd)
 }
 
 fn spawn_reader<R>(mut reader: R, buffer: SharedBuffer)
