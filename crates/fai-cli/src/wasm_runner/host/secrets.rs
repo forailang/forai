@@ -31,6 +31,10 @@ use super::host_ops::signal_host_error;
 pub(crate) struct SecretsManifest {
     /// Backend name: "env" (default) | "dotenvx" | "aws".
     pub(crate) backend: String,
+    /// `allow_undeclared = true` — runtime `secrets.get` accepts names
+    /// outside the manifest (user-configured secret names). Literal
+    /// names in source are still checked against the manifest.
+    pub(crate) allow_undeclared: bool,
     /// Declared secret names visible to this run's target.
     pub(crate) declared: Vec<String>,
     /// Values pre-resolved host-side by a non-env backend (dotenvx
@@ -79,9 +83,12 @@ pub(crate) fn active_backend() -> String {
 }
 
 /// Whether `name` is declared for this run. `None` manifest = no
-/// declaration requirement (loose single-file mode).
+/// declaration requirement (loose single-file mode); `allow_undeclared`
+/// relaxes the runtime rule for user-configured names.
 fn undeclared(name: &str) -> bool {
-    with_manifest(|m| m.is_some_and(|m| !m.declared.iter().any(|d| d == name)))
+    with_manifest(|m| {
+        m.is_some_and(|m| !m.allow_undeclared && !m.declared.iter().any(|d| d == name))
+    })
 }
 
 /// Resolve a secret name to plaintext on the HOST side. This is the single
@@ -95,14 +102,86 @@ fn undeclared(name: &str) -> bool {
 /// (stale-while-revalidate — no I/O on this thread). The env fallback
 /// covers the `env` backend and lets a dotenvx/aws manifest still work
 /// in dev with exported variables.
+/// An EMPTY value counts as unset — for secrets, `NAME=""` means
+/// "unconfigured", not "the secret is the empty string".
 pub(crate) fn resolve_secret(name: &str) -> Option<String> {
     if let Some(v) = with_manifest(|m| m.and_then(|m| m.resolved.get(name).cloned())) {
-        return Some(v);
+        return non_empty(v);
     }
     if let Some(v) = crate::aws_secrets::resolve(name) {
-        return Some(v);
+        return non_empty(v);
     }
-    std::env::var(name).ok()
+    std::env::var(name).ok().and_then(non_empty)
+}
+
+fn non_empty(v: String) -> Option<String> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// `$NAME` / `${NAME}` template substitution over declared secrets — the
+/// language-level home of brain's `resolveSecrets` convention (plan 132
+/// phase 6). An agent can author config text containing `$SLACK_API_KEY`
+/// WITHOUT ever seeing the value; a trusted sink resolves right before
+/// use. Only resolvable (and declared, unless `allow_undeclared`) names
+/// substitute; everything else — including a literal `$5` — passes
+/// through untouched. Reveal-class for audit purposes: the result holds
+/// plaintext, so it must go straight to an egress sink.
+pub(crate) fn resolve_template(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            // Copy one full UTF-8 char.
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        let rest = &text[i + 1..];
+        // ${NAME}
+        if let Some(inner) = rest.strip_prefix('{') {
+            if let Some(close) = inner.find('}') {
+                if let Some(value) = substitutable(&inner[..close]) {
+                    out.push_str(&value);
+                    i += 1 + 1 + close + 1; // $ { NAME }
+                    continue;
+                }
+            }
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        // $NAME — the leading [A-Za-z0-9_] identifier run (ASCII).
+        let ident_len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if ident_len > 0 {
+            if let Some(value) = substitutable(&rest[..ident_len]) {
+                out.push_str(&value);
+                i += 1 + ident_len;
+                continue;
+            }
+        }
+        out.push('$');
+        i += 1;
+    }
+    out
+}
+
+fn substitutable(name: &str) -> Option<String> {
+    if name.is_empty() || undeclared(name) {
+        return None;
+    }
+    resolve_secret(name)
 }
 
 /// The catchable message for a reveal that cannot resolve. Split out so
@@ -323,6 +402,54 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.secrets_resolve_template(ptr, len) -> i64 (fresh String).
+    // `$NAME`/`${NAME}` substitution — reveal-class: the result may hold
+    // plaintext and must go straight to an egress sink.
+    linker
+        .func_wrap(
+            "env",
+            "secrets_resolve_template",
+            |mut caller: Caller<'_, ()>, text_ptr: i32, text_len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let text = {
+                    let data = mem.data(&caller);
+                    read_slice(data, text_ptr, text_len)
+                };
+                let resolved = resolve_template(&text);
+                super::super::heap::wasm_alloc_str(&mut caller, &mem, &resolved)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.secrets_reveal_or(handle, default_ptr, default_len) -> i64
+    // (fresh String). Reveal with a fallback for unresolvable names —
+    // for sinks that treat a missing key as "unconfigured" rather than
+    // an error. Reveal-class for audit purposes.
+    linker
+        .func_wrap(
+            "env",
+            "secrets_reveal_or",
+            |mut caller: Caller<'_, ()>,
+             handle: i64,
+             default_ptr: i32,
+             default_len: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let (name, default) = {
+                    let data = mem.data(&caller);
+                    (
+                        read_secret_name(data, handle),
+                        read_slice(data, default_ptr, default_len),
+                    )
+                };
+                let value = name
+                    .and_then(|n| resolve_secret(&n))
+                    .unwrap_or(default);
+                super::super::heap::wasm_alloc_str(&mut caller, &mem, &value)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.secrets_reveal(handle) -> i64 (fresh plaintext String). THE
     // audit anchor (plan 132 phase 2): the only import that moves secret
     // plaintext into guest memory. Failure paths raise catchable errors
@@ -423,6 +550,52 @@ mod tests {
             resolve_secret_payload("bearer:FAI_TEST_SECRET_PAYLOAD_UNSET"),
             None
         );
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn resolve_template_substitutes_known_names() {
+        let name = "FAI_TEST_TEMPLATE_SECRET";
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, "tok-77");
+        }
+        assert_eq!(
+            resolve_template("Bearer $FAI_TEST_TEMPLATE_SECRET"),
+            "Bearer tok-77"
+        );
+        assert_eq!(resolve_template("a${FAI_TEST_TEMPLATE_SECRET}b"), "atok-77b");
+        // Unknown names, bare dollars, and malformed braces pass through.
+        assert_eq!(
+            resolve_template("costs $5, key $FAI_TEST_TEMPLATE_UNSET"),
+            "costs $5, key $FAI_TEST_TEMPLATE_UNSET"
+        );
+        assert_eq!(resolve_template("${unterminated"), "${unterminated");
+        assert_eq!(resolve_template("trailing $"), "trailing $");
+        assert_eq!(resolve_template("no placeholders"), "no placeholders");
+        // Multibyte text around placeholders survives.
+        assert_eq!(
+            resolve_template("«$FAI_TEST_TEMPLATE_SECRET»"),
+            "«tok-77»"
+        );
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn empty_env_value_counts_as_unset() {
+        let name = "FAI_TEST_EMPTY_SECRET";
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, "");
+        }
+        assert_eq!(resolve_secret(name), None);
+        assert_eq!(resolve_template("$FAI_TEST_EMPTY_SECRET"), "$FAI_TEST_EMPTY_SECRET");
         #[allow(unused_unsafe)]
         unsafe {
             std::env::remove_var(name);

@@ -370,6 +370,7 @@ pub(crate) fn prepare_secrets(
 
     Ok(Some(wasm_runner::SecretsManifest {
         backend: cfg.backend.clone(),
+        allow_undeclared: cfg.allow_undeclared,
         declared: decls.iter().map(|d| d.name.clone()).collect(),
         resolved,
     }))

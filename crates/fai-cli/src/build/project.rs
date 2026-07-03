@@ -92,6 +92,12 @@ pub(crate) struct SecretDecl {
 pub(crate) struct SecretsConfig {
     /// `backend = "env" | "dotenvx" | "aws"`. Defaults to `env`.
     pub(crate) backend: String,
+    /// `allow_undeclared = true` — let `secrets.get` accept names outside
+    /// the manifest at RUNTIME (for user-configured secret names that
+    /// cannot be known statically, e.g. per-webhook signing secrets).
+    /// The check-time rule is unaffected: literal names in source must
+    /// still be declared.
+    pub(crate) allow_undeclared: bool,
     pub(crate) declarations: Vec<SecretDecl>,
     /// Backend-specific config from `[secrets.<backend>]` sections,
     /// e.g. `[secrets.aws] region/prefix`, keyed by backend then key.
@@ -666,6 +672,8 @@ pub(crate) fn parse_project_info(content: &str) -> ProjectInfo {
                 let secrets = info.secrets.get_or_insert_with(SecretsConfig::default);
                 if k == "backend" {
                     secrets.backend = v_unquoted;
+                } else if k == "allow_undeclared" {
+                    secrets.allow_undeclared = v_unquoted == "true";
                 } else {
                     // A declaration: `NAME = {}` or
                     // `NAME = { required = true, targets = ["server"] }`.

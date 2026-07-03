@@ -33,6 +33,19 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // Blocking refetch through the active backend's cache (aws rotation
     // point); env/dotenvx return 0.
     ins(b, "secretsRefresh", &[], &[Type::Int]);
+    // Reveal-class helpers (audit: grep reveal / resolveTemplate).
+    ins(
+        b,
+        "secretsResolveTemplate",
+        &[p("text", Type::String)],
+        &[Type::String],
+    );
+    ins(
+        b,
+        "secretsRevealOr",
+        &[p("secret", Type::Secret), p("default", Type::String)],
+        &[Type::String],
+    );
 }
 
 #[cfg(test)]

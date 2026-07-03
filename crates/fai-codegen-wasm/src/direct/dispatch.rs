@@ -420,6 +420,17 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         ),
         ("std.secrets", "header") => (IMPORT_SECRETS_HEADER, &[AS::Boxed], RS::Boxed),
         ("std.secrets", "refresh") => (IMPORT_SECRETS_REFRESH, &[], RS::MakeInt),
+        // Reveal-class helpers: template substitution and reveal-with-default.
+        ("std.secrets", "resolveTemplate") => (
+            IMPORT_SECRETS_RESOLVE_TEMPLATE,
+            &[AS::String],
+            RS::Boxed,
+        ),
+        ("std.secrets", "revealOr") => (
+            IMPORT_SECRETS_REVEAL_OR,
+            &[AS::Boxed, AS::String],
+            RS::Boxed,
+        ),
 
         // std.net / std.ffi — availability checks.
         ("std.net", "available") => (IMPORT_NET_AVAILABLE, &[], RS::MakeBool),
