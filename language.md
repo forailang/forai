@@ -872,11 +872,21 @@ descriptions are available via `fai doc <name>` at any time.
 Available modules: `std.string`, `std.array`, `std.dictionary`, `std.math`,
 `std.convert`, `std.json`, `std.http.request`, `std.http.server`, `std.file`,
 `std.path`, `std.env`, `std.events`, `std.error`, `std.time`, `std.log`,
-`std.cli`, `std.net`, `std.ffi`, `std.process`, `std.crypto`.
+`std.cli`, `std.net`, `std.ffi`, `std.process`, `std.crypto`, `std.secrets`.
+
+`std.secrets` provides opaque `Secret` handles: `secrets.get(name)` returns a
+handle carrying only the NAME; the plaintext stays host-side and is resolved
+at egress (HTTP auth headers via `secrets.bearer`/`basic`/`header`, child
+process env), so it never enters program memory. Printing a Secret renders
+`«secret NAME»`; interpolation, concatenation, comparison, and case dispatch
+are check errors. Declare secrets in fai.toml under `[secrets]` (backends:
+`env`, `dotenvx`, `aws`); `secrets.reveal(...)` is the single greppable
+plaintext audit anchor for trusted non-HTTP sinks. See `fai doc std.secrets`.
 
 Some modules are native-host only and expose an availability probe so code
 that also runs in the browser can branch instead of trapping:
-`process.available()`, `crypto.available()`, `net.available()`. For example,
+`process.available()`, `crypto.available()`, `net.available()`,
+`secrets.available()`. For example,
 `std.process` runs shell commands (`process.run`) and long-running command
 sessions (`process.start`/`write`/`read`/`stop`), returning JSON result
 strings — see `fai doc std.process`.
