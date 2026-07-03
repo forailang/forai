@@ -1,0 +1,9 @@
+[project]
+name = "SecretsManifest"
+version = "0.1.0"
+source_root = "src"
+
+[secrets]
+backend = "env"
+APP_TOKEN = { required = true }
+OPTIONAL_EXTRA = {}

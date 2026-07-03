@@ -1,0 +1,19 @@
+# expect: ok
+# stdout:
+#   caught: true
+
+use std.secrets
+
+use std.string
+
+def main
+    @return Void
+do
+    let name = 'NOT' + '_DECLARED'
+    try
+        let key = secrets.get(name)
+        print(key)
+    catch e
+        print('caught: ' + toString(string.contains(e.message, 'not declared')))
+    end
+end

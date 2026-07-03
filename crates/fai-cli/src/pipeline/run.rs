@@ -66,8 +66,12 @@ pub(crate) fn step_run(args: &[String], project: Option<&str>, reporter: &Report
         .map(|a| a.as_str())
         .collect();
 
+    // The active sub-project key (when known) — the `[secrets]`
+    // per-declaration `targets = [...]` filter compares against it.
+    let mut active_target: Option<String> = None;
     let path = if let Some(target) = project {
         // Explicit `--project NAME` — honour it over everything else.
+        active_target = Some(target.to_string());
         resolve_target_entry_point(target).unwrap_or_else(|| {
             reporter.error_line(&format!("could not resolve target '{}'", target));
             reporter.step(StepStatus::Fail, "run", "unknown target");
@@ -80,6 +84,7 @@ pub(crate) fn step_run(args: &[String], project: Option<&str>, reporter: &Report
             arg.to_string()
         } else {
             // Target name (legacy positional form, still supported)
+            active_target = Some(arg.to_string());
             resolve_target_entry_point(arg).unwrap_or_else(|| {
                 reporter.error_line(&format!("could not resolve target '{}'", arg));
                 reporter.step(StepStatus::Fail, "run", "unknown target");
@@ -120,6 +125,22 @@ pub(crate) fn step_run(args: &[String], project: Option<&str>, reporter: &Report
     // `forai run`. Plan 99 Phase 2.4.
     let run_source_root = find_source_root(&path);
     let run_info = read_project_info_full(run_source_root.as_deref());
+
+    // Plan 132: startup secret validation. Fail-fast on missing required
+    // secrets — with the name and backend, never a value — instead of
+    // "crash at first use, maybe in production". The returned manifest is
+    // installed on the runner below so `secrets_get` can reject
+    // undeclared names at runtime.
+    let secrets_manifest =
+        match prepare_secrets(&run_info, active_target.as_deref(), run_source_root.as_deref()) {
+            Ok(m) => m,
+            Err(e) => {
+                reporter.error_line(&e);
+                reporter.step(StepStatus::Fail, "run", "missing required secrets");
+                std::process::exit(1);
+            }
+        };
+
     inject_peer_hash(
         &mut content,
         &run_info,
@@ -163,11 +184,77 @@ pub(crate) fn step_run(args: &[String], project: Option<&str>, reporter: &Report
         None,
     );
     let externs = extract_extern_info_full(&content, &path, synthetic_modules);
+    let _secrets_guard = wasm_runner::SecretsGuard::set(secrets_manifest);
     if let Err(e) = wasm_runner::run_wasm_with_externs_opts(&wasm_bytes, externs, run_opts) {
         reporter.error_line(&e);
         reporter.step(StepStatus::Fail, "run", "runtime error");
         std::process::exit(1);
     }
+}
+
+/// Plan 132: build the active [`wasm_runner::SecretsManifest`] from the
+/// project's `[secrets]` section and fail-fast validate required secrets
+/// for the active target.
+///
+/// The `env` backend host-loads the project's `.env` (beside fai.toml)
+/// into the process environment first — real environment variables win
+/// over file entries — so declared secrets in a local dotenv file resolve
+/// both here and later at egress. Later backends (dotenvx phase 4, aws
+/// phase 5) plug in behind the same manifest.
+///
+/// Errors name the secret and the backend, never a value.
+pub(crate) fn prepare_secrets(
+    info: &ProjectInfo,
+    active_target: Option<&str>,
+    source_root: Option<&str>,
+) -> Result<Option<wasm_runner::SecretsManifest>, String> {
+    let Some(cfg) = &info.secrets else {
+        return Ok(None);
+    };
+
+    // Merge `.env` beside fai.toml (mirror read_project_info_full's
+    // fai.toml discovery: source_root itself, else its parent).
+    if let Some(root) = source_root {
+        let root = std::path::Path::new(root);
+        let project_dir = if root.join("fai.toml").exists() {
+            root
+        } else {
+            root.parent().unwrap_or(root)
+        };
+        if let Ok(content) = std::fs::read_to_string(project_dir.join(".env")) {
+            for (key, value) in wasm_runner::parse_dotenv(&content) {
+                if std::env::var_os(&key).is_none() {
+                    // SAFETY: same single-threaded-before-run argument as
+                    // `env.load` in host/env.rs — validation runs before
+                    // the module (and any worker) starts.
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
+                }
+            }
+        }
+    }
+
+    let decls = cfg.declarations_for_target(active_target);
+    let missing: Vec<String> = decls
+        .iter()
+        .filter(|d| d.required && std::env::var_os(&d.name).is_none())
+        .map(|d| format!("'{}'", d.name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing required secret{} {} (backend {})",
+            if missing.len() > 1 { "s" } else { "" },
+            missing.join(", "),
+            cfg.backend,
+        ));
+    }
+
+    Ok(Some(wasm_runner::SecretsManifest {
+        backend: cfg.backend.clone(),
+        declared: decls.iter().map(|d| d.name.clone()).collect(),
+    }))
 }
 
 /// Build the host-side extern table by walking the entry file plus

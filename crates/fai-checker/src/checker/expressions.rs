@@ -800,6 +800,22 @@ impl Checker {
             }
             let arg_expr = &arg.unwrap().value;
             let actual = self.check_expression(arg_expr, env)?;
+            // Plan 132: with a `[secrets]` manifest installed, a literal
+            // `secrets.get` name must be declared. Dynamic names can't be
+            // checked here — those raise a catchable error at runtime.
+            if sig.name == "secretsGet" && i == 0 {
+                if let (Some(declared), Expression::StringExpression(se)) =
+                    (&self.declared_secrets, arg_expr)
+                {
+                    if !declared.contains(&se.value) {
+                        return Err(CheckError::new(format!(
+                            "Secret '{}' is not declared in [secrets] in fai.toml. \
+                             Add `{} = {{}}` (or `{{ required = true }}`) to declare it",
+                            se.value, se.value
+                        )));
+                    }
+                }
+            }
             // A Secret flows only into Secret-typed parameters plus a small
             // redaction-safe allowlist (plan 132). Without this, any
             // Unknown-typed parameter (length, json.stringify, user helpers)

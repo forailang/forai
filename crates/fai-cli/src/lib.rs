@@ -1011,6 +1011,11 @@ fn compile_fai_to_wasm(
     }
 
     let mut checker = fai_checker::Checker::new();
+    // Plan 132: literal `secrets.get` names must be declared in the
+    // project's [secrets] manifest when one exists.
+    if let Some(names) = declared_secret_names_for_path(path) {
+        checker.set_declared_secrets(names);
+    }
     if let Err(e) = run_checker(&mut checker, &prepared) {
         eprintln!("{}", format_check_errors(&checker, &e));
         std::process::exit(1);

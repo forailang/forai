@@ -1,0 +1,7 @@
+[project]
+name = "SecretsMissingRequired"
+version = "0.1.0"
+source_root = "src"
+
+[secrets]
+FAI_FIXTURE_MISSING_REQUIRED_SECRET = { required = true }

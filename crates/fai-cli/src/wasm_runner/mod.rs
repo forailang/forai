@@ -25,6 +25,8 @@ mod print;
 
 pub use fai_ffi::FfiType;
 pub use host::util::{ExternGuard, ExternInfo};
+pub(crate) use host::parse_dotenv;
+pub(crate) use host::secrets::{SecretsGuard, SecretsManifest};
 
 /// Shared wasmtime engine. Cheap to clone but expensive to construct; build
 /// once per process.

@@ -16,7 +16,7 @@ mod json;
 mod net;
 mod process;
 pub(crate) mod reactor;
-mod secrets;
+pub(crate) mod secrets;
 mod socket_registry;
 mod sockets;
 mod spy;
@@ -24,6 +24,7 @@ mod storage;
 pub(super) mod util;
 
 pub(crate) use async_ops::{park_for_next_event, prune_fired_timers};
+pub(crate) use env::parse_dotenv;
 
 /// Dispatch fired reactor watches to their owners (plan 103 U5): socket waits
 /// perform their non-blocking I/O and return the guest task ids to resume;

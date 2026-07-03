@@ -207,6 +207,12 @@ pub struct Checker {
     /// doesn't hide unrelated errors in other functions. When non-empty,
     /// `check_program`/`check_with_modules` returns a combined error.
     pub collected_errors: Vec<CheckError>,
+    /// Declared secret names from the project's `[secrets]` manifest
+    /// (plan 132), installed by the CLI via [`Checker::set_declared_secrets`].
+    /// `Some(names)` makes `secrets.get` with a literal name outside the
+    /// set a check-time error. `None` (no manifest — loose single-file
+    /// runs) leaves literal names unrestricted.
+    pub(super) declared_secrets: Option<HashSet<String>>,
 }
 
 impl Checker {
@@ -232,7 +238,15 @@ impl Checker {
             array_int_index_sites: HashSet::new(),
             record_field_read_sites: HashMap::new(),
             collected_errors: Vec::new(),
+            declared_secrets: None,
         }
+    }
+
+    /// Install the project's declared secret names (plan 132). With a
+    /// manifest installed, `secrets.get('NAME')` on an undeclared literal
+    /// name fails at check time; dynamic names stay a runtime concern.
+    pub fn set_declared_secrets(&mut self, names: HashSet<String>) {
+        self.declared_secrets = Some(names);
     }
 }
 

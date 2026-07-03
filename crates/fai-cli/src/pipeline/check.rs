@@ -84,6 +84,16 @@ pub(crate) fn run_project_check(project_root: &std::path::Path, src_dir: &str) -
     let prepared = fai_compiler::prepare_module_directory_for_tests(&src_path.to_string_lossy())
         .map_err(|e| (e, 1))?;
     let mut checker = fai_checker::Checker::new();
+    // Plan 132: literal secrets.get names must come from the manifest.
+    if let Some(secrets) = &info.secrets {
+        checker.set_declared_secrets(
+            secrets
+                .declarations
+                .iter()
+                .map(|d| d.name.clone())
+                .collect(),
+        );
+    }
     let prepared_modules: Vec<fai_checker::PreparedModule> = prepared
         .modules
         .iter()
@@ -162,6 +172,16 @@ pub(crate) fn try_check_single_file(path: &str) -> Result<(), (String, usize)> {
     )
     .map_err(|e| (e.to_string(), 1))?;
     let mut checker = fai_checker::Checker::new();
+    // Plan 132: literal secrets.get names must come from the manifest.
+    if let Some(secrets) = &info.secrets {
+        checker.set_declared_secrets(
+            secrets
+                .declarations
+                .iter()
+                .map(|d| d.name.clone())
+                .collect(),
+        );
+    }
     match run_checker(&mut checker, &prepared) {
         Ok(()) => Ok(()),
         Err(e) => Err((

@@ -2386,6 +2386,73 @@
         assert_eq!(shared.source.as_deref(), Some("shared/src"));
     }
 
+    // ── Plan 132: [secrets] manifest parsing ─────────────────────
+
+    #[test]
+    fn test_parse_secrets_manifest() {
+        let info = parse_project_info(
+            "[project]\nname = \"App\"\n\n\
+             [secrets]\nbackend = \"dotenvx\"\n\
+             STRIPE_KEY = { required = true }\n\
+             OPENAI_API_KEY = { required = true, targets = [\"server\", \"worker\"] }\n\
+             SLACK_BOT_TOKEN = {}\n\n\
+             [secrets.aws]\nregion = \"us-east-1\"\nprefix = \"brain/prod/\"\n",
+        );
+        let secrets = info.secrets.expect("secrets section parsed");
+        assert_eq!(secrets.backend, "dotenvx");
+        assert_eq!(secrets.declarations.len(), 3);
+
+        let stripe = &secrets.declarations[0];
+        assert_eq!(stripe.name, "STRIPE_KEY");
+        assert!(stripe.required);
+        assert!(stripe.targets.is_empty());
+
+        let openai = &secrets.declarations[1];
+        assert!(openai.required);
+        assert_eq!(openai.targets, vec!["server", "worker"]);
+
+        let slack = &secrets.declarations[2];
+        assert!(!slack.required);
+        assert!(slack.targets.is_empty());
+
+        let aws = &secrets.backend_options["aws"];
+        assert_eq!(aws["region"], "us-east-1");
+        assert_eq!(aws["prefix"], "brain/prod/");
+    }
+
+    #[test]
+    fn test_parse_secrets_backend_defaults_to_env() {
+        let info = parse_project_info("[secrets]\nAPI_KEY = { required = true }\n");
+        let secrets = info.secrets.expect("secrets section parsed");
+        assert_eq!(secrets.backend, "env");
+        assert_eq!(secrets.declarations.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_secrets_absent_is_none() {
+        let info = parse_project_info("[project]\nname = \"App\"\n");
+        assert!(info.secrets.is_none());
+    }
+
+    #[test]
+    fn test_secrets_declarations_for_target() {
+        let info = parse_project_info(
+            "[secrets]\n\
+             ALL = { required = true }\n\
+             SERVER_ONLY = { required = true, targets = [\"server\"] }\n",
+        );
+        let secrets = info.secrets.unwrap();
+        let server = secrets.declarations_for_target(Some("server"));
+        assert_eq!(server.len(), 2);
+        let client = secrets.declarations_for_target(Some("client"));
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].name, "ALL");
+        // Loose/single-project runs (no sub-project target) validate only
+        // untargeted declarations.
+        let loose = secrets.declarations_for_target(None);
+        assert_eq!(loose.len(), 1);
+    }
+
     #[test]
     fn test_parse_sub_projects_dont_clobber_root() {
         // Sub-project sections shouldn't overwrite root [project] fields

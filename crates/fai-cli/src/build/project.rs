@@ -68,6 +68,48 @@ pub(crate) struct SubProject {
     pub(crate) assets: Vec<(String, String)>,
 }
 
+/// One `[secrets]` declaration (plan 132):
+/// `STRIPE_KEY = { required = true, targets = ["server"] }` or bare
+/// `SLACK_TOKEN = {}` for an optional secret available to all targets.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SecretDecl {
+    pub(crate) name: String,
+    /// `required = true` — startup validation fails the boot when the
+    /// active backend cannot resolve this name.
+    pub(crate) required: bool,
+    /// `targets = ["server"]` — restrict the declaration (and its
+    /// startup validation) to the named sub-projects. Empty = all.
+    pub(crate) targets: Vec<String>,
+}
+
+/// The `[secrets]` manifest (plan 132): backend selection is config,
+/// not code — the same program runs against `env` in dev and `aws` in
+/// prod with no source change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SecretsConfig {
+    /// `backend = "env" | "dotenvx" | "aws"`. Defaults to `env`.
+    pub(crate) backend: String,
+    pub(crate) declarations: Vec<SecretDecl>,
+    /// Backend-specific config from `[secrets.<backend>]` sections,
+    /// e.g. `[secrets.aws] region/prefix`, keyed by backend then key.
+    pub(crate) backend_options:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+}
+
+impl SecretsConfig {
+    /// Declarations that apply to the given active target name (a
+    /// sub-project key, or None for a single-project/loose run).
+    pub(crate) fn declarations_for_target(&self, target: Option<&str>) -> Vec<&SecretDecl> {
+        self.declarations
+            .iter()
+            .filter(|d| {
+                d.targets.is_empty()
+                    || target.is_some_and(|t| d.targets.iter().any(|x| x == t))
+            })
+            .collect()
+    }
+}
+
 /// Everything `forai build` reads out of the project's `fai.toml` up
 /// front. Workspace + remote-interface information is also picked up
 /// here so the build path only touches the file once.
@@ -97,6 +139,21 @@ pub(crate) struct ProjectInfo {
     pub(crate) interface_from: Option<String>,
     /// Named sub-projects (e.g. `[project.client]`, `[project.server]`).
     pub(crate) sub_projects: std::collections::HashMap<String, SubProject>,
+    /// `[secrets]` manifest (plan 132). `None` when the section is absent.
+    pub(crate) secrets: Option<SecretsConfig>,
+}
+
+/// Plan 132: every declared secret name (across all targets) for the
+/// project owning `path` — the check-time declaration set for
+/// `secrets.get` literal-name validation. `None` = no `[secrets]`
+/// section (loose files stay unrestricted).
+pub(crate) fn declared_secret_names_for_path(
+    path: &str,
+) -> Option<std::collections::HashSet<String>> {
+    let source_root = find_source_root(path);
+    read_project_info_full(source_root.as_deref())
+        .secrets
+        .map(|s| s.declarations.iter().map(|d| d.name.clone()).collect())
 }
 
 pub(crate) fn read_project_info(source_root: Option<&str>) -> (String, String, Option<String>) {
@@ -459,6 +516,46 @@ pub(crate) fn parse_string_array(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse a TOML inline table (`{ required = true, targets = ["a", "b"] }`)
+/// into (key, raw value) pairs. Commas inside `[...]` arrays don't split.
+/// An empty table (`{}`) or a non-table value yields no pairs.
+fn parse_inline_table(v: &str) -> Vec<(String, String)> {
+    let v = v.trim();
+    let Some(inner) = v.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    for c in inner.chars() {
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ']' | '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    parts.push(current);
+    for part in parts {
+        if let Some((k, val)) = part.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() {
+                out.push((k.to_string(), val.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn parse_project_info(content: &str) -> ProjectInfo {
     let mut info = ProjectInfo {
         name: "unknown".into(),
@@ -562,7 +659,45 @@ pub(crate) fn parse_project_info(content: &str) -> ProjectInfo {
                 "from" => info.interface_from = Some(v_unquoted),
                 _ => {}
             },
-            _ => {}
+            "secrets" => {
+                let secrets = info.secrets.get_or_insert_with(SecretsConfig::default);
+                if k == "backend" {
+                    secrets.backend = v_unquoted;
+                } else {
+                    // A declaration: `NAME = {}` or
+                    // `NAME = { required = true, targets = ["server"] }`.
+                    let mut decl = SecretDecl {
+                        name: k.to_string(),
+                        required: false,
+                        targets: Vec::new(),
+                    };
+                    for (ik, iv) in parse_inline_table(v) {
+                        match ik.as_str() {
+                            "required" => decl.required = iv == "true",
+                            "targets" => decl.targets = parse_string_array(&iv),
+                            _ => {}
+                        }
+                    }
+                    secrets.declarations.push(decl);
+                }
+            }
+            s => {
+                // `[secrets.<backend>]` — backend-specific options.
+                if let Some(backend) = s.strip_prefix("secrets.") {
+                    let secrets = info.secrets.get_or_insert_with(SecretsConfig::default);
+                    secrets
+                        .backend_options
+                        .entry(backend.to_string())
+                        .or_default()
+                        .insert(k.to_string(), v_unquoted);
+                }
+            }
+        }
+    }
+
+    if let Some(secrets) = info.secrets.as_mut() {
+        if secrets.backend.is_empty() {
+            secrets.backend = "env".to_string();
         }
     }
 

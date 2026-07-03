@@ -1,0 +1,10 @@
+# expect: runtime_error
+# error: missing required secret
+
+use std.secrets
+
+def main
+    @return Void
+do
+    print(secrets.has('FAI_FIXTURE_MISSING_REQUIRED_SECRET'))
+end

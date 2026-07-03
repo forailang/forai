@@ -275,7 +275,7 @@ fn import_name(idx: u32) -> &'static str {
 fn import_signals_errors(import_idx: u32) -> bool {
     matches!(
         import_idx,
-        IMPORT_FILE_READ_STR | IMPORT_WRITE_FILE | IMPORT_FILE_LIST
+        IMPORT_FILE_READ_STR | IMPORT_WRITE_FILE | IMPORT_FILE_LIST | IMPORT_SECRETS_GET
     )
 }
 
