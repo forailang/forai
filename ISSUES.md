@@ -6,20 +6,49 @@ fixing commit.
 
 ## Open
 
-### rc: double-free in brain's data.hooks.memorySearchOutput under FAI_RC_CHECK
+### async engine: sync throw after catching a failed async task hangs the scheduler
 
-- **Date:** 2026-06-11
-- **Area:** RC release path (double-free), surfaced by plan-118 leak lane
-- **Found by:** `FAI_RC_CHECK=1 fai test` over brain's inline suite.
+- **Date:** 2026-07-03
+- **Area:** async engine (error state / park) — pre-existing, found while
+  fixing the bare-string throw bug (reproduces on the unmodified baseline).
+- **Severity:** high — `fai run` parks forever, no output, no timeout.
 
-`data.hooks.memorySearchOutput — returns only documents matching the
-extracted keywords` traps with `rc-check: release of freed object at
-0x527b8` (a double-free) while passing without the guards. 457/458
-brain cases are RC_CHECK-clean; this is the one corruption-class
-failure, in the same hooks subtree as brain's open multi-GB
-hooks-runaway issue — plausibly the same root cause. Needs a minimal
-repro; candidate classes: an over-release in a path the plan-117
-phase-3/4 helper migration will reroute.
+Shape: `main` catches a **failed async task** (a function that awaits and
+then throws to its awaiter), then calls **any sync function that throws**
+inside a second `try`/`catch`. The second throw never reaches the catch;
+the scheduler parks forever. The same second call *not* throwing (or no
+prior async failure) runs fine, and the test-runner lane runs both
+functions fine — only the main-path sequence hangs. Likely stale
+error/park state left by the async-fail catch path.
+
+```
+def boom      # sleep(1) then throw Error('x')
+def rethrow   # throw Error('original')   (sync)
+
+def main do
+    try boom() catch e print(e.message) end       # prints, ok
+    try rethrow() catch e print(e.message) end    # ← hangs here
+end
+```
+
+Repro fixture (skipped):
+`tests/fixtures/language/errors/async_fail_then_sync_throw/`.
+
+### async engine: an error thrown across `fail`/catch leaks the error object
+
+- **Date:** 2026-07-03 (pre-existing; measured while fixing bare-string throw)
+- **Area:** async engine catch-var ownership (plan-117 async-runtime-root family)
+
+A `throw Error('x')` that crosses the async `fail` → awaiter-catch path
+leaks the error dict + its two strings (3 objects per throw) — measured
+identical on the unmodified baseline with `--check-leaks` over a variant
+of `tests/fixtures/language/reclaim/async_throws_reclaims/`. The awaiting
+catch binds the error without a matching release (same borrowed-catch-var
+convention noted at `direct.rs` `Term::ThrowTo`). Bare-value throws now
+box into an Error-shaped wrapper (2026-07-03), so they exhibit the same
+per-throw leak instead of none. Safe but unbounded for servers that throw
+across tasks in a loop; belongs with the `# leak: expected`
+async-runtime-root ratchets when the catch-var convention is fixed.
 
 ### test-mode codegen: UFCS call in an entry file fails the test step with a misattributed UnknownIdentifier
 
@@ -44,79 +73,6 @@ Repro fixture (skipped): `tests/fixtures/language/ufcs/entry_file_test_step/`.
 Until fixed, plan-118 fixtures avoid UFCS-in-entry shapes where the
 test step matters.
 
-### codegen: tail-position `from_dict` passes check but breaks build, with a misattributed error
-
-- **Date:** 2026-06-01
-- **Area:** checker/codegen discrepancy (`from_dict` builtin)
-- **Found by:** Brain — a webhook test/util that built an `HttpRequest`.
-
-`from_dict` needs an explicit target-type annotation to codegen. The working
-form is:
-
-```
-let x T = from_dict(dict)
-x
-```
-
-Using it in **tail/return position** — relying on the function's `-> T` return
-type to supply the target type — type-checks fine (`fai check` is green) but
-**fails codegen** (`fai build` / `fai test`). Two things make it costly to
-diagnose:
-
-1. The error is **misattributed**: it surfaces at the *next* package that uses
-   `from_dict`, not the offending call site. Ours pointed at `Forui.rpc`
-   `withCookies` (`UnknownIdentifier("from_dict") (line 162:35)`) even though
-   that code was correct and unchanged — the real culprit was a tail-position
-   `from_dict` in the Brain app.
-2. `fai check` and the codegen disagree, so the problem only appears after a
-   green check, in the build/test step, in a dependency.
-
-Minimal repro:
-
-```
-def make -> HttpRequest do
-    var d = {}
-    d = set(d, 'path', '/x')
-    from_dict(d)   # tail position — checks OK, breaks build
-end
-```
-
-Workaround: always bind via `let x T = from_dict(...)`. Proposed fix: make
-codegen honor the return-type annotation for tail-position `from_dict` (match
-the checker), or have the checker reject tail-position `from_dict` with a
-clear, correctly-located error. Related to forai #1/#5 (built-in types like
-`HttpResponse`/`HttpRequest` not constructible by name, forcing the
-`from_dict` round-trip in the first place).
-
-### build: two `rpc_server` targets in one project share a single RPC surface
-
-- **Date:** 2026-06-01
-- **Area:** CLI / multi-target build (RPC dispatch + surface discovery)
-- **Found by:** Brain — trying to add a standalone task server as a second
-  `rpc_server` target alongside the existing web/server targets.
-
-A project's RPC surface is discovered from the project `source_root`, not the
-per-target `source`. Consequences when adding a second `rpc_server` target:
-
-- The new target's generated `__rpcDispatch` includes **every** `remote def`
-  in the shared `src` tree (so a task server inherited Brain's `tools_call`,
-  `capabilities_search`, etc.), and fails to compile when one of those remote
-  defs returns a type not reachable from the new target's `main`
-  (`Unknown type 'SkillExecutionResult'` from generated dispatch code).
-- Setting the target's `source` to a different folder does **not** redirect RPC
-  discovery — it still reads `<source_root>/<module>` and errors
-  (`cannot read module directory 'src/taskserver'`).
-
-Net: you can't host two *independently-scoped* RPC services as targets of one
-`fai.toml`. The practical resolution is a **separate fai project** (own
-`fai.toml` + `source_root`), with the services talking over HTTP. That's what
-Brain's task server became (`brain/task_server/`).
-
-Proposed fix: scope RPC surface discovery + dispatch generation to the target's
-own `source`/reachable graph, so multiple isolated `rpc_server` targets can
-coexist in one project. Until then, document that isolated services need
-separate projects.
-
 ### runtime: caught `e.message` can read stale garbage when thrown before DB init
 
 - **Date:** 2026-06-01
@@ -130,76 +86,11 @@ ordering where the shared DB (`getDb()`) had not yet been initialized when the
 throw occurred. Forcing `getDb()` before the throw makes `e.message` read
 correctly. So a caught exception's `.message` can surface unrelated/leaked bytes
 depending on prior runtime state (here, whether the sqlite layer was
-initialized). Likely the same underlying string/exception memory issue as the
-bare-`throw` bug below. Repro is order-sensitive; the tell is `e.message`
+initialized). Was suspected to share a root cause with the bare-`throw`
+bug (now fixed — see Resolved, 2026-07-03: non-dict throws box into an
+Error-shaped dict); worth re-running brain's order-sensitive repro against
+the fixed runtime before investigating further. The tell is `e.message`
 containing text the throwing code never produced.
-
-### language: bare `throw <string>` produces a corrupt, memory-unsafe `e.message`
-
-- **Date:** 2026-05-31
-- **Area:** language / runtime (exceptions + string representation)
-- **Severity:** high — memory-unsafe (wasm OOB access), silent data corruption.
-- **Found by:** Brain project (`forai/brain`), routed tool-call audit work.
-
-Throwing a bare string and catching it yields a `message` that is not a
-well-formed String. Throwing via the `Error(...)` constructor works correctly.
-
-Minimal repro (no DB, no deps):
-
-```forai
-def boomString
-    @return Void
-do
-    throw 'hello from string'
-end
-
-def boomError
-    @return Void
-do
-    throw Error('hello from Error')
-end
-
-def main
-    @return Void
-do
-    try
-        boomError()
-    catch e
-        print(e.message)            # -> "hello from Error"  (correct)
-        print(string.trim(e.message))   # ok
-    end
-    try
-        boomString()
-    catch e
-        print(e.message)            # -> "null"  (WRONG; should be the thrown string)
-        print(string.trim(e.message))   # -> wasm trap: out of bounds memory access
-    end
-end
-```
-
-Observed with bare-string throws:
-
-- `e.message` renders as `null` (so `'' + e.message` is the 4-char string
-  `"null"`), i.e. the thrown text is lost.
-- Operations that read the value's raw pointer/length — `string.trim(e.message)`,
-  or binding it as a SQL parameter via `Forsqlite.exec_params` — fault or
-  corrupt state. The wasm trap address is ASCII character data (e.g.
-  `0x6f77207b` = bytes of the thrown text), i.e. string bytes are being
-  dereferenced as a pointer.
-- Operations that copy char-by-char (`print`, `'prefix' + e.message`) happen to
-  succeed, which masks the problem until a raw-pointer consumer touches it.
-
-This surfaced in Brain as `forsqlite.exec_params finalize failed` when an audit
-row tried to persist a caught validation error's `e.message`: the bare-string
-throw made the bound parameter malformed and SQLite's `step`/`finalize` failed.
-Switching the throw sites to `throw Error(...)` (the idiom the rest of the
-codebase already uses) fixed it.
-
-Proposed fix: decide on `throw` semantics for non-`Error` operands. Either
-(a) box a bare-string throw into a proper error whose `.message` is that string,
-or (b) reject `throw <non-Error>` at type-check time. Either way, a caught
-`e.message` must always be a valid, memory-safe String. The current silent
-corruption + OOB access is the dangerous part.
 
 ### stdlib: no directory-creation primitive in `std.file`
 
@@ -239,14 +130,74 @@ tests and skills currently shell out for cleanup too.
 **not** create missing parent directories, so writing to a path like
 `/tmp/new_dir/file.txt` when `/tmp/new_dir` does not exist fails.
 
-The failure is also silent at the call site in a misleading way: `fileWrite`
-returns `0` (→ `false`) on error rather than throwing, so callers that ignore
-the boolean result get no signal that the write was dropped. Combined with the
-missing `mkdir` above, there is no clean way to write into a new nested path.
+~~The failure is also silent at the call site~~ **Update 2026-07-02:** the
+silent-failure half is fixed — `file.read`, `file.write`, and `file.list`
+failures now raise a guest-catchable error carrying the path and OS reason
+(error-channel migration; pinned by
+`tests/fixtures/language/stdlib/file_errors_catchable/` and
+`file_read_missing_uncaught.invalid/`). What remains open here is the
+missing-primitive half: without `file.makeDirs` there is still no
+first-class way to write into a new nested path — the write now fails
+*loudly*, but it still fails.
 
-Proposed fix: decide on intended semantics and make them consistent —
-either (a) have `file.write` create parent directories automatically
-(`create_dir_all` on the parent before `fs::write`), or (b) keep it strict but
-document that the parent must exist and pair it with a `file.makeDirs`
-primitive (see the issue above). Either way, consider surfacing write failures
-more loudly than a bare `false`.
+Proposed fix (remaining): decide between (a) `file.write` creating parent
+directories automatically (`create_dir_all` before `fs::write`), or (b) keep
+it strict and pair it with a `file.makeDirs` primitive (see the issue above).
+
+## Resolved
+
+### rc: double-free in brain's data.hooks.memorySearchOutput under FAI_RC_CHECK
+
+- **Date:** 2026-06-11; no longer reproduces as of 2026-07-03.
+
+`FAI_RC_CHECK=1 fai test` over brain's full inline suite is now clean —
+`data.hooks.memorySearchOutput` passes (3 cases) and both target lanes
+report 2095 + 1968 passed with no rc-check traps. The specific fixing
+change is unconfirmed: candidates are the 2026-07-03 non-dict throw
+boxing (hooks paths throw), the file-error error-channel migration, or
+the plan-120/121/122 ownership-ABI phases landed since the report. If a
+regression resurfaces, start from the hooks subtree's throw/error paths.
+
+### language: bare `throw <string>` produces a corrupt, memory-unsafe `e.message`
+
+- **Date:** 2026-05-31, resolved 2026-07-03 (semantics option (a)).
+
+Non-dict thrown values are now boxed at the throw site into an
+Error-shaped `{message: toString(value)}` dict — in all three lowering
+paths (sync `compile_throw`, async `Term::ThrowTo`, async `Term::Fail`)
+— so a caught `e.message` is always a valid, memory-safe String and
+`string.trim(e.message)` no longer traps. Dicts (Error values, thrown
+records) pass through untouched. Pinned by
+`tests/fixtures/language/errors/throw_bare_string/` (unskipped, with
+`leak: flat` + `ownership: balanced` gates) and
+`errors/throw_bare_string_async/`; documented in language.md.
+Note: bare throws now allocate the wrapper, so they participate in the
+pre-existing async fail/catch error-object leak (tracked above).
+
+### codegen: tail-position `from_dict` passes check but breaks build, with a misattributed error
+
+- **Date:** 2026-06-01, resolved 2026-07-03.
+
+Fixed in two parts. (1) Tail/return-position `from_dict(d)` in a function
+whose `@return` is a plain named type is now desugared into the
+typed-binding form (`fai-compiler::desugar`, applied in
+`convert_program` so the checker and both codegen paths agree) — the
+ISSUES.md repro compiles and runs. (2) Remaining unsupported positions
+(argument position; optional/array/generic target types) get a dedicated
+`from_dict-without-typed-binding` diagnostic with the `let x T =
+from_dict(d)` suggestion, instead of `UnknownIdentifier("from_dict")`
+whose best-effort location walk pointed at an unrelated module's
+legitimate `from_dict`. Pinned by
+`tests/fixtures/language/types/from_dict_tail_position/` (unskipped),
+`types/from_dict_arg_position.invalid/`, and fai-compiler desugar unit
+tests.
+
+### build: two `rpc_server` targets in one project share a single RPC surface
+
+- **Date:** 2026-06-01, resolved by plan 100 (reachable RPC surface),
+  regression-pinned 2026-07-02.
+
+RPC surface discovery is now scoped to each target's reachable graph, so two
+`rpc_server` targets over one `src` tree build independently. Pinned by
+`crates/fai-feature-tests/tests/two_rpc_targets.rs` over the tracked project
+fixture `tests/fixtures/projects/two_rpc_servers/`.

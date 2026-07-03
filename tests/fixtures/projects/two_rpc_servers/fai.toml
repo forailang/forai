@@ -1,0 +1,18 @@
+[project]
+name = "TwoRpcServers"
+version = "0.1.0"
+source_root = "src"
+
+[project.api]
+target = "native"
+source = "src"
+main = "src/platforms/api/main.fai"
+build_dir = "build/api"
+rpc_server = true
+
+[project.tasks]
+target = "native"
+source = "src"
+main = "src/platforms/tasks/main.fai"
+build_dir = "build/tasks"
+rpc_server = true

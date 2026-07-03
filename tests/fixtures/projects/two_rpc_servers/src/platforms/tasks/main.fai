@@ -1,0 +1,7 @@
+# Standalone task server target: does not import apidata, so its RPC
+# surface must not inherit api's remote defs (plan 100 scoping).
+def main
+    @return Void
+do
+    print('tasks up')
+end

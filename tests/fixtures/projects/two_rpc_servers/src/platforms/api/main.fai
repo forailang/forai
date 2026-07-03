@@ -1,0 +1,8 @@
+use apidata
+
+def main
+    @return Void
+do
+    let s = apidata.getSecret()
+    print(s.token)
+end
