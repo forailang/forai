@@ -102,7 +102,21 @@ fn property_access_hint(obj_type: &Type, property: &str) -> String {
 }
 
 impl Checker {
+    /// Type-check one expression, attaching its source location to any
+    /// error that doesn't already carry one. Recursion goes through this
+    /// wrapper, so the *innermost* failing expression wins the location —
+    /// a mismatch inside an `if` condition points at the condition, not
+    /// at the enclosing `def` line (plan 130 A1).
     pub(super) fn check_expression(
+        &mut self,
+        expr: &Expression,
+        env: &mut Environment,
+    ) -> Result<Type, CheckError> {
+        self.check_expression_unlocated(expr, env)
+            .map_err(|e| self.attach_location(e, super::expression_location(expr)))
+    }
+
+    fn check_expression_unlocated(
         &mut self,
         expr: &Expression,
         env: &mut Environment,
@@ -285,6 +299,7 @@ impl Checker {
                 }
             }
             Expression::FunctionExpression(fd) => {
+                self.check_arity_limit(fd)?;
                 // Check the body first to get body type
                 env.push_scope();
                 for param in &fd.params {

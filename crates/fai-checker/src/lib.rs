@@ -10,6 +10,14 @@ pub mod types;
 pub use checker::{Checker, PreparedModule};
 pub use error::CheckError;
 
+/// Maximum number of wasm argument slots a function or closure may use.
+/// Generic type parameters occupy a slot each, so a declaration's slot
+/// count is `params + type_params`. The direct wasm backend pre-builds one
+/// `FaiFunc(arity)` type per arity up to this limit (fai-codegen-wasm's
+/// `MAX_DIRECT_ARITY` re-exports this value); the checker rejects
+/// declarations over the limit so codegen never sees them.
+pub const MAX_FUNCTION_ARITY: usize = 16;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3147,5 +3155,74 @@ do
 end
 "#,
         );
+    }
+
+    #[test]
+    fn test_body_error_located_at_statement_not_def_line() {
+        // Plan 130 A1: an error deep in a function body must be attributed
+        // to the offending statement/expression, not the `def` line.
+        let source = "\
+# Spins forever, wrongly.
+def spin
+    @return Void
+do
+    while 'nope'
+        print('x')
+    end
+end
+
+def main
+    @return Void
+do
+    spin()
+end
+";
+        let prepared = fai_compiler::prepare_source(source, None)
+            .unwrap_or_else(|e| panic!("prepare error: {}", e));
+        let mut checker = Checker::new();
+        let err = checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect_err("non-Bool while condition must be rejected");
+        assert!(
+            err.message.contains("While condition must be Bool"),
+            "unexpected message: {}",
+            err.message
+        );
+        // `while` sits on line 5 (def is line 2) at column 5.
+        assert_eq!(err.line, Some(5), "line should be the while statement");
+        assert_eq!(err.column, Some(5));
+    }
+
+    #[test]
+    fn test_body_error_located_at_inner_expression() {
+        // The innermost failing expression wins the location: the bad `+`
+        // in the initializer, not the `let` or the `def`.
+        let source = "\
+# Adds badly.
+def bad
+    @return Int
+do
+    let x = 1 + 'a'
+    x
+end
+
+def main
+    @return Void
+do
+    print(bad())
+end
+";
+        let prepared = fai_compiler::prepare_source(source, None)
+            .unwrap_or_else(|e| panic!("prepare error: {}", e));
+        let mut checker = Checker::new();
+        let err = checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect_err("Int + String must be rejected");
+        assert!(
+            err.message.contains("requires numeric or string operands"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert_eq!(err.line, Some(5), "line should be the initializer");
     }
 }

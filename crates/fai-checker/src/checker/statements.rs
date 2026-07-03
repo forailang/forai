@@ -9,15 +9,27 @@ use crate::error::CheckError;
 use crate::types::*;
 
 impl Checker {
+    /// Type-check one statement, attaching the statement's own source
+    /// location to any error that doesn't already carry one. Expression
+    /// checks attach their (more precise) location first, so this is the
+    /// statement-granularity fallback that keeps body errors off the
+    /// enclosing `def` line (plan 130 A1).
     pub(super) fn check_statement(
         &mut self,
         stmt: &Statement,
         env: &mut Environment,
     ) -> Result<Type, CheckError> {
+        self.check_statement_unlocated(stmt, env)
+            .map_err(|e| self.attach_location(e, super::statement_location(stmt)))
+    }
+
+    fn check_statement_unlocated(
+        &mut self,
+        stmt: &Statement,
+        env: &mut Environment,
+    ) -> Result<Type, CheckError> {
         match stmt {
-            Statement::ExpressionStatement(es) => self
-                .check_expression(&es.expression, env)
-                .map_err(|e| self.attach_location(e, &es.location)),
+            Statement::ExpressionStatement(es) => self.check_expression(&es.expression, env),
             Statement::IfStatement(is) => self.check_if_statement(is, env),
             Statement::CaseStatement(cs) => self.check_case_statement(cs, env),
             Statement::TryStatement(ts) => self.check_try_statement(ts, env),

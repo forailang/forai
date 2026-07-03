@@ -1,0 +1,11 @@
+# expect: check_error
+# error: Closure has 17 parameters; the maximum is 16
+# error_at: 7:13
+def main
+    @return Void
+do
+    let f = do with a Int, b Int, c Int, d Int, e Int, f Int, g Int, h Int, i Int, j Int, k Int, l Int, m Int, n Int, o Int, p Int, q Int
+        a + q
+    end
+    print(f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17))
+end

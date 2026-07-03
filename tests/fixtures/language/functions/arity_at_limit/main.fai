@@ -1,0 +1,37 @@
+# expect: ok
+# stdout:
+#   17
+# Adds the first and last of sixteen ints.
+def wide
+    @param a Int
+    @param b Int
+    @param c Int
+    @param d Int
+    @param e Int
+    @param f Int
+    @param g Int
+    @param h Int
+    @param i Int
+    @param j Int
+    @param k Int
+    @param l Int
+    @param m Int
+    @param n Int
+    @param o Int
+    @param p Int
+    @return Int
+do
+    a + p
+end
+
+def main
+    @return Void
+do
+    print(wide(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+end
+
+test wide
+    it 'adds first and last'
+        assert.equals(wide(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), 17)
+    end
+end

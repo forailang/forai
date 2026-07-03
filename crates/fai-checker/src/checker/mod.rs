@@ -59,6 +59,38 @@ pub fn member_chain_depth(me: &MemberExpression) -> u32 {
     depth
 }
 
+/// Source location of a statement — every statement node carries one.
+/// Used as the fallback error location for statement-level checks so
+/// diagnostics point at the offending statement, not the enclosing
+/// `def` line (plan 130 A1). Declaration variants are included for
+/// completeness even though `check_program` attaches their locations
+/// itself.
+pub(super) fn statement_location(stmt: &Statement) -> &SourceLocation {
+    match stmt {
+        Statement::UseStatement(s) => &s.location,
+        Statement::LetStatement(s) => &s.location,
+        Statement::VarStatement(s) => &s.location,
+        Statement::AssignmentStatement(s) => &s.location,
+        Statement::FunctionDeclaration(s) => &s.location,
+        Statement::TypeDeclaration(s) => &s.location,
+        Statement::EnumDeclaration(s) => &s.location,
+        Statement::TestDeclaration(s) => &s.location,
+        Statement::IfStatement(s) => &s.location,
+        Statement::CaseStatement(s) => &s.location,
+        Statement::TryStatement(s) => &s.location,
+        Statement::ThrowStatement(s) => &s.location,
+        Statement::ForStatement(s) => &s.location,
+        Statement::WhileStatement(s) => &s.location,
+        Statement::BreakStatement(s) => &s.location,
+        Statement::ContinueStatement(s) => &s.location,
+        Statement::ReturnStatement(s) => &s.location,
+        Statement::ExpressionStatement(s) => &s.location,
+        Statement::ExternBlockDeclaration(s) => &s.location,
+        Statement::NowaitStatement(s) => &s.location,
+        Statement::FunctionTypeDefDeclaration(s) => &s.location,
+    }
+}
+
 fn expression_location(expr: &Expression) -> &SourceLocation {
     match expr {
         Expression::IdentifierExpression(e) => &e.location,

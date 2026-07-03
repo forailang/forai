@@ -1,0 +1,17 @@
+# expect: check_error
+# error: While condition must be Bool, got String
+# error_at: 8:5
+# Uses a non-Bool while condition deep inside a function body.
+def spin
+    @return Void
+do
+    while 'nope'
+        print('x')
+    end
+end
+
+def main
+    @return Void
+do
+    spin()
+end

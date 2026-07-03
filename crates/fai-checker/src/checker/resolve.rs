@@ -97,10 +97,47 @@ impl Checker {
         }
     }
 
+    /// Reject declarations whose wasm argument-slot count (params plus
+    /// generic type params) exceeds `MAX_FUNCTION_ARITY`. The direct wasm
+    /// backend only builds call types up to that arity, so anything larger
+    /// must fail here, with a location, rather than panic in codegen.
+    pub(super) fn check_arity_limit(&self, fd: &FunctionDeclaration) -> Result<(), CheckError> {
+        let slots = fd.params.len() + fd.type_params.len();
+        if slots <= crate::MAX_FUNCTION_ARITY {
+            return Ok(());
+        }
+        // Anonymous do-blocks get synthetic `<block:N>` names from the parser.
+        let what = if fd.name.is_empty() || fd.name.starts_with("<block") {
+            "Closure".to_string()
+        } else {
+            format!("Function '{}'", fd.name)
+        };
+        let detail = if fd.type_params.is_empty() {
+            format!("has {} parameters", fd.params.len())
+        } else {
+            format!(
+                "has {} parameters and {} generic type parameters ({} slots)",
+                fd.params.len(),
+                fd.type_params.len(),
+                slots
+            )
+        };
+        Err(self.attach_location(
+            CheckError::new(format!(
+                "{} {}; the maximum is {}",
+                what,
+                detail,
+                crate::MAX_FUNCTION_ARITY
+            )),
+            &fd.location,
+        ))
+    }
+
     pub(super) fn function_type_from_decl(
         &self,
         fd: &FunctionDeclaration,
     ) -> Result<Type, CheckError> {
+        self.check_arity_limit(fd)?;
         let params: Vec<FunctionParam> = fd
             .params
             .iter()

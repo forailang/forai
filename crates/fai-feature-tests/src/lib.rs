@@ -42,6 +42,57 @@ impl ErrorPattern {
     }
 }
 
+/// `# error_at: <line>:<col>` directive — asserts the matched error is
+/// *attributed* to a specific source position, piggybacking on the CLI's
+/// `(line L:C)` rendering. When both `# error:` and `# error_at:` are
+/// present, one output line must contain the pattern AND the location,
+/// so the location provably belongs to that error rather than a
+/// neighboring one. Guards the plan-130 A1 body-level attribution work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorLocation {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl ErrorLocation {
+    fn rendered(&self) -> String {
+        format!("(line {}:{})", self.line, self.column)
+    }
+}
+
+/// One output line must satisfy the pattern (if any) and the expected
+/// location (if any) *together*.
+fn error_output_matches(
+    pattern: &ErrorPattern,
+    error_at: Option<ErrorLocation>,
+    haystack: &str,
+) -> bool {
+    match error_at {
+        None => pattern.matches(haystack),
+        Some(at) => {
+            let loc = at.rendered();
+            haystack
+                .lines()
+                .any(|line| pattern.matches(line) && line.contains(&loc))
+        }
+    }
+}
+
+fn parse_error_at(value: &str) -> Result<ErrorLocation, String> {
+    let (l, c) = value
+        .split_once(':')
+        .ok_or_else(|| format!("`# error_at:` wants `<line>:<col>`, got '{}'", value))?;
+    let line = l
+        .trim()
+        .parse()
+        .map_err(|_| format!("`# error_at:` line is not a number: '{}'", l))?;
+    let column = c
+        .trim()
+        .parse()
+        .map_err(|_| format!("`# error_at:` column is not a number: '{}'", c))?;
+    Ok(ErrorLocation { line, column })
+}
+
 /// `# leak:` directive (plan 118 U3) — the expected-leak ratchet.
 /// Two-sided: a `Flat` fixture that leaks fails; an `Expected` fixture
 /// that runs flat fails ("flip the marker"). Fixtures WITHOUT the
@@ -76,6 +127,7 @@ pub struct Fixture {
     pub stdout: Option<String>,
     pub browser: Option<BrowserAssertion>,
     pub error: Option<ErrorPattern>,
+    pub error_at: Option<ErrorLocation>,
     pub skip: Option<String>,
     pub leak: Option<LeakExpectation>,
     pub ownership: Option<OwnershipExpectation>,
@@ -235,6 +287,7 @@ fn parse_fixture(
     let mut stdout_lines: Option<Vec<String>> = None;
     let mut browser = BrowserAssertion::default();
     let mut error: Option<ErrorPattern> = None;
+    let mut error_at: Option<ErrorLocation> = None;
     let mut skip: Option<String> = None;
     let mut leak: Option<LeakExpectation> = None;
     let mut ownership: Option<OwnershipExpectation> = None;
@@ -304,6 +357,10 @@ fn parse_fixture(
                     }
                     active = Some("error");
                 }
+                "error_at" => {
+                    error_at = Some(parse_error_at(value)?);
+                    active = Some("error_at");
+                }
                 "skip" => {
                     skip = Some(value.to_string());
                     active = Some("skip");
@@ -345,6 +402,9 @@ fn parse_fixture(
         }
         _ => {}
     }
+    if error_at.is_some() && error.is_none() {
+        return Err("`# error_at:` needs an `# error:` pattern to anchor to".to_string());
+    }
 
     let stdout = stdout_lines.map(|v| v.join("\n"));
     let browser = if browser.selector.is_some()
@@ -377,6 +437,7 @@ fn parse_fixture(
         stdout,
         browser,
         error,
+        error_at,
         skip,
         leak,
         ownership,
@@ -846,14 +907,16 @@ fn assert_check_error(fx: &Fixture) -> Result<(), FixtureFailure> {
     let pattern = fx.error.as_ref().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if pattern.matches(&stderr) || pattern.matches(&stdout) {
+    if error_output_matches(pattern, fx.error_at, &stderr)
+        || error_output_matches(pattern, fx.error_at, &stdout)
+    {
         return Ok(());
     }
     Err(FixtureFailure {
         gate: "check",
         detail: format!(
-            "checker rejected as expected but message didn't match pattern.\n  pattern: {:?}\n  stdout: {}\n  stderr: {}",
-            pattern, stdout.trim(), stderr.trim(),
+            "checker rejected as expected but message didn't match pattern.\n  pattern: {:?}\n  error_at: {:?}\n  stdout: {}\n  stderr: {}",
+            pattern, fx.error_at, stdout.trim(), stderr.trim(),
         ),
     })
 }
@@ -899,14 +962,16 @@ fn assert_run_error(fx: &Fixture, phase: &str) -> Result<(), FixtureFailure> {
     let pattern = fx.error.as_ref().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if pattern.matches(&stderr) || pattern.matches(&stdout) {
+    if error_output_matches(pattern, fx.error_at, &stderr)
+        || error_output_matches(pattern, fx.error_at, &stdout)
+    {
         return Ok(());
     }
     Err(FixtureFailure {
         gate: "run",
         detail: format!(
-            "{} error as expected but message didn't match pattern.\n  pattern: {:?}\n  stdout: {}\n  stderr: {}",
-            phase, pattern, stdout.trim(), stderr.trim(),
+            "{} error as expected but message didn't match pattern.\n  pattern: {:?}\n  error_at: {:?}\n  stdout: {}\n  stderr: {}",
+            phase, pattern, fx.error_at, stdout.trim(), stderr.trim(),
         ),
     })
 }

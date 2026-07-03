@@ -118,6 +118,7 @@ end
 | `expect: runtime_error` | Program executes but traps or throws. Requires `error:`. |
 | `stdout:` | Expected stdout. Each following `#` line (indented under the directive) is one output line. Trailing newline tolerated. |
 | `error:` | Pattern the diagnostic must contain. Plain substring, or `/regex/` for a regex. |
+| `error_at: <line>:<col>` | The matched error must be attributed to this source position: one output line must contain both the `error:` pattern and `(line <line>:<col>)`. Requires `error:`. Use it to pin diagnostic *attribution* (plan 130 A1) — a fixture passes only if the error points at the right statement, not just anywhere in the file. |
 | `skip: <reason>` | Temporarily skip. Must reference a tracking issue. |
 | `browser:` | Browser assertion. Use `selector:` plus `text:`/`html:` for DOM assertions, `rootResult:` for the root return value, optional duration bounds for async parity, and optional `click:` actions for browser event coverage. |
 | `leak: flat` | Leak gate (plan 118): re-run under `--check-leaks`; the program must end with zero live heap objects. Locals release at scope exit, so a flat fixture avoids module-level `var`s (they stay live by design). |
