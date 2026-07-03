@@ -17,6 +17,9 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     ins(b, "secretsGet", &[p("name", Type::String)], &[Type::Secret]);
     ins(b, "secretsHas", &[p("name", Type::String)], &[Type::Bool]);
     ins(b, "secretsAvailable", &[], &[Type::Bool]);
+    // The single audit anchor: the only API that moves plaintext into
+    // guest memory. `grep reveal` = the complete exposure audit.
+    ins(b, "secretsReveal", &[p("secret", Type::Secret)], &[Type::String]);
 }
 
 #[cfg(test)]
@@ -32,7 +35,7 @@ mod tests {
     #[test]
     fn test_secrets_builtins_registered() {
         let b = fresh();
-        for name in &["secretsGet", "secretsHas", "secretsAvailable"] {
+        for name in &["secretsGet", "secretsHas", "secretsAvailable", "secretsReveal"] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
     }
@@ -45,6 +48,19 @@ mod tests {
                 assert_eq!(sig.params.len(), 1);
                 assert!(matches!(sig.params[0].ty, Type::String));
                 assert!(matches!(sig.returns[0], Type::Secret));
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn test_secrets_reveal_takes_secret_returns_string() {
+        let b = fresh();
+        match b.get("secretsReveal").unwrap() {
+            Type::Function(sig) => {
+                assert_eq!(sig.params.len(), 1);
+                assert!(matches!(sig.params[0].ty, Type::Secret));
+                assert!(matches!(sig.returns[0], Type::String));
             }
             _ => panic!("expected Function"),
         }

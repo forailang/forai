@@ -960,6 +960,13 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: RPrim,
         doc: "encoded bool availability probe",
     },
+    HostImportRow {
+        canon: "std.secrets",
+        method: "reveal",
+        import: "secrets_reveal",
+        ret: ROwn,
+        doc: "fresh plaintext string via wasm_alloc_str; the plan-132 audit anchor",
+    },
     // std.events — the subscription dict is host-built fresh (heap::reserve
     // in build_subscription). Handler retention is the separate, pinned
     // phase-6 issue and does not change the RESULT's ownership.
@@ -1891,7 +1898,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 110, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 111, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

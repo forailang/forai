@@ -20,7 +20,8 @@ use std::cell::RefCell;
 
 use wasmtime::*;
 
-use super::super::heap::wasm_alloc_secret;
+use super::super::heap::{wasm_alloc_secret, wasm_alloc_str};
+use super::super::nan_box::{ADDR_MASK, OBJ_TAG_SECRET, QNAN, SIGN_BIT};
 use super::env::read_slice;
 use super::host_ops::signal_host_error;
 
@@ -89,6 +90,51 @@ pub(crate) fn resolve_secret(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// The catchable message for a reveal that cannot resolve. Split out so
+/// the value-free-diagnostics unit test can grep every rendered error
+/// against seeded plaintext.
+pub(crate) fn unresolvable_message(name: &str) -> String {
+    format!(
+        "secrets.reveal: secret '{}' could not be resolved (backend {})",
+        name,
+        active_backend()
+    )
+}
+
+/// The catchable message for an undeclared `secrets.get` name.
+pub(crate) fn undeclared_message(name: &str) -> String {
+    format!(
+        "secrets.get '{}' is not declared in [secrets] (backend {}). \
+         Add `{} = {{}}` (or `{{ required = true }}`) to fai.toml",
+        name,
+        active_backend(),
+        name
+    )
+}
+
+/// Decode a NaN-boxed value as a Secret handle and return its name.
+/// `None` when the value isn't an object or isn't tagged SECRET.
+fn read_secret_name(data: &[u8], val: i64) -> Option<String> {
+    let bits = val as u64;
+    if (bits & (QNAN | SIGN_BIT)) != (QNAN | SIGN_BIT) {
+        return None;
+    }
+    let addr = (bits & ADDR_MASK) as usize;
+    if addr + 8 > data.len() {
+        return None;
+    }
+    let tag = i32::from_le_bytes(data[addr..addr + 4].try_into().unwrap());
+    if tag != OBJ_TAG_SECRET {
+        return None;
+    }
+    let len = i32::from_le_bytes(data[addr + 4..addr + 8].try_into().unwrap()).max(0) as usize;
+    let end = addr.saturating_add(8).saturating_add(len);
+    if end > data.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&data[addr + 8..end]).into_owned())
+}
+
 pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // env.secrets_get(name_ptr, name_len) -> i64 (NaN-boxed Secret handle).
     // Undeclared name (when a manifest exists) raises a catchable guest
@@ -105,17 +151,8 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     read_slice(data, name_ptr, name_len)
                 };
                 if undeclared(&name) {
-                    return signal_host_error(
-                        &mut caller,
-                        "secrets",
-                        &format!(
-                            "secrets.get '{}' is not declared in [secrets] (backend {}). \
-                             Add `{} = {{}}` (or `{{ required = true }}`) to fai.toml",
-                            name,
-                            active_backend(),
-                            name
-                        ),
-                    );
+                    let msg = undeclared_message(&name);
+                    return signal_host_error(&mut caller, "secrets", &msg);
                 }
                 wasm_alloc_secret(&mut caller, &mem, &name)
             },
@@ -148,5 +185,88 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap("env", "secrets_available", || -> i32 { 1 })
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.secrets_reveal(handle) -> i64 (fresh plaintext String). THE
+    // audit anchor (plan 132 phase 2): the only import that moves secret
+    // plaintext into guest memory. Failure paths raise catchable errors
+    // that name the secret and backend — never a value.
+    linker
+        .func_wrap(
+            "env",
+            "secrets_reveal",
+            |mut caller: Caller<'_, ()>, handle: i64| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let name = {
+                    let data = mem.data(&caller);
+                    read_secret_name(data, handle)
+                };
+                let Some(name) = name else {
+                    return signal_host_error(
+                        &mut caller,
+                        "secrets",
+                        "secrets.reveal expects a Secret handle from secrets.get",
+                    );
+                };
+                match resolve_secret(&name) {
+                    Some(value) => wasm_alloc_str(&mut caller, &mem, &value),
+                    None => {
+                        let msg = unresolvable_message(&name);
+                        signal_host_error(&mut caller, "secrets", &msg)
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan 132 phase 2 gate: every rendered secrets error names the
+    /// secret and backend but provably never contains the resolved
+    /// value. Seeds a real value into the process env, renders each
+    /// message for that secret, and greps.
+    #[test]
+    fn error_messages_never_contain_secret_values() {
+        let name = "FAI_TEST_SECRET_DIAGNOSTICS";
+        let value = "plaintext-hunter2-do-not-print";
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        assert_eq!(resolve_secret(name).as_deref(), Some(value));
+
+        let rendered = [undeclared_message(name), unresolvable_message(name)];
+        for msg in &rendered {
+            assert!(
+                !msg.contains(value),
+                "diagnostic leaked a secret value: {}",
+                msg
+            );
+            assert!(msg.contains(name), "diagnostic must name the secret: {}", msg);
+        }
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn read_secret_name_rejects_non_secret() {
+        // A primitive (non-object) value is rejected outright.
+        assert_eq!(read_secret_name(&[], 42), None);
+        // An object-boxed addr pointing at a STRING-tagged block is
+        // rejected — reveal must not read arbitrary strings.
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&0i32.to_le_bytes()); // OBJ_TAG_STRING
+        data[4..8].copy_from_slice(&3i32.to_le_bytes());
+        data[8..11].copy_from_slice(b"abc");
+        let boxed = (QNAN | SIGN_BIT) as i64;
+        assert_eq!(read_secret_name(&data, boxed), None);
+        // The same block tagged SECRET yields the name.
+        data[0..4].copy_from_slice(&OBJ_TAG_SECRET.to_le_bytes());
+        assert_eq!(read_secret_name(&data, boxed), Some("abc".to_string()));
+    }
 }

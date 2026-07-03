@@ -611,7 +611,15 @@ pub const IMPORT_SECRETS_HAS: u32 = 128;
 /// `env.secrets_available() -> i32` — availability probe: 1 on the native
 /// host, 0 in the browser (std.secrets is server-side only by design).
 pub const IMPORT_SECRETS_AVAILABLE: u32 = 129;
-pub const IMPORT_COUNT: u32 = 130;
+/// `env.secrets_reveal(handle) -> i64` — resolve a Secret handle to its
+/// plaintext as a fresh guest String. THE single audit anchor (plan 132):
+/// `grep reveal` lists every place plaintext enters guest memory. For
+/// trusted non-HTTP sinks (HMAC verification, FFI, CLI args); the common
+/// sinks (HTTP auth, child env) resolve at egress and never need it.
+/// Unresolvable name or non-Secret argument raises a catchable error
+/// naming the secret and backend — never a value.
+pub const IMPORT_SECRETS_REVEAL: u32 = 130;
+pub const IMPORT_COUNT: u32 = 131;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1448,6 +1456,8 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         ),
         // IMPORT_SECRETS_AVAILABLE: () -> i32 (1 native, 0 browser).
         ("secrets_available", vec![], vec![ValType::I32]),
+        // IMPORT_SECRETS_REVEAL: (handle) -> i64 (fresh plaintext String).
+        ("secrets_reveal", vec![ValType::I64], vec![ValType::I64]),
     ]
 }
 

@@ -407,6 +407,9 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         ("std.secrets", "get") => (IMPORT_SECRETS_GET, &[AS::String], RS::Boxed),
         ("std.secrets", "has") => (IMPORT_SECRETS_HAS, &[AS::String], RS::MakeBool),
         ("std.secrets", "available") => (IMPORT_SECRETS_AVAILABLE, &[], RS::MakeBool),
+        // `reveal` is the single audit anchor: the only API that moves
+        // plaintext into guest memory. Errors are catchable and value-free.
+        ("std.secrets", "reveal") => (IMPORT_SECRETS_REVEAL, &[AS::Boxed], RS::Boxed),
 
         // std.net / std.ffi — availability checks.
         ("std.net", "available") => (IMPORT_NET_AVAILABLE, &[], RS::MakeBool),
