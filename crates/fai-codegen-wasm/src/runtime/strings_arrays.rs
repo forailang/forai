@@ -330,7 +330,6 @@ pub(super) fn emit_concat_move(base: u32) -> Function {
     f
 }
 
-
 /// Helper to emit a method dispatch case: if method_id == id, run body and return.
 pub(super) fn emit_native_method_dispatch(
     f: &mut Function,

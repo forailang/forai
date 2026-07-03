@@ -677,7 +677,6 @@ pub const TRAP_DICT_CAP_INSANE: i32 = 13;
 /// logical size, `b` = rounded block size.
 pub const TRAP_ALLOC_TOO_BIG: i32 = 14;
 
-
 /// Return the WASM type signatures needed for runtime functions.
 /// Each entry is (params, results).
 pub fn type_signatures() -> Vec<(Vec<ValType>, Vec<ValType>)> {
@@ -1473,7 +1472,6 @@ pub fn rt_fn_names() -> [&'static str; RT_COUNT as usize] {
         "rt_concat_move",
     ]
 }
-
 
 #[cfg(test)]
 mod ownership_roundtrip_tests {

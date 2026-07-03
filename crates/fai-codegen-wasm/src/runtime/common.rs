@@ -344,7 +344,6 @@ pub struct KnownStrings {
     pub last: (u32, u32),       // "last"
 }
 
-
 pub(super) fn mem0() -> MemArg {
     MemArg {
         offset: 0,

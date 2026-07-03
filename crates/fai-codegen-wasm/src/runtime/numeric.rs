@@ -597,7 +597,6 @@ pub(super) fn emit_cmp(base: u32, op: CmpOp) -> Function {
     f
 }
 
-
 // ── $rt_itoa(ptr: i32, val: i32) -> i32 (length) ────────────────
 // Writes decimal digits of val into memory at ptr. Returns length.
 
@@ -781,7 +780,6 @@ pub(super) fn emit_itoa() -> Function {
     f.instruction(&Instruction::End);
     f
 }
-
 
 // ── $rt_parse_int(str_val: i64) -> i64 (NaN-boxed Int or Null) ────────
 //

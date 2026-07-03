@@ -12,7 +12,6 @@ pub const NUM_FREE_BUCKETS: u32 = 1024;
 /// Bytes the bucket-head array occupies (one i32 head per bucket).
 pub const FREE_BUCKET_REGION_BYTES: u32 = NUM_FREE_BUCKETS * 4;
 
-
 // ── $rt_live_objects() -> i32 — read the live-object counter (plan 115) ──
 // The counter's global index depends on the module layout, so it's captured
 // here at emit time. The `__liveObjects()` debug builtin calls this and boxes
@@ -23,7 +22,6 @@ pub(super) fn emit_live_objects(live_count_global: u32) -> Function {
     f.instruction(&Instruction::End);
     f
 }
-
 
 /// FAI_HEAP_VERIFY: emit a loop scanning every free-bucket head for an
 /// implausible pointer (TRAP_FREELIST_CORRUPT) or an overwritten poison
@@ -669,7 +667,6 @@ pub(super) fn emit_free(
     f
 }
 
-
 // ── $rt_retain(v: i64) -> i64 — reference-count increment (plan 113) ──
 // Bump the count in the 8-byte prefix at obj_addr-8; no-op + passthrough for
 // primitives. Returns `v` so call sites can retain inline.
@@ -1014,7 +1011,6 @@ pub(super) fn emit_release(base: u32, bucket_base: u32, import_remap: &[Option<u
     f.instruction(&Instruction::End);
     f
 }
-
 
 #[cfg(test)]
 mod alloc_free_tests {
