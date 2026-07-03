@@ -1,0 +1,332 @@
+use crate::*;
+
+pub(crate) fn step_run(args: &[String], project: Option<&str>, reporter: &Reporter) {
+    // Phase D: `--wasm` is no longer a toggle — wasm is the only run
+    // path. Accept the flag for back-compat with scripts that pass it;
+    // the explicit `use_wasm` binding is kept as `_` so the filter at
+    // the top of `positional` still skips it.
+    let _use_wasm = args.iter().any(|a| a == "--wasm");
+
+    // Plan 116 phase 2: `--watchdog[=secs]` / `--debug` arm the hang
+    // watchdog — if the program hasn't completed after the deadline,
+    // the runner interrupts it and prints a post-mortem dump (async
+    // task table + heap stats). Equals-form only: positional-arg
+    // detection above treats a bare value after `--watchdog` as a
+    // target name. `FAI_WATCHDOG=<secs>` works as an env fallback.
+    let watchdog_secs = args
+        .iter()
+        .find_map(|a| {
+            if a == "--watchdog" || a == "--debug" {
+                Some(10)
+            } else {
+                a.strip_prefix("--watchdog=").and_then(|v| v.parse().ok())
+            }
+        })
+        .or(wasm_runner::RunOptions::from_env().watchdog_secs);
+    // Plan 116 phase 5: `--check-leaks[=interval:<ms>]` arms the heap
+    // allocation ledger. The flag has a codegen half (rt_alloc/rt_free
+    // emit `__fai_alloc_event`/`__fai_free_event`) and a runner half
+    // (record events, print the itemized live set at exit/trap, or on
+    // an interval for servers). `FAI_CHECK_LEAKS=1|interval:<ms>` is
+    // the env fallback.
+    let check_leaks = args
+        .iter()
+        .find_map(|a| {
+            if a == "--check-leaks" {
+                Some(wasm_runner::CheckLeaksOptions::default())
+            } else {
+                a.strip_prefix("--check-leaks=")
+                    .map(|v| wasm_runner::CheckLeaksOptions {
+                        interval_ms: v.strip_prefix("interval:").and_then(|n| n.parse().ok()),
+                    })
+            }
+        })
+        .or(wasm_runner::RunOptions::from_env().check_leaks);
+    if check_leaks.is_some() {
+        // Codegen gate — must be set before compile_fai_to_wasm below.
+        fai_codegen_wasm::set_check_leaks(true);
+    }
+    let check_ownership = args.iter().any(|a| a == "--check-ownership")
+        || wasm_runner::RunOptions::from_env().check_ownership;
+    if check_ownership {
+        fai_codegen_wasm::set_ownership_check(true);
+        fai_codegen_wasm::set_check_leaks(true);
+    }
+    let run_opts = wasm_runner::RunOptions {
+        watchdog_secs,
+        check_leaks,
+        check_ownership,
+    };
+
+    // Check if the first positional arg is a target name or a file path.
+    // If no positional arg, try project-based resolution from cwd.
+    let positional: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with("--") && *a != "--wasm")
+        .map(|a| a.as_str())
+        .collect();
+
+    let path = if let Some(target) = project {
+        // Explicit `--project NAME` — honour it over everything else.
+        resolve_target_entry_point(target).unwrap_or_else(|| {
+            reporter.error_line(&format!("could not resolve target '{}'", target));
+            reporter.step(StepStatus::Fail, "run", "unknown target");
+            std::process::exit(1);
+        })
+    } else if let Some(arg) = positional.first() {
+        let is_file = arg.contains('.') || arg.contains('/') || arg.contains('\\');
+        if is_file {
+            // Explicit file path — use it directly
+            arg.to_string()
+        } else {
+            // Target name (legacy positional form, still supported)
+            resolve_target_entry_point(arg).unwrap_or_else(|| {
+                reporter.error_line(&format!("could not resolve target '{}'", arg));
+                reporter.step(StepStatus::Fail, "run", "unknown target");
+                std::process::exit(1);
+            })
+        }
+    } else {
+        // No arg — find the default/only target from fai.toml. When
+        // the project has multiple sub-projects this prints a clear
+        // `--project required` message and exits.
+        resolve_default_entry_point().unwrap_or_else(|| {
+            reporter.step(StepStatus::Fail, "run", "target not specified");
+            std::process::exit(1);
+        })
+    };
+
+    // Run pre-compiled .wasm files directly via Wasmtime
+    if path.ends_with(".wasm") {
+        let wasm_bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error reading {}: {}", path, e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = wasm_runner::run_wasm_opts(&wasm_bytes, run_opts) {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let mut content = read_file(&path);
+
+    // Apply peerHash injection when `[remote-interface] from = "..."`
+    // is set — the VM/JIT paths must see the same source the build
+    // path does, or `peerHash()` won't resolve when running via
+    // `forai run`. Plan 99 Phase 2.4.
+    let run_source_root = find_source_root(&path);
+    let run_info = read_project_info_full(run_source_root.as_deref());
+    inject_peer_hash(
+        &mut content,
+        &run_info,
+        run_source_root.as_deref(),
+        /* verbose = */ false,
+    );
+
+    // Plan 101: inject generated RPC dispatch/proxies for run path too.
+    inject_rpc_dispatch(
+        &mut content,
+        &run_info,
+        run_source_root.as_deref(),
+        Some(&path),
+    );
+
+    // Generate synthetic RPC-proxy modules so `use { X } from Server`
+    // resolves during the run-path's type check. Without this, a
+    // fullstack server whose entry does `use { App } from client` (and
+    // whose transitive client imports reach the `Server` proxy) fails
+    // with `Unknown name 'App'` — the check step in compile_fai sees
+    // the client's unresolved `Server` imports and cascades. `step_build`
+    // and `step_check` (via `check_single_file`) already do this; run
+    // now matches.
+    let synthetic_modules = generate_rpc_proxy_modules(run_source_root.as_deref());
+
+    // Phase H: the only input format is `.fai` source. The old
+    // pre-compiled JSON-bytecode path lived on top of the bytecode→wasm
+    // codegen — deleted along with `translate.rs` / `module.rs`.
+    if !path.ends_with(".fai") {
+        eprintln!(
+            "error: only .fai source files are supported (pre-compiled JSON input was removed in Phase H)",
+        );
+        std::process::exit(1);
+    }
+    let wasm_bytes = compile_fai_to_wasm(
+        &content,
+        &path,
+        false,
+        synthetic_modules.clone(),
+        None,
+        None,
+    );
+    let externs = extract_extern_info_full(&content, &path, synthetic_modules);
+    if let Err(e) = wasm_runner::run_wasm_with_externs_opts(&wasm_bytes, externs, run_opts) {
+        reporter.error_line(&e);
+        reporter.step(StepStatus::Fail, "run", "runtime error");
+        std::process::exit(1);
+    }
+}
+
+/// Build the host-side extern table by walking the entry file plus
+/// every resolved dependency module — matching the codegen's
+/// `extern_fn_indices` ordering (entry first, then modules in
+/// discovery order). The wasm runner's `call_ffi` import indexes
+/// into this table by `ext_fn_idx`. `[ffi.<name>].lib` in fai.toml
+/// overrides the C library name; otherwise the block's own `extern
+/// <name>` identifier is used.
+pub(crate) fn extract_extern_info_full(
+    content: &str,
+    path: &str,
+    synthetic_modules: Vec<(String, String)>,
+) -> Vec<wasm_runner::ExternInfo> {
+    let source_root = find_source_root(path);
+
+    // Run the same compile pre-pass the codegen uses so we see the
+    // identical set of modules (and in the same order). Extern blocks
+    // live in the compiler-side AST; iterate entry.statements first,
+    // then each module's statements.
+    let prepared = match fai_compiler::prepare_source_with_synthetic_and_entry(
+        content,
+        source_root.as_deref(),
+        synthetic_modules,
+        Some(path),
+    ) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    // Each module (or entry) may root a different `fai.toml` — load
+    // the ffi config from the one the source root points at.
+    let ffi_config = source_root
+        .as_deref()
+        .map(fai_compiler::ffi_config::load_ffi_config)
+        .unwrap_or_default();
+    // Library-name override: only from the entry project's own
+    // fai.toml. Per-dependency `[ffi.*]` overrides would require the
+    // compiler to expose each module's source root — DiscoveredModule
+    // doesn't carry that today. In practice every fai dep so far uses
+    // `extern <libname>` directly, so the override is optional.
+    let resolve_lib = |block_name: &str| -> String {
+        ffi_config
+            .libraries
+            .get(block_name)
+            .map(|lc| lc.lib.clone())
+            .unwrap_or_else(|| block_name.to_string())
+    };
+
+    let mut externs = Vec::new();
+    let push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
+                      externs: &mut Vec<wasm_runner::ExternInfo>| {
+        let library = resolve_lib(&block.library);
+        for decl in &block.functions {
+            let param_types: Vec<wasm_runner::FfiType> = decl
+                .params
+                .iter()
+                .map(|p| compiler_typenode_to_ffi_type(&p.type_node, p.is_out))
+                .collect();
+            let return_type = decl
+                .return_type
+                .as_ref()
+                .map(|tn| compiler_typenode_to_ffi_type(tn, false))
+                .unwrap_or(wasm_runner::FfiType::Void);
+            externs.push(wasm_runner::ExternInfo {
+                library: library.clone(),
+                function: decl.name.clone(),
+                param_types,
+                return_type,
+            });
+        }
+    };
+
+    for stmt in &prepared.serde_ast.statements {
+        if let fai_compiler::ast::Statement::ExternBlockDeclaration(block) = stmt {
+            push_block(block, &mut externs);
+        }
+    }
+    for module in &prepared.modules {
+        for stmt in &module.statements {
+            if let fai_compiler::ast::Statement::ExternBlockDeclaration(block) = stmt {
+                push_block(block, &mut externs);
+            }
+        }
+    }
+    externs
+}
+
+/// Like `extract_extern_info_full` but takes an already-prepared
+/// program. Used by the test-step paths that already have the
+/// `PreparedProgram` on hand and don't want to re-parse.
+pub(crate) fn extract_externs_from_prepared(
+    prepared: &fai_compiler::PreparedProgram,
+    source_root: Option<&str>,
+) -> Vec<wasm_runner::ExternInfo> {
+    let ffi_config = source_root
+        .map(fai_compiler::ffi_config::load_ffi_config)
+        .unwrap_or_default();
+    let resolve_lib = |block_name: &str| -> String {
+        ffi_config
+            .libraries
+            .get(block_name)
+            .map(|lc| lc.lib.clone())
+            .unwrap_or_else(|| block_name.to_string())
+    };
+    let mut externs = Vec::new();
+    let push_block = |block: &fai_compiler::ast::ExternBlockDeclaration,
+                      externs: &mut Vec<wasm_runner::ExternInfo>| {
+        let library = resolve_lib(&block.library);
+        for decl in &block.functions {
+            let param_types: Vec<wasm_runner::FfiType> = decl
+                .params
+                .iter()
+                .map(|p| compiler_typenode_to_ffi_type(&p.type_node, p.is_out))
+                .collect();
+            let return_type = decl
+                .return_type
+                .as_ref()
+                .map(|tn| compiler_typenode_to_ffi_type(tn, false))
+                .unwrap_or(wasm_runner::FfiType::Void);
+            externs.push(wasm_runner::ExternInfo {
+                library: library.clone(),
+                function: decl.name.clone(),
+                param_types,
+                return_type,
+            });
+        }
+    };
+    for stmt in &prepared.serde_ast.statements {
+        if let fai_compiler::ast::Statement::ExternBlockDeclaration(block) = stmt {
+            push_block(block, &mut externs);
+        }
+    }
+    for module in &prepared.modules {
+        for stmt in &module.statements {
+            if let fai_compiler::ast::Statement::ExternBlockDeclaration(block) = stmt {
+                push_block(block, &mut externs);
+            }
+        }
+    }
+    externs
+}
+
+fn compiler_typenode_to_ffi_type(
+    tn: &fai_compiler::ast::TypeNode,
+    is_out: bool,
+) -> wasm_runner::FfiType {
+    use wasm_runner::FfiType;
+    if is_out {
+        return FfiType::OutPtr;
+    }
+    let name = tn.name.as_deref().unwrap_or("");
+    match name {
+        "Int" => FfiType::Int,
+        "Float" => FfiType::Double,
+        "String" => FfiType::String,
+        "Bool" => FfiType::Bool,
+        "Ptr" => FfiType::Pointer,
+        "Void" => FfiType::Void,
+        _ => FfiType::Pointer,
+    }
+}
