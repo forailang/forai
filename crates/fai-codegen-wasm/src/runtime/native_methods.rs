@@ -1,0 +1,3004 @@
+use super::*;
+
+pub(super) fn emit_call_native(base: u32, import_remap: &[Option<u32>]) -> Function {
+    // locals: 3=addr(i32), 4=method_id(i32), 5=arg0(i64), 6=arg1(i64),
+    // 7..14=i32 temps, 15..16=i64 temps, 17..18=extra i32 temps,
+    // 19=extra i64 temp.
+    //
+    // The last two i32 temps (17, 18) were added for METHOD_REPLACE
+    // which needs more persistent state than 7..14 provide (6 arg-field
+    // locals + output_addr + out_i + i + match_flag + inner-j = 11
+    // i32s). Free to reuse in other methods that need extra scratch —
+    // document your use at the method body.
+    let mut f = Function::new([
+        (1, ValType::I32),
+        (1, ValType::I32),
+        (1, ValType::I64),
+        (1, ValType::I64),
+        (8, ValType::I32),
+        (2, ValType::I64),
+        (2, ValType::I32),
+        (1, ValType::I64),
+    ]);
+    // addr = obj_addr(callee)
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+    f.instruction(&Instruction::LocalSet(3));
+    // tag = mem[addr]
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Load(mem0()));
+    f.instruction(&Instruction::LocalSet(7));
+
+    // Tuple type constructor path.
+    f.instruction(&Instruction::LocalGet(7));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_TUPLE));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // tuple_count = mem[addr+4]
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+
+        // Need at least (name, fields)
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(2));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // fields_arr_val = tuple[1]
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(15));
+        // defaults_arr_val = tuple[2] or null
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::LocalSet(16));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(2));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 24,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(16));
+        f.instruction(&Instruction::End);
+
+        // field_arr_addr / field_count
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10));
+
+        // Allocate instance: [tag][count][type_name:i64][entries...]
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(11)); // instance addr
+
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_INSTANCE));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // defaults_count / defaults_addr
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(12)); // defaults addr
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(13)); // defaults count
+        f.instruction(&Instruction::LocalGet(16));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::I64Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(16));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(12));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(13));
+        f.instruction(&Instruction::End);
+
+        // for i in 0..field_count
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(14));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // entry addr = instance + 16 + i*16
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(16));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(16));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(7));
+
+            // key = fields_arr[i]
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::I64Store(mem0()));
+
+            // value = arg[i] else default[i] else null
+            f.instruction(&Instruction::I64Const(VAL_NULL));
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::Else);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::LocalGet(13));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::I64Const(VAL_NULL));
+            f.instruction(&Instruction::I64Eq);
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::I64Const(VAL_NULL));
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::Drop);
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::I64Store(MemArg {
+                offset: 8,
+                align: 0,
+                memory_index: 0,
+            }));
+
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(14));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // At this point the callee is not a Tuple (handled above) and
+    // not a Closure (handled by the caller in emit_native_call
+    // before reaching RT_CALL_NATIVE). The only valid remaining
+    // shape is NativeFn; anything else — Dict, Array, String,
+    // Instance, Module, or a non-object value whose unboxed address
+    // happened to land on some arbitrary memory — is not callable.
+    //
+    // Before this trap, the fallthrough silently returned VAL_NULL,
+    // which masked bugs: callers would continue with null and trap
+    // or misbehave somewhere downstream instead of at the call site.
+    // The VM errors with "not callable" in this same case, so
+    // trapping matches VM semantics and gives a stack trace that
+    // points at the real problem. See plans/98-wasm-codegen-hardening.md
+    // step 3 for the sibling pattern on unimplemented natives.
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Load(mem0()));
+    f.instruction(&Instruction::I32Const(OBJ_TAG_NATIVE_FN));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+    // method_id = mem[addr+4]
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 4,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalSet(4));
+    // Read arg0 (if available)
+    f.instruction(&Instruction::LocalGet(2)); // arg_count
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(1)); // args_ptr
+    f.instruction(&Instruction::I64Load(mem0()));
+    f.instruction(&Instruction::LocalSet(5));
+    f.instruction(&Instruction::End);
+    // Read arg1 (if available)
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Load(MemArg {
+        offset: 8,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalSet(6));
+    f.instruction(&Instruction::End);
+
+    // Dispatch on method_id
+    // METHOD_LENGTH = 0
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Eqz); // method_id == 0
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // length: return mem[obj_addr(arg0) + 4] as int
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_ABS = 1
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_ABS));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(7));
+        // if negative, negate
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_MIN = 2
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_MIN));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        // select: if a < b then a else b
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::Select);
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_MAX = 3
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_MAX));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::I32GtS);
+        f.instruction(&Instruction::Select);
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_APPEND = 6
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_APPEND));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // append: allocate a new array with count + 1 and copy existing items + arg1
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // src array addr
+
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // count
+
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9)); // dest addr
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I64Store(mem0()));
+
+        // RC (plan 113 R1): the new array co-owns every element it now holds —
+        // the `count` references shallow-copied from the source plus the
+        // appended one. Retain each (local 10 = loop index, n = count + 1), or
+        // releasing the source array later deep-frees elements this array still
+        // points at. RT_RETAIN's is_obj guard skips primitives.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I64Load(mem0()));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_APPEND_MOVE = 57 — assignment-position append. The codegen
+    // emits this only for `xs = append(xs, x)`-shaped reassignments of an
+    // owned binding, so the source value is dead once the call returns.
+    // Fast path (rc == 1, spare block capacity): write the element in
+    // place, bump count, retain the element (the array owns it) and the
+    // array itself (the owned return; the caller's release of the old
+    // binding drops it back to 1). Slow path (shared or full): copy like
+    // METHOD_APPEND but over-allocate the destination to
+    // max(2 × count, 4) elements so subsequent in-place appends are
+    // amortized O(1). RT_ALLOC stamps the over-allocated logical size at
+    // obj-4, which RT_RELEASE/RT_FREE already honor (same discipline as
+    // dict spare-capacity growth, plan 115).
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_APPEND_MOVE));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // src array addr
+
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // count
+
+        // needed = 8 (header) + (count + 1) * 8
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(12));
+
+        // fast = tag == ARRAY  &  rc == 1  &  needed <= stamped logical size
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load(mem0())); // rc word at obj-8
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load(mem0())); // logical size at obj-4
+        f.instruction(&Instruction::I32LeU);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // mem[src + 8 + count*8] = elem
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::I64Store(MemArg {
+                offset: 8,
+                align: 0,
+                memory_index: 0,
+            }));
+            // count += 1
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store(MemArg {
+                offset: 4,
+                align: 0,
+                memory_index: 0,
+            }));
+            // The array owns the appended element (RT_RETAIN's is_obj
+            // guard skips primitives).
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Drop);
+            // Owned return: +1 on the array itself; RT_RETAIN returns
+            // the value, which is exactly the call's result.
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::Call(base + RT_RETAIN));
+            f.instruction(&Instruction::Return);
+        }
+        f.instruction(&Instruction::End);
+
+        // Slow path: copy into a block sized max(2 × count, 4) entries.
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(2));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32LtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9)); // dest addr
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // The new array co-owns every element it now holds — the `count`
+        // references shallow-copied from the source plus the appended one
+        // (same discipline as METHOD_APPEND; RC, plan 113 R1).
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I64Load(mem0()));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_IS_EMPTY = 7
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I32Const(METHOD_IS_EMPTY));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::Call(base + RT_MAKE_BOOL));
+        f.instruction(&Instruction::Return);
+    }
+    f.instruction(&Instruction::End);
+
+    // METHOD_FIRST = 55: `array.first(arr)` → first element or
+    // `null` if the array is empty. Layout assumes OBJ_TAG_ARRAY
+    // so tag=1, count@4, items start at offset 8. Reading an empty
+    // string or dict via `first` would read garbage — the checker
+    // types the method as `Array<T> → T?`, so type safety prevents
+    // the misuse.
+    emit_native_method_dispatch(&mut f, base, METHOD_FIRST, |f, base| {
+        // addr = obj_addr(arg0)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // count = mem[addr + 4]
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // Return items[0] — i64 at mem[addr + 8].
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_LAST = 56: `array.last(arr)` → last element or `null`
+    // if empty. Same shape as METHOD_FIRST; just reads the tail.
+    emit_native_method_dispatch(&mut f, base, METHOD_LAST, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // count = mem[addr + 4]
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // Load at addr + 8 + (count - 1) * 8.
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I64Load(mem0()));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_FILE_READ = 8: file.read(path_str) -> string_obj
+    // Extracts path string, calls host read_file, wraps result as string obj.
+    emit_native_method_dispatch(&mut f, base, METHOD_FILE_READ, |f, base| {
+        // Get path string address
+        f.instruction(&Instruction::LocalGet(5)); // arg0 = path string obj
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // path_obj_addr
+                                                  // Allocate 64KB scratch buffer for file content
+        f.instruction(&Instruction::I32Const(65536));
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalTee(3)); // buf_ptr (reuse local 3)
+                                                  // Call host: read_file(path_ptr, path_len, buf_ptr) -> content_len
+        f.instruction(&Instruction::LocalGet(7)); // path_obj_addr
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add); // path data ptr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        })); // path len
+        f.instruction(&Instruction::LocalGet(3)); // buf_ptr
+        emit_import_call(f, IMPORT_READ_FILE, import_remap);
+        f.instruction(&Instruction::LocalTee(4)); // content_len or -1
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // Wrap buf content as string object
+        f.instruction(&Instruction::LocalGet(3)); // buf_ptr (source data)
+        f.instruction(&Instruction::LocalGet(4)); // content_len
+        f.instruction(&Instruction::Call(base + RT_ALLOC_STRING));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_FILE_WRITE = 9: file.write(path_str, content_str) -> void
+    emit_native_method_dispatch(&mut f, base, METHOD_FILE_WRITE, |f, base| {
+        // Extract path
+        f.instruction(&Instruction::LocalGet(5)); // arg0 = path
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // Extract content
+        f.instruction(&Instruction::LocalGet(6)); // arg1 = content
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(3));
+        // Call host: write_file(path_ptr, path_len, content_ptr, content_len)
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        emit_import_call(f, IMPORT_WRITE_FILE, import_remap);
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_FILE_EXISTS = 10: file.exists(path_str) -> Bool.
+    // Mirrors the path-ptr/path-len convention used by METHOD_FILE_READ.
+    // IMPORT_FILE_EXISTS sits at index 29 and must be routed through the
+    // remap table because server imports at 16-17 and 20-24 are disabled
+    // on `wasm-html` / `wasm` targets, which shifts higher import indices.
+    let ir_for_exists = import_remap;
+    emit_native_method_dispatch(&mut f, base, METHOD_FILE_EXISTS, |f, base| {
+        // path_obj_addr = obj_addr(arg0)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // Host: file_exists(path_ptr, path_len) -> i32 (1/0)
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add); // path data ptr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        })); // path len
+        emit_import_call(f, IMPORT_FILE_EXISTS, ir_for_exists);
+        f.instruction(&Instruction::Call(base + RT_MAKE_BOOL));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_TIME_NOW = 11
+    emit_native_method_dispatch(&mut f, base, METHOD_TIME_NOW, |f, _base| {
+        emit_import_call(f, IMPORT_NOW_MS, import_remap);
+        f.instruction(&Instruction::Call(_base + RT_MAKE_FLOAT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_TIME_UNIX = 12: time.unix() -> Int (seconds since epoch).
+    // VM parity: `native_time_unix` returns `Value::int`. We compute
+    // `now_ms() / 1000.0`, truncate to i32, and NaN-box as an Int.
+    emit_native_method_dispatch(&mut f, base, METHOD_TIME_UNIX, |f, _base| {
+        emit_import_call(f, IMPORT_NOW_MS, import_remap);
+        f.instruction(&Instruction::F64Const(1000.0));
+        f.instruction(&Instruction::F64Div);
+        f.instruction(&Instruction::I32TruncF64S);
+        f.instruction(&Instruction::Call(_base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_RANDOM = 13
+    emit_native_method_dispatch(&mut f, base, METHOD_RANDOM, |f, _base| {
+        emit_import_call(f, IMPORT_RANDOM, import_remap);
+        f.instruction(&Instruction::Call(_base + RT_MAKE_FLOAT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SLEEP = 14
+    emit_native_method_dispatch(&mut f, base, METHOD_SLEEP, |f, _base| {
+        // arg0 is NaN-boxed float (ms)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(_base + RT_AS_NUMBER));
+        emit_import_call(f, IMPORT_SLEEP_MS, import_remap);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_FLOOR = 4: floor(x) -> Int
+    emit_native_method_dispatch(&mut f, base, METHOD_FLOOR, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::F64Floor);
+        f.instruction(&Instruction::I32TruncSatF64S);
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_CEIL = 5: ceil(x) -> Int
+    emit_native_method_dispatch(&mut f, base, METHOD_CEIL, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::F64Ceil);
+        f.instruction(&Instruction::I32TruncSatF64S);
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_ROUND = 17: round(x) -> Int
+    emit_native_method_dispatch(&mut f, base, METHOD_ROUND, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::F64Nearest);
+        f.instruction(&Instruction::I32TruncSatF64S);
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SQRT = 18: sqrt(x) -> Float
+    emit_native_method_dispatch(&mut f, base, METHOD_SQRT, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::F64Sqrt);
+        f.instruction(&Instruction::Call(base + RT_MAKE_FLOAT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_CONTAINS = 19: contains(haystack_str, needle_str) -> Bool
+    emit_native_method_dispatch(&mut f, base, METHOD_CONTAINS, |f, base| {
+        // Dispatch on container tag first. Tag 0 = String → fall
+        // through to the byte-scan below. Tag 1 = Array → scan items
+        // by i64 bit-equality.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_array_contains_body(f, base);
+        f.instruction(&Instruction::End);
+
+        // Extract haystack: arg0 (local 5) is NaN-boxed string
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // haystack_addr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // haystack_len
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(7)); // haystack_ptr (now points to data)
+
+        // Extract needle: arg1 (local 6) is NaN-boxed string
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9)); // needle_addr
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10)); // needle_len
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(9)); // needle_ptr
+
+        // If needle_len == 0, return true
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_TRUE));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // If needle_len > haystack_len, return false
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_FALSE));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // Loop i from 0 to haystack_len - needle_len (inclusive)
+        // local 11 = i, local 12 = limit (haystack_len - needle_len + 1)
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(11)); // i = 0
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(12)); // limit
+
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if i >= limit: break (not found)
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // Compare needle bytes at haystack[i..i+needle_len]
+            f.instruction(&Instruction::LocalGet(7)); // haystack_ptr
+            f.instruction(&Instruction::LocalGet(11)); // + i
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10)); // needle_len
+            f.instruction(&Instruction::LocalGet(9)); // needle_ptr
+            f.instruction(&Instruction::LocalGet(10)); // needle_len
+            f.instruction(&Instruction::Call(base + RT_STR_EQ));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::I64Const(VAL_TRUE));
+            f.instruction(&Instruction::Return);
+            f.instruction(&Instruction::End);
+
+            // i++
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(11));
+            f.instruction(&Instruction::Br(0)); // continue
+        }
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        f.instruction(&Instruction::I64Const(VAL_FALSE));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SPLIT = 20: split(text_str, sep_str) -> Array<String>
+    // Uses locals 7-14 for working data
+    emit_native_method_dispatch(&mut f, base, METHOD_SPLIT, |f, base| {
+        // Extract text string
+        f.instruction(&Instruction::LocalGet(5)); // arg0 = text
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // text_obj_addr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // text_len
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(7)); // text_ptr
+
+        // Extract separator string
+        f.instruction(&Instruction::LocalGet(6)); // arg1 = sep
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9)); // sep_obj_addr
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10)); // sep_len
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(9)); // sep_ptr
+
+        // First pass: count splits to know array size
+        // local 11 = pos, local 12 = count
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(11)); // pos = 0
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::LocalSet(12)); // count = 1 (at least one segment)
+
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if pos + sep_len > text_len: break. Written as an addition
+            // rather than `pos > text_len - sep_len` because the subtraction
+            // is unsigned and underflows when text_len < sep_len (e.g.
+            // split("", "/")), making the guard never fire and the scan walk
+            // off the end of memory.
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GtU);
+            f.instruction(&Instruction::BrIf(1)); // break
+
+            // if str_eq(text_ptr+pos, sep_len, sep_ptr, sep_len)
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::Call(base + RT_STR_EQ));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // count++, pos += sep_len
+                f.instruction(&Instruction::LocalGet(12));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(12));
+                f.instruction(&Instruction::LocalGet(11));
+                f.instruction(&Instruction::LocalGet(10));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(11));
+                f.instruction(&Instruction::Br(1)); // continue
+            }
+            f.instruction(&Instruction::End);
+
+            // pos++
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(11));
+            f.instruction(&Instruction::Br(0)); // continue
+        }
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        // Allocate array: [tag=1][count][items...] = 8 + count*8 bytes
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(13)); // arr_addr
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // Second pass: fill array with substrings
+        // local 11 = pos (scan), local 14 = start (segment start), local 12 = arr_index
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(11)); // pos = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(14)); // start = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(12)); // arr_index = 0
+
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if pos + sep_len > text_len: break (emit final segment after
+            // loop). Addition form avoids the unsigned underflow that the
+            // `pos > text_len - sep_len` form hits when text_len < sep_len.
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GtU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // if str_eq(text_ptr+pos, sep_len, sep_ptr, sep_len)
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::Call(base + RT_STR_EQ));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                // Emit segment [start..pos] as string into array
+                f.instruction(&Instruction::LocalGet(13)); // arr_addr
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(12)); // arr_index
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Mul);
+                f.instruction(&Instruction::I32Add); // slot addr
+
+                f.instruction(&Instruction::LocalGet(7)); // text_ptr + start
+                f.instruction(&Instruction::LocalGet(14));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(11)); // len = pos - start
+                f.instruction(&Instruction::LocalGet(14));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::Call(base + RT_ALLOC_STRING));
+                f.instruction(&Instruction::I64Store(mem0())); // store in slot
+
+                // arr_index++
+                f.instruction(&Instruction::LocalGet(12));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(12));
+
+                // start = pos + sep_len, pos = start
+                f.instruction(&Instruction::LocalGet(11));
+                f.instruction(&Instruction::LocalGet(10));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalTee(14)); // start
+                f.instruction(&Instruction::LocalSet(11)); // pos
+                f.instruction(&Instruction::Br(1)); // continue
+            }
+            f.instruction(&Instruction::End);
+
+            // pos++
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(11));
+            f.instruction(&Instruction::Br(0)); // continue
+        }
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        // Emit final segment [start..text_len]
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add); // slot addr
+
+        f.instruction(&Instruction::LocalGet(7)); // text_ptr + start
+        f.instruction(&Instruction::LocalGet(14));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8)); // len = text_len - start
+        f.instruction(&Instruction::LocalGet(14));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::Call(base + RT_ALLOC_STRING));
+        f.instruction(&Instruction::I64Store(mem0()));
+
+        // Return NaN-boxed array
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_JOIN = 21: join(arr, sep_str) -> String
+    emit_native_method_dispatch(&mut f, base, METHOD_JOIN, |f, base| {
+        // Extract array: arg0 (local 5)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // arr_addr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // arr_count
+
+        // Extract separator string
+        f.instruction(&Instruction::LocalGet(6)); // arg1 = sep
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9)); // sep_obj_addr
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10)); // sep_len
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(9)); // sep_ptr
+
+        // If empty array, return empty string
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Call(base + RT_ALLOC_STRING));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // Start with first element as result. It is borrowed from the array
+        // until the first concat creates a fresh accumulator.
+        // local 15 = accumulator (i64 NaN-boxed string)
+        // local 17 = accumulator-owned flag (i32)
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        })); // arr[0]
+        f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
+        f.instruction(&Instruction::LocalSet(15)); // result = toString(arr[0])
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(17));
+
+        // local 11 = i (loop from 1)
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::LocalSet(11));
+
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if i >= count: break
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // temp = concat(result, sep_string). The separator copy and any
+            // previously owned accumulator are internal temps and can be
+            // released once temp supersedes them.
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::LocalGet(9)); // sep_ptr
+            f.instruction(&Instruction::LocalGet(10)); // sep_len
+            f.instruction(&Instruction::Call(base + RT_ALLOC_STRING)); // NaN-boxed sep
+            f.instruction(&Instruction::LocalTee(16));
+            f.instruction(&Instruction::Call(base + RT_CONCAT));
+            f.instruction(&Instruction::LocalSet(19));
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::LocalGet(17));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::End);
+
+            // result = concat(result, toString(arr[i]))
+            f.instruction(&Instruction::LocalGet(19));
+            f.instruction(&Instruction::LocalGet(7)); // arr_addr
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(11)); // i
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0())); // arr[i]
+            f.instruction(&Instruction::Call(base + RT_VALUE_TO_STR));
+            f.instruction(&Instruction::Call(base + RT_CONCAT));
+            f.instruction(&Instruction::LocalSet(15));
+            f.instruction(&Instruction::LocalGet(19));
+            f.instruction(&Instruction::Call(base + RT_RELEASE));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(17));
+
+            // i++
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(11));
+            f.instruction(&Instruction::Br(0)); // continue
+        }
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        // One-element arrays never enter the loop, so the accumulator is still
+        // borrowed from arr[0]. Retain it here to keep join's Owned result
+        // contract uniform.
+        f.instruction(&Instruction::LocalGet(17));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Drop);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SORT = 22: sort(arr) -> new sorted Array (bubble sort on i32 values)
+    emit_native_method_dispatch(&mut f, base, METHOD_SORT, |f, base| {
+        // Extract source array
+        f.instruction(&Instruction::LocalGet(5)); // arg0 = array
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // src_addr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // count
+
+        // Allocate new array: 8 + count*8
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9)); // dst_addr
+                                                  // Write tag and count
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        // Copy items from source
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // RC (plan 113 R1): the sorted array co-owns every element copied
+        // from the source — the MemoryCopy above shallow-copies the boxed
+        // refs, so without a retain both arrays "own" the same elements
+        // with one count, and releasing the source later double-frees each
+        // element this array still points at. `array.slice`/`reverse`
+        // already do this; `sort` was the lone gap (it predates heap-
+        // element support — the old i32 compare only handled primitives,
+        // which need no retain). local 14 = scratch index; the bubble-sort
+        // comparison below reuses it fresh per iteration.
+        emit_retain_array_elems(f, base, /*dst*/ 9, /*count*/ 8, /*idx*/ 14);
+
+        // Bubble sort: outer loop i from 0 to count-1
+        // local 10 = i (outer), local 11 = j (inner), local 12 = addr_j, local 13 = addr_j1
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10)); // i = 0
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if i >= count - 1: break. SIGNED compare — for an empty array
+            // `count - 1` underflows to -1, and an unsigned `>=` would read 0xFFFFFFFF
+            // and run the loop, reading past the zero-length array (OOB). Signed: 0 >= -1
+            // is true, so it breaks immediately. count/i are small non-negative.
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::BrIf(1));
+
+            // Inner loop: j from 0 to count - 1 - i
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(11)); // j = 0
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            {
+                // if j >= count - 1 - i: break inner (signed, same underflow guard)
+                f.instruction(&Instruction::LocalGet(11));
+                f.instruction(&Instruction::LocalGet(8));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::LocalGet(10));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::I32GeS);
+                f.instruction(&Instruction::BrIf(1));
+
+                // addr_j = dst + 8 + j*8
+                f.instruction(&Instruction::LocalGet(9));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(11));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Mul);
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(12)); // addr_j
+
+                // addr_j1 = addr_j + 8
+                f.instruction(&Instruction::LocalGet(12));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(13)); // addr_j1
+
+                // Decide whether to swap (arr[j] should sort AFTER arr[j+1]).
+                // Strings compare lexically via RT_STR_CMP; everything else
+                // keeps the raw i32 compare (ints, and — as before — boxed
+                // pointers for mixed/other types). Without the string case,
+                // `array.sort` on strings ordered by allocation address, not
+                // content — which silently broke filename-ordered migration
+                // runners and any string sort. locals: 14/17 = a/b obj addr,
+                // 15/16 = a/b boxed value (i64 scratch, free in sort).
+                let off4 = MemArg {
+                    offset: 4,
+                    align: 0,
+                    memory_index: 0,
+                };
+                f.instruction(&Instruction::LocalGet(12));
+                f.instruction(&Instruction::I64Load(mem0()));
+                f.instruction(&Instruction::LocalSet(15)); // a
+                f.instruction(&Instruction::LocalGet(13));
+                f.instruction(&Instruction::I64Load(mem0()));
+                f.instruction(&Instruction::LocalSet(16)); // b
+                                                           // both_str = is_str(a) && is_str(b)
+                f.instruction(&Instruction::LocalGet(15));
+                f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
+                f.instruction(&Instruction::LocalGet(15));
+                f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                f.instruction(&Instruction::I32Load(mem0()));
+                f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::LocalGet(16));
+                f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
+                f.instruction(&Instruction::LocalGet(16));
+                f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                f.instruction(&Instruction::I32Load(mem0()));
+                f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
+                {
+                    // RT_STR_CMP(a_ptr, a_len, b_ptr, b_len) > 0
+                    f.instruction(&Instruction::LocalGet(15));
+                    f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                    f.instruction(&Instruction::LocalTee(14)); // a_addr
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(14));
+                    f.instruction(&Instruction::I32Load(off4)); // a_len
+                    f.instruction(&Instruction::LocalGet(16));
+                    f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+                    f.instruction(&Instruction::LocalTee(17)); // b_addr
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(17));
+                    f.instruction(&Instruction::I32Load(off4)); // b_len
+                    f.instruction(&Instruction::Call(base + RT_STR_CMP));
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::I32GtS);
+                }
+                f.instruction(&Instruction::Else);
+                {
+                    f.instruction(&Instruction::LocalGet(15));
+                    f.instruction(&Instruction::I32WrapI64);
+                    f.instruction(&Instruction::LocalGet(16));
+                    f.instruction(&Instruction::I32WrapI64);
+                    f.instruction(&Instruction::I32GtS);
+                }
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    // Swap: temp = arr[j]; arr[j] = arr[j+1]; arr[j+1] = temp
+                    f.instruction(&Instruction::LocalGet(12));
+                    f.instruction(&Instruction::I64Load(mem0()));
+                    f.instruction(&Instruction::LocalSet(15)); // temp
+                    f.instruction(&Instruction::LocalGet(12));
+                    f.instruction(&Instruction::LocalGet(13));
+                    f.instruction(&Instruction::I64Load(mem0()));
+                    f.instruction(&Instruction::I64Store(mem0()));
+                    f.instruction(&Instruction::LocalGet(13));
+                    f.instruction(&Instruction::LocalGet(15));
+                    f.instruction(&Instruction::I64Store(mem0()));
+                }
+                f.instruction(&Instruction::End);
+
+                // j++
+                f.instruction(&Instruction::LocalGet(11));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(11));
+                f.instruction(&Instruction::Br(0));
+            }
+            f.instruction(&Instruction::End); // end inner loop
+            f.instruction(&Instruction::End); // end inner block
+
+            // i++
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(10));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End); // end outer loop
+        f.instruction(&Instruction::End); // end outer block
+
+        // Return NaN-boxed array
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SLICE = 24: array.slice(arr, start, end) -> new array of
+    // items `[start..end)`. Mirrors native_array_slice in fai-runtime:
+    // clamps start/end to [0, len], treats end<start as empty slice.
+    //
+    // The call_native wrapper only pre-loads arg0 (local 5) and arg1
+    // (local 6). arg2 (end) must be read from args_ptr (local 1) at
+    // offset 16.
+    emit_native_method_dispatch(&mut f, base, METHOD_SLICE, |f, base| {
+        // src_addr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // src_len = mem[src_addr + 4]
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+
+        // start = unbox(arg1) as i32
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(9));
+        // end = unbox(mem[args_ptr + 16]) as i32
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(10));
+
+        // Clamp start/end to [0, src_len] and collapse end<start to an empty
+        // range — shared with METHOD_SUBSTRING via emit_clamp_range_to_len
+        // (signed compares, so a wrapped/negative index can't drive an OOB).
+        emit_clamp_range_to_len(f, /*start*/ 9, /*end*/ 10, /*len*/ 8);
+
+        // count = end - start
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(11));
+
+        // Allocate destination array: 8 + count*8 bytes.
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(12));
+
+        // Write header: tag + count.
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // memcpy items: dst = dst_addr + 8, src = src_addr + 8 + start*8, n = count*8
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // RC: the slice co-owns the element refs copied from the source.
+        emit_retain_array_elems(f, base, 12, 11, 14);
+
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_REVERSE = 25: array.reverse(arr) -> new array with items
+    // in reverse order.
+    emit_native_method_dispatch(&mut f, base, METHOD_REVERSE, |f, base| {
+        // src_addr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // count
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+
+        // Allocate dest: 8 + count*8
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9));
+
+        // Write header.
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // Loop: for i in 0..count, dst[i] = src[count - 1 - i]
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10)); // i
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // Load src[count - 1 - i]
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0()));
+            f.instruction(&Instruction::LocalSet(15)); // tmp i64
+
+            // Store into dst[i]
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::I64Store(mem0()));
+
+            // i++
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(10));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        // RC: the reversed array co-owns the element refs copied from the source.
+        emit_retain_array_elems(f, base, 9, 8, 14);
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_TO_UPPER = 26: string.toUpper(s) -> new string with ASCII
+    // lowercase letters shifted to uppercase. Non-ASCII bytes pass
+    // through — this intentionally diverges from the VM's
+    // str::to_uppercase for non-ASCII input (see the METHOD_TO_UPPER
+    // docs at the constant definition). A full-Unicode impl would
+    // require a case-folding table.
+    //
+    // Shape: for i in 0..len, if data[i] in b'a'..=b'z', write data[i]-32
+    // into dst; else write data[i] unchanged.
+    emit_string_case_shift(&mut f, base, METHOD_TO_UPPER, /* to_upper */ true);
+
+    // METHOD_TO_LOWER = 27: ASCII-only mirror of METHOD_TO_UPPER.
+    emit_string_case_shift(&mut f, base, METHOD_TO_LOWER, /* to_upper */ false);
+
+    // METHOD_TRIM / METHOD_TRIM_START / METHOD_TRIM_END — all share the
+    // same body, gated by two flags passed into the helper.
+    emit_native_method_dispatch(&mut f, base, METHOD_TRIM, |f, base| {
+        emit_trim_body(
+            f, base, /* strip_start */ true, /* strip_end */ true,
+        );
+    });
+    emit_native_method_dispatch(&mut f, base, METHOD_TRIM_START, |f, base| {
+        emit_trim_body(
+            f, base, /* strip_start */ true, /* strip_end */ false,
+        );
+    });
+    emit_native_method_dispatch(&mut f, base, METHOD_TRIM_END, |f, base| {
+        emit_trim_body(
+            f, base, /* strip_start */ false, /* strip_end */ true,
+        );
+    });
+
+    // METHOD_STARTS_WITH = 29: string.startsWith(text, prefix) -> Bool.
+    // Byte-compare `prefix_len` bytes starting at offset 0 of `text`.
+    emit_native_method_dispatch(&mut f, base, METHOD_STARTS_WITH, |f, base| {
+        // text_addr / text_len
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        // prefix_addr / prefix_len
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10));
+
+        // If prefix_len > text_len → false.
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Call(base + RT_MAKE_BOOL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // emit_byte_compare_prefix needs the offset in an i32 local.
+        // We can't pass literal `0` as the local index — index 0 is
+        // the `callee: i64` param of rt_call_native. Use local 11 as
+        // an i32 scratch holding 0.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(11));
+        emit_byte_compare_prefix(
+            f, base, /*text_addr*/ 7, /*prefix_addr*/ 9, /*prefix_len*/ 10,
+            /*offset*/ 11,
+        );
+    });
+
+    // METHOD_ENDS_WITH = 30: string.endsWith(text, suffix) -> Bool.
+    // Byte-compare `suffix_len` bytes starting at offset
+    // `text_len - suffix_len`.
+    emit_native_method_dispatch(&mut f, base, METHOD_ENDS_WITH, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10));
+
+        // If suffix_len > text_len → false.
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Call(base + RT_MAKE_BOOL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // offset = text_len - suffix_len, stored in local 11.
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(11));
+        emit_byte_compare_prefix(f, base, 7, 9, 10, 11);
+    });
+
+    // METHOD_INDEX_OF = 31: string.indexOf(text, needle) -> Int. -1 if
+    // not found. Naive byte scan — O(text_len * needle_len) worst case,
+    // acceptable for the typical short-needle use case.
+    emit_native_method_dispatch(&mut f, base, METHOD_INDEX_OF, |f, base| {
+        // Dispatch on container tag — Array falls into a separate
+        // body (i64 bit-equality scan), String falls through to the
+        // byte-level substring scan below.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        emit_array_index_of_body(f, base);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10));
+
+        // Empty needle matches at position 0.
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // last_start = text_len - needle_len. If < 0, return -1.
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(11)); // last_start
+
+        // Outer loop: i in 0..=last_start
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(12));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32GtU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // Inner: byte-compare needle vs text[i..i+needle_len].
+            // local 14 is the i32 "match" flag (locals 15-16 are i64
+            // per the function prelude, so we can't use them here).
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(13));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(14)); // match = 1
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            {
+                f.instruction(&Instruction::LocalGet(13));
+                f.instruction(&Instruction::LocalGet(10));
+                f.instruction(&Instruction::I32GeU);
+                f.instruction(&Instruction::BrIf(1));
+
+                // text byte at i + j
+                f.instruction(&Instruction::LocalGet(7));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(12));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(13));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load8U(mem0()));
+                // needle byte at j
+                f.instruction(&Instruction::LocalGet(9));
+                f.instruction(&Instruction::I32Const(8));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalGet(13));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load8U(mem0()));
+                f.instruction(&Instruction::I32Ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::LocalSet(14));
+                f.instruction(&Instruction::Br(2));
+                f.instruction(&Instruction::End);
+
+                f.instruction(&Instruction::LocalGet(13));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::LocalSet(13));
+                f.instruction(&Instruction::Br(0));
+            }
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+
+            // If match, return i.
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+            f.instruction(&Instruction::Return);
+            f.instruction(&Instruction::End);
+
+            // i++
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(12));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::Call(base + RT_MAKE_INT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SUBSTRING = 32: string.substring(text, start, end) ->
+    // String. arg0 = text (local 5), arg1 = start (local 6), arg2 =
+    // end (must be read from args_ptr+16 because call_native pre-loads
+    // only arg0/arg1).
+    emit_native_method_dispatch(&mut f, base, METHOD_SUBSTRING, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        // start = unbox(arg1)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(9));
+        // end = unbox(mem[args_ptr + 16])
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(10));
+
+        emit_clamp_range_to_len(f, /*start*/ 9, /*end*/ 10, /*len*/ 8);
+
+        // new_len = end - start
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(12));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_REPEAT = 33: string.repeat(text, count) -> String with
+    // `text` concatenated `count` times. Negative count is treated as 0
+    // (mirrors VM's `.max(0)` clamp).
+    emit_native_method_dispatch(&mut f, base, METHOD_REPEAT, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        // count = max(0, unbox(arg1))
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::End);
+
+        // total_len = text_len * count
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::LocalSet(10));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // for i in 0..count: memcpy(dst+8+i*text_len, src+8, text_len)
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(12));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            f.instruction(&Instruction::LocalGet(11));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+
+            f.instruction(&Instruction::LocalGet(12));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(12));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_REPLACE = 34: string.replace(text, find, with) -> String
+    // with every non-overlapping occurrence of `find` in `text`
+    // replaced by `with`. arg2 (`with`) is read from `args_ptr + 16`.
+    //
+    // Two-pass algorithm:
+    //   Pass 1 — count occurrences, derive output length
+    //   Pass 2 — allocate and copy segments, substituting at each match
+    //
+    // Edge: if `find` is empty, return `text` unchanged. The VM's Rust
+    // `str::replace` inserts `with` between every byte in that case
+    // ("abc".replace("", "-") => "-a-b-c-"); we skip that to avoid an
+    // infinite-loop trap. Parity tests must avoid empty `find`.
+    //
+    // i32 locals reserved (3, 4, 7-14, 17-18 — 12 total):
+    //   7  text_addr       13  count / out_i (phase 2)
+    //   8  text_len        14  match_flag / output_len
+    //   9  find_addr       17  inner j (compare scratch)
+    //   10 find_len        18  unused
+    //   11 with_addr
+    //   12 with_len
+    //   3  output_addr     4  outer i
+    emit_native_method_dispatch(&mut f, base, METHOD_REPLACE, |f, base| {
+        // Extract text / find / with.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(9));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(10));
+        // with_val = mem[args_ptr + 16] (i64)
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(11));
+        f.instruction(&Instruction::LocalGet(11));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(12));
+
+        // Empty-find early return: return arg0 unchanged, but RETAIN it first
+        // (RC, plan 113 R2) so this path yields an owned +1 just like the
+        // fresh-allocating path below. That uniformity is what lets callers
+        // treat `replace` as ownership-transferring (`is_fresh_builtin_call`)
+        // without a use-after-free when `find` is empty.
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_RETAIN));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // Also: if find_len > text_len, no matches possible — skip to
+        // a fresh copy of text. But simpler: let phase 1 count 0, phase
+        // 2 copies text byte-for-byte. The two-pass still terminates.
+
+        // ── Phase 1: count matches.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(13)); // count
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(4)); // i
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if i + find_len > text_len break
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GtU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // compare at i
+            emit_byte_compare_flag(
+                f, /*text*/ 7, /*find*/ 9, /*find_len*/ 10, /*offset*/ 4,
+                /*flag*/ 14, /*j*/ 17,
+            );
+
+            f.instruction(&Instruction::LocalGet(14));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(13));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(13));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(4));
+            f.instruction(&Instruction::Else);
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(4));
+            f.instruction(&Instruction::End);
+
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        // ── Compute output_len = text_len + count*(with_len - find_len)
+        // Reuse local 14 for output_len (no longer needed as flag).
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::LocalGet(12));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(13));
+        f.instruction(&Instruction::LocalGet(10));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(14));
+
+        // Alloc output (local 3) and write header.
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(14));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(3));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(14));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // ── Phase 2: copy, substituting at each match.
+        // i = 0, out_i = 0. Reuse 13 as out_i; 4 as i.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(13));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            // if i >= text_len break
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // Try match at i if enough room
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32LeU);
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            {
+                emit_byte_compare_flag(f, 7, 9, 10, 4, 14, 17);
+                f.instruction(&Instruction::LocalGet(14));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                {
+                    // memcpy(output + 8 + out_i, with + 8, with_len)
+                    f.instruction(&Instruction::LocalGet(3));
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(13));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(11));
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(12));
+                    f.instruction(&Instruction::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    });
+                    // out_i += with_len
+                    f.instruction(&Instruction::LocalGet(13));
+                    f.instruction(&Instruction::LocalGet(12));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalSet(13));
+                    // i += find_len
+                    f.instruction(&Instruction::LocalGet(4));
+                    f.instruction(&Instruction::LocalGet(10));
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalSet(4));
+                    // Continue the outer Loop. Nesting from this point:
+                    //   0 = inner If (match), 1 = outer If (room),
+                    //   2 = Loop, 3 = Block. Br 2 reloops.
+                    f.instruction(&Instruction::Br(2));
+                }
+                f.instruction(&Instruction::End);
+            }
+            f.instruction(&Instruction::End);
+
+            // Fallthrough: no match at i — copy one byte.
+            // out[out_i] = text[i]
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(13));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Load8U(mem0()));
+            f.instruction(&Instruction::I32Store8(mem0()));
+            // out_i++, i++
+            f.instruction(&Instruction::LocalGet(13));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(13));
+            f.instruction(&Instruction::LocalGet(4));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(4));
+
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_POW = 35: math.pow(base, exp) -> Float. Integer-exponent
+    // only (exp truncated to i32). See the METHOD_POW const doc.
+    //
+    // Locals: 15 (i64 temp) is used as the f64 scratch via
+    // reinterpretation isn't necessary — f64 values can just live on
+    // the stack or in 15/16 as i64 alias since wasm locals are typed.
+    // We need f64 locals here, but the emit_call_native prelude only
+    // provides i32 and i64 locals. We work around this by doing all
+    // f64 math on the stack without intermediate locals, staying
+    // within the values-on-stack stack discipline.
+    emit_native_method_dispatch(&mut f, base, METHOD_POW, |f, base| {
+        // result (f64) kicks off at 1.0, stored temporarily via
+        // i64 reinterpretation in local 15.
+        f.instruction(&Instruction::F64Const(1.0));
+        f.instruction(&Instruction::I64ReinterpretF64);
+        f.instruction(&Instruction::LocalSet(15));
+
+        // base (f64) lives in local 16 (also via reinterpret).
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::I64ReinterpretF64);
+        f.instruction(&Instruction::LocalSet(16));
+
+        // n = i32(exp)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_AS_NUMBER));
+        f.instruction(&Instruction::I32TruncF64S);
+        f.instruction(&Instruction::LocalSet(7));
+
+        // If n is negative: compute positive pow then take 1/result.
+        // Track sign separately.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(8)); // invert = 0
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::End);
+
+        // Loop: while n > 0: result *= base; n--.
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(1));
+            // result = result * base  (via reinterpret)
+            f.instruction(&Instruction::LocalGet(15));
+            f.instruction(&Instruction::F64ReinterpretI64);
+            f.instruction(&Instruction::LocalGet(16));
+            f.instruction(&Instruction::F64ReinterpretI64);
+            f.instruction(&Instruction::F64Mul);
+            f.instruction(&Instruction::I64ReinterpretF64);
+            f.instruction(&Instruction::LocalSet(15));
+            // n--
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(7));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
+        // Apply inversion if exponent was negative.
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::F64Const(1.0));
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::F64ReinterpretI64);
+        f.instruction(&Instruction::F64Div);
+        f.instruction(&Instruction::I64ReinterpretF64);
+        f.instruction(&Instruction::LocalSet(15));
+        f.instruction(&Instruction::End);
+
+        // NaN-box the f64 result.
+        f.instruction(&Instruction::LocalGet(15));
+        f.instruction(&Instruction::F64ReinterpretI64);
+        f.instruction(&Instruction::Call(base + RT_MAKE_FLOAT));
+        f.instruction(&Instruction::Return);
+    });
+
+    // ── std.http.server response helpers ─────────────────────────
+    //
+    // Each of text/html/json/ok/redirect calls
+    // `IMPORT_HTTP_SERVER_RESPONSE(kind, status, body_ptr, body_len)`.
+    // The host allocates a Dict on the guest heap containing
+    // `{status, body, contentType?, location?}` and returns a
+    // NaN-boxed pointer, so we can `Return` its result directly.
+
+    // METHOD_SERVER_TEXT: text(status, body) -> Dict (Content-Type: text/plain)
+    let ir = import_remap;
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_TEXT, |f, base| {
+        emit_server_response_call(
+            f,
+            base,
+            RESPONSE_KIND_TEXT,
+            /* body_is_arg1 */ true,
+            ir,
+        );
+    });
+    // METHOD_SERVER_HTML: html(status, body) -> Dict (Content-Type: text/html)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_HTML, |f, base| {
+        emit_server_response_call(f, base, RESPONSE_KIND_HTML, true, ir);
+    });
+    // METHOD_SERVER_JSON: json(status, body) -> Dict
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_JSON, |f, base| {
+        emit_server_response_call(f, base, RESPONSE_KIND_JSON, true, ir);
+    });
+    // METHOD_SERVER_OK: ok(body) -> Dict (status=200)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_OK, |f, base| {
+        emit_server_response_call(f, base, RESPONSE_KIND_OK, false, ir);
+    });
+    // METHOD_SERVER_REDIRECT: redirect(status, url) -> Dict (location=url)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_REDIRECT, |f, base| {
+        emit_server_response_call(f, base, RESPONSE_KIND_REDIRECT, true, ir);
+    });
+
+    // METHOD_SERVER_LISTEN: listen(router, port) -> Void (starts router accept loop)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_LISTEN, |f, _base| {
+        // router (arg0) is a NaN-boxed Int: low 32 bits are the router ID.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        // port (arg1) is a NaN-boxed Int: low 32 bits are the port.
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32WrapI64);
+        emit_import_call(f, IMPORT_HTTP_SERVER_ROUTER_LISTEN, ir);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SERVER_ROUTER: router() -> Router (Int ID, NaN-boxed)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_ROUTER, |f, _base| {
+        emit_import_call(f, IMPORT_HTTP_SERVER_ROUTER, ir);
+        // Wrap the returned i32 ID as a NaN-boxed Int.
+        f.instruction(&Instruction::I64ExtendI32U);
+        let tag = (0x7FF8_0000_0000_0000u64 | 0x0001_0000_0000_0000u64) as i64; // QNAN | TAG_INT
+        f.instruction(&Instruction::I64Const(tag));
+        f.instruction(&Instruction::I64Or);
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SERVER_GET: get(router, pattern, handler) -> Void
+    // Call: http_server_router_get(router_id: i32, pat_ptr: i32, pat_len: i32, handler: i64)
+    // arg0=router(local 5), arg1=pattern(local 6), arg2=handler(args_ptr+16)
+    // METHOD_SERVER_GET: get(router, pattern, handler) -> Void
+    // Call: http_server_router_get(router_id: i32, pat_ptr: i32, pat_len: i32, handler: i64)
+    // arg0=router(local 5), arg1=pattern(local 6), arg2=handler(args_ptr+16)
+    // local 15 (i64 temp) used to stash handler while computing string ptr+len.
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_GET, |f, base| {
+        // Load arg2 (handler) from args_ptr[2] = *(args_ptr + 16) into local 15 (i64 temp)
+        f.instruction(&Instruction::LocalGet(1)); // args_ptr (i32)
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(15)); // handler → local 15 (i64 temp)
+                                                   // router_id: arg0 (local 5, NaN-boxed Int) → i32
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        // pattern string addr → local 8 (i32 temp)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(8));
+        // pat_ptr = str_addr + 8
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        // pat_len = mem[str_addr + 4]
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        // handler (local 15, i64)
+        f.instruction(&Instruction::LocalGet(15));
+        emit_import_call(f, IMPORT_HTTP_SERVER_ROUTER_GET, ir);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SERVER_POST: post(router, pattern, handler) -> Void
+    // Same 3-arg layout as GET; uses local 15 (i64 temp) for handler.
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_POST, |f, base| {
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 16,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(15));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(15));
+        emit_import_call(f, IMPORT_HTTP_SERVER_ROUTER_POST, ir);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_SERVER_SERVE_FILES: serveFiles(router, dir) -> Void
+    // Call: http_server_router_serve_files(router_id: i32, dir_ptr: i32, dir_len: i32)
+    emit_native_method_dispatch(&mut f, base, METHOD_SERVER_SERVE_FILES, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        emit_import_call(f, IMPORT_HTTP_SERVER_ROUTER_SERVE_FILES, ir);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // ── std.json methods (runtime fallback path) ─────────────────
+    // METHOD_JSON_PARSE: json.parse(val) -> value via IMPORT_JSON_PARSE.
+    //
+    // Only reached when emit_get_field_by_idx couldn't statically
+    // resolve the call (library-compiled code). See the method_check
+    // comment above for the trigger conditions.
+    //
+    // Mirrors the VM's `native_json_parse` which calls `val_to_str`
+    // before parsing — non-String inputs (e.g. an Array returned from
+    // `getString(dict, 'args')`) are returned as-is rather than
+    // round-tripped through JSON. Matches VM semantics for the case
+    // that triggers this path in the todo-fullstack server
+    // (Forui.rpc::parseArgs).
+    emit_native_method_dispatch(&mut f, base, METHOD_JSON_PARSE, |f, base| {
+        // If arg0 is not an object: pass-through.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_IS_OBJ));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // Get object addr and tag.
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // If tag != String: pass-through.
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(mem0()));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_STRING));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // String: extract ptr+len, call host import.
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add); // ptr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        })); // len
+        emit_import_call(f, IMPORT_JSON_PARSE, import_remap);
+        f.instruction(&Instruction::Return);
+    });
+    // METHOD_JSON_STRINGIFY: json.stringify(val) -> string via IMPORT_JSON_STRINGIFY.
+    emit_native_method_dispatch(&mut f, base, METHOD_JSON_STRINGIFY, |f, _base| {
+        f.instruction(&Instruction::LocalGet(5));
+        emit_import_call(f, IMPORT_JSON_STRINGIFY, import_remap);
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_STORAGE_GET: storageGet(key) -> String? via IMPORT_STORAGE_GET.
+    // Mirrors METHOD_FILE_READ — stage a 64KB scratch buffer, ask the
+    // host to write the value in, wrap the returned byte-length as a
+    // fai String (or VAL_NULL when the host returned -1 for "absent").
+    emit_native_method_dispatch(&mut f, base, METHOD_STORAGE_GET, |f, base| {
+        // key_addr = obj_addr(arg0)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // Allocate 64KB scratch buffer for the value
+        f.instruction(&Instruction::I32Const(65536));
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalTee(3)); // buf_ptr
+                                                  // storage_get(key_ptr, key_len, buf_ptr) -> value_len or -1
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add); // key data ptr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        })); // key len
+        f.instruction(&Instruction::LocalGet(3)); // buf_ptr
+        emit_import_call(f, IMPORT_STORAGE_GET, import_remap);
+        f.instruction(&Instruction::LocalTee(4)); // result len
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(VAL_NULL));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // Wrap the scratch bytes as a String.
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::Call(base + RT_ALLOC_STRING));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_STORAGE_SET: storageSet(key, value) -> Void via IMPORT_STORAGE_SET.
+    emit_native_method_dispatch(&mut f, base, METHOD_STORAGE_SET, |f, base| {
+        // key_addr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        // val_addr
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(3));
+        // storage_set(key_ptr, key_len, val_ptr, val_len)
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        emit_import_call(f, IMPORT_STORAGE_SET, import_remap);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_STORAGE_REMOVE: storageRemove(key) -> Void via IMPORT_STORAGE_REMOVE.
+    emit_native_method_dispatch(&mut f, base, METHOD_STORAGE_REMOVE, |f, base| {
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        emit_import_call(f, IMPORT_STORAGE_REMOVE, import_remap);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_STORAGE_CLEAR: storageClear() -> Void via IMPORT_STORAGE_CLEAR.
+    emit_native_method_dispatch(&mut f, base, METHOD_STORAGE_CLEAR, |f, _base| {
+        emit_import_call(f, IMPORT_STORAGE_CLEAR, import_remap);
+        f.instruction(&Instruction::I64Const(VAL_VOID));
+        f.instruction(&Instruction::Return);
+    });
+
+    // METHOD_GET_STRING / METHOD_GET_INT / METHOD_GET_BOOL — std.dictionary
+    // typed accessors. VM parity: all three are aliases for dict_get — no
+    // runtime type coercion, just key lookup. Returns VAL_NULL when the
+    // key is missing. Shared body emitted three times via the helper.
+    //
+    // Stack effect: arg0 (dict, i64) + arg1 (key string, i64) →
+    //   key_addr = RT_OBJ_ADDR(arg1)
+    //   RT_GET_FIELD(arg0, key_addr+8, mem[key_addr+4]) → i64 value
+    for method_id in [METHOD_GET_STRING, METHOD_GET_INT, METHOD_GET_BOOL] {
+        emit_native_method_dispatch(&mut f, base, method_id, |f, base| {
+            // key_addr = obj_addr(arg1)
+            f.instruction(&Instruction::LocalGet(6));
+            f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+            f.instruction(&Instruction::LocalSet(7));
+            // RT_GET_FIELD(dict = arg0, key_ptr = key_addr+8, key_len = mem[key_addr+4])
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: 4,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::Call(base + RT_GET_FIELD));
+            f.instruction(&Instruction::Return);
+        });
+    }
+
+    // METHOD_GET_KEYS = 23: getKeys(dict) -> Array of key strings
+    emit_native_method_dispatch(&mut f, base, METHOD_GET_KEYS, |f, base| {
+        // Extract dict
+        f.instruction(&Instruction::LocalGet(5)); // arg0 = dict
+        f.instruction(&Instruction::Call(base + RT_OBJ_ADDR));
+        f.instruction(&Instruction::LocalSet(7)); // dict_addr
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(8)); // count
+
+        // Alloc array: 8 + count*8
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(base + RT_ALLOC));
+        f.instruction(&Instruction::LocalSet(9)); // arr_addr
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(OBJ_TAG_ARRAY));
+        f.instruction(&Instruction::I32Store(mem0()));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // Loop: copy key_val from dict entry[i] to arr[i]
+        // Dict entry layout: [key:i64][val:i64] at dict_addr+8+i*16
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(10)); // i = 0
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+
+            // arr_slot = arr_addr + 8 + i*8
+            f.instruction(&Instruction::LocalGet(9));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+
+            // key_val = mem[dict_addr + 8 + i*16]
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(16));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I64Load(mem0()));
+
+            // store in arr slot
+            f.instruction(&Instruction::I64Store(mem0()));
+
+            // i++
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(10));
+            f.instruction(&Instruction::Br(0));
+        }
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        // RC: the keys array co-owns the key strings it copied from the dict.
+        emit_retain_array_elems(f, base, 9, 8, 14);
+
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(base + RT_MAKE_OBJ));
+        f.instruction(&Instruction::Return);
+    });
+
+    // Default: no METHOD_* branch matched. This means either
+    //   (a) rt_get_field returned a NativeFn with method_id=UNKNOWN
+    //       because the method name didn't match any `ks.*` entry, or
+    //   (b) the method name DID match a ks entry but rt_call_native
+    //       has no implementation for that METHOD_* id yet.
+    //
+    // Either way, this is a wasm-codegen gap relative to the VM
+    // (fai-runtime, which has ~110 natives while the wasm codegen
+    // covers ~50 today). Previously this fallthrough silently returned
+    // `null`, which meant calls to unimplemented natives produced
+    // nonsense output — the `string.toUpper` parity test was a live
+    // example before we implemented METHOD_TO_UPPER.
+    //
+    // Trap loudly instead so the gap is impossible to miss. The
+    // wasmtime / browser error points at this function (rt_call_native)
+    // and the method_id is in local 4 — map it back to the METHOD_*
+    // constant in this file to identify which native is missing, then
+    // add the implementation.
+    //
+    // See plans/98-wasm-codegen-hardening.md step 3.
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+    f
+}
