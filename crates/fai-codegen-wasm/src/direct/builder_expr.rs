@@ -2949,10 +2949,10 @@ impl<'a, 'c> Builder<'a, 'c> {
 
     /// `sleep(ms)` — test-mode / legacy direct path via IMPORT_SLEEP_MS.
     ///
-    /// Production routing sends async-effectful programs through
-    /// `async_codegen`, where `sleep` lowers to scheduler-owned frame state
-    /// plus `host_set_timer`. This direct fallback is reachable only in
-    /// test-mode builds (where `try_codegen_async` declines) and old
+    /// Production routing sends async-effectful programs through the async
+    /// engine, where `sleep` lowers to scheduler-owned frame state plus
+    /// `host_set_timer`. This direct fallback is reachable only in
+    /// test-mode builds (where async lowering is skipped) and old
     /// embedding paths that do not run async analysis; there the host
     /// `sleep_ms` import is a real (blocking) sleep so test assertions on
     /// async functions return correct values.

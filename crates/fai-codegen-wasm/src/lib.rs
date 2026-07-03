@@ -11,10 +11,8 @@
 
 pub mod async_analysis;
 mod async_codegen;
-mod async_emit_spec;
 pub mod async_engine;
 pub mod async_runtime;
-mod async_wait_codegen;
 pub mod debug_info;
 pub mod direct;
 mod program;
@@ -250,14 +248,8 @@ pub fn codegen_direct_full_reasoned_with_entry_file(
         }
         async_engine_error = direct::take_last_async_engine_error();
     }
-    if let Some(outcome) = async_codegen::try_codegen_async(ast, modules, &async_analysis, is_test)
-    {
-        match outcome {
-            async_codegen::AsyncBuildOutcome::Compiled(wasm) => return Ok(wasm),
-            async_codegen::AsyncBuildOutcome::Unsupported(err) => {
-                return Err(async_engine_error.unwrap_or(err));
-            }
-        }
+    if let Some(err) = async_codegen::async_unsupported_error(&async_analysis, is_test) {
+        return Err(async_engine_error.unwrap_or(err));
     }
 
     let rt = direct::RtOffsets {
