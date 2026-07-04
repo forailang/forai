@@ -63,7 +63,14 @@ pub fn generate_dispatch_for_functions(
     out.push_str("use std.json\n");
     out.push_str("use std.http.server\n");
     out.push_str("use std.events\n");
-    out.push_str("use { handleRpcRequest } from Forui.rpc\n");
+    // rpcAuthCheck gates every non-public endpoint before its body runs
+    // (plan 133 phase 2); public endpoints get no gate at all.
+    let any_gated = remote_fns.iter().any(|fd| fd.auth != "public");
+    if any_gated {
+        out.push_str("use { handleRpcRequest, rpcAuthCheck } from Forui.rpc\n");
+    } else {
+        out.push_str("use { handleRpcRequest } from Forui.rpc\n");
+    }
     for (module, names) in import_groups(remote_fns) {
         out.push_str(&format!("use {{ {} }} from {}\n", names.join(", "), module));
     }
@@ -87,6 +94,28 @@ pub fn generate_dispatch_for_functions(
             out.push_str(&format!("{}{}", "  ".repeat(i), else_prefix));
         }
         out.push_str(&format!("{}if {}\n", indent, route_condition(fd)));
+
+        // @auth gate (plan 133 phase 2): runs BEFORE the body — an
+        // unauthenticated/unauthorized call never reaches user code.
+        // `public` endpoints emit no gate (greppable in generated
+        // source); an empty legacy policy fails closed as `session`.
+        let gated = fd.auth != "public";
+        if gated {
+            let policy = if fd.auth.is_empty() {
+                "session"
+            } else {
+                fd.auth.as_str()
+            };
+            out.push_str(&format!(
+                "{}  let __authFail = rpcAuthCheck('{}', '{}', ctx, argsJson)\n",
+                indent,
+                policy,
+                fd.auth_authorizer.as_deref().unwrap_or("")
+            ));
+            out.push_str(&format!("{}  if __authFail != ''\n", indent));
+            out.push_str(&format!("{}    __authFail\n", indent));
+            out.push_str(&format!("{}  else\n", indent));
+        }
 
         // Wrap each call in try/catch so errors from RPC functions become
         // JSON error responses rather than WASM traps. Around the call,
@@ -174,6 +203,10 @@ pub fn generate_dispatch_for_functions(
             ));
             out.push_str(&format!("{}  end\n", indent));
             out.push_str(&format!("{}  __rpcResult\n", indent));
+        }
+        if gated {
+            // Close the auth-gate else branch.
+            out.push_str(&format!("{}  end\n", indent));
         }
     }
 
@@ -591,8 +624,9 @@ mod tests {
             result
         );
         assert!(
-            result.contains("use { handleRpcRequest } from Forui.rpc"),
-            "generated dispatch should import Forui.rpc handler. Got:\n{}",
+            result.contains("use { handleRpcRequest, rpcAuthCheck } from Forui.rpc"),
+            "generated dispatch should import the Forui.rpc handler and the \
+             auth gate (the test fns are session-gated). Got:\n{}",
             result
         );
     }
