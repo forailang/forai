@@ -454,6 +454,57 @@
     }
 
     #[test]
+    fn test_public_endpoint_reaching_secret_warns() {
+        // A @auth public remote def whose call graph reaches secrets.get
+        // gets a check-time warning (not an error — the program checks).
+        let source = "use std.secrets\n\n\
+             # Reads a secret (helper).\n\
+             def loadKey\n    @return String\ndo\n  secrets.reveal(secrets.get('K'))\nend\n\n\
+             # Open endpoint that transitively reaches the secret.\n\
+             remote def leak\n    @auth public\n    @return String\ndo\n  loadKey()\nend\n\n\
+             def main\n    @return Void\ndo\n  print(leak())\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        // Declared so the secrets.get literal-name check passes; the lint
+        // is independent of declaration.
+        let mut declared = std::collections::HashSet::new();
+        declared.insert("K".to_string());
+        checker.set_declared_secrets(declared);
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("program checks (warning, not error)");
+        assert!(
+            checker
+                .warnings
+                .iter()
+                .any(|w| w.contains("leak") && w.contains("secrets.")),
+            "expected a public-endpoint-reaches-secret warning, got: {:?}",
+            checker.warnings
+        );
+    }
+
+    #[test]
+    fn test_session_endpoint_reaching_secret_does_not_warn() {
+        let source = "use std.secrets\n\n\
+             # Session-gated endpoint using a secret.\n\
+             remote def useKey\n    @auth session\n    @return String\ndo\n  secrets.reveal(secrets.get('K'))\nend\n\n\
+             def main\n    @return Void\ndo\n  print(useKey())\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        let mut declared = std::collections::HashSet::new();
+        declared.insert("K".to_string());
+        checker.set_declared_secrets(declared);
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checks");
+        assert!(
+            checker.warnings.is_empty(),
+            "session endpoints should not warn, got: {:?}",
+            checker.warnings
+        );
+    }
+
+    #[test]
     fn test_valid_auth_policies_pass() {
         let source = "# Open ping.\nremote def ping\n    @auth public\n    @return String\ndo\n  'pong'\nend\n\n\
              # Session-gated.\nremote def whoami\n    @auth session\n    @return String\ndo\n  'me'\nend\n\n\

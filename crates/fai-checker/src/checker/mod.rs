@@ -15,6 +15,7 @@ use crate::std_modules;
 use crate::types::*;
 
 mod expressions;
+mod lint_rpc_secrets;
 mod program;
 mod resolve;
 mod statements;

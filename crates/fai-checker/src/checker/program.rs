@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use fai_compiler::ast::*;
 
+use super::lint_rpc_secrets::collect_fn_decls;
 use super::{Checker, PreparedModule};
 use crate::builtins;
 use crate::environment::Environment;
@@ -28,6 +29,7 @@ impl Checker {
         let empty_exports = HashMap::new();
         self.install_imports(statements, &mut env, &empty_exports, None)?;
         self.check_top_level_statements(statements, &mut env)?;
+        self.lint_public_endpoints_reaching_secrets(&collect_fn_decls(&[statements]));
         self.finish_check()
     }
 
@@ -138,6 +140,12 @@ impl Checker {
         // which matches the compiler's empty module_prefix for the entry.
         self.current_module = None;
         self.check_top_level_statements(entry_statements, &mut env)?;
+        // Plan 133 phase 5 lint over the whole program (entry + modules).
+        let mut all: Vec<&[Statement]> = vec![entry_statements];
+        for module in modules {
+            all.push(&module.statements);
+        }
+        self.lint_public_endpoints_reaching_secrets(&collect_fn_decls(&all));
         self.finish_check()
     }
 

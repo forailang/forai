@@ -105,7 +105,11 @@ pub(crate) fn run_project_check(project_root: &std::path::Path, src_dir: &str) -
             file_path: None,
         })
         .collect();
-    match checker.check_with_modules(&prepared.serde_ast.statements, &prepared_modules) {
+    let result = checker.check_with_modules(&prepared.serde_ast.statements, &prepared_modules);
+    for w in &checker.warnings {
+        eprintln!("{}", w);
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(e) => Err((
             format_check_errors(&checker, &e),
@@ -182,7 +186,14 @@ pub(crate) fn try_check_single_file(path: &str) -> Result<(), (String, usize)> {
                 .collect(),
         );
     }
-    match run_checker(&mut checker, &prepared) {
+    let result = run_checker(&mut checker, &prepared);
+    // Plan 133 phase 5: surface checker warnings (e.g. a public remote
+    // def reaching a secrets API) on stderr. Non-fatal — the check still
+    // passes; they read as `warning: ...` so tooling can grep them.
+    for w in &checker.warnings {
+        eprintln!("{}", w);
+    }
+    match result {
         Ok(()) => Ok(()),
         Err(e) => Err((
             format_check_errors(&checker, &e),
