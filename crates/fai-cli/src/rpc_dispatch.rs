@@ -162,10 +162,29 @@ pub fn generate_dispatch_for_functions(
             out.push_str(&format!("{}  end\n", indent));
             out.push_str(&format!("{}  __rpcResult\n", indent));
         } else {
+            // Arg validation at the boundary (plan 133 phase 3):
+            // oversized, malformed, or wrong-arity args answer the fixed
+            // 400 envelope BEFORE any parse-derived value reaches the
+            // body. 1 MiB is a per-call ceiling on the serialized args,
+            // separate from the transport body cap.
+            let bad_request = r#"'{"ok":false,"badRequest":true,"error":"bad request"}'"#;
+            out.push_str(&format!(
+                "{}  if length(argsJson) > 1048576\n",
+                indent
+            ));
+            out.push_str(&format!("{}    {}\n", indent, bad_request));
+            out.push_str(&format!("{}  else\n", indent));
             out.push_str(&format!(
                 "{}  let __parsed = json.parse(argsJson)\n",
                 indent
             ));
+            out.push_str(&format!(
+                "{}  if __parsed == null or length(__parsed) != {}\n",
+                indent,
+                fd.params.len()
+            ));
+            out.push_str(&format!("{}    {}\n", indent, bad_request));
+            out.push_str(&format!("{}  else\n", indent));
             let args: Vec<String> = fd
                 .params
                 .iter()
@@ -203,6 +222,9 @@ pub fn generate_dispatch_for_functions(
             ));
             out.push_str(&format!("{}  end\n", indent));
             out.push_str(&format!("{}  __rpcResult\n", indent));
+            // Close the arity/size validation else branches.
+            out.push_str(&format!("{}  end\n", indent));
+            out.push_str(&format!("{}  end\n", indent));
         }
         if gated {
             // Close the auth-gate else branch.

@@ -23,7 +23,7 @@ use std.dictionary
 
 use std.string
 
-use { caller, onResolveIdentity } from Forui.rpc
+use { caller, interfaceMode, onResolveIdentity } from Forui.rpc
 
 # Resolve the caller from the x-test-user header (test-only seam).
 def resolveTestIdentity
@@ -68,6 +68,7 @@ end
 def main
     @return Void
 do
+    interfaceMode('public')
     onResolveIdentity(resolveTestIdentity)
     var r = server.router()
     addRpcRoutes(r)

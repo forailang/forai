@@ -20,7 +20,7 @@ use std.dictionary
 
 use std.string
 
-use { authorizer, caller, onResolveIdentity } from Forui.rpc
+use { authorizer, caller, interfaceMode, onResolveIdentity } from Forui.rpc
 
 # Resolve the caller from the x-test-user header (test-only seam).
 def resolveTestIdentity
@@ -115,9 +115,25 @@ test nuke
     end
 end
 
+# Upper-case an argument (arity-1 endpoint for arg validation tests).
+remote def echoUpper
+    @param text String
+    @auth session
+    @return String
+do
+    string.toUpper(text)
+end
+
+test echoUpper
+    it 'upper-cases'
+        assert.equals(echoUpper('ab'), 'AB')
+    end
+end
+
 def main
     @return Void
 do
+    interfaceMode('public')
     onResolveIdentity(resolveTestIdentity)
     authorizer('admin', isAdmin)
     var r = server.router()
@@ -224,7 +240,14 @@ fn interface_hash(port: u16) -> String {
 }
 
 fn rpc_call(port: u16, function: &str, user: Option<&str>, hash: &str) -> String {
-    let body = format!(r#"{{"fn":"{}","args":[],"hash":"{}"}}"#, function, hash);
+    rpc_call_args(port, function, "[]", user, hash)
+}
+
+fn rpc_call_args(port: u16, function: &str, args: &str, user: Option<&str>, hash: &str) -> String {
+    let body = format!(
+        r#"{{"fn":"{}","args":{},"hash":"{}"}}"#,
+        function, args, hash
+    );
     let user_header = match user {
         Some(u) => format!("x-test-user: {}\r\n", u),
         None => String::new(),
@@ -283,6 +306,21 @@ fn auth_policies_enforced_at_dispatch_boundary() {
     // Unauthenticated nuke: 401 (authn precedes authz).
     let resp = rpc_call(port, "nuke", None, &hash);
     assert!(status_line(&resp).contains("401"), "authz unauth: {}", resp);
+
+    // Arg validation (phase 3): wrong arity and non-JSON args answer the
+    // fixed 400 envelope; a valid call still works.
+    let resp = rpc_call_args(port, "echoUpper", "[1,2]", Some("alice"), &hash);
+    assert!(status_line(&resp).contains("400"), "arity: {}", resp);
+    assert!(
+        resp.contains(r#"{"ok":false,"badRequest":true,"error":"bad request"}"#),
+        "{}",
+        resp
+    );
+    let resp = rpc_call_args(port, "echoUpper", r#""notjson""#, Some("alice"), &hash);
+    assert!(status_line(&resp).contains("400"), "malformed: {}", resp);
+    let resp = rpc_call_args(port, "echoUpper", r#"["hey"]"#, Some("alice"), &hash);
+    assert!(status_line(&resp).contains("200"), "valid args: {}", resp);
+    assert!(resp.contains(r#"{"ok":true,"value":"HEY"}"#), "{}", resp);
 
     // The 401/403 rejections must never have entered the handler bodies:
     // exactly TWO body-entry prints (authed whoami, admin nuke) plus the
