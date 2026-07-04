@@ -146,9 +146,25 @@ pub struct FunctionDeclaration {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_remote: bool,
+    /// `@auth` contract annotation (plan 133) — required on `remote def`.
+    #[serde(default)]
+    pub auth_policy: Option<AuthPolicy>,
     pub location: SourceLocation,
     #[serde(default)]
     pub doc_comment: Option<String>,
+}
+
+/// Parsed `@auth` annotation (plan 133). See the fai-parser twin for
+/// the grammar; `kind` is validated by the checker (`public`/`session`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPolicy {
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub authorizer: Option<String>,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug, Clone, Deserialize)]

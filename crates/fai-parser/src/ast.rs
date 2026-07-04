@@ -120,8 +120,32 @@ pub struct FunctionDeclaration {
     /// True when declared with `remote def` — this function is an RPC
     /// endpoint exposed over the network.
     pub is_remote: bool,
+    /// `@auth` contract annotation (plan 133). Required on every
+    /// `remote def` (default-deny — the checker rejects an undeclared
+    /// remote endpoint); invalid on non-remote functions.
+    pub auth_policy: Option<AuthPolicy>,
     pub location: SourceLocation,
     pub doc_comment: Option<String>,
+}
+
+/// Parsed `@auth` annotation (plan 133).
+///
+/// Grammar:
+///   `@auth public`                    — explicitly open endpoint
+///   `@auth session`                   — authenticated caller required
+///   `@auth session, role: 'admin'`    — session + named authorizer
+///
+/// `kind` is the policy keyword (`public`/`session` — validated by the
+/// checker, not the parser, so unknown policies get a located check
+/// error). `authorizer` is the quoted name after the optional
+/// `label: '...'` pair; `label` is the free-form key before the colon,
+/// kept so `fai fmt` round-trips the author's wording.
+#[derive(Debug, Clone)]
+pub struct AuthPolicy {
+    pub kind: String,
+    pub label: Option<String>,
+    pub authorizer: Option<String>,
+    pub location: SourceLocation,
 }
 
 #[derive(Debug, Clone)]

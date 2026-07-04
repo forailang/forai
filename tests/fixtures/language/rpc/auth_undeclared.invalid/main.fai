@@ -1,0 +1,15 @@
+# expect: check_error
+# error: must declare @auth
+
+# An endpoint that forgot its auth declaration.
+remote def ping
+    @return String
+do
+    'pong'
+end
+
+def main
+    @return Void
+do
+    print(ping())
+end

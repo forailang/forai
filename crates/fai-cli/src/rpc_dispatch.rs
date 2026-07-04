@@ -12,6 +12,12 @@ pub struct DispatchFunction {
     pub key: String,
     pub params: Vec<String>,
     pub returns_void: bool,
+    /// `@auth` policy kind (plan 133): "public" | "session". Consumed by
+    /// the generated dispatch gate (phase 2). Empty only for legacy
+    /// sources — the checker rejects undeclared remote defs.
+    pub auth: String,
+    /// Named authorizer for `session, <label>: '<name>'` policies.
+    pub auth_authorizer: Option<String>,
 }
 
 /// Generate server-side RPC dispatch code from a shared module's source.
@@ -214,6 +220,12 @@ fn dispatch_function_from_parser(fd: &FunctionDeclaration) -> DispatchFunction {
         key: fd.name.clone(),
         params: fd.params.iter().map(|p| p.name.clone()).collect(),
         returns_void: returns_void_parser(fd),
+        auth: fd
+            .auth_policy
+            .as_ref()
+            .map(|a| a.kind.clone())
+            .unwrap_or_default(),
+        auth_authorizer: fd.auth_policy.as_ref().and_then(|a| a.authorizer.clone()),
     }
 }
 
@@ -459,6 +471,8 @@ mod tests {
                 key: "data.tasks.getTasks".to_string(),
                 params: vec![],
                 returns_void: false,
+                auth: "session".to_string(),
+                auth_authorizer: None,
             }],
             "h",
         )
@@ -491,6 +505,8 @@ mod tests {
                     key: "data.tasks.get".to_string(),
                     params: vec![],
                     returns_void: false,
+                    auth: "session".to_string(),
+                    auth_authorizer: None,
                 },
                 DispatchFunction {
                     module: Some("auth.tasks".to_string()),
@@ -498,6 +514,8 @@ mod tests {
                     key: "auth.tasks.get".to_string(),
                     params: vec![],
                     returns_void: false,
+                    auth: "session".to_string(),
+                    auth_authorizer: None,
                 },
             ],
             "h",

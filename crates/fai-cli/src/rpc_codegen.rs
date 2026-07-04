@@ -197,7 +197,11 @@ pub(crate) fn rewrite_remote_def_bodies(
                 // Mark non-remote so downstream code (RPC dispatch
                 // generation, schema export) doesn't try to wire this
                 // up server-side too — the body is now a client stub.
+                // The @auth policy goes with it: enforcement lives at the
+                // SERVER dispatch boundary; the client stub is a plain
+                // def and the checker rejects @auth on non-remote fns.
                 fd.is_remote = false;
+                fd.auth_policy = None;
                 had_rewrite = true;
                 rewritten += 1;
             }

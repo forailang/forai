@@ -419,6 +419,53 @@
         );
     }
 
+    // ── Plan 133: @auth default-deny on remote defs ───────────────────
+
+    #[test]
+    fn test_remote_def_without_auth_is_an_error() {
+        check_err(
+            "# Ping.\nremote def ping\n    @return String\ndo\n  'pong'\nend\n\ndef main\n    @return Void\ndo\n  print(ping())\nend",
+            "must declare @auth",
+        );
+    }
+
+    #[test]
+    fn test_auth_on_non_remote_def_is_an_error() {
+        check_err(
+            "# Local helper.\ndef helper\n    @auth session\n    @return Int\ndo\n  1\nend\n\ndef main\n    @return Void\ndo\n  print(helper())\nend",
+            "only valid on `remote def`",
+        );
+    }
+
+    #[test]
+    fn test_unknown_auth_policy_is_an_error() {
+        check_err(
+            "# Ping.\nremote def ping\n    @auth admin\n    @return String\ndo\n  'pong'\nend\n\ndef main\n    @return Void\ndo\n  print(ping())\nend",
+            "Unknown @auth policy 'admin'",
+        );
+    }
+
+    #[test]
+    fn test_public_with_authorizer_is_an_error() {
+        check_err(
+            "# Ping.\nremote def ping\n    @auth public, role: 'admin'\n    @return String\ndo\n  'pong'\nend\n\ndef main\n    @return Void\ndo\n  print(ping())\nend",
+            "cannot take an authorizer",
+        );
+    }
+
+    #[test]
+    fn test_valid_auth_policies_pass() {
+        let source = "# Open ping.\nremote def ping\n    @auth public\n    @return String\ndo\n  'pong'\nend\n\n\
+             # Session-gated.\nremote def whoami\n    @auth session\n    @return String\ndo\n  'me'\nend\n\n\
+             # Admin-gated.\nremote def nuke\n    @auth session, role: 'admin'\n    @return String\ndo\n  'done'\nend\n\n\
+             def main\n    @return Void\ndo\n  print(ping())\n  print(whoami())\n  print(nuke())\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("all three @auth forms should check clean");
+    }
+
     #[test]
     fn test_missing_doc_comment_error_is_actionable() {
         // Regression test for the agent benchmark: doc-comment errors

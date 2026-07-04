@@ -50,6 +50,17 @@ impl RpcSurface {
                     .map(|p| p.name.clone())
                     .collect(),
                 returns_void: returns_void_compiler(&f.declaration),
+                auth: f
+                    .declaration
+                    .auth_policy
+                    .as_ref()
+                    .map(|a| a.kind.clone())
+                    .unwrap_or_default(),
+                auth_authorizer: f
+                    .declaration
+                    .auth_policy
+                    .as_ref()
+                    .and_then(|a| a.authorizer.clone()),
             })
             .collect()
     }

@@ -2766,6 +2766,7 @@
             is_private: None,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: loc,
             doc_comment: None,
         };

@@ -394,6 +394,12 @@ fn convert_fn_decl(f: &n::FunctionDeclaration) -> s::FunctionDeclaration {
         is_private: Some(f.is_private),
         is_abstract: f.is_abstract,
         is_remote: f.is_remote,
+        auth_policy: f.auth_policy.as_ref().map(|a| s::AuthPolicy {
+            kind: a.kind.clone(),
+            label: a.label.clone(),
+            authorizer: a.authorizer.clone(),
+            location: loc(&a.location),
+        }),
         location: loc(&f.location),
         doc_comment: f.doc_comment.clone(),
     }

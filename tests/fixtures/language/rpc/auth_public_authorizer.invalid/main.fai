@@ -1,0 +1,16 @@
+# expect: check_error
+# error: cannot take an authorizer
+
+# public runs no checks, so an authorizer on it is a contradiction.
+remote def ping
+    @auth public, role: 'admin'
+    @return String
+do
+    'pong'
+end
+
+def main
+    @return Void
+do
+    print(ping())
+end

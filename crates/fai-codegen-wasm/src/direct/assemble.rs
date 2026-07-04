@@ -773,6 +773,7 @@ pub fn build_program_full(
                     is_private: None,
                     is_abstract: false,
                     is_remote: false,
+                    auth_policy: None,
                     location: loc_zero.clone(),
                     doc_comment: None,
                 };
@@ -797,6 +798,7 @@ pub fn build_program_full(
         is_private: None,
         is_abstract: false,
         is_remote: false,
+        auth_policy: None,
         location: loc_zero.clone(),
         doc_comment: None,
     };
@@ -814,6 +816,7 @@ pub fn build_program_full(
         is_private: None,
         is_abstract: false,
         is_remote: false,
+        auth_policy: None,
         location: loc_zero.clone(),
         doc_comment: None,
     };

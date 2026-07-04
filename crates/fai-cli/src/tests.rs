@@ -2067,6 +2067,7 @@
             concat!(
                 "# Gets reachable tasks.\n",
                 "remote def getTasks\n",
+                "    @auth session\n",
                 "    @return String[]\n",
                 "do\n",
                 "  []\n",
@@ -2079,6 +2080,7 @@
             concat!(
                 "# Dangerous endpoint that must stay unexposed.\n",
                 "remote def deleteEverything\n",
+                "    @auth session\n",
                 "    @return String\n",
                 "do\n",
                 "  'nope'\n",
@@ -2178,6 +2180,7 @@
                 "remote def updatePerson\n",
                 "    @param id Int\n",
                 "    @param name String\n",
+                "    @auth session\n",
                 "    @return String\n",
                 "do\n",
                 "  name\n",
@@ -2250,6 +2253,7 @@
                 "remote def updatePerson\n",
                 "    @param id Int\n",
                 "    @param name String\n",
+                "    @auth session\n",
                 "    @return String\n",
                 "do\n",
                 "  updatePersonInternal(id, name)\n",

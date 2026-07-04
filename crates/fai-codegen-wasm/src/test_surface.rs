@@ -40,6 +40,7 @@ fn wrapper_decl(name: String, body: Vec<Statement>, td: &TestDeclaration) -> Fun
         is_private: None,
         is_abstract: false,
         is_remote: false,
+        auth_policy: None,
         location: td.location.clone(),
         doc_comment: None,
     }

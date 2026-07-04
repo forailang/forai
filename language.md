@@ -765,7 +765,9 @@ do
 end
 ```
 
-The remote declarations live with the domain code:
+The remote declarations live with the domain code. Every `remote def` must
+declare its auth policy with `@auth` — an endpoint cannot ship publicly
+callable by omission (default-deny; a missing `@auth` is a check error):
 
 ```fai
 # src/data/tasks/main.fai
@@ -775,20 +777,33 @@ remote type Task
 end
 
 remote def getTasks
-    @param token String
+    @auth session
     @return Task[]
 do
   ...
 end
 
 remote def addTask
-    @param token String
     @param text String
+    @auth session
     @return Task
 do
   ...
 end
 ```
+
+`@auth` policies:
+- `@auth public` — explicitly open to unauthenticated callers. The only way
+  an endpoint can be public, and it is greppable and visible in the schema.
+- `@auth session` — a resolved caller identity is required; the dispatch
+  boundary rejects unauthenticated calls with 401 before the body runs.
+- `@auth session, role: 'admin'` — session plus a named authorizer the app
+  registers; a false authorizer result rejects with 403. The label before
+  the colon (`role`) is free-form documentation; the quoted name selects
+  the registered authorizer.
+
+`@auth` is only valid on `remote def` — on a local `def` it is a check
+error. The canonical position is after `@param` lines and before `@return`.
 
 A `remote def` that exists on disk but is not reachable from the server target's
 imports is not exposed by that server. Non-remote helpers in the same module are

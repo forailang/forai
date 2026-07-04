@@ -1692,6 +1692,7 @@ impl<'a, 'c> Builder<'a, 'c> {
             is_private: None,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: s.location.clone(),
             doc_comment: None,
         };

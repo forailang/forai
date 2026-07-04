@@ -375,6 +375,7 @@ impl Parser {
         let mut type_params = Vec::new();
         let mut params = Vec::new();
         let mut return_types = Vec::new();
+        let mut auth_policy: Option<AuthPolicy> = None;
         let mut seen_param = false;
         let mut seen_return = false;
 
@@ -511,9 +512,57 @@ impl Parser {
                         location: r_loc,
                     });
                 }
+                "auth" => {
+                    // @auth <kind> [, <label>: '<authorizer>']  (plan 133)
+                    if auth_policy.is_some() {
+                        return Err(format!(
+                            "Duplicate @auth annotation at {}:{}",
+                            keyword.line, keyword.column
+                        ));
+                    }
+                    let a_loc = self.peek_location();
+                    let kind = self
+                        .consume(
+                            TokenType::Identifier,
+                            "Expected an auth policy after '@auth' (public or session)",
+                        )?
+                        .lexeme
+                        .clone();
+                    let mut label = None;
+                    let mut authorizer = None;
+                    if self.check(TokenType::Comma) {
+                        self.advance(); // consume ','
+                        let label_tok = self
+                            .consume(
+                                TokenType::Identifier,
+                                "Expected an authorizer label after ',' in @auth (e.g. role: 'admin')",
+                            )?
+                            .lexeme
+                            .clone();
+                        self.consume(
+                            TokenType::Colon,
+                            "Expected ':' after the authorizer label in @auth",
+                        )?;
+                        let name_tok = self
+                            .consume(
+                                TokenType::String,
+                                "Expected a quoted authorizer name in @auth (e.g. role: 'admin')",
+                            )?
+                            .lexeme
+                            .clone();
+                        label = Some(label_tok);
+                        authorizer = Some(name_tok);
+                    }
+                    auth_policy = Some(AuthPolicy {
+                        kind,
+                        label,
+                        authorizer,
+                        location: a_loc,
+                    });
+                }
                 other => {
                     return Err(format!(
-                        "Expected 'type', 'param', or 'return' after '@', got '{}' at {}:{}",
+                        "Expected 'type', 'param', 'return', or 'auth' after '@', got '{}' at {}:{}",
                         other, keyword.line, keyword.column
                     ));
                 }
@@ -564,6 +613,7 @@ impl Parser {
             is_private: false,
             is_abstract,
             is_remote,
+            auth_policy,
             location: loc,
             doc_comment,
         }))
@@ -624,6 +674,7 @@ impl Parser {
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: loc,
             doc_comment: None,
         }))
@@ -688,6 +739,7 @@ impl Parser {
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: loc,
             doc_comment: None,
         }))

@@ -3837,6 +3837,7 @@ pub fn try_codegen_async_engine(
             is_private: None,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: loc.clone(),
             doc_comment: None,
         };

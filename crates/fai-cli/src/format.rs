@@ -411,6 +411,15 @@ fn format_function_decl_v2(f: &FunctionDeclaration, indent: &str) -> String {
         ));
     }
 
+    // @auth (plan 133) — canonical position: after @param, before @return
+    if let Some(auth) = &f.auth_policy {
+        let authorizer_text = match (&auth.label, &auth.authorizer) {
+            (Some(label), Some(name)) => format!(", {}: '{}'", label, name),
+            _ => String::new(),
+        };
+        lines.push(format!("{}@auth {}{}", inner, auth.kind, authorizer_text));
+    }
+
     // @return declarations
     for r in &f.return_types {
         if let Some(doc) = &r.doc_comment {
@@ -1931,6 +1940,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: Some("Greets someone.".to_string()),
         };
@@ -1965,6 +1975,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: Some("Identity function.".to_string()),
         };
@@ -1998,6 +2009,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: None,
         };
@@ -2137,6 +2149,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: None,
         };
@@ -2164,6 +2177,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: None,
         };
@@ -2189,6 +2203,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: Some("Compute something.".to_string()),
         };
@@ -2225,6 +2240,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: None,
         };
@@ -2597,6 +2613,7 @@ end
             is_private: false,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: l,
             doc_comment: Some("Identity.".to_string()),
         };

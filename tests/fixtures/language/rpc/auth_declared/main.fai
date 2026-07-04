@@ -1,0 +1,55 @@
+# expect: ok
+# stdout:
+#   pong
+#   me
+#   done
+
+# Explicitly open endpoint.
+remote def ping
+    @auth public
+    @return String
+do
+    'pong'
+end
+
+# Authenticated-caller endpoint.
+remote def whoami
+    @auth session
+    @return String
+do
+    'me'
+end
+
+# Session + named authorizer endpoint.
+remote def nuke
+    @auth session, role: 'admin'
+    @return String
+do
+    'done'
+end
+
+test ping
+    it 'answers pong'
+        assert.equals(ping(), 'pong')
+    end
+end
+
+test whoami
+    it 'answers me'
+        assert.equals(whoami(), 'me')
+    end
+end
+
+test nuke
+    it 'answers done'
+        assert.equals(nuke(), 'done')
+    end
+end
+
+def main
+    @return Void
+do
+    print(ping())
+    print(whoami())
+    print(nuke())
+end

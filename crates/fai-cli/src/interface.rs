@@ -28,6 +28,12 @@ pub struct FunctionSpec {
     pub params: Vec<ParamSpec>,
     pub returns: Vec<String>,
     pub doc_comment: Option<String>,
+    /// `@auth` policy kind (plan 133): "public" | "session". Reported in
+    /// the schema so public endpoints are visible/auditable. Empty when
+    /// the source predates @auth (checker rejects that at build time).
+    pub auth: String,
+    /// Named authorizer for `session, <label>: '<name>'` policies.
+    pub auth_authorizer: Option<String>,
 }
 
 #[derive(Debug)]
@@ -168,6 +174,12 @@ pub(crate) fn extract_function_with_origin(
         params,
         returns,
         doc_comment: fd.doc_comment.clone(),
+        auth: fd
+            .auth_policy
+            .as_ref()
+            .map(|a| a.kind.clone())
+            .unwrap_or_default(),
+        auth_authorizer: fd.auth_policy.as_ref().and_then(|a| a.authorizer.clone()),
     }
 }
 
@@ -338,7 +350,16 @@ pub fn spec_to_json(spec: &InterfaceSpec) -> String {
         }
         json.push_str("],\n");
         let rets: Vec<String> = f.returns.iter().map(|r| format!("\"{}\"", r)).collect();
-        json.push_str(&format!("      \"returns\": [{}]\n", rets.join(", ")));
+        json.push_str(&format!("      \"returns\": [{}]", rets.join(", ")));
+        // @auth visibility (plan 133): which endpoints are public is part
+        // of the schema, so it is auditable without reading source.
+        if !f.auth.is_empty() {
+            json.push_str(&format!(",\n      \"auth\": \"{}\"", f.auth));
+            if let Some(authorizer) = &f.auth_authorizer {
+                json.push_str(&format!(",\n      \"authorizer\": \"{}\"", authorizer));
+            }
+        }
+        json.push('\n');
         json.push_str("    }");
         if i < spec.functions.len() - 1 {
             json.push(',');
@@ -466,6 +487,7 @@ mod tests {
             is_private,
             is_abstract: false,
             is_remote: false,
+            auth_policy: None,
             location: loc(),
             doc_comment: None,
         }

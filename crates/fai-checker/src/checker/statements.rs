@@ -162,6 +162,65 @@ impl Checker {
             }
         }
 
+        // @auth enforcement (plan 133). Default-deny: every remote def
+        // must declare its policy, so a new endpoint cannot ship publicly
+        // callable by omission. `public` is the only way to be open, and
+        // it is greppable.
+        if fd.is_remote && !is_synthetic {
+            match &fd.auth_policy {
+                None => {
+                    let err = CheckError::new(format!(
+                        "remote def '{}' must declare @auth. Every RPC endpoint \
+                         declares its auth policy in the contract:\n\n  \
+                         @auth session            # authenticated caller required\n  \
+                         @auth public             # explicitly open to anyone\n  \
+                         @auth session, role: 'admin'  # session + named authorizer\n\n\
+                         Add the line after @param and before @return.",
+                        fd.name
+                    ));
+                    self.collected_errors
+                        .push(self.attach_location(err, &fd.location));
+                }
+                Some(auth) => {
+                    match auth.kind.as_str() {
+                        "public" => {
+                            if auth.authorizer.is_some() {
+                                let err = CheckError::new(format!(
+                                    "@auth public on '{}' cannot take an authorizer — \
+                                     public endpoints run no auth checks. Use \
+                                     `@auth session, {}: '{}'` to require one.",
+                                    fd.name,
+                                    auth.label.as_deref().unwrap_or("role"),
+                                    auth.authorizer.as_deref().unwrap_or(""),
+                                ));
+                                self.collected_errors
+                                    .push(self.attach_location(err, &auth.location));
+                            }
+                        }
+                        "session" => {}
+                        other => {
+                            let err = CheckError::new(format!(
+                                "Unknown @auth policy '{}' on '{}'. Valid policies: \
+                                 `public`, `session`, or `session, <label>: '<authorizer>'`.",
+                                other, fd.name
+                            ));
+                            self.collected_errors
+                                .push(self.attach_location(err, &auth.location));
+                        }
+                    }
+                }
+            }
+        } else if fd.auth_policy.is_some() && !fd.is_remote {
+            let err = CheckError::new(format!(
+                "@auth is only valid on `remote def` — '{}' is not remote. \
+                 Auth policies gate the RPC dispatch boundary; a local \
+                 function has no caller to authenticate.",
+                fd.name
+            ));
+            self.collected_errors
+                .push(self.attach_location(err, &fd.location));
+        }
+
         // Abstract functions (no body) are interface declarations —
         // validate param types but skip body/return checking.
         if fd.is_abstract {
