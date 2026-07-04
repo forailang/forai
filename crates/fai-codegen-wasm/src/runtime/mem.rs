@@ -40,55 +40,39 @@ pub(super) fn emit_current_task(current_task_global: Option<u32>) -> Function {
     f
 }
 
-/// Emit `table_base + current*REC_SIZE + field` and load the i32 there,
-/// guarded by `g_current >= 0` (else the given fallback). Shared by the
-/// task-context helpers, which are emitted outside the async engine and
-/// therefore inline the record math.
-fn emit_current_record_i32_read(
-    f: &mut Function,
-    current_global: u32,
-    table_base_global: u32,
-    field_offset: u64,
-    fallback: i32,
-) {
-    f.instruction(&Instruction::GlobalGet(current_global));
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::I32GeS);
-    f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
-        ValType::I32,
-    )));
-    f.instruction(&Instruction::GlobalGet(table_base_global));
-    f.instruction(&Instruction::GlobalGet(current_global));
-    f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
-    f.instruction(&Instruction::I32Mul);
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Load(MemArg {
-        offset: field_offset,
-        align: 0,
-        memory_index: 0,
-    }));
-    f.instruction(&Instruction::Else);
-    f.instruction(&Instruction::I32Const(fallback));
-    f.instruction(&Instruction::End);
-}
-
 /// Current task's inherited request-context id (plan 133): O_CTX of the
-/// current record; -1 when there is no current task or in sync modules.
-/// Backs the `taskContextId()` builtin.
-pub(super) fn emit_task_ctx(sched: Option<(u32, u32)>) -> Function {
+/// current record when a task is running; otherwise the ambient
+/// `fallback_global` slot. That fallback makes `taskContextId()` a
+/// coherent get/set pair even at top level / in sync modules (where
+/// `g_current` is -1) — there is no task concurrency there, so a single
+/// ambient slot is correct, and it lets direct-call unit tests of
+/// `actAs`/`caller()` behave like the async server path. Backs the
+/// `taskContextId()` builtin.
+pub(super) fn emit_task_ctx(sched: Option<(u32, u32)>, fallback_global: u32) -> Function {
     let mut f = Function::new([]);
+    let empty = wasm_encoder::BlockType::Result(ValType::I32);
     match sched {
         Some((current_global, table_base_global)) => {
-            emit_current_record_i32_read(
-                &mut f,
-                current_global,
-                table_base_global,
-                crate::async_engine::O_CTX,
-                -1,
-            );
+            f.instruction(&Instruction::GlobalGet(current_global));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::GlobalGet(table_base_global));
+            f.instruction(&Instruction::GlobalGet(current_global));
+            f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: crate::async_engine::O_CTX,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::Else);
+            f.instruction(&Instruction::GlobalGet(fallback_global));
+            f.instruction(&Instruction::End);
         }
         None => {
-            f.instruction(&Instruction::I32Const(-1));
+            f.instruction(&Instruction::GlobalGet(fallback_global));
         }
     }
     f.instruction(&Instruction::End);
@@ -96,30 +80,39 @@ pub(super) fn emit_task_ctx(sched: Option<(u32, u32)>) -> Function {
 }
 
 /// Stamp the current task's request-context id (plan 133): write O_CTX
-/// on the current record. No-op when there is no current task or in
-/// sync modules. Backs the `setTaskContextId(id)` builtin; children
-/// spawned after the stamp inherit it (see `emit_spawn`).
-pub(super) fn emit_set_task_ctx(sched: Option<(u32, u32)>) -> Function {
+/// on the current record when a task is running, else the ambient
+/// `fallback_global` (see `emit_task_ctx`). Backs `setTaskContextId(id)`;
+/// children spawned after the stamp inherit it (see `emit_spawn`).
+pub(super) fn emit_set_task_ctx(sched: Option<(u32, u32)>, fallback_global: u32) -> Function {
     // param 0: id (i32)
     let mut f = Function::new([]);
-    if let Some((current_global, table_base_global)) = sched {
-        let empty = wasm_encoder::BlockType::Empty;
-        f.instruction(&Instruction::GlobalGet(current_global));
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::I32GeS);
-        f.instruction(&Instruction::If(empty));
-        f.instruction(&Instruction::GlobalGet(table_base_global));
-        f.instruction(&Instruction::GlobalGet(current_global));
-        f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
-        f.instruction(&Instruction::I32Mul);
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Store(MemArg {
-            offset: crate::async_engine::O_CTX,
-            align: 0,
-            memory_index: 0,
-        }));
-        f.instruction(&Instruction::End);
+    let empty = wasm_encoder::BlockType::Empty;
+    match sched {
+        Some((current_global, table_base_global)) => {
+            f.instruction(&Instruction::GlobalGet(current_global));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::GlobalGet(table_base_global));
+            f.instruction(&Instruction::GlobalGet(current_global));
+            f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I32Store(MemArg {
+                offset: crate::async_engine::O_CTX,
+                align: 0,
+                memory_index: 0,
+            }));
+            f.instruction(&Instruction::Else);
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::GlobalSet(fallback_global));
+            f.instruction(&Instruction::End);
+        }
+        None => {
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::GlobalSet(fallback_global));
+        }
     }
     f.instruction(&Instruction::End);
     f

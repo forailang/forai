@@ -991,6 +991,17 @@
             },
             &ConstExpr::i32_const(0),
         );
+        // Ambient task-context fallback (index 6, plan 133) — the slot the
+        // `emit_all(.., 6)` call below hands taskContextId/setTaskContextId
+        // for the no-current-task case. -1 = none.
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(-1),
+        );
         module.section(&globals);
 
         let import_count = import_sigs.len() as u32;
@@ -1034,7 +1045,7 @@
             .map(|i| Some(i as u32))
             .collect();
         let known = runtime::KnownStrings::default();
-        for f in runtime::emit_all(import_count, &import_remap, &known, 4, 5, bucket_base, None, None) {
+        for f in runtime::emit_all(import_count, &import_remap, &known, 4, 5, bucket_base, None, None, 6) {
             code.function(&f);
         }
         for (_, f) in &program.top_level {

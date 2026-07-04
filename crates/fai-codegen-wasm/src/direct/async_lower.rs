@@ -4723,6 +4723,12 @@ pub fn try_codegen_async_engine(
     // earlier global indices.
     globals.global(i32mut, &ConstExpr::i32_const(-1)); // completed_head
     globals.global(i32mut, &ConstExpr::i32_const(-1)); // completed_tail
+    // Ambient request-context id fallback (plan 133): the slot
+    // taskContextId()/setTaskContextId() use when g_current is -1
+    // (top level, before/after any task). Per-task O_CTX is used while a
+    // task runs; this covers the no-current-task case so the pair is
+    // coherent everywhere. -1 = none.
+    globals.global(i32mut, &ConstExpr::i32_const(-1)); // task_ctx_fallback
     module.section(&globals);
 
     // Heap free-list / live-count globals, appended after fixed+sched+
@@ -4732,6 +4738,7 @@ pub fn try_codegen_async_engine(
     let timer_waiting_global = live_count_global + 1;
     let completed_head_global = timer_waiting_global + 1;
     let completed_tail_global = completed_head_global + 1;
+    let task_ctx_fallback_global = completed_tail_global + 1; // ambient ctx slot (plan 133)
 
     let mut exports = ExportSection::new();
     exports.export("_start_async", ExportKind::Func, start_async_idx);
@@ -4864,6 +4871,7 @@ pub fn try_codegen_async_engine(
         bucket_base,
         Some(layout.g_current),
         Some((layout.g_table_base, layout.capacity)),
+        task_ctx_fallback_global,
     ) {
         code.function(&f);
     }

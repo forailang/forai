@@ -1784,6 +1784,18 @@ pub fn assemble_wasm_module_with_test_flag(
         },
         &ConstExpr::i32_const(0),
     );
+    // Ambient request-context id fallback (plan 133): the slot
+    // taskContextId()/setTaskContextId() use when no scheduler task is
+    // current. Sync modules have no scheduler, so this is their only
+    // slot; -1 = none. Appended last to keep earlier indices unchanged.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(-1),
+    );
     module.section(&globals);
 
     // Function indices use the POST-filter import count so they
@@ -1879,6 +1891,7 @@ pub fn assemble_wasm_module_with_test_flag(
     let mut code = CodeSection::new();
     let freelist_global = 4 + program.module_var_count; // appended after fixed+module-var globals
     let live_count_global = freelist_global + 1; // appended after the free-list
+    let task_ctx_fallback_global = live_count_global + 1; // ambient ctx slot (plan 133)
     for f in crate::runtime::emit_all(
         actual_import_count,
         &import_remap,
@@ -1890,6 +1903,7 @@ pub fn assemble_wasm_module_with_test_flag(
         // and taskWaiterId() has no table to read.
         None,
         None,
+        task_ctx_fallback_global,
     ) {
         code.function(&f);
     }

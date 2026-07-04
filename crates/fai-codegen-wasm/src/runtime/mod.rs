@@ -32,6 +32,7 @@ pub fn emit_all(
     bucket_base: u32,
     current_task_global: Option<u32>,
     task_table: Option<(u32, i32)>,
+    task_ctx_fallback_global: u32,
 ) -> Vec<Function> {
     let base = import_count;
     vec![
@@ -93,7 +94,13 @@ pub fn emit_all(
         emit_concat_move(base),                    // rt_concat_move
         emit_current_task(current_task_global),    // rt_current_task
         emit_task_waiter(task_table),              // rt_task_waiter
-        emit_task_ctx(current_task_global.zip(task_table.map(|(tb, _)| tb))), // rt_task_ctx
-        emit_set_task_ctx(current_task_global.zip(task_table.map(|(tb, _)| tb))), // rt_set_task_ctx
+        emit_task_ctx(
+            current_task_global.zip(task_table.map(|(tb, _)| tb)),
+            task_ctx_fallback_global,
+        ), // rt_task_ctx
+        emit_set_task_ctx(
+            current_task_global.zip(task_table.map(|(tb, _)| tb)),
+            task_ctx_fallback_global,
+        ), // rt_set_task_ctx
     ]
 }
