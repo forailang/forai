@@ -2030,7 +2030,7 @@
                 "    @param request HttpRequest\n",
                 "    @param specJson String\n",
                 "    @param specHash String\n",
-                "    @param dispatch (String, String) -> String\n",
+                "    @param dispatch (String, String, Dictionary) -> String\n",
                 "    @return HttpResponse\n",
                 "do\n",
                 "  server.json(200, '{}')\n",

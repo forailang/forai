@@ -11,7 +11,7 @@ use super::debug_table::DbgTable;
 use wasmtime::{Instance, Store};
 
 // Task record layout — mirrors `fai-codegen-wasm/src/async_engine.rs`.
-const REC_SIZE: usize = 56;
+const REC_SIZE: usize = 64;
 const O_STATUS: usize = 0;
 const O_RESUME: usize = 4;
 const O_JOIN: usize = 12;

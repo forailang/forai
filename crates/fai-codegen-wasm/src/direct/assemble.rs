@@ -1886,6 +1886,10 @@ pub fn assemble_wasm_module_with_test_flag(
         freelist_global,
         live_count_global,
         bucket_base,
+        // Sync modules have no scheduler — taskId() is a constant -1
+        // and taskWaiterId() has no table to read.
+        None,
+        None,
     ) {
         code.function(&f);
     }

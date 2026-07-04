@@ -23,6 +23,150 @@ pub(super) fn emit_live_objects(live_count_global: u32) -> Function {
     f
 }
 
+/// Current scheduler task id (plan 133): the async engine's `g_current`
+/// global, whose index is baked here at emit time. Sync modules have no
+/// scheduler — they get a constant -1. Backs the `taskId()` builtin.
+pub(super) fn emit_current_task(current_task_global: Option<u32>) -> Function {
+    let mut f = Function::new([]);
+    match current_task_global {
+        Some(g) => {
+            f.instruction(&Instruction::GlobalGet(g));
+        }
+        None => {
+            f.instruction(&Instruction::I32Const(-1));
+        }
+    }
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Emit `table_base + current*REC_SIZE + field` and load the i32 there,
+/// guarded by `g_current >= 0` (else the given fallback). Shared by the
+/// task-context helpers, which are emitted outside the async engine and
+/// therefore inline the record math.
+fn emit_current_record_i32_read(
+    f: &mut Function,
+    current_global: u32,
+    table_base_global: u32,
+    field_offset: u64,
+    fallback: i32,
+) {
+    f.instruction(&Instruction::GlobalGet(current_global));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32GeS);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+        ValType::I32,
+    )));
+    f.instruction(&Instruction::GlobalGet(table_base_global));
+    f.instruction(&Instruction::GlobalGet(current_global));
+    f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: field_offset,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::I32Const(fallback));
+    f.instruction(&Instruction::End);
+}
+
+/// Current task's inherited request-context id (plan 133): O_CTX of the
+/// current record; -1 when there is no current task or in sync modules.
+/// Backs the `taskContextId()` builtin.
+pub(super) fn emit_task_ctx(sched: Option<(u32, u32)>) -> Function {
+    let mut f = Function::new([]);
+    match sched {
+        Some((current_global, table_base_global)) => {
+            emit_current_record_i32_read(
+                &mut f,
+                current_global,
+                table_base_global,
+                crate::async_engine::O_CTX,
+                -1,
+            );
+        }
+        None => {
+            f.instruction(&Instruction::I32Const(-1));
+        }
+    }
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Stamp the current task's request-context id (plan 133): write O_CTX
+/// on the current record. No-op when there is no current task or in
+/// sync modules. Backs the `setTaskContextId(id)` builtin; children
+/// spawned after the stamp inherit it (see `emit_spawn`).
+pub(super) fn emit_set_task_ctx(sched: Option<(u32, u32)>) -> Function {
+    // param 0: id (i32)
+    let mut f = Function::new([]);
+    if let Some((current_global, table_base_global)) = sched {
+        let empty = wasm_encoder::BlockType::Empty;
+        f.instruction(&Instruction::GlobalGet(current_global));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32GeS);
+        f.instruction(&Instruction::If(empty));
+        f.instruction(&Instruction::GlobalGet(table_base_global));
+        f.instruction(&Instruction::GlobalGet(current_global));
+        f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: crate::async_engine::O_CTX,
+            align: 0,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// Awaiting-parent (waiter) of a task id (plan 133): O_WAITER from the
+/// task record at `table_base + id*REC_SIZE`. -1 for out-of-range ids
+/// (covers the host/root sentinel -2 becoming visible: callers treat any
+/// negative as "no parent") and in sync modules. Backs `taskWaiterId`.
+pub(super) fn emit_task_waiter(sched: Option<(u32, i32)>) -> Function {
+    // param 0: id (i32)
+    let mut f = Function::new([]);
+    let empty = wasm_encoder::BlockType::Empty;
+    match sched {
+        Some((table_base_global, capacity)) => {
+            // if id < 0 || id >= capacity { return -1 }
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32LtS);
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I32Const(capacity));
+            f.instruction(&Instruction::I32GeS);
+            f.instruction(&Instruction::I32Or);
+            f.instruction(&Instruction::If(empty));
+            f.instruction(&Instruction::I32Const(-1));
+            f.instruction(&Instruction::Return);
+            f.instruction(&Instruction::End);
+            // load(table_base + id*REC_SIZE + O_WAITER)
+            f.instruction(&Instruction::GlobalGet(table_base_global));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I32Const(crate::async_engine::REC_SIZE));
+            f.instruction(&Instruction::I32Mul);
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: crate::async_engine::O_WAITER,
+                align: 0,
+                memory_index: 0,
+            }));
+        }
+        None => {
+            f.instruction(&Instruction::I32Const(-1));
+        }
+    }
+    f.instruction(&Instruction::End);
+    f
+}
+
 /// FAI_HEAP_VERIFY: emit a loop scanning every free-bucket head for an
 /// implausible pointer (TRAP_FREELIST_CORRUPT) or an overwritten poison
 /// tag (TRAP_FREED_DIRTY). `idx_local`/`node_local` are caller-provided

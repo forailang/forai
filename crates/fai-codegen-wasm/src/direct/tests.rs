@@ -1034,7 +1034,7 @@
             .map(|i| Some(i as u32))
             .collect();
         let known = runtime::KnownStrings::default();
-        for f in runtime::emit_all(import_count, &import_remap, &known, 4, 5, bucket_base) {
+        for f in runtime::emit_all(import_count, &import_remap, &known, 4, 5, bucket_base, None, None) {
             code.function(&f);
         }
         for (_, f) in &program.top_level {

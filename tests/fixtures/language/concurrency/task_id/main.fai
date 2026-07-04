@@ -1,0 +1,30 @@
+# expect: ok
+# stdout:
+#   distinct: true
+#   main-has-id: true
+#   stable-across-yield: true
+
+# Report this task's id after a yield.
+def myId
+    @return Int
+do
+    sleep(5)
+    taskId()
+end
+
+test myId
+    it 'returns a non-negative id under the scheduler'
+        assert.isTrue(myId() >= 0)
+    end
+end
+
+def main
+    @return Void
+do
+    let a, b = all(myId(), myId())
+    print('distinct: ' + toString(a != b))
+    print('main-has-id: ' + toString(taskId() >= 0))
+    let before = taskId()
+    sleep(5)
+    print('stable-across-yield: ' + toString(taskId() == before))
+end

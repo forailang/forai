@@ -2794,6 +2794,48 @@ impl<'a, 'c> Builder<'a, 'c> {
                 self.emit(Instruction::I64ReinterpretF64);
                 Ok(Some(()))
             }
+            // ── current async task id (plan 133) ──
+            "taskId" => {
+                if !args.is_empty() {
+                    return Err(BuildError::UnsupportedExpression("taskId-arg-count"));
+                }
+                // Scheduler global index is baked into the runtime helper
+                // at emit time (same trick as __liveObjects). Sync modules
+                // return -1.
+                self.emit(Instruction::Call(self.rt().base + RT_CURRENT_TASK));
+                self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
+                Ok(Some(()))
+            }
+            // ── inherited request-context id (plan 133) ──
+            "taskContextId" => {
+                if !args.is_empty() {
+                    return Err(BuildError::UnsupportedExpression("taskContextId-arg-count"));
+                }
+                self.emit(Instruction::Call(self.rt().base + RT_TASK_CTX));
+                self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
+                Ok(Some(()))
+            }
+            "setTaskContextId" => {
+                if args.len() != 1 {
+                    return Err(BuildError::UnsupportedExpression(
+                        "setTaskContextId-arg-count",
+                    ));
+                }
+                self.emit_int_arg_from_expr(args[0])?;
+                self.emit(Instruction::Call(self.rt().base + RT_SET_TASK_CTX));
+                self.emit(Instruction::I64Const(VAL_VOID));
+                Ok(Some(()))
+            }
+            // ── awaiting-parent of a task id (plan 133) ──
+            "taskWaiterId" => {
+                if args.len() != 1 {
+                    return Err(BuildError::UnsupportedExpression("taskWaiterId-arg-count"));
+                }
+                self.emit_int_arg_from_expr(args[0])?;
+                self.emit(Instruction::Call(self.rt().base + RT_TASK_WAITER));
+                self.emit(Instruction::Call(self.rt().base + RT_MAKE_INT));
+                Ok(Some(()))
+            }
             // ── debug: live heap-object counter (plan 115) ──
             "__liveObjects" => {
                 if !args.is_empty() {

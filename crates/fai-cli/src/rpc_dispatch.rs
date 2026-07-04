@@ -69,10 +69,14 @@ pub fn generate_dispatch_for_functions(
     }
     out.push('\n');
 
-    // Generate dispatch function
+    // Generate dispatch function. `ctx` is the per-request context built
+    // by Forui.rpc.handleRpcRequest (plan 133): resolved caller identity
+    // plus request metadata. The @auth gate (phase 2) consumes it before
+    // any handler body runs.
     out.push_str("# Auto-generated RPC dispatch.\ndef __rpcDispatch\n");
     out.push_str("    @param fnName String\n");
     out.push_str("    @param argsJson String\n");
+    out.push_str("    @param ctx Dictionary\n");
     out.push_str("    @return String\n");
     out.push_str("do\n");
 
@@ -187,7 +191,13 @@ pub fn generate_dispatch_for_functions(
         .iter()
         .map(|fd| format!("\"{}\"", fd.key))
         .collect();
-    let spec = format!("{{\"functions\":[{}]}}", fn_names.join(","));
+    // The served spec includes the hash so clients (and tests) can build
+    // valid /fai/rpc calls from GET /fai/interface alone.
+    let spec = format!(
+        "{{\"hash\":\"{}\",\"functions\":[{}]}}",
+        hash,
+        fn_names.join(",")
+    );
 
     // Generate handler — uses HttpRequest (typed) instead of Dictionary
     out.push_str("# Auto-generated RPC handler.\ndef __rpcHandler\n");

@@ -80,7 +80,29 @@ pub const RT_LIVE_OBJECTS: u32 = 43;
 // owned string (rc == 1) with spare block capacity; grows with 2× capacity
 // otherwise; falls back to RT_ADD semantics for non-string / shared values.
 pub const RT_CONCAT_MOVE: u32 = 44;
-pub const RT_COUNT: u32 = 45;
+// Current async task id (plan 133): reads the scheduler's `g_current`
+// global in async modules (index baked at emit time, like
+// RT_LIVE_OBJECTS); returns -1 in sync modules, which have no
+// scheduler. Backs the `taskId()` builtin — per-task keying for
+// request-scoped state that survives cooperative yields.
+pub const RT_CURRENT_TASK: u32 = 45;
+// Awaiting-parent (waiter) of a task id (plan 133): reads O_WAITER from
+// the task record, -1 for out-of-range ids or in sync modules. Backs the
+// `taskWaiterId(id)` builtin — request-scoped state walks this chain so
+// auto-awaited child tasks inherit their request's context while
+// detached (`nowait`) tasks do not.
+pub const RT_TASK_WAITER: u32 = 46;
+// Inherited request-context id of the CURRENT task (plan 133): reads
+// O_CTX from the current task record; -1 when unset or in sync modules.
+// `spawn` copies the field parent→child, so this is the reliable
+// "which request am I serving" key — backs `taskContextId()`.
+pub const RT_TASK_CTX: u32 = 47;
+// Stamp the current task's request-context id (plan 133): writes O_CTX
+// on the current record (no-op in sync modules / with no current task).
+// Backs `setTaskContextId(id)` — the framework calls it once per
+// request on the route task; descendants inherit via spawn.
+pub const RT_SET_TASK_CTX: u32 = 48;
+pub const RT_COUNT: u32 = 49;
 
 // Object type tags for heap objects
 pub const OBJ_TAG_STRING: i32 = 0;
@@ -831,6 +853,18 @@ pub fn type_signatures() -> Vec<(Vec<ValType>, Vec<ValType>)> {
         (vec![], vec![ValType::I32]),
         // RT_CONCAT_MOVE: (i64, i64) -> i64
         (vec![ValType::I64, ValType::I64], vec![ValType::I64]),
+        // RT_CURRENT_TASK: () -> i32 — current scheduler task id (-1 in
+        // sync modules).
+        (vec![], vec![ValType::I32]),
+        // RT_TASK_WAITER: (i32 id) -> i32 — awaiting-parent task id, -1
+        // when none/out-of-range/sync.
+        (vec![ValType::I32], vec![ValType::I32]),
+        // RT_TASK_CTX: () -> i32 — current task's inherited request-context
+        // id (-1 unset/sync).
+        (vec![], vec![ValType::I32]),
+        // RT_SET_TASK_CTX: (i32) -> () — stamp the current task's
+        // request-context id (no-op sync/no-current).
+        (vec![ValType::I32], vec![]),
     ]
 }
 
@@ -1561,6 +1595,10 @@ pub fn rt_fn_names() -> [&'static str; RT_COUNT as usize] {
         "rt_release",
         "rt_live_objects",
         "rt_concat_move",
+        "rt_current_task",
+        "rt_task_waiter",
+        "rt_task_ctx",
+        "rt_set_task_ctx",
     ]
 }
 

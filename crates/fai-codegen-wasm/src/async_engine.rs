@@ -22,7 +22,7 @@
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 // ─── Task record layout (bytes, in linear memory) ───────────────────
-pub const REC_SIZE: i32 = 56;
+pub const REC_SIZE: i32 = 64;
 // i32: task status (READY/RUNNING/WAITING/COMPLETE/FAILED). Public def below.
 const O_RESUME: u64 = 4; // i32: function-table index of the resume fn
 /// i32: frame pointer (locals live across suspension). Public so the
@@ -52,6 +52,14 @@ pub const O_STATUS: u64 = 0;
 /// (sound: a missed spawn site leaks rather than freeing a wrong size). Sits in
 /// the spare i32 at offset 52 (`O_RSTATE` is the last used field at 48).
 pub const O_FRAME_SIZE: u64 = 52;
+/// i32: inherited request-context id (plan 133); -1 = none. `spawn`
+/// copies it from the spawning task (`g_current`), so every descendant
+/// of a request's root task — auto-awaited children AND detached
+/// `nowait` chains alike — carries the request id it was born under.
+/// The framework (Forui.rpc) allocates one id per request, stamps the
+/// route task via `setTaskContextId`, and keys per-request state by it.
+/// Offset 60 is padding (REC_SIZE 64 keeps records 8-aligned).
+pub const O_CTX: u64 = 56;
 
 const ST_READY: i32 = 0;
 const ST_RUNNING: i32 = 1;
@@ -368,6 +376,21 @@ fn emit_spawn(l: &SchedLayout) -> Function {
     // size. If a site forgets, this 0 means "don't free" — a leak, not a
     // corruption (vs. a stale size left in a recycled slot).
     set_i32(&mut f, O_FRAME_SIZE, Instruction::I32Const(0));
+    // Inherit the request-context id from the spawning task (plan 133):
+    // child.ctx = g_current >= 0 ? table[g_current].ctx : -1. Host-driven
+    // spawns (main, route tasks before the framework stamps them) start
+    // at -1.
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::GlobalGet(l.g_current));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32GeS);
+    f.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    rec_addr_global(&mut f, l, l.g_current);
+    f.instruction(&Instruction::I32Load(ma(O_CTX)));
+    f.instruction(&Instruction::Else);
+    f.instruction(&Instruction::I32Const(-1));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::I32Store(ma(O_CTX)));
     // live++ (one more task not yet finished)
     f.instruction(&Instruction::GlobalGet(l.g_live));
     f.instruction(&Instruction::I32Const(1));

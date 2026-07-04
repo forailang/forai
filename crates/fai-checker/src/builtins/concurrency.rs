@@ -12,6 +12,23 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
     // calls auto-await by default, so a `wait` spelling would read like an
     // await keyword. See language.md "Concurrency".
     ins(b, "sleep", &[p("ms", Type::Int)], &[Type::Void]);
+    // `taskId()` — the current scheduler task's id (plan 133), -1 in a
+    // sync (non-scheduler) module. The key for request/task-scoped state
+    // that must survive cooperative yields (forui's per-request RPC
+    // context uses it; a module-global alone bleeds across tasks).
+    ins(b, "taskId", &[], &[Type::Int]);
+    // `taskWaiterId(id)` — the task currently awaiting `id` (its parent
+    // for auto-awaited calls), or -1 when none/detached/sync. Together
+    // with taskId() this lets request-scoped state walk the await chain
+    // so child tasks inherit their request's context.
+    ins(b, "taskWaiterId", &[p("id", Type::Int)], &[Type::Int]);
+    // Inherited request-context id (plan 133): the scheduler copies it
+    // parent -> child at spawn, so every descendant of a stamped task
+    // reports the same id. `taskContextId()` reads the current task's;
+    // `setTaskContextId(id)` stamps it (framework use — Forui.rpc marks
+    // each request's route task; -1 = none).
+    ins(b, "taskContextId", &[], &[Type::Int]);
+    ins(b, "setTaskContextId", &[p("id", Type::Int)], &[Type::Void]);
 }
 
 #[cfg(test)]

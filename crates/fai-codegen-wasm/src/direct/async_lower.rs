@@ -4862,6 +4862,8 @@ pub fn try_codegen_async_engine(
         freelist_global,
         live_count_global,
         bucket_base,
+        Some(layout.g_current),
+        Some((layout.g_table_base, layout.capacity)),
     ) {
         code.function(&f);
     }

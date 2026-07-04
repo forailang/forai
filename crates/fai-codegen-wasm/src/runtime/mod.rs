@@ -30,6 +30,8 @@ pub fn emit_all(
     freelist_global: u32,
     live_count_global: u32,
     bucket_base: u32,
+    current_task_global: Option<u32>,
+    task_table: Option<(u32, i32)>,
 ) -> Vec<Function> {
     let base = import_count;
     vec![
@@ -89,5 +91,9 @@ pub fn emit_all(
         emit_release(base, bucket_base, import_remap), // rt_release
         emit_live_objects(live_count_global),      // rt_live_objects
         emit_concat_move(base),                    // rt_concat_move
+        emit_current_task(current_task_global),    // rt_current_task
+        emit_task_waiter(task_table),              // rt_task_waiter
+        emit_task_ctx(current_task_global.zip(task_table.map(|(tb, _)| tb))), // rt_task_ctx
+        emit_set_task_ctx(current_task_global.zip(task_table.map(|(tb, _)| tb))), // rt_set_task_ctx
     ]
 }
