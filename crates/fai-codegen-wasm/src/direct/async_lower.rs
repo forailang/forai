@@ -603,6 +603,16 @@ enum Incoming {
         bind: Option<String>,
         on_error: Option<(usize, String)>,
     },
+    /// Resume of an `all(...)` bound to a SINGLE name: `let results =
+    /// all(c1(), c2(), ...)`. After every child completes, collect the `count`
+    /// child results into a fresh Tuple and bind it to `name` (whereas
+    /// `Awaited` destructures each child into its own name). `results[k]` then
+    /// indexes the tuple.
+    AwaitedAllTuple {
+        name: String,
+        count: usize,
+        on_error: Option<(usize, String)>,
+    },
 }
 
 /// A basic block in the resumable function's CFG: what to assign at entry
@@ -1183,16 +1193,28 @@ impl<'a> CfgBuilder<'a> {
                 _ => unreachable!(),
             };
             if let Some(children) = all_call(value, self.fns) {
-                if binds.len() != children.len() {
-                    return Err(());
-                }
+                let n = children.len();
                 let on_error = self.handler();
                 let next = self.new_block();
                 self.blocks[cur].term = Term::All { children, next };
-                self.blocks[next].incoming = Incoming::Awaited {
-                    binds: binds.into_iter().map(Some).collect(),
-                    on_error,
-                };
+                if binds.len() == n {
+                    // `let (a, b) = all(c1(), c2())` — destructure each child
+                    // result into its own name.
+                    self.blocks[next].incoming = Incoming::Awaited {
+                        binds: binds.into_iter().map(Some).collect(),
+                        on_error,
+                    };
+                } else if binds.len() == 1 {
+                    // `let results = all(c1(), c2())` — collect the child
+                    // results into a single tuple bound to `results`.
+                    self.blocks[next].incoming = Incoming::AwaitedAllTuple {
+                        name: binds.into_iter().next().unwrap(),
+                        count: n,
+                        on_error,
+                    };
+                } else {
+                    return Err(());
+                }
                 return Ok(Flow::Continue(next));
             }
         }
@@ -2576,6 +2598,65 @@ pub(super) fn build_resume_fn(
                     b.emit(Instruction::Call(layout.task_result));
                     b.emit(Instruction::Call(b.rt().base + RT_RELEASE));
                 }
+                free_pending(&mut b, slot as u64);
+            }
+        }
+        if let Incoming::AwaitedAllTuple {
+            name,
+            count,
+            on_error,
+        } = &blk.incoming
+        {
+            // A failed child routes its error (to catch, or fails this task) —
+            // same as the destructuring `Awaited` path.
+            check_child_error(&mut b, on_error.as_ref())?;
+            let n = *count;
+            // Build a fresh Tuple [r0..r_{n-1}]: [tag=TUPLE][count][elem*8].
+            // Each child completed with an owned `+1` result read via
+            // `task_result`; it transfers straight into the tuple slot (no
+            // retain), and `free_pending` below releases the scheduler record's
+            // own copy — mirroring `assign_pending` + `free_pending`.
+            let addr = b.alloc_i32_local();
+            b.emit(Instruction::I32Const(8 + (n as i32) * 8));
+            b.emit(Instruction::Call(b.rt().base + RT_ALLOC));
+            b.emit(Instruction::LocalSet(addr));
+            b.emit(Instruction::LocalGet(addr));
+            b.emit(Instruction::I32Const(crate::runtime::OBJ_TAG_TUPLE));
+            b.emit(Instruction::I32Store(mem0()));
+            b.emit(Instruction::LocalGet(addr));
+            b.emit(Instruction::I32Const(n as i32));
+            b.emit(Instruction::I32Store(mem_off(4)));
+            for slot in 0..n {
+                b.emit(Instruction::LocalGet(addr));
+                b.emit(Instruction::LocalGet(frame_ptr_l));
+                b.emit(Instruction::I32Load(mem_off(
+                    frame.pending_off + (slot as u64) * 4,
+                )));
+                b.emit(Instruction::Call(layout.task_result));
+                b.emit(Instruction::I64Store(mem_off(8 + (slot as u64) * 8)));
+            }
+            let tuple_l = b.alloc_local();
+            b.emit(Instruction::LocalGet(addr));
+            b.emit(Instruction::Call(b.rt().base + RT_MAKE_OBJ));
+            b.emit(Instruction::LocalSet(tuple_l));
+            // Bind the tuple (owned +1) to `name`, matching `assign_pending`'s
+            // cell-vs-frame-slot store.
+            let l = *var_local
+                .get(name)
+                .ok_or(BuildError::UnsupportedExpression("async-unknown-all-bind"))?;
+            if cell_vars.contains(name) {
+                b.emit(Instruction::LocalGet(tuple_l));
+                b.emit_cell_store(l, ExprResult::boxed(true));
+            } else {
+                b.emit(Instruction::LocalGet(tuple_l));
+                b.assign_to_async_frame_slot(
+                    l,
+                    ExprResult::boxed(true),
+                    release_set.contains(name),
+                );
+            }
+            // Recycle each child's scheduler record.
+            for slot in 0..n {
                 free_pending(&mut b, slot as u64);
             }
         }
