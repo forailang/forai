@@ -1423,10 +1423,43 @@ fn status_text(status: i32) -> &'static str {
     }
 }
 
+/// `SameSite` must be exactly one of `Strict`, `Lax`, `None` (browsers
+/// ignore anything else). Normalize case and return the canonical spelling,
+/// or `None` to drop an invalid value (plan 134). `None` (the value) without
+/// `Secure` is rejected by browsers; we keep it but warn — the safe path is
+/// `sessionCookie`, which never sets `None`.
+fn canonical_same_site(ss: &str) -> Option<&'static str> {
+    match ss.to_ascii_lowercase().as_str() {
+        "strict" => Some("Strict"),
+        "lax" => Some("Lax"),
+        "none" => Some("None"),
+        _ => None,
+    }
+}
+
+/// True when the loud dev flag asks the runner to drop `Secure` so cookies
+/// still set over plain-HTTP localhost. Production leaves it unset and stays
+/// hardened. Warns once so it can never be mistaken for prod behavior.
+fn insecure_cookies_dev() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if std::env::var_os("FAI_INSECURE_COOKIES").is_some() {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[fai] FAI_INSECURE_COOKIES=1: stripping `Secure` from Set-Cookie \
+                 (dev only — cookies will ride plain HTTP)"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Format a single `Set-Cookie:` value (everything after the `: `).
 /// Pure-Rust so the formatting can be unit-tested without standing up
 /// a guest wasm instance. Skips optional attributes that the caller
-/// didn't set.
+/// didn't set. `insecure_dev` strips `Secure` for local plain-HTTP dev.
 fn format_cookie(
     name: &str,
     value: &str,
@@ -1435,6 +1468,7 @@ fn format_cookie(
     http_only: Option<bool>,
     secure: Option<bool>,
     same_site: Option<&str>,
+    insecure_dev: bool,
 ) -> String {
     let mut out = format!("{}={}", name, value);
     if let Some(p) = path {
@@ -1449,13 +1483,21 @@ fn format_cookie(
     if matches!(http_only, Some(true)) {
         out.push_str("; HttpOnly");
     }
-    if matches!(secure, Some(true)) {
+    let secure_on = matches!(secure, Some(true)) && !insecure_dev;
+    if secure_on {
         out.push_str("; Secure");
     }
     if let Some(ss) = same_site {
-        if !ss.is_empty() {
+        if let Some(canon) = canonical_same_site(ss) {
+            if canon == "None" && !secure_on {
+                eprintln!(
+                    "[fai] cookie '{}' sets SameSite=None without Secure; browsers \
+                     will reject it. Use sessionCookie (SameSite=Lax) instead.",
+                    name
+                );
+            }
             out.push_str("; SameSite=");
-            out.push_str(ss);
+            out.push_str(canon);
         }
     }
     out
@@ -1504,6 +1546,7 @@ fn read_cookies(mem: &Memory, caller: &mut Caller<'_, ()>, addr: usize) -> Vec<S
             http_only,
             secure,
             same_site.as_deref(),
+            insecure_cookies_dev(),
         ));
     }
     lines
@@ -1783,33 +1826,33 @@ mod tests {
 
     #[test]
     fn format_cookie_minimum_is_name_value_only() {
-        let line = format_cookie("session", "tok-1", None, None, None, None, None);
+        let line = format_cookie("session", "tok-1", None, None, None, None, None, false);
         assert_eq!(line, "session=tok-1");
     }
 
     #[test]
     fn format_cookie_includes_path_when_set() {
-        let line = format_cookie("session", "tok", Some("/"), None, None, None, None);
+        let line = format_cookie("session", "tok", Some("/"), None, None, None, None, false);
         assert_eq!(line, "session=tok; Path=/");
     }
 
     #[test]
     fn format_cookie_skips_empty_path() {
-        let line = format_cookie("session", "tok", Some(""), None, None, None, None);
+        let line = format_cookie("session", "tok", Some(""), None, None, None, None, false);
         assert_eq!(line, "session=tok");
     }
 
     #[test]
     fn format_cookie_includes_max_age_when_set() {
-        let line = format_cookie("session", "tok", None, Some(3600), None, None, None);
+        let line = format_cookie("session", "tok", None, Some(3600), None, None, None, false);
         assert_eq!(line, "session=tok; Max-Age=3600");
     }
 
     #[test]
     fn format_cookie_emits_http_only_only_when_true() {
-        let yes = format_cookie("a", "b", None, None, Some(true), None, None);
-        let no = format_cookie("a", "b", None, None, Some(false), None, None);
-        let absent = format_cookie("a", "b", None, None, None, None, None);
+        let yes = format_cookie("a", "b", None, None, Some(true), None, None, false);
+        let no = format_cookie("a", "b", None, None, Some(false), None, None, false);
+        let absent = format_cookie("a", "b", None, None, None, None, None, false);
         assert_eq!(yes, "a=b; HttpOnly");
         assert_eq!(no, "a=b");
         assert_eq!(absent, "a=b");
@@ -1817,21 +1860,48 @@ mod tests {
 
     #[test]
     fn format_cookie_emits_secure_only_when_true() {
-        let yes = format_cookie("a", "b", None, None, None, Some(true), None);
-        let no = format_cookie("a", "b", None, None, None, Some(false), None);
+        let yes = format_cookie("a", "b", None, None, None, Some(true), None, false);
+        let no = format_cookie("a", "b", None, None, None, Some(false), None, false);
         assert_eq!(yes, "a=b; Secure");
         assert_eq!(no, "a=b");
     }
 
     #[test]
+    fn format_cookie_insecure_dev_strips_secure() {
+        // FAI_INSECURE_COOKIES path: Secure is dropped for local HTTP dev.
+        let stripped = format_cookie("a", "b", None, None, None, Some(true), None, true);
+        assert_eq!(stripped, "a=b");
+    }
+
+    #[test]
     fn format_cookie_includes_same_site_value() {
-        let line = format_cookie("a", "b", None, None, None, None, Some("Lax"));
+        let line = format_cookie("a", "b", None, None, None, None, Some("Lax"), false);
         assert_eq!(line, "a=b; SameSite=Lax");
     }
 
     #[test]
+    fn format_cookie_normalizes_same_site_case() {
+        // Case-insensitive input canonicalizes to the spec spelling.
+        assert_eq!(
+            format_cookie("a", "b", None, None, None, None, Some("lax"), false),
+            "a=b; SameSite=Lax"
+        );
+        assert_eq!(
+            format_cookie("a", "b", None, None, None, None, Some("STRICT"), false),
+            "a=b; SameSite=Strict"
+        );
+    }
+
+    #[test]
+    fn format_cookie_drops_invalid_same_site() {
+        // An unrecognized SameSite value is dropped, not emitted verbatim.
+        let line = format_cookie("a", "b", None, None, None, None, Some("bogus"), false);
+        assert_eq!(line, "a=b");
+    }
+
+    #[test]
     fn format_cookie_skips_empty_same_site() {
-        let line = format_cookie("a", "b", None, None, None, None, Some(""));
+        let line = format_cookie("a", "b", None, None, None, None, Some(""), false);
         assert_eq!(line, "a=b");
     }
 
@@ -1845,6 +1915,7 @@ mod tests {
             Some(true),
             Some(true),
             Some("Strict"),
+            false,
         );
         assert_eq!(
             line,
