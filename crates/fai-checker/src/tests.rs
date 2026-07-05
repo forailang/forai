@@ -484,6 +484,70 @@
     }
 
     #[test]
+    fn test_raw_session_cookie_missing_httponly_warns() {
+        // A raw `Cookie` literal with a session-shaped name and no httpOnly
+        // draws a plan-134 warning pointing at sessionCookie (not an error).
+        let source = "use std.http.server\n\n\
+             # Builds a raw session cookie.\n\
+             def bad\n    @param t String\n    @return Cookie\ndo\n  \
+             let c Cookie = from_dict({name: 'my_session' value: t path: '/'})\n  c\nend\n\n\
+             def main\n    @return Void\ndo\n  let _c = bad('t')\n  print('ok')\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("program checks (warning, not error)");
+        assert!(
+            checker
+                .warnings
+                .iter()
+                .any(|w| w.contains("my_session") && w.contains("sessionCookie")),
+            "expected a raw-session-cookie warning, got: {:?}",
+            checker.warnings
+        );
+    }
+
+    #[test]
+    fn test_session_cookie_with_httponly_and_samesite_does_not_warn() {
+        let source = "use std.http.server\n\n\
+             # Safe session cookie.\n\
+             def ok\n    @param t String\n    @return Cookie\ndo\n  \
+             let c Cookie = from_dict({name: 'my_session' value: t path: '/' httpOnly: true sameSite: 'Lax'})\n  c\nend\n\n\
+             def main\n    @return Void\ndo\n  let _c = ok('t')\n  print('ok')\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checks");
+        assert!(
+            checker.warnings.is_empty(),
+            "a HttpOnly+SameSite session cookie should not warn, got: {:?}",
+            checker.warnings
+        );
+    }
+
+    #[test]
+    fn test_csrf_cookie_does_not_warn() {
+        // fai_csrf is intentionally JS-readable (not HttpOnly); its name is
+        // not session-shaped, so the lint leaves it alone.
+        let source = "use std.http.server\n\n\
+             # Builds a csrf cookie.\n\
+             def csrf\n    @param t String\n    @return Cookie\ndo\n  \
+             let c Cookie = from_dict({name: 'fai_csrf' value: t path: '/' sameSite: 'Strict'})\n  c\nend\n\n\
+             def main\n    @return Void\ndo\n  let _c = csrf('t')\n  print('ok')\nend";
+        let prepared = fai_compiler::prepare_source(source, None).expect("prepare");
+        let mut checker = Checker::new();
+        checker
+            .check_program(&prepared.serde_ast.statements)
+            .expect("checks");
+        assert!(
+            checker.warnings.is_empty(),
+            "csrf cookie should not warn, got: {:?}",
+            checker.warnings
+        );
+    }
+
+    #[test]
     fn test_session_endpoint_reaching_secret_does_not_warn() {
         let source = "use std.secrets\n\n\
              # Session-gated endpoint using a secret.\n\

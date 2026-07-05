@@ -16,6 +16,7 @@ use crate::types::*;
 
 mod expressions;
 mod lint_rpc_secrets;
+mod lint_session_cookie;
 mod program;
 mod resolve;
 mod statements;

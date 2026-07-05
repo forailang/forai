@@ -30,6 +30,7 @@ impl Checker {
         self.install_imports(statements, &mut env, &empty_exports, None)?;
         self.check_top_level_statements(statements, &mut env)?;
         self.lint_public_endpoints_reaching_secrets(&collect_fn_decls(&[statements]));
+        self.lint_session_cookie_attrs(&[statements]);
         self.finish_check()
     }
 
@@ -146,6 +147,7 @@ impl Checker {
             all.push(&module.statements);
         }
         self.lint_public_endpoints_reaching_secrets(&collect_fn_decls(&all));
+        self.lint_session_cookie_attrs(&all);
         self.finish_check()
     }
 
