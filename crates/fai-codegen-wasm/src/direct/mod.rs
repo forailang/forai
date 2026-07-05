@@ -280,6 +280,9 @@ fn import_signals_errors(import_idx: u32) -> bool {
         IMPORT_FILE_READ_STR
             | IMPORT_WRITE_FILE
             | IMPORT_FILE_LIST
+            // json.parse raises a catchable error on malformed input rather
+            // than returning null (json_stringify never fails, so it stays off).
+            | IMPORT_JSON_PARSE
             | IMPORT_SECRETS_GET
             | IMPORT_SECRETS_REVEAL
             | IMPORT_SECRETS_BEARER

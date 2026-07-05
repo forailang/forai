@@ -3795,6 +3795,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         let stash = self.emit_string_arg_stashing(args[0])?;
         self.emit_import_call(crate::runtime::IMPORT_JSON_PARSE);
         self.release_stash(stash);
+        // Malformed JSON raises a catchable error (see import_signals_errors);
+        // the module-call path gets this check automatically, the bare/UFCS
+        // path needs it emitted here.
+        self.emit_post_call_propagation(&[]);
         Ok(())
     }
 

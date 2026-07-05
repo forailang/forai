@@ -53,6 +53,11 @@ function faiJsonQueryEval(root,path){{var steps=[];var i=0;var n=path.length;fun
 function writeStr(p,s){{const b=new TextEncoder().encode(s);new Uint8Array(instance.exports.memory.buffer,p).set(b);return b.length}}
 function writeStrToWasm(s){{const b=new TextEncoder().encode(s);const base=instance.exports.__heap_ptr.value;const logsz=8+b.length;const h=base+8;const m=new Uint8Array(instance.exports.memory.buffer);const d=new DataView(instance.exports.memory.buffer);d.setInt32(base,1,true);d.setInt32(base+4,logsz,true);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;return OBJ_MASK|BigInt(h)}}
 function readNanBoxedStr(v){{const n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{const a=Number(n&0x0000FFFFFFFFFFFFn);const d=new DataView(instance.exports.memory.buffer);if(d.getInt32(a,true)===0){{const l=d.getInt32(a+4,true);return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,a+8,l))}}}}return''}}
+// Raise a catchable forai error from a host import: build an {{message,kind}}
+// dict on the guest heap and set the exported __error_flag/__error_value
+// globals. Generated code's post-call propagation turns it into a throw at the
+// call site (mirrors signal_host_error in the native runtime).
+function signalHostError(kind,message){{const eb=jsToWasm({{message:String(message),kind:String(kind)}});if(instance&&instance.exports.__error_flag){{instance.exports.__error_flag.value=1;instance.exports.__error_value.value=eb}}return NULL_VAL}}
 function invokeExport(name,...args){{const fn=instance.exports[name];if(!fn){{console.warn('FAI invokeExport missing export', name);return;}}debugLog('FAI invokeExport:start', {{name,args}});try{{const result=fn(...args);debugLog('FAI invokeExport:end', {{name,result}});return result;}}catch(e){{console.error('FAI invokeExport:failed', {{name,args,error:e}});throw e;}}}}
 let asyncRootDone=false;
 function rootResultText(result){{const v=wasmToJs(result);if(Array.isArray(v))return JSON.stringify(v);if(v===null||v===undefined)return'';return String(v);}}
@@ -81,7 +86,7 @@ const env={{
   http_post(a,b,c,d,e){{try{{const x=new XMLHttpRequest();x.open('POST',readStr(a,b),false);x.setRequestHeader('Content-Type','application/json');x.send(readStr(c,d));return writeStr(e,x.responseText)}}catch(e){{return -1}}}},
   set_html(p,l){{const html=readStr(p,l);console.log('FAI set_html', {{length:l}});debugLog('FAI set_html:preview', html.slice(0,240));morphDom(app,html,false);wireEvents()}},
   set_html_at(a,b,p,l){{const selector=readStr(a,b);const html=readStr(p,l);let root=document.querySelector(selector);if(!root&&selector.startsWith('#')){{root=document.createElement('div');root.id=selector.slice(1);app.innerHTML='';app.appendChild(root);}}if(!root){{console.error('FAI set_html_at missing root', selector);return;}}console.log('FAI set_html_at', {{selector,length:l}});debugLog('FAI set_html_at:preview', {{selector,html:html.slice(0,240)}});morphDom(root,html,selector!=='#app');wireEvents()}},
-  json_parse(p,l){{try{{const s=readStr(p,l);const v=JSON.parse(s);return jsToWasm(v)}}catch(e){{return QNAN|TAG_NULL}}}},
+  json_parse(p,l){{try{{const s=readStr(p,l);const v=JSON.parse(s);return jsToWasm(v)}}catch(e){{return signalHostError('json','json.parse: invalid JSON: '+(e&&e.message?e.message:e))}}}},
   json_stringify(v){{try{{const j=wasmToJs(v);return writeStrToWasm(JSON.stringify(j))}}catch(e){{return writeStrToWasm('null')}}}},
   json_query(p,l,qp,ql){{try{{const root=JSON.parse(readStr(p,l));const m=faiJsonQueryEval(root,readStr(qp,ql));if(m===null)return QNAN|TAG_NULL;return jsToWasm(m)}}catch(e){{return QNAN|TAG_NULL}}}},
   json_query_page(p,l,qp,ql,off,lim){{try{{const root=JSON.parse(readStr(p,l));const m=faiJsonQueryEval(root,readStr(qp,ql));if(m===null)return QNAN|TAG_NULL;const total=m.length;let s=Math.max(0,off|0);if(s>total)s=total;const t=Math.max(0,lim|0);return jsToWasm({{total:total,items:m.slice(s,s+t)}})}}catch(e){{return QNAN|TAG_NULL}}}},
@@ -208,6 +213,11 @@ function writeStr(p,s){{var b=new TextEncoder().encode(s);new Uint8Array(instanc
 function wasmGrow(needed){{var mem=instance.exports.memory;var cur=mem.buffer.byteLength;if(needed>cur){{var pages=Math.ceil((needed-cur)/65536);mem.grow(pages)}}}}
 function writeStrToWasm(s){{var b=new TextEncoder().encode(s),base=instance.exports.__heap_ptr.value,logsz=8+b.length,h=base+8;wasmGrow(base+8+logsz+8);var m=new Uint8Array(instance.exports.memory.buffer),d=new DataView(instance.exports.memory.buffer);d.setInt32(base,1,true);d.setInt32(base+4,logsz,true);d.setInt32(h,0,true);d.setInt32(h+4,b.length,true);m.set(b,h+8);instance.exports.__heap_ptr.value=(h+8+b.length+7)&~7;faiLeakAlloc(h,logsz,true);return OBJ_MASK|BigInt(h)}}
 function readNanBoxedStr(v){{var n=BigInt(v);if((n&OBJ_MASK)===OBJ_MASK){{var a=Number(n&0x0000FFFFFFFFFFFFn),d=new DataView(instance.exports.memory.buffer);if(d.getInt32(a,true)===0){{var l=d.getInt32(a+4,true);return new TextDecoder().decode(new Uint8Array(instance.exports.memory.buffer,a+8,l))}}}}return''}}
+// Raise a catchable forai error from a host import: build an {{message,kind}}
+// dict on the guest heap and set the exported __error_flag/__error_value
+// globals. Generated code's post-call propagation turns it into a throw at the
+// call site (mirrors signal_host_error in the native runtime).
+function signalHostError(kind,message){{var eb=jsToWasm({{message:String(message),kind:String(kind)}});if(instance&&instance.exports.__error_flag){{instance.exports.__error_flag.value=1;instance.exports.__error_value.value=eb}}return NULL_VAL}}
 function faiHostRetain(v){{if(instance&&instance.exports.__fai_retain)instance.exports.__fai_retain(BigInt.asIntN(64,BigInt(v)));return BigInt.asIntN(64,BigInt(v))}}
 function faiHostRelease(v){{if(instance&&instance.exports.__fai_release)instance.exports.__fai_release(BigInt.asIntN(64,BigInt(v)))}}
 function invokeExport(name){{var fn=instance.exports[name];if(!fn)return;var args=Array.prototype.slice.call(arguments,1);try{{return fn.apply(null,args)}}catch(e){{console.error('FAI',name,'failed',e);throw e}}}}
@@ -284,7 +294,7 @@ var env={{
   http_post:function(a,b,c,d,e){{try{{var x=new XMLHttpRequest();x.open('POST',readStr(a,b),false);x.setRequestHeader('Content-Type','application/json');x.send(readStr(c,d));return writeStr(e,x.responseText)}}catch(e){{return -1}}}},
   set_html:function(p,l){{morphDom(app,readStr(p,l),false);wireEvents()}},
   set_html_at:function(a,b,p,l){{var selector=readStr(a,b),html=readStr(p,l);var root=document.querySelector(selector);if(!root&&selector.charAt(0)==='#'){{root=document.createElement('div');root.id=selector.slice(1);app.innerHTML='';app.appendChild(root)}}if(!root)return;morphDom(root,html,selector!=='#app');wireEvents()}},
-  json_parse:function(p,l){{try{{return jsToWasm(JSON.parse(readStr(p,l)))}}catch(e){{return QNAN|TAG_NULL}}}},
+  json_parse:function(p,l){{try{{return jsToWasm(JSON.parse(readStr(p,l)))}}catch(e){{return signalHostError('json','json.parse: invalid JSON: '+(e&&e.message?e.message:e))}}}},
   json_stringify:function(v){{try{{return writeStrToWasm(JSON.stringify(wasmToJs(v)))}}catch(e){{return writeStrToWasm('null')}}}},
   json_query:function(p,l,qp,ql){{try{{var root=JSON.parse(readStr(p,l));var m=faiJsonQueryEval(root,readStr(qp,ql));if(m===null)return QNAN|TAG_NULL;return jsToWasm(m)}}catch(e){{return QNAN|TAG_NULL}}}},
   json_query_page:function(p,l,qp,ql,off,lim){{try{{var root=JSON.parse(readStr(p,l));var m=faiJsonQueryEval(root,readStr(qp,ql));if(m===null)return QNAN|TAG_NULL;var total=m.length;var s=Math.max(0,off|0);if(s>total)s=total;var t=Math.max(0,lim|0);return jsToWasm({{total:total,items:m.slice(s,s+t)}})}}catch(e){{return QNAN|TAG_NULL}}}},

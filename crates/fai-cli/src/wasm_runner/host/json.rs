@@ -2,6 +2,7 @@
 
 use wasmtime::*;
 
+use super::host_ops::signal_host_error;
 use super::super::heap::{build_value, wasm_alloc_str};
 use super::super::nan_box::{
     ADDR_MASK, OBJ_TAG_ARRAY, OBJ_TAG_DICT, OBJ_TAG_SECRET, OBJ_TAG_STRING, QNAN, SIGN_BIT,
@@ -26,7 +27,17 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 };
                 match serde_json::from_str::<serde_json::Value>(&json_str) {
                     Ok(v) => build_value(&mut caller, &mem, &v),
-                    Err(_) => VAL_NULL,
+                    // Malformed JSON raises a catchable forai error (via the
+                    // __error_flag / __error_value channel) instead of silently
+                    // returning null — codegen marks IMPORT_JSON_PARSE as
+                    // error-signaling so the nearest try/catch (or the caller)
+                    // sees it. The serde message names the offending
+                    // line:column.
+                    Err(e) => signal_host_error(
+                        &mut caller,
+                        "json",
+                        &format!("json.parse: invalid JSON: {}", e),
+                    ),
                 }
             },
         )

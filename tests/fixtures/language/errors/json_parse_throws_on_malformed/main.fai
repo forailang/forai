@@ -1,0 +1,45 @@
+# expect: ok
+# leak: flat
+# `json.parse` raises a catchable error on malformed input instead of silently
+# returning null/empty. Valid JSON still parses. The error is deliverable to a
+# `try`/`catch` (via the __error_flag/__error_value host-error channel) so code
+# can distinguish "bad input" from "parsed to empty".
+
+use std.json
+
+# Parse, reporting whether it threw.
+def parseOutcome
+    @param raw String
+    @return String
+do
+    try
+        let d Dictionary = json.parse(raw)
+        var v = 'no-a'
+        if getString(d, 'a')?
+            v = getString(d, 'a')!
+        end
+        'ok:' + v
+    catch e
+        'threw'
+    end
+end
+
+test parseOutcome
+    it 'throws on malformed JSON'
+        assert.equals(parseOutcome('{'), 'threw')
+        assert.equals(parseOutcome('{bad'), 'threw')
+        assert.equals(parseOutcome('not json'), 'threw')
+        assert.equals(parseOutcome(''), 'threw')
+    end
+    it 'still parses valid JSON'
+        assert.equals(parseOutcome('{"a":"b"}'), 'ok:b')
+        assert.equals(parseOutcome('{}'), 'ok:no-a')
+    end
+end
+
+def main
+    @return Void
+do
+    print(parseOutcome('{bad'))
+    print(parseOutcome('{"a":"b"}'))
+end
