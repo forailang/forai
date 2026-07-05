@@ -1153,10 +1153,10 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// `assert.equals`, `assert.isTrue`, `assert.isFalse`. Each
     /// evaluates a condition and produces an i32 `ok` flag (1 = pass,
     /// 0 = fail). On success we leave `VAL_TRUE` on the stack; on
-    /// failure we push the caller's message (or `(0, 0)` as a
-    /// sentinel the host substitutes with a default) to
-    /// `IMPORT_SET_TRAP_MSG`, then emit `unreachable` — the test
-    /// runner catches the trap and reads the message.
+    /// failure we raise the caller's message (or `"assertion failed"`)
+    /// through the error channel via `emit_throw_owned` — a catchable
+    /// throw that runs `finally`, and traps at the fatal test frame when
+    /// uncaught (so the runner still records the failure + message).
     ///
     /// Truthiness matches the runtime's VM: `null`, `void`, and
     /// `false` are falsy; everything else (including `0`, `""`,
@@ -3030,7 +3030,8 @@ impl<'a, 'c> Builder<'a, 'c> {
     /// `assert.calledWith(target, ...expected)` — serialise the
     /// expected arg values into a scratch buffer and compare
     /// against the host's recorded calls. Traps via
-    /// `IMPORT_SET_TRAP_MSG` + `unreachable` on mismatch.
+    /// Raises through the error channel on mismatch (the host sets the
+    /// error value; the guest runs the post-call propagation).
     fn compile_spy_assert_called_with(
         &mut self,
         call_args: &[fai_compiler::ast::CallArgument],
@@ -3100,17 +3101,18 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::LocalGet(buf));
         self.emit(Instruction::I32Const((expected_count.max(1) * 8) as i32));
         self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_FREE));
-        self.emit(Instruction::LocalGet(assertion_failed));
-        // i32 result on stack: 0 pass, 1 fail.
-        self.emit_open(Instruction::If(BlockType::Empty));
-        self.emit(Instruction::Unreachable);
-        self.emit_close();
+        // On mismatch the host raised the error channel (a catchable throw
+        // that runs `finally`), so the recorded i32 flag is no longer branched
+        // on. Push VOID and run the post-call propagation, which routes a set
+        // error to the enclosing try/catch or the fatal test frame.
+        let _ = assertion_failed;
         self.emit(Instruction::I64Const(VAL_VOID));
+        self.emit_post_call_propagation(&[]);
         Ok(())
     }
 
     /// `assert.callCount(target, n)` — compare the recorded count
-    /// against `n`. Traps on mismatch.
+    /// against `n`. Raises through the error channel on mismatch.
     fn compile_spy_assert_call_count(
         &mut self,
         call_args: &[fai_compiler::ast::CallArgument],
@@ -3141,14 +3143,15 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.compile_expr(&call_args[1].value)?;
         self.emit(Instruction::I32WrapI64);
         self.emit_import_call(crate::runtime::IMPORT_SPY_ASSERT_CALL_COUNT);
-        self.emit_open(Instruction::If(BlockType::Empty));
-        self.emit(Instruction::Unreachable);
-        self.emit_close();
+        // Drop the pass/fail i32; on failure the host set the error channel.
+        self.emit(Instruction::Drop);
         self.emit(Instruction::I64Const(VAL_VOID));
+        self.emit_post_call_propagation(&[]);
         Ok(())
     }
 
-    /// `assert.notCalled(target)` — traps if any call was recorded.
+    /// `assert.notCalled(target)` — raises through the error channel if
+    /// any call was recorded.
     fn compile_spy_assert_not_called(
         &mut self,
         call_args: &[fai_compiler::ast::CallArgument],
@@ -3173,10 +3176,10 @@ impl<'a, 'c> Builder<'a, 'c> {
         };
         self.emit(Instruction::I32Const(fn_id as i32));
         self.emit_import_call(crate::runtime::IMPORT_SPY_ASSERT_NOT_CALLED);
-        self.emit_open(Instruction::If(BlockType::Empty));
-        self.emit(Instruction::Unreachable);
-        self.emit_close();
+        // Drop the pass/fail i32; on failure the host set the error channel.
+        self.emit(Instruction::Drop);
         self.emit(Instruction::I64Const(VAL_VOID));
+        self.emit_post_call_propagation(&[]);
         Ok(())
     }
 

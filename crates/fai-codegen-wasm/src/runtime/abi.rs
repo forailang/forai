@@ -411,9 +411,12 @@ pub const IMPORT_CLI_WRITE_LINE: u32 = 66;
 pub const IMPORT_CLI_CLEAR: u32 = 67;
 pub const IMPORT_CLI_MOVE_TO: u32 = 68;
 /// `env.__fai_set_trap_msg(ptr, len) -> void` — store an assertion-failure
-/// message in a host-side thread-local. The guest follows this with
-/// `unreachable`; the CLI test runner catches the trap and surfaces the
-/// stored message. Phase E plumbing for `test.equal` / `test.assert`.
+/// message in a host-side thread-local. No longer emitted by codegen:
+/// `assert.*` and the spy assertions now raise through the error channel
+/// (a catchable throw), and uncaught failures report via `__fai_trap_report`.
+/// The import slot is retained (still declared in `import_signatures` and
+/// installed by the host) for ABI-index stability.
+#[allow(dead_code)]
 pub const IMPORT_SET_TRAP_MSG: u32 = 69;
 /// Spy/mock host imports for the `test` + `assert.*` framework.
 ///

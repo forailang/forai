@@ -1,0 +1,48 @@
+# expect: ok
+# leak: flat
+# A failed spy assertion (assert.calledWith / callCount / notCalled) unwinds
+# through try/catch/finally like assert.* — a catchable throw that runs
+# `finally` — instead of a hard trap that skips cleanup. (Spy assertions are
+# test-only, so this is exercised from a test block, not main.)
+
+# Spied helper (referenced by assert.callCount below).
+def record
+    @return Int
+do
+    1
+end
+
+# Triggers a failing `assert.callCount` (0 calls, not 99) inside
+# try/catch/finally and reports which paths ran.
+def observe
+    @return String
+do
+    var caught = 'no'
+    var fin = 'no'
+    try
+        assert.callCount(record, 99)
+    catch e
+        caught = 'yes'
+    finally
+        fin = 'yes'
+    end
+    'caught=' + caught + ' fin=' + fin
+end
+
+test observe
+    it 'a failed spy assertion is catchable and runs finally'
+        assert.equals(observe(), 'caught=yes fin=yes')
+    end
+end
+
+test record
+    it 'returns 1'
+        assert.equals(record(), 1)
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

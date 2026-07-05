@@ -9,16 +9,17 @@
 //! its real body.
 //!
 //! Spy assertion imports return `i32` — 0 on success, 1 on
-//! failure (with a trap message already stashed via
-//! `__fai_set_trap_msg`). The guest wraps the call in an `if`
-//! that emits `unreachable` on 1, so the CLI test runner reads
-//! the trap message via the existing `take_trap_msg` protocol.
+//! failure. On failure they raise through the error channel
+//! (`signal_host_error` sets `__error_flag`/`__error_value` with the
+//! message); the guest drops the i32 and runs the post-call propagation,
+//! so a failed spy assertion unwinds `try`/`catch`/`finally` like
+//! `assert.*` instead of hard-trapping past cleanup.
 
 use wasmtime::*;
 
 use super::super::heap::{host_release_value, host_release_values, host_retain_value};
 use super::super::nan_box::{ADDR_MASK, OBJ_TAG_STRING, QNAN, SIGN_BIT};
-use super::io::set_trap_msg;
+use super::host_ops::signal_host_error;
 
 /// Compare two NaN-boxed values for spy-assertion purposes.
 /// Exact i64 equality first (handles Int, Bool, null, void, same
@@ -222,10 +223,17 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 if matched {
                     0
                 } else {
-                    set_trap_msg(format!(
-                        "spy assertion failed: fn_id {} not called with expected args",
-                        fn_id,
-                    ));
+                    // Raise through the error channel (a catchable throw that
+                    // runs `finally`) rather than a hard trap, matching
+                    // `assert.*`. The guest runs the post-call propagation.
+                    let _ = signal_host_error(
+                        &mut caller,
+                        "assertion",
+                        &format!(
+                            "spy assertion failed: fn_id {} not called with expected args",
+                            fn_id,
+                        ),
+                    );
                     1
                 }
             },
@@ -236,7 +244,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .func_wrap(
             "env",
             "spy_assert_call_count",
-            |fn_id: i32, expected: i32| -> i32 {
+            |mut caller: Caller<'_, ()>, fn_id: i32, expected: i32| -> i32 {
                 let actual = SPY_STATE.with(|s| {
                     s.borrow()
                         .get(fn_id as usize)
@@ -246,10 +254,14 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 if actual == expected {
                     0
                 } else {
-                    set_trap_msg(format!(
-                        "spy call count mismatch: fn_id {} expected {}, got {}",
-                        fn_id, expected, actual,
-                    ));
+                    let _ = signal_host_error(
+                        &mut caller,
+                        "assertion",
+                        &format!(
+                            "spy call count mismatch: fn_id {} expected {}, got {}",
+                            fn_id, expected, actual,
+                        ),
+                    );
                     1
                 }
             },
@@ -257,23 +269,31 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         .map_err(|e| format!("linker error: {}", e))?;
 
     linker
-        .func_wrap("env", "spy_assert_not_called", |fn_id: i32| -> i32 {
-            let count = SPY_STATE.with(|s| {
-                s.borrow()
-                    .get(fn_id as usize)
-                    .map(|e| e.calls.len())
-                    .unwrap_or(0)
-            });
-            if count == 0 {
-                0
-            } else {
-                set_trap_msg(format!(
-                    "spy assertion failed: fn_id {} was called {} time(s)",
-                    fn_id, count,
-                ));
-                1
-            }
-        })
+        .func_wrap(
+            "env",
+            "spy_assert_not_called",
+            |mut caller: Caller<'_, ()>, fn_id: i32| -> i32 {
+                let count = SPY_STATE.with(|s| {
+                    s.borrow()
+                        .get(fn_id as usize)
+                        .map(|e| e.calls.len())
+                        .unwrap_or(0)
+                });
+                if count == 0 {
+                    0
+                } else {
+                    let _ = signal_host_error(
+                        &mut caller,
+                        "assertion",
+                        &format!(
+                            "spy assertion failed: fn_id {} was called {} time(s)",
+                            fn_id, count,
+                        ),
+                    );
+                    1
+                }
+            },
+        )
         .map_err(|e| format!("linker error: {}", e))?;
 
     Ok(())
