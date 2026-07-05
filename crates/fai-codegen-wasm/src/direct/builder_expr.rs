@@ -1218,17 +1218,32 @@ impl<'a, 'c> Builder<'a, 'c> {
         // value like any other call.
         self.emit(Instruction::I64Const(QNAN | TAG_BOOL | 1));
         self.emit(Instruction::Else);
-        // Fail path: stringify message (or push empty sentinel),
-        // trap.
+        // Fail path: raise the assertion message through the error channel —
+        // a `throw` of the message string (wrapped to `{message: ...}`) — so
+        // `finally`/cleanup on the way out actually runs. A hard trap here
+        // (the previous behaviour) unwound straight to the host, skipping every
+        // `finally` between the assert and the test boundary (the brain
+        // test-isolation cascade). Uncaught, it reaches the test-case wrapper —
+        // a fatal frame — which traps there with the reported message so the
+        // host still records the failure.
         if call_args.len() > msg_arg_idx {
-            self.emit_string_arg_from_expr(&call_args[msg_arg_idx].value)?;
+            let result =
+                self.compile_expr_result_as(&call_args[msg_arg_idx].value, ValueShape::Boxed)?;
+            if result.ownership == ExprOwnership::Borrowed {
+                self.emit_ownership_event_for_stack(OwnershipOp::Retain, OWNERSHIP_SITE_UNKNOWN, 0);
+                self.emit(Instruction::Call(self.rt().base + RT_RETAIN));
+            }
         } else {
-            // No message — the host fills in a default.
-            self.emit(Instruction::I32Const(0));
-            self.emit(Instruction::I32Const(0));
+            // No message — synthesise a default. `emit_throw_owned` wraps this
+            // String into `{message: "assertion failed"}`.
+            let (off, len) = self.ctx.strings.borrow_mut().intern("assertion failed");
+            self.emit(Instruction::I32Const(off as i32));
+            self.emit(Instruction::I32Const(len as i32));
+            self.emit(Instruction::Call(self.rt().base + RT_ALLOC_STRING));
         }
-        self.emit_import_call(IMPORT_SET_TRAP_MSG);
-        self.emit(Instruction::Unreachable);
+        let thrown_local = self.alloc_local();
+        self.emit(Instruction::LocalSet(thrown_local));
+        self.emit_throw_owned(thrown_local);
         self.emit_close();
         Ok(())
     }

@@ -1611,6 +1611,37 @@ impl<'a, 'c> Builder<'a, 'c> {
         }
         let thrown_local = self.alloc_local();
         self.emit(Instruction::LocalSet(thrown_local));
+        self.emit_throw_owned(thrown_local);
+        Ok(())
+    }
+
+    /// True for frames where an *uncaught* error must terminate rather than
+    /// return-with-flag: the program entry (`<__start__>`) and each test-case /
+    /// hook wrapper (`<test:...>`, `<test-before-all:...>`,
+    /// `<test-after-all:...>`). A test wrapper is invoked by the bare
+    /// `_fai_run_test` dispatcher, which drops the wrapper's result and does
+    /// NOT inspect `__error_flag` — so an uncaught error that merely set the
+    /// flag would be read by the host as a PASS. Trapping (with a reported
+    /// message) makes `run_case` return `Err`, which the host records as the
+    /// failure. This also makes an uncaught `throw` in a test body a real
+    /// failure, not just a failed `assert`.
+    pub(super) fn frame_is_fatal_on_uncaught(&self) -> bool {
+        // `<__start__>` (real entry), `main` (the entry itself — real builds
+        // wrap it in `<__start__>`, but a standalone/single-fn build exports
+        // `main` directly as `_start`), and each test-case / hook wrapper.
+        self.fd.name == "<__start__>"
+            || self.fd.name == "main"
+            || self.fd.name.starts_with("<test")
+    }
+
+    /// Raise the owned `+1` value in `thrown_local` through the error channel:
+    /// wrap a non-dict into `{message: ...}`, then either branch to the nearest
+    /// enclosing `try`'s catch handler or (uncaught) stash it into the error
+    /// globals and return — trapping instead in a fatal frame. Shared by
+    /// `throw` and by a failed `assert` (which raises its message this way so
+    /// `finally`/cleanup runs on the way out instead of being skipped by a hard
+    /// trap).
+    pub(super) fn emit_throw_owned(&mut self, thrown_local: u32) {
         self.emit_wrap_bare_throw(thrown_local, true);
         if let Some(frame) = self.tries.last().copied() {
             let rel = self.block_depth - frame.catch_abs;
@@ -1621,19 +1652,26 @@ impl<'a, 'c> Builder<'a, 'c> {
             self.emit(Instruction::Br(rel));
         } else {
             self.emit_cleanup_to_depth(0);
-            // Stash the value into the error globals; the caller
-            // will pick it up via the post-call propagation check.
             self.emit(Instruction::LocalGet(thrown_local));
             self.emit(Instruction::GlobalSet(GLOBAL_ERROR_VALUE));
-            self.emit(Instruction::I32Const(1));
-            self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
-            // Placeholder return value — the caller throws it away
-            // as soon as it sees the flag set.
-            self.emit(Instruction::I64Const(0));
-            self.emit_debug_function_end();
-            self.emit(Instruction::Return);
+            if self.frame_is_fatal_on_uncaught() {
+                // Report the error value so the trap names it, then trap —
+                // the host reads it out and records the case failure.
+                self.emit(Instruction::I32Const(crate::runtime::TRAP_UNCAUGHT_ERROR));
+                self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));
+                self.emit(Instruction::I64Const(0));
+                self.emit_import_call(IMPORT_TRAP_REPORT);
+                self.emit(Instruction::Unreachable);
+            } else {
+                self.emit(Instruction::I32Const(1));
+                self.emit(Instruction::GlobalSet(GLOBAL_ERROR_FLAG));
+                // Placeholder return value — the caller throws it away
+                // as soon as it sees the flag set.
+                self.emit(Instruction::I64Const(0));
+                self.emit_debug_function_end();
+                self.emit(Instruction::Return);
+            }
         }
-        Ok(())
     }
 
     /// Emit the post-call propagation check. The call's i64 result
@@ -1695,13 +1733,13 @@ impl<'a, 'c> Builder<'a, 'c> {
                     self.emit(Instruction::Return);
                 }
             }
-        } else if self.fd.name == "<__start__>" {
-            // Outermost frame — there is nowhere left to propagate.
-            // A clean `Return` here would silently exit the program
-            // with `error_flag` still set; trap instead so an
-            // uncaught throw terminates the program (the pre-fix
-            // behaviour from before cross-function throw landed).
-            // See forai#4. Report the error value first so the trap
+        } else if self.frame_is_fatal_on_uncaught() {
+            // Outermost frame (program entry) or a test-case wrapper — there is
+            // nowhere left to propagate. A clean `Return` here would leave
+            // `error_flag` set: at `<__start__>` that silently exits the
+            // program (forai#4); in a test wrapper the bare `_fai_run_test`
+            // dispatcher would read it as a PASS. Trap instead so the host
+            // records the failure. Report the error value first so the trap
             // names it (plan 116).
             self.emit(Instruction::I32Const(crate::runtime::TRAP_UNCAUGHT_ERROR));
             self.emit(Instruction::GlobalGet(GLOBAL_ERROR_VALUE));

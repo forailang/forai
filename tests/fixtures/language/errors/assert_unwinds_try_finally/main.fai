@@ -1,0 +1,48 @@
+# expect: ok
+# leak: flat
+# A failed `assert` unwinds through `try`/`catch`/`finally` like a thrown
+# error, instead of hard-trapping straight to the host. That means `finally`
+# cleanup (and `catch`) runs on the way out — previously a failed assert
+# skipped every enclosing `finally`, leaking setup/teardown state into later
+# tests. (Uncaught, a failed assert still fails its test — it traps at the
+# test wrapper with the reported message.)
+
+# Exercises a failing assert inside try/catch/finally and records the path.
+def observeAssert
+    @return String
+do
+    var log = ''
+    try
+        assert.equals(1, 2, 'mismatch')
+        log = log + 'unreached'
+    catch e
+        log = log + 'caught:' + e.message
+    finally
+        log = log + '|finally'
+    end
+    log
+end
+
+test observeAssert
+    it 'a failed assert throws, is catchable, and runs finally'
+        assert.equals(observeAssert(), 'caught:mismatch|finally')
+    end
+    it 'a passing assert does not throw'
+        var log = ''
+        try
+            assert.equals(2, 2)
+            log = 'ok'
+        catch e
+            log = 'caught'
+        finally
+            log = log + '|fin'
+        end
+        assert.equals(log, 'ok|fin')
+    end
+end
+
+def main
+    @return Void
+do
+    print(observeAssert())
+end
