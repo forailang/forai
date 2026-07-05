@@ -1424,6 +1424,68 @@ impl<'a, 'c> Builder<'a, 'c> {
         Ok(())
     }
 
+    /// `try`/`catch` in tail position: the tail expression of the try body
+    /// (or, on a caught throw, of the catch body) is the function's return
+    /// value. The statement form (`compile_try`) discards that value, which
+    /// would silently return Void — decoding as an empty/garbage heap value at
+    /// the call site. A tail try must preserve it.
+    ///
+    /// Without a `finally`, each body is compiled as a tail and emits its own
+    /// `Return` — exactly the shape `compile_if_branches_tail` uses. A `throw`
+    /// inside the try body still `br`s to `$catch_handler`; the tail `Return`
+    /// only fires on the success path.
+    fn compile_try_as_tail(&mut self, s: &TryStatement) -> Result<(), BuildError> {
+        if s.finally_body.is_some() {
+            // The checker types a `finally` try as Void (it is not a value
+            // expression), so a `finally` try only reaches tail position in a
+            // Void-returning function. Preserve the statement lowering and
+            // return Void — the same path the pre-tail `_` arm took.
+            self.compile_try(s)?;
+            self.emit_all_active_drops();
+            self.emit(Instruction::I64Const(VAL_VOID));
+            self.emit_debug_function_end();
+            self.emit(Instruction::Return);
+            return Ok(());
+        }
+        let err_local = self.alloc_local();
+        let cleanup_depth = self.cleanup_depth();
+        self.emit_open(Instruction::Block(BlockType::Empty)); // $after_try
+        self.emit_open(Instruction::Block(BlockType::Empty)); // $catch_handler
+        let catch_abs = self.block_depth;
+        self.tries.push(TryFrame {
+            catch_abs,
+            cleanup_depth,
+            err_local,
+        });
+
+        // Success path: the try body's tail expression returns.
+        self.push_scope();
+        self.compile_stmts_as_tail(&s.try_body)?;
+        self.pop_scope();
+        // Every path through `compile_stmts_as_tail` ends in `Return`, so no
+        // `br $after_try` is needed — the catch handler is reached only via a
+        // `throw`'s `br $catch_handler`.
+        self.tries.pop();
+        self.emit_close(); // end $catch_handler
+
+        // Caught path: `err_local` holds the thrown value, bound under the
+        // catch name; the catch body's tail expression returns.
+        self.push_scope();
+        self.bind(&s.catch_name, err_local);
+        self.note_droppable(err_local);
+        self.compile_stmts_as_tail(&s.catch_body)?;
+        self.pop_scope();
+        self.emit_close(); // end $after_try
+
+        // Fall-through safety: both bodies already `Return`, so this trailer is
+        // unreachable, but it keeps the function body stack-valid at its end —
+        // the same trailer the tail `if`/`case` arms emit.
+        self.emit(Instruction::I64Const(VAL_VOID));
+        self.emit_debug_function_end();
+        self.emit(Instruction::Return);
+        Ok(())
+    }
+
     /// Lower `throw expr`. Inside a `try`, stores the value into the
     /// innermost try's `err_local` and branches to `$catch_handler`
     /// — the inline fast path with no globals touched.
@@ -2247,6 +2309,7 @@ impl<'a, 'c> Builder<'a, 'c> {
     fn compile_tail_stmt(&mut self, stmt: &Statement) -> Result<(), BuildError> {
         match stmt {
             Statement::ExpressionStatement(es) => self.return_value(Some(&es.expression)),
+            Statement::TryStatement(s) => self.compile_try_as_tail(s),
             Statement::IfStatement(s) => {
                 self.compile_if_branches_tail(&s.branches, s.else_branch.as_deref())?;
                 // Fall-through safety: if no branch matched and

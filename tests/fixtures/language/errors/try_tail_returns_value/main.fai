@@ -1,0 +1,94 @@
+# expect: ok
+# ownership: balanced
+# leak: flat
+# A `try`/`catch` in tail position must return its value — the try body's
+# tail on the success path, the catch body's tail on a caught throw. The sync
+# direct path used to discard it and return Void, so a heap return (dict,
+# array, string) decoded as empty/garbage at the call site.
+
+# Builds a dict as the tail value of a try (no throw).
+def tailDict
+    @return Dictionary
+do
+    try
+        let d = set({}, 'k', 'v')
+        d
+    catch e
+        {}
+    end
+end
+
+# Caught path returns the catch body's tail value after a real throw.
+def caughtMessage
+    @return String
+do
+    try
+        let _x = boom()
+        'unreached'
+    catch e
+        e.message
+    end
+end
+
+# Always throws.
+def boom
+    @return Int
+do
+    throw Error('boom')
+end
+
+# Builds an array as the tail value of a try.
+def tailArray
+    @return Int[]
+do
+    try
+        let a Int[] = [10 20 30]
+        a
+    catch e
+        let empty Int[] = []
+        empty
+    end
+end
+
+test tailDict
+    it 'returns the try body tail dict on the success path'
+        let cfg = tailDict()
+        assert.equals(getString(cfg, 'k')!, 'v')
+    end
+end
+
+test caughtMessage
+    it 'returns the catch body tail value after a caught throw'
+        assert.equals(caughtMessage(), 'boom')
+    end
+end
+
+test boom
+    it 'always throws'
+        var threw = false
+        try
+            let _x = boom()
+        catch e
+            threw = true
+        end
+        assert.isTrue(threw)
+    end
+end
+
+test tailArray
+    it 'returns the try body tail array intact'
+        let xs = tailArray()
+        assert.equals(length(xs), 3)
+        assert.equals(xs[0], 10)
+        assert.equals(xs[2], 30)
+    end
+end
+
+def main
+    @return Void
+do
+    let cfg = tailDict()
+    print('success: ' + getString(cfg, 'k')!)
+    print('caught: ' + caughtMessage())
+    print('heap-array: ' + toString(length(tailArray())))
+end
