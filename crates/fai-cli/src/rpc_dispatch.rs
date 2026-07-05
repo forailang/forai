@@ -67,9 +67,9 @@ pub fn generate_dispatch_for_functions(
     // (plan 133 phase 2); public endpoints get no gate at all.
     let any_gated = remote_fns.iter().any(|fd| fd.auth != "public");
     if any_gated {
-        out.push_str("use { handleRpcRequest, rpcAuthCheck } from Forui.rpc\n");
+        out.push_str("use { handleRpcRequest, rpcAuthCheck, rpcArgsOrNull } from Forui.rpc\n");
     } else {
-        out.push_str("use { handleRpcRequest } from Forui.rpc\n");
+        out.push_str("use { handleRpcRequest, rpcArgsOrNull } from Forui.rpc\n");
     }
     for (module, names) in import_groups(remote_fns) {
         out.push_str(&format!("use {{ {} }} from {}\n", names.join(", "), module));
@@ -174,8 +174,11 @@ pub fn generate_dispatch_for_functions(
             ));
             out.push_str(&format!("{}    {}\n", indent, bad_request));
             out.push_str(&format!("{}  else\n", indent));
+            // `rpcArgsOrNull` catches malformed JSON and yields null (json.parse
+            // itself now throws), so a bad args payload stays a 400 badRequest
+            // here instead of propagating as a 500.
             out.push_str(&format!(
-                "{}  let __parsed = json.parse(argsJson)\n",
+                "{}  let __parsed = rpcArgsOrNull(argsJson)\n",
                 indent
             ));
             out.push_str(&format!(
@@ -646,7 +649,7 @@ mod tests {
             result
         );
         assert!(
-            result.contains("use { handleRpcRequest, rpcAuthCheck } from Forui.rpc"),
+            result.contains("use { handleRpcRequest, rpcAuthCheck, rpcArgsOrNull } from Forui.rpc"),
             "generated dispatch should import the Forui.rpc handler and the \
              auth gate (the test fns are session-gated). Got:\n{}",
             result
