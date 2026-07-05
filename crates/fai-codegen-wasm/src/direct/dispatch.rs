@@ -458,6 +458,12 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         ),
         ("std.crypto", "base64Encode") => (IMPORT_CRYPTO_BASE64_ENCODE, &[AS::String], RS::Boxed),
         ("std.crypto", "base64Decode") => (IMPORT_CRYPTO_BASE64_DECODE, &[AS::String], RS::Boxed),
+        ("std.crypto", "randomHex") => (IMPORT_CRYPTO_RANDOM_HEX, &[AS::Int], RS::Boxed),
+        ("std.crypto", "pbkdf2Sha256Hex") => (
+            IMPORT_CRYPTO_PBKDF2_SHA256_HEX,
+            &[AS::String, AS::String, AS::Int],
+            RS::Boxed,
+        ),
         ("std.crypto", "rs256SignBase64Url") => (
             IMPORT_CRYPTO_RS256_SIGN_BASE64_URL,
             &[AS::String, AS::String],

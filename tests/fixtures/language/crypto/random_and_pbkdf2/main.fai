@@ -1,0 +1,51 @@
+# expect: ok
+# Native crypto for secure logins: crypto.randomHex (CSPRNG-backed session
+# tokens / salts — NOT the fixed-seed math.random) and crypto.pbkdf2Sha256Hex
+# (password hashing).
+
+use std.crypto
+
+# Generate a random hex token (session token / salt).
+def genToken
+    @param nBytes Int
+    @return String
+do
+    crypto.randomHex(nBytes)
+end
+
+# Hash a password with a salt (10k iterations here to keep the fixture fast;
+# real apps use more).
+def hashPw
+    @param pw String
+    @param salt String
+    @return String
+do
+    crypto.pbkdf2Sha256Hex(pw, salt, 10000)
+end
+
+test genToken
+    it 'returns 2*n hex chars and is unpredictable across calls'
+        let a = genToken(16)
+        assert.equals(length(a), 32)
+        assert.isFalse(a == genToken(16))
+    end
+end
+
+test hashPw
+    it 'is stable for the same password+salt'
+        assert.equals(hashPw('hunter2', 's'), hashPw('hunter2', 's'))
+    end
+    it 'is a 32-byte (64 hex) derived key'
+        assert.equals(length(hashPw('hunter2', 's')), 64)
+    end
+    it 'differs for a wrong password and for a different salt'
+        assert.isFalse(hashPw('hunter2', 's') == hashPw('wrong', 's'))
+        assert.isFalse(hashPw('hunter2', 's') == hashPw('hunter2', 't'))
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

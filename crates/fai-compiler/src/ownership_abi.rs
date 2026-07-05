@@ -1181,6 +1181,20 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
     },
     HostImportRow {
         canon: "std.crypto",
+        method: "randomHex",
+        import: "crypto_random_hex",
+        ret: ROwn,
+        doc: "fresh hex string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
+        method: "pbkdf2Sha256Hex",
+        import: "crypto_pbkdf2_sha256_hex",
+        ret: ROwn,
+        doc: "fresh hex string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.crypto",
         method: "hexEncode",
         import: "crypto_hex_encode",
         ret: ROwn,

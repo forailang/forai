@@ -669,7 +669,12 @@ pub const IMPORT_SECRETS_RESOLVE_TEMPLATE: u32 = 135;
 /// reveal with a fallback for unresolvable names ("unconfigured" sinks).
 /// Reveal-class for audit purposes.
 pub const IMPORT_SECRETS_REVEAL_OR: u32 = 136;
-pub const IMPORT_COUNT: u32 = 137;
+/// `env.crypto_random_hex(n_bytes) -> i64` — hex of n CSPRNG bytes. Native-only.
+pub const IMPORT_CRYPTO_RANDOM_HEX: u32 = 137;
+/// `env.crypto_pbkdf2_sha256_hex(pw_ptr,len, salt_ptr,len, iters) -> i64` —
+/// PBKDF2-HMAC-SHA256, 32-byte derived key as hex. Native-only.
+pub const IMPORT_CRYPTO_PBKDF2_SHA256_HEX: u32 = 138;
+pub const IMPORT_COUNT: u32 = 139;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1542,6 +1547,22 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         (
             "secrets_reveal_or",
             vec![ValType::I64, ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_RANDOM_HEX: (n_bytes) -> i64 (fresh hex String of n
+        // cryptographically-secure random bytes). Native-only.
+        ("crypto_random_hex", vec![ValType::I32], vec![ValType::I64]),
+        // IMPORT_CRYPTO_PBKDF2_SHA256_HEX: (pw_ptr,len, salt_ptr,len, iters)
+        // -> i64 (fresh 32-byte derived key as hex). Native-only.
+        (
+            "crypto_pbkdf2_sha256_hex",
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             vec![ValType::I64],
         ),
     ]

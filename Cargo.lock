@@ -653,6 +653,7 @@ dependencies = [
  "fai-ffi",
  "fai-parser",
  "flate2",
+ "getrandom 0.2.17",
  "hkdf",
  "hmac",
  "k256",

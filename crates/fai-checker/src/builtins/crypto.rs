@@ -52,6 +52,17 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("data", Type::String)],
         &[Type::String],
     );
+    ins(b, "cryptoRandomHex", &[p("nBytes", Type::Int)], &[Type::String]);
+    ins(
+        b,
+        "cryptoPbkdf2Sha256Hex",
+        &[
+            p("password", Type::String),
+            p("salt", Type::String),
+            p("iterations", Type::Int),
+        ],
+        &[Type::String],
+    );
     ins(
         b,
         "cryptoRs256SignBase64Url",
@@ -83,6 +94,8 @@ mod tests {
             "cryptoBase64Encode",
             "cryptoBase64Decode",
             "cryptoRs256SignBase64Url",
+            "cryptoRandomHex",
+            "cryptoPbkdf2Sha256Hex",
         ] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }

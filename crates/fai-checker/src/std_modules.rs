@@ -369,6 +369,8 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("base64Encode", "cryptoBase64Encode"),
             ("base64Decode", "cryptoBase64Decode"),
             ("rs256SignBase64Url", "cryptoRs256SignBase64Url"),
+            ("randomHex", "cryptoRandomHex"),
+            ("pbkdf2Sha256Hex", "cryptoPbkdf2Sha256Hex"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))

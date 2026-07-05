@@ -45,6 +45,30 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// PBKDF2-HMAC-SHA256 with a 32-byte derived key (dkLen == hLen, so a single
+/// block). Hand-rolled over the `hmac` crate to avoid a new dependency:
+/// `T1 = U1 ^ U2 ^ ... ^ Uc`, `U1 = PRF(password, salt || INT(1))`,
+/// `Ui = PRF(password, U{i-1})`. Standard, constant work per iteration.
+fn pbkdf2_hmac_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    // U1 = HMAC(password, salt || 0x00000001)
+    let mut mac = HmacSha256::new_from_slice(password).unwrap();
+    mac.update(salt);
+    mac.update(&1u32.to_be_bytes());
+    let mut u = mac.finalize().into_bytes();
+    let mut t = u;
+    for _ in 1..iterations {
+        let mut mac = HmacSha256::new_from_slice(password).unwrap();
+        mac.update(&u);
+        u = mac.finalize().into_bytes();
+        for (ti, ui) in t.iter_mut().zip(u.iter()) {
+            *ti ^= *ui;
+        }
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&t);
+    out
+}
+
 /// Normalize private keys copied into env/config values. Many deployments
 /// store PEMs as a single line with escaped newlines.
 fn normalize_pem(pem: &str) -> String {
@@ -230,6 +254,52 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                     &mem,
                     &rs256_sign_base64_url(&private_key_pem, &msg),
                 )
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_random_hex(n_bytes) -> i64. Hex of `n` cryptographically
+    // secure random bytes from the OS CSPRNG (getrandom). The right source
+    // for session tokens and password salts — unlike math.random(), which is
+    // a fixed-seed PRNG. `n` is clamped to [1, 1024].
+    linker
+        .func_wrap(
+            "env",
+            "crypto_random_hex",
+            |mut caller: Caller<'_, ()>, n_bytes: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let n = n_bytes.clamp(1, 1024) as usize;
+                let mut buf = vec![0u8; n];
+                if getrandom::getrandom(&mut buf).is_err() {
+                    return wasm_alloc_str(&mut caller, &mem, "");
+                }
+                wasm_alloc_str(&mut caller, &mem, &to_hex(&buf))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_pbkdf2_sha256_hex(pw_ptr,len, salt_ptr,len, iters) -> i64.
+    // PBKDF2-HMAC-SHA256, 32-byte derived key, returned as hex. Hand-rolled
+    // over the hmac crate (no extra dep). `iters` is clamped to [1, 5_000_000]
+    // to bound worst-case cost. Use for password hashing: store
+    // `iterations:salt:hex` and verify with a constant-time compare.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_pbkdf2_sha256_hex",
+            |mut caller: Caller<'_, ()>,
+             pw_ptr: i32,
+             pw_len: i32,
+             salt_ptr: i32,
+             salt_len: i32,
+             iters: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let password = read_str(&caller, &mem, pw_ptr, pw_len);
+                let salt = read_str(&caller, &mem, salt_ptr, salt_len);
+                let iterations = (iters.max(1) as u32).min(5_000_000);
+                let dk = pbkdf2_hmac_sha256_32(password.as_bytes(), salt.as_bytes(), iterations);
+                wasm_alloc_str(&mut caller, &mem, &to_hex(&dk))
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
