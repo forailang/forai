@@ -163,10 +163,6 @@ pub(crate) fn refresh_all() -> i32 {
     ok
 }
 
-pub(crate) fn is_active() -> bool {
-    current_state().is_some()
-}
-
 fn fetch_into_cache(state: &AwsState, name: &str) -> Result<(), String> {
     let secret_id = format!("{}{}", state.config.prefix, name);
     let raw = get_secret_value(&state.config, &state.credentials, &secret_id)?;
