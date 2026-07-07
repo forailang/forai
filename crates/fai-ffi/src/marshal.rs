@@ -59,11 +59,18 @@ impl MarshaledArgs {
     ) -> Result<(), std::string::String> {
         match ty {
             FfiType::Int => {
+                // Sign-extend to the full pointer width. Zero-extending (`as u32`)
+                // turns a negative Int like -1 into 0x0000_0000_FFFF_FFFF, but a C
+                // function that reads the arg as a 64-bit word (a pointer or long)
+                // needs the sign-extended 0xFFFF_FFFF_FFFF_FFFF — e.g.
+                // SQLITE_TRANSIENT, sqlite's (void*)-1 destructor sentinel that
+                // tells it to copy bound text. Functions taking a 32-bit `int`
+                // read only the low bits, so this is unchanged for them.
                 if val.is_int() {
-                    self.args.push(CArg::Word(val.as_int() as u32 as usize));
+                    self.args.push(CArg::Word(val.as_int() as i64 as usize));
                 } else if val.is_float() {
                     self.args
-                        .push(CArg::Word(val.as_float() as i32 as u32 as usize));
+                        .push(CArg::Word(val.as_float() as i32 as i64 as usize));
                 } else {
                     return Err("expected Int value".into());
                 }
@@ -84,11 +91,17 @@ impl MarshaledArgs {
                     if let ObjectData::String(s) = val.as_object().data() {
                         let cstr = CString::new(s.data.as_str())
                             .map_err(|_| "string contains null byte".to_string())?;
-                        // Use into_raw() so the allocation persists beyond this call.
-                        // C functions like sqlite3_bind_text with SQLITE_STATIC require
-                        // the string to remain valid until the prepared statement is
-                        // finalized — which is longer than a single FFI call frame.
-                        let ptr = cstr.into_raw() as usize;
+                        // Keep the CString owned in `_temp_strings` and pass a
+                        // pointer into its (separately heap-allocated, stable)
+                        // buffer. It stays valid for the whole call and is freed
+                        // when this MarshaledArgs drops — on the sync path at the
+                        // end of the call, on the offload path when the owning
+                        // PreparedFfiCall drops after `raw_call` returns. A C
+                        // function that must retain the bytes past the call must
+                        // copy them (e.g. sqlite3_bind_text with SQLITE_TRANSIENT);
+                        // we no longer leak the allocation to keep it alive forever.
+                        let ptr = cstr.as_ptr() as usize;
+                        self._temp_strings.push(cstr);
                         self.args.push(CArg::Word(ptr));
                     } else {
                         return Err("expected String value".into());
@@ -149,12 +162,17 @@ impl MarshaledArgs {
 
     /// For the boundary-offload path: the marshaled args as plain words, if the
     /// signature is all word-sized (Int/Bool/String/Ptr — pointers already
-    /// resolved to raw addresses, strings to leaked C allocations) and has no
-    /// out-params. `None` for float args or out-params, which the offload path
-    /// does not support (the caller keeps those externs synchronous). The
-    /// returned words are `Send` and carry no thread-local state, so the call
-    /// can run on a worker thread.
-    pub fn into_offload_words(self) -> Option<Vec<usize>> {
+    /// resolved to raw addresses, strings to owned C allocations returned
+    /// alongside) and has no out-params. `None` for float args or out-params,
+    /// which the offload path does not support (the caller keeps those externs
+    /// synchronous). The returned words are `Send` and carry no thread-local
+    /// state, so the call can run on a worker thread.
+    ///
+    /// Returns the words alongside the owned CStrings backing any string args,
+    /// so the caller (PreparedFfiCall) can keep them alive until the call runs
+    /// and free them afterwards — otherwise dropping self here would free them
+    /// and leave `words` pointing at freed memory.
+    pub fn into_offload_words(mut self) -> Option<(Vec<usize>, Vec<CString>)> {
         if !self.out_ptr_slots.is_empty() {
             return None;
         }
@@ -165,7 +183,8 @@ impl MarshaledArgs {
                 CArg::Float(_) => return None,
             }
         }
-        Some(words)
+        let strings = std::mem::take(&mut self._temp_strings);
+        Some((words, strings))
     }
 }
 

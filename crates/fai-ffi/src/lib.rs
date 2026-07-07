@@ -263,12 +263,20 @@ pub struct PreparedFfiCall {
     fn_ptr: usize,
     words: Vec<usize>,
     return_type: FfiType,
+    /// Owned C strings backing any string args in `words`. Kept alive until the
+    /// call has run and freed when this struct drops — which happens on the
+    /// worker thread right after `raw_call` returns. A C function that needs the
+    /// bytes to outlive the call must copy them (e.g. SQLITE_TRANSIENT); without
+    /// this the strings would either dangle (if freed early) or leak forever (as
+    /// they did before, via `CString::into_raw`).
+    _strings: Vec<CString>,
 }
 
 // SAFETY: `fn_ptr` is a process-global C function address and `words` are
-// scalars carrying no pointers into thread-local or GC-managed state. Running
-// the call on another thread touches none of this process's Rust state; the
-// result conversion (which does) stays on the main thread.
+// scalars carrying no pointers into thread-local or GC-managed state. `_strings`
+// are plain host-heap allocations (Send). Running the call on another thread
+// touches none of this process's Rust state; the result conversion (which does)
+// stays on the main thread.
 unsafe impl Send for PreparedFfiCall {}
 
 impl PreparedFfiCall {
@@ -314,7 +322,7 @@ pub fn prepare_offload(
             message: format!("{}.{} arg {}: {}", lib, func, i, e),
         })?;
     }
-    let words = c_args.into_offload_words().ok_or_else(|| FfiError {
+    let (words, strings) = c_args.into_offload_words().ok_or_else(|| FfiError {
         message: format!(
             "{}.{}: offload supports only word-sized args and no out-params",
             lib, func
@@ -324,6 +332,7 @@ pub fn prepare_offload(
         fn_ptr: fn_ptr as usize,
         words,
         return_type: return_type.clone(),
+        _strings: strings,
     })
 }
 

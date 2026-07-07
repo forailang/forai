@@ -1,0 +1,26 @@
+# expect: ok
+# stdout: ok
+# leak: flat
+
+extern c
+    def strlen(s: String) -> Int
+end
+
+# Regression (owned string arg to an extern call): a freshly-allocated string
+# passed as an argument to a C function carries a +1 the callee never consumes
+# (the host copies the bytes it needs during the call). The synchronous extern
+# call path — used for for-effect and tail-position extern calls, e.g.
+# forsqlite's `sqlite3_bind_text(stmt, i, "{{val}}", ...)` — used to store the
+# arg into the scratch buffer and free the buffer flat, never releasing the
+# object. That leaked one String per call, the dominant per-call leak in a
+# forsqlite insert loop. Calling the extern for effect (discarding the result)
+# takes that synchronous path; the loop makes any per-call residue visible to
+# --check-leaks, which the `leak: flat` gate asserts is zero.
+def main
+    @return Void
+do
+    for i in 0..50
+        strlen('a temporary heap string')
+    end
+    print('ok')
+end

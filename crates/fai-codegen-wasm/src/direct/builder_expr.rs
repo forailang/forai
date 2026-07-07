@@ -4116,6 +4116,17 @@ impl<'a, 'c> Builder<'a, 'c> {
         self.emit(Instruction::Call(self.rt().base + RT_ALLOC));
         self.emit(Instruction::LocalSet(args_buf));
 
+        // Owned (freshly-allocated) heap args — a string literal, an
+        // interpolation, an inline `string.repeat(...)` — carry a +1 the callee
+        // does not consume: the host copies the bytes it needs during the call
+        // (out params aside, which are borrowed identifiers). Nothing else ever
+        // brings that +1 back to zero, so without releasing them here every
+        // such arg leaks once per call — the dominant per-call leak in a
+        // forsqlite insert loop (`sqlite3_bind_text(stmt, i, "{{val}}", …)`).
+        // The async offload path does the same via `emit_release_owned_arg_locals`;
+        // this is its synchronous twin. Borrowed args (variables, params) are
+        // owned by the enclosing frame and released by its normal teardown.
+        let mut owned_arg_locals: Vec<u32> = Vec::new();
         for (i, a) in args.iter().enumerate() {
             self.emit(Instruction::LocalGet(args_buf));
             self.emit(Instruction::I32Const((i as i32) * 8));
@@ -4124,7 +4135,12 @@ impl<'a, 'c> Builder<'a, 'c> {
             // A RawFloat/RawInt from an arithmetic fast-path (e.g.
             // `fabs(-5.5)`) stored unconverted would trip wasm
             // validation with "expected i64, found f64".
-            self.compile_expr_as(a, ValueShape::Boxed)?;
+            let result = self.compile_expr_result_as(a, ValueShape::Boxed)?;
+            if result.ownership == ExprOwnership::Owned {
+                let owned = self.alloc_local();
+                self.emit(Instruction::LocalTee(owned));
+                owned_arg_locals.push(owned);
+            }
             self.emit(Instruction::I64Store(MemArg {
                 offset: 0,
                 align: 3,
@@ -4174,6 +4190,14 @@ impl<'a, 'c> Builder<'a, 'c> {
                     }
                 }
             }
+        }
+        // Release any owned heap args now that the call has consumed the bytes
+        // it needed. Do this before freeing the flat scratch buffer (which only
+        // holds the NaN-boxed words, not the objects).
+        for local in &owned_arg_locals {
+            self.emit(Instruction::LocalGet(*local));
+            self.emit_ownership_event_for_stack(OwnershipOp::Release, OWNERSHIP_SITE_UNKNOWN, 0);
+            self.emit(Instruction::Call(self.rt().base + crate::runtime::RT_RELEASE));
         }
         // Free the scratch buffer (raw i64 slots, not an object graph — a
         // flat RT_FREE, no child release). Then restore the return value.
