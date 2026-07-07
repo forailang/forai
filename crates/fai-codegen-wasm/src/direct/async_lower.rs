@@ -1350,6 +1350,25 @@ impl<'a> CfgBuilder<'a> {
                         };
                         return Ok(Flow::Continue(next));
                     }
+                    if let Some((closure, args)) = async_closure_call(&asg.value, self.fns)
+                        .or_else(|| indirect_closure_call(&asg.value, self.params, self.fns))
+                    {
+                        if !self.args_ok(&args) {
+                            return Err(());
+                        }
+                        let on_error = self.handler();
+                        let next = self.new_block();
+                        self.blocks[cur].term = Term::AwaitClosure {
+                            closure,
+                            args,
+                            next,
+                        };
+                        self.blocks[next].incoming = Incoming::Awaited {
+                            binds: vec![Some(names[0].clone())],
+                            on_error,
+                        };
+                        return Ok(Flow::Continue(next));
+                    }
                 }
             }
             if expr_has_user_call(&asg.value, self.fns) {
