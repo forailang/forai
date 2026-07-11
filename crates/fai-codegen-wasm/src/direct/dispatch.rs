@@ -469,6 +469,31 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
             &[AS::String, AS::String],
             RS::Boxed,
         ),
+        ("std.crypto", "sha256Base64Url") => (
+            IMPORT_CRYPTO_SHA256_BASE64URL,
+            &[AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "base64UrlEncode") => (
+            IMPORT_CRYPTO_BASE64URL_ENCODE,
+            &[AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "base64UrlDecode") => (
+            IMPORT_CRYPTO_BASE64URL_DECODE,
+            &[AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "aesGcmEncrypt") => (
+            IMPORT_CRYPTO_AES_GCM_ENCRYPT,
+            &[AS::String, AS::String, AS::String, AS::String],
+            RS::Boxed,
+        ),
+        ("std.crypto", "aesGcmDecrypt") => (
+            IMPORT_CRYPTO_AES_GCM_DECRYPT,
+            &[AS::String, AS::String, AS::String, AS::String],
+            RS::Boxed,
+        ),
         ("std.ffi", "available") => (IMPORT_FFI_AVAILABLE, &[AS::String], RS::MakeBool),
 
         // std.net.tcp — handle-based TCP surface.

@@ -211,6 +211,11 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             avail[IMPORT_CRYPTO_RS256_SIGN_BASE64_URL as usize] = false;
             avail[IMPORT_CRYPTO_RANDOM_HEX as usize] = false;
             avail[IMPORT_CRYPTO_PBKDF2_SHA256_HEX as usize] = false;
+            avail[IMPORT_CRYPTO_SHA256_BASE64URL as usize] = false;
+            avail[IMPORT_CRYPTO_BASE64URL_ENCODE as usize] = false;
+            avail[IMPORT_CRYPTO_BASE64URL_DECODE as usize] = false;
+            avail[IMPORT_CRYPTO_AES_GCM_ENCRYPT as usize] = false;
+            avail[IMPORT_CRYPTO_AES_GCM_DECRYPT as usize] = false;
             // FFI is native-only; an extern call reached on the browser
             // compiles to `unreachable` like the other stripped imports.
             avail[IMPORT_FFI_BEGIN as usize] = false;

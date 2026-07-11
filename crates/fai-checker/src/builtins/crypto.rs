@@ -69,6 +69,46 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[p("privateKeyPem", Type::String), p("message", Type::String)],
         &[Type::String],
     );
+    ins(
+        b,
+        "cryptoSha256Base64Url",
+        &[p("data", Type::String)],
+        &[Type::String],
+    );
+    ins(
+        b,
+        "cryptoBase64UrlEncode",
+        &[p("data", Type::String)],
+        &[Type::String],
+    );
+    ins(
+        b,
+        "cryptoBase64UrlDecode",
+        &[p("data", Type::String)],
+        &[Type::String],
+    );
+    ins(
+        b,
+        "cryptoAesGcmEncrypt",
+        &[
+            p("keyHex", Type::String),
+            p("nonceHex", Type::String),
+            p("aad", Type::String),
+            p("plaintext", Type::String),
+        ],
+        &[Type::String],
+    );
+    ins(
+        b,
+        "cryptoAesGcmDecrypt",
+        &[
+            p("keyHex", Type::String),
+            p("nonceHex", Type::String),
+            p("aad", Type::String),
+            p("ciphertextBase64", Type::String),
+        ],
+        &[Type::String],
+    );
 }
 
 #[cfg(test)]
@@ -96,8 +136,27 @@ mod tests {
             "cryptoRs256SignBase64Url",
             "cryptoRandomHex",
             "cryptoPbkdf2Sha256Hex",
+            "cryptoSha256Base64Url",
+            "cryptoBase64UrlEncode",
+            "cryptoBase64UrlDecode",
+            "cryptoAesGcmEncrypt",
+            "cryptoAesGcmDecrypt",
         ] {
             assert!(b.contains_key(*name), "missing: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_aes_gcm_takes_four_strings_returns_string() {
+        let b = fresh();
+        for name in &["cryptoAesGcmEncrypt", "cryptoAesGcmDecrypt"] {
+            match b.get(*name).unwrap() {
+                Type::Function(sig) => {
+                    assert_eq!(sig.params.len(), 4);
+                    assert!(matches!(sig.returns[0], Type::String));
+                }
+                _ => panic!("expected Function"),
+            }
         }
     }
 

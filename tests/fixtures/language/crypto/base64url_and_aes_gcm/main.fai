@@ -1,0 +1,91 @@
+# expect: ok
+# OAuth-support crypto: PKCE S256 challenge (crypto.sha256Base64Url),
+# base64url encode/decode, and AES-256-GCM token encryption at rest with a
+# caller-supplied nonce and associated data.
+
+use std.crypto
+
+# PKCE S256 code_challenge = base64url(SHA-256(code_verifier)).
+def pkceChallenge
+    @param verifier String
+    @return String
+do
+    crypto.sha256Base64Url(verifier)
+end
+
+# Round-trip a value through base64url encode then decode.
+def roundTripBase64Url
+    @param value String
+    @return String
+do
+    crypto.base64UrlDecode(crypto.base64UrlEncode(value))
+end
+
+# Encrypt a token blob bound to a connection id (associated data).
+def sealToken
+    @param keyHex String
+    @param nonceHex String
+    @param connId String
+    @param blob String
+    @return String
+do
+    crypto.aesGcmEncrypt(keyHex, nonceHex, connId, blob)
+end
+
+# Decrypt a sealed token blob; empty string signals authentication failure.
+def openToken
+    @param keyHex String
+    @param nonceHex String
+    @param connId String
+    @param sealed String
+    @return String
+do
+    crypto.aesGcmDecrypt(keyHex, nonceHex, connId, sealed)
+end
+
+test pkceChallenge
+    it 'matches the RFC 7636 Appendix B S256 vector'
+        assert.equals(pkceChallenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk'), 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM')
+    end
+end
+
+test roundTripBase64Url
+    it 'round-trips through encode/decode'
+        assert.equals(roundTripBase64Url('hello forai'), 'hello forai')
+    end
+end
+
+test sealToken
+    it 'round-trips a token blob under key + nonce + associated data'
+        let key = '00000000000000000000000000000000000000000000000000000000000000ff'
+        let nonce = '111111111111111111111111'
+        let sealed = sealToken(key, nonce, 'conn:7', '{"access":"tok"}')
+        assert.isFalse(sealed == '')
+        assert.equals(openToken(key, nonce, 'conn:7', sealed), '{"access":"tok"}')
+    end
+    it 'produces different ciphertext under a different nonce'
+        let key = '00000000000000000000000000000000000000000000000000000000000000ff'
+        let a = sealToken(key, '111111111111111111111111', 'conn:7', 'same')
+        let b = sealToken(key, '222222222222222222222222', 'conn:7', 'same')
+        assert.isFalse(a == b)
+    end
+end
+
+test openToken
+    it 'fails authentication under a different connection id (associated data)'
+        let key = '00000000000000000000000000000000000000000000000000000000000000ff'
+        let nonce = '111111111111111111111111'
+        let sealed = sealToken(key, nonce, 'conn:7', 'secret')
+        assert.equals(openToken(key, nonce, 'conn:8', sealed), '')
+    end
+    it 'returns empty for a malformed sealed value'
+        let key = '00000000000000000000000000000000000000000000000000000000000000ff'
+        assert.equals(openToken(key, '111111111111111111111111', 'conn:7', 'not-base64!!'), '')
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

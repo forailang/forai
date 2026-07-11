@@ -898,6 +898,16 @@ are check errors. Declare secrets in fai.toml under `[secrets]` (backends:
 `env`, `dotenvx`, `aws`); `secrets.reveal(...)` is the single greppable
 plaintext audit anchor for trusted non-HTTP sinks. See `fai doc std.secrets`.
 
+`std.crypto` provides native hashing, HMAC, PBKDF2, RS256 signing, hex, and
+base64 (`fai doc std.crypto`), plus OAuth-support primitives: `sha256Base64Url`
+(the PKCE S256 `code_challenge` builder), `base64UrlEncode`/`base64UrlDecode`
+(unpadded base64url), and `aesGcmEncrypt`/`aesGcmDecrypt` for AES-256-GCM
+encryption at rest. The AES functions are text-safe: `keyHex` is 64 hex chars
+(32 bytes), `nonceHex` is 24 hex chars (12 bytes), `aad` is associated data
+bound into the tag, `encrypt` returns standard base64 of ciphertext||tag, and
+`decrypt` returns an empty string on authentication failure or malformed input.
+Use a fresh nonce per encryption; never reuse a (key, nonce) pair.
+
 Some modules are native-host only and expose an availability probe so code
 that also runs in the browser can branch instead of trapping:
 `process.available()`, `crypto.available()`, `net.available()`,

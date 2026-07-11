@@ -4,6 +4,8 @@
 //! there). String args arrive as (ptr, len) into guest memory; string
 //! results are allocated back onto the guest heap as NaN-boxed strings.
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -67,6 +69,69 @@ fn pbkdf2_hmac_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 
     let mut out = [0u8; 32];
     out.copy_from_slice(&t);
     out
+}
+
+/// Decode a lowercase-or-uppercase hex string into bytes. Returns None on any
+/// non-hex character or an odd length — callers treat None as malformed input.
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+/// AES-256-GCM encrypt. key must be 32 bytes (64 hex chars), nonce 12 bytes
+/// (24 hex chars). Returns standard base64 of ciphertext||tag, or an empty
+/// string on any malformed input.
+fn aes_gcm_encrypt(key_hex: &str, nonce_hex: &str, aad: &[u8], plaintext: &[u8]) -> String {
+    let (Some(key_bytes), Some(nonce_bytes)) = (from_hex(key_hex), from_hex(nonce_hex)) else {
+        return String::new();
+    };
+    if key_bytes.len() != 32 || nonce_bytes.len() != 12 {
+        return String::new();
+    }
+    let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    match cipher.encrypt(nonce, Payload { msg: plaintext, aad }) {
+        Ok(ct) => STANDARD.encode(ct),
+        Err(_) => String::new(),
+    }
+}
+
+/// AES-256-GCM decrypt. Inverse of `aes_gcm_encrypt`; ciphertext is standard
+/// base64 of ciphertext||tag. Returns the plaintext as a UTF-8 (lossy) string,
+/// or an empty string on authentication failure or malformed input. The token
+/// vault never stores an empty plaintext, so empty unambiguously signals
+/// failure there.
+fn aes_gcm_decrypt(key_hex: &str, nonce_hex: &str, aad: &[u8], ciphertext_b64: &str) -> String {
+    let (Some(key_bytes), Some(nonce_bytes)) = (from_hex(key_hex), from_hex(nonce_hex)) else {
+        return String::new();
+    };
+    if key_bytes.len() != 32 || nonce_bytes.len() != 12 {
+        return String::new();
+    }
+    let Ok(ct) = STANDARD.decode(ciphertext_b64.as_bytes()) else {
+        return String::new();
+    };
+    let cipher = <Aes256Gcm as aes_gcm::KeyInit>::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    match cipher.decrypt(nonce, Payload { msg: &ct, aad }) {
+        Ok(pt) => String::from_utf8_lossy(&pt).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Normalize private keys copied into env/config values. Many deployments
@@ -304,6 +369,104 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.crypto_sha256_base64url(ptr, len) -> i64. Raw SHA-256 digest as
+    // unpadded base64url — the PKCE S256 code_challenge builder.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_sha256_base64url",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = read_str(&caller, &mem, ptr, len);
+                let mut hasher = Sha256::new();
+                hasher.update(data.as_bytes());
+                let digest = hasher.finalize();
+                wasm_alloc_str(&mut caller, &mem, &URL_SAFE_NO_PAD.encode(digest))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_base64url_encode(ptr, len) -> i64. Unpadded base64url.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_base64url_encode",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = read_str(&caller, &mem, ptr, len);
+                wasm_alloc_str(&mut caller, &mem, &URL_SAFE_NO_PAD.encode(data.as_bytes()))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_base64url_decode(ptr, len) -> i64. Decoded bytes as UTF-8
+    // (lossy); invalid base64url yields an empty string.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_base64url_decode",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = read_str(&caller, &mem, ptr, len);
+                let decoded = URL_SAFE_NO_PAD.decode(data.as_bytes()).unwrap_or_default();
+                let text = String::from_utf8_lossy(&decoded).into_owned();
+                wasm_alloc_str(&mut caller, &mem, &text)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_aes_gcm_encrypt(key,len, nonce,len, aad,len, pt,len) -> i64.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_aes_gcm_encrypt",
+            |mut caller: Caller<'_, ()>,
+             key_ptr: i32,
+             key_len: i32,
+             nonce_ptr: i32,
+             nonce_len: i32,
+             aad_ptr: i32,
+             aad_len: i32,
+             pt_ptr: i32,
+             pt_len: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key_hex = read_str(&caller, &mem, key_ptr, key_len);
+                let nonce_hex = read_str(&caller, &mem, nonce_ptr, nonce_len);
+                let aad = read_str(&caller, &mem, aad_ptr, aad_len);
+                let plaintext = read_str(&caller, &mem, pt_ptr, pt_len);
+                let out = aes_gcm_encrypt(&key_hex, &nonce_hex, aad.as_bytes(), plaintext.as_bytes());
+                wasm_alloc_str(&mut caller, &mem, &out)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.crypto_aes_gcm_decrypt(key,len, nonce,len, aad,len, ct,len) -> i64.
+    linker
+        .func_wrap(
+            "env",
+            "crypto_aes_gcm_decrypt",
+            |mut caller: Caller<'_, ()>,
+             key_ptr: i32,
+             key_len: i32,
+             nonce_ptr: i32,
+             nonce_len: i32,
+             aad_ptr: i32,
+             aad_len: i32,
+             ct_ptr: i32,
+             ct_len: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key_hex = read_str(&caller, &mem, key_ptr, key_len);
+                let nonce_hex = read_str(&caller, &mem, nonce_ptr, nonce_len);
+                let aad = read_str(&caller, &mem, aad_ptr, aad_len);
+                let ciphertext = read_str(&caller, &mem, ct_ptr, ct_len);
+                let out = aes_gcm_decrypt(&key_hex, &nonce_hex, aad.as_bytes(), &ciphertext);
+                wasm_alloc_str(&mut caller, &mem, &out)
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     Ok(())
 }
 
@@ -380,6 +543,83 @@ mod tests {
     #[test]
     fn rs256_invalid_key_returns_empty_string() {
         assert_eq!(rs256_sign_base64_url("not a key", "header.payload"), "");
+    }
+
+    #[test]
+    fn pkce_s256_rfc7636_vector() {
+        // RFC 7636 Appendix B: verifier
+        // "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" hashes to challenge
+        // "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(hasher.finalize()),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn base64url_no_padding_or_url_unsafe_chars() {
+        let encoded = URL_SAFE_NO_PAD.encode(b"\xfb\xff\xbf");
+        assert!(!encoded.contains('=') && !encoded.contains('+') && !encoded.contains('/'));
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(encoded.as_bytes()).unwrap(),
+            b"\xfb\xff\xbf"
+        );
+    }
+
+    #[test]
+    fn aes_gcm_round_trip_with_aad() {
+        let key = "00".repeat(32); // 32-byte key
+        let nonce = "11".repeat(12); // 12-byte nonce
+        let ct = aes_gcm_encrypt(&key, &nonce, b"conn:7", b"{\"access\":\"tok\"}");
+        assert!(!ct.is_empty());
+        let pt = aes_gcm_decrypt(&key, &nonce, b"conn:7", &ct);
+        assert_eq!(pt, "{\"access\":\"tok\"}");
+    }
+
+    #[test]
+    fn aes_gcm_wrong_aad_fails() {
+        let key = "00".repeat(32);
+        let nonce = "11".repeat(12);
+        let ct = aes_gcm_encrypt(&key, &nonce, b"conn:7", b"secret");
+        // Decrypting with a different associated data must fail authentication.
+        assert_eq!(aes_gcm_decrypt(&key, &nonce, b"conn:8", &ct), "");
+    }
+
+    #[test]
+    fn aes_gcm_tampered_ciphertext_fails() {
+        let key = "00".repeat(32);
+        let nonce = "11".repeat(12);
+        let ct = aes_gcm_encrypt(&key, &nonce, b"", b"secret");
+        let mut raw = STANDARD.decode(&ct).unwrap();
+        raw[0] ^= 0x01; // flip a bit
+        let tampered = STANDARD.encode(&raw);
+        assert_eq!(aes_gcm_decrypt(&key, &nonce, b"", &tampered), "");
+    }
+
+    #[test]
+    fn aes_gcm_bad_key_length_is_empty() {
+        // 16-byte key (AES-128 size) is rejected — this API is AES-256 only.
+        let short_key = "00".repeat(16);
+        let nonce = "11".repeat(12);
+        assert_eq!(aes_gcm_encrypt(&short_key, &nonce, b"", b"x"), "");
+    }
+
+    #[test]
+    fn aes_gcm_distinct_nonces_distinct_ciphertexts() {
+        let key = "ab".repeat(32);
+        let ct1 = aes_gcm_encrypt(&key, &"01".repeat(12), b"", b"same");
+        let ct2 = aes_gcm_encrypt(&key, &"02".repeat(12), b"", b"same");
+        assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn from_hex_rejects_bad_input() {
+        assert!(from_hex("zz").is_none());
+        assert!(from_hex("abc").is_none()); // odd length
+        assert_eq!(from_hex("00ff").unwrap(), vec![0x00, 0xff]);
     }
 
     #[test]

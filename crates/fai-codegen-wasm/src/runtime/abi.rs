@@ -674,7 +674,25 @@ pub const IMPORT_CRYPTO_RANDOM_HEX: u32 = 137;
 /// `env.crypto_pbkdf2_sha256_hex(pw_ptr,len, salt_ptr,len, iters) -> i64` —
 /// PBKDF2-HMAC-SHA256, 32-byte derived key as hex. Native-only.
 pub const IMPORT_CRYPTO_PBKDF2_SHA256_HEX: u32 = 138;
-pub const IMPORT_COUNT: u32 = 139;
+/// `env.crypto_sha256_base64url(ptr, len) -> i64` — raw SHA-256 digest of the
+/// input bytes encoded as unpadded base64url. The PKCE S256 challenge builder.
+pub const IMPORT_CRYPTO_SHA256_BASE64URL: u32 = 139;
+/// `env.crypto_base64url_encode(ptr, len) -> i64` — unpadded base64url. Native-only.
+pub const IMPORT_CRYPTO_BASE64URL_ENCODE: u32 = 140;
+/// `env.crypto_base64url_decode(ptr, len) -> i64` — decode unpadded base64url
+/// to a UTF-8 (lossy) string; malformed input yields an empty string.
+pub const IMPORT_CRYPTO_BASE64URL_DECODE: u32 = 141;
+/// `env.crypto_aes_gcm_encrypt(key,len, nonce,len, aad,len, pt,len) -> i64` —
+/// AES-256-GCM. key is 64 hex chars (32 bytes), nonce 24 hex chars (12 bytes),
+/// aad and plaintext are UTF-8; returns standard base64 of ciphertext||tag, or
+/// an empty string on any malformed input. Native-only.
+pub const IMPORT_CRYPTO_AES_GCM_ENCRYPT: u32 = 142;
+/// `env.crypto_aes_gcm_decrypt(key,len, nonce,len, aad,len, ct,len) -> i64` —
+/// inverse of encrypt; ct is standard base64 of ciphertext||tag. Returns the
+/// UTF-8 (lossy) plaintext, or an empty string on authentication failure or
+/// malformed input. Native-only.
+pub const IMPORT_CRYPTO_AES_GCM_DECRYPT: u32 = 143;
+pub const IMPORT_COUNT: u32 = 144;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1557,6 +1575,56 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
         (
             "crypto_pbkdf2_sha256_hex",
             vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_SHA256_BASE64URL: (ptr,len) -> i64. Native-only.
+        (
+            "crypto_sha256_base64url",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_BASE64URL_ENCODE: (ptr,len) -> i64. Native-only.
+        (
+            "crypto_base64url_encode",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_BASE64URL_DECODE: (ptr,len) -> i64. Native-only.
+        (
+            "crypto_base64url_decode",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_AES_GCM_ENCRYPT: (key,len, nonce,len, aad,len, pt,len)
+        // -> i64 (base64 ciphertext||tag, or empty on error). Native-only.
+        (
+            "crypto_aes_gcm_encrypt",
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            vec![ValType::I64],
+        ),
+        // IMPORT_CRYPTO_AES_GCM_DECRYPT: (key,len, nonce,len, aad,len, ct,len)
+        // -> i64 (plaintext, or empty on auth failure). Native-only.
+        (
+            "crypto_aes_gcm_decrypt",
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
                 ValType::I32,
                 ValType::I32,
                 ValType::I32,
