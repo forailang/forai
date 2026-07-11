@@ -494,6 +494,13 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
             &[AS::String, AS::String, AS::String, AS::String],
             RS::Boxed,
         ),
+        ("std.http.request", "guarded") => (
+            IMPORT_HTTP_REQUEST_GUARDED,
+            &[AS::String, AS::String, AS::String, AS::Boxed, AS::String],
+            RS::Boxed,
+        ),
+        ("std.url", "encode") => (IMPORT_URL_ENCODE, &[AS::String], RS::Boxed),
+        ("std.url", "decode") => (IMPORT_URL_DECODE, &[AS::String], RS::Boxed),
         ("std.ffi", "available") => (IMPORT_FFI_AVAILABLE, &[AS::String], RS::MakeBool),
 
         // std.net.tcp — handle-based TCP surface.

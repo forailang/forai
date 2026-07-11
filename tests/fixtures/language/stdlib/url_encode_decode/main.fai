@@ -1,0 +1,40 @@
+# expect: ok
+# URL percent-encoding for OAuth form bodies and query components.
+
+use std.url
+
+# Encode a value for use in an application/x-www-form-urlencoded body.
+def encodeParam
+    @param value String
+    @return String
+do
+    url.encode(value)
+end
+
+# Decode a percent-encoded query value (as read from a callback URL).
+def decodeParam
+    @param value String
+    @return String
+do
+    url.decode(value)
+end
+
+test encodeParam
+    it 'leaves unreserved characters and escapes the rest'
+        assert.equals(encodeParam('a b&c=d'), 'a%20b%26c%3Dd')
+        assert.equals(encodeParam('token-value_1.0~'), 'token-value_1.0~')
+    end
+end
+
+test decodeParam
+    it 'round-trips an encoded value and maps + to space'
+        assert.equals(decodeParam('a%20b%26c%3Dd'), 'a b&c=d')
+        assert.equals(decodeParam('a+b'), 'a b')
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

@@ -692,7 +692,17 @@ pub const IMPORT_CRYPTO_AES_GCM_ENCRYPT: u32 = 142;
 /// UTF-8 (lossy) plaintext, or an empty string on authentication failure or
 /// malformed input. Native-only.
 pub const IMPORT_CRYPTO_AES_GCM_DECRYPT: u32 = 143;
-pub const IMPORT_COUNT: u32 = 144;
+/// `env.http_request_guarded(method,len, url,len, body,len, headers, options)
+/// -> i64` — hardened outbound request: private/loopback/link-local resolved
+/// IPs are refused, redirects are not followed unless opted in, and the body
+/// is size-capped with a truncation marker. Returns a Response Dict or null.
+pub const IMPORT_HTTP_REQUEST_GUARDED: u32 = 144;
+/// `env.url_encode(ptr, len) -> i64` — percent-encode a value for use as an
+/// application/x-www-form-urlencoded component. Native-only.
+pub const IMPORT_URL_ENCODE: u32 = 145;
+/// `env.url_decode(ptr, len) -> i64` — percent-decode; `+` becomes space.
+pub const IMPORT_URL_DECODE: u32 = 146;
+pub const IMPORT_COUNT: u32 = 147;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1631,6 +1641,34 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
                 ValType::I32,
                 ValType::I32,
             ],
+            vec![ValType::I64],
+        ),
+        // IMPORT_HTTP_REQUEST_GUARDED: (method,len, url,len, body,len,
+        // headers_val, options_json,len) -> i64 (Response Dict or null).
+        (
+            "http_request_guarded",
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I64,
+                ValType::I32,
+                ValType::I32,
+            ],
+            vec![ValType::I64],
+        ),
+        // IMPORT_URL_ENCODE / IMPORT_URL_DECODE: (ptr,len) -> i64.
+        (
+            "url_encode",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ),
+        (
+            "url_decode",
+            vec![ValType::I32, ValType::I32],
             vec![ValType::I64],
         ),
     ]

@@ -885,9 +885,18 @@ Use `fai doc std` to browse all standard library modules, or `fai doc std.array`
 descriptions are available via `fai doc <name>` at any time.
 
 Available modules: `std.string`, `std.array`, `std.dictionary`, `std.math`,
-`std.convert`, `std.json`, `std.http.request`, `std.http.server`, `std.file`,
-`std.path`, `std.env`, `std.events`, `std.error`, `std.time`, `std.log`,
-`std.cli`, `std.net`, `std.ffi`, `std.process`, `std.crypto`, `std.secrets`.
+`std.convert`, `std.json`, `std.http.request`, `std.http.server`, `std.url`,
+`std.file`, `std.path`, `std.env`, `std.events`, `std.error`, `std.time`,
+`std.log`, `std.cli`, `std.net`, `std.ffi`, `std.process`, `std.crypto`,
+`std.secrets`.
+
+`std.url` provides `encode`/`decode` for percent-encoding form-body and query
+components. `std.http.request.guarded(method, url, body, headers, optionsJson)`
+is a hardened outbound request for credential-proxy use: it refuses hosts that
+resolve to private/loopback/link-local addresses, does not follow redirects
+unless opted in, and size-caps the response with a truncation marker. Options
+(`blockPrivateIps`, `followRedirects`, `maxRedirects`, `maxBytes`) are a JSON
+object string.
 
 `std.secrets` provides opaque `Secret` handles: `secrets.get(name)` returns a
 handle carrying only the NAME; the plaintext stays host-side and is resolved

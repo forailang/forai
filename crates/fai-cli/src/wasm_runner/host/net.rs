@@ -84,6 +84,262 @@ fn read_str(mem: &Memory, caller: &impl AsContext, ptr: i32, len: i32) -> String
     String::from_utf8_lossy(&data[start..end]).into_owned()
 }
 
+/// Percent-encode a value as an `application/x-www-form-urlencoded` component:
+/// every byte outside the RFC 3986 unreserved set becomes `%XX`.
+fn percent_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Percent-decode; `+` decodes to a space (form-encoding convention). A
+/// malformed `%` escape is passed through literally. Result is UTF-8 (lossy).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// True if an address must never be reached by the credential proxy: loopback,
+/// private, link-local, unspecified, broadcast, CGNAT, or an IPv4-mapped v6 of
+/// any of those. This is the SSRF fence (plan R15/R15a).
+#[cfg(feature = "http-client")]
+fn ip_is_blocked(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|m| ip_is_blocked(IpAddr::V4(m)))
+                    .unwrap_or(false)
+        }
+    }
+}
+
+/// Extract (host, port) from an absolute URL without a URL-parsing crate.
+/// Defaults the port by scheme. Returns None if the URL has no authority.
+#[cfg(feature = "http-client")]
+fn host_port_from_url(url: &str) -> Option<(String, u16)> {
+    let is_https = url.starts_with("https");
+    let default_port = if is_https { 443 } else { 80 };
+    let after_scheme = url.split("://").nth(1)?;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    // Drop any userinfo prefix.
+    let authority = authority.rsplit('@').next()?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        // [ipv6]:port
+        let (h, tail) = rest.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default_port);
+        return Some((h.to_string(), port));
+    }
+    match authority.split_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().ok().unwrap_or(default_port))),
+        None => Some((authority.to_string(), default_port)),
+    }
+}
+
+/// Resolve the URL's host and refuse if it maps to any non-public address.
+/// Resolution failure is treated as a refusal (fail closed). This runs per
+/// guarded call; brain re-dispatches each same-host redirect hop as a fresh
+/// guarded call, so every hop is re-checked. Residual: a sub-second DNS
+/// rebind between this check and ureq's connect is not pinned out (v1 relies
+/// on the operator-trusted deployment precondition; pin-to-resolved-IP is
+/// deferred).
+#[cfg(feature = "http-client")]
+fn guard_host_public(url: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let Some((host, port)) = host_port_from_url(url) else {
+        return Err("guarded: could not parse host from URL".to_string());
+    };
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("guarded: DNS resolution failed: {}", e))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if ip_is_blocked(addr.ip()) {
+            return Err(format!("guarded: {} resolves to a blocked address", host));
+        }
+    }
+    if !any {
+        return Err(format!("guarded: {} did not resolve", host));
+    }
+    Ok(())
+}
+
+/// Hardened outbound request for the credential proxy. Applies the SSRF IP
+/// guard, a no-follow-by-default redirect policy, and a response size cap with
+/// a truncation marker. Returns a Response value (status/body/headers) or None
+/// on refusal/transport failure.
+#[cfg(feature = "http-client")]
+fn do_guarded_request(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    request_headers: &[(String, String)],
+    options_json: &str,
+) -> Option<serde_json::Value> {
+    let opts: serde_json::Value = serde_json::from_str(options_json).unwrap_or(serde_json::json!({}));
+    let block_private = opts
+        .get("blockPrivateIps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let follow = opts
+        .get("followRedirects")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let max_redirects = opts.get("maxRedirects").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+    let max_bytes = opts
+        .get("maxBytes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1_048_576);
+
+    if block_private && guard_host_public(url).is_err() {
+        return None;
+    }
+
+    let redirects = if follow { max_redirects.max(1) } else { 0 };
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(redirects)
+        .max_redirects_will_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+
+    let has_content_type = request_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+
+    let req_result = match (method, body) {
+        ("GET", _) => {
+            let mut req = agent.get(url);
+            for (n, v) in request_headers {
+                req = req.header(n, v);
+            }
+            req.call()
+        }
+        ("DELETE", _) => {
+            let mut req = agent.delete(url);
+            for (n, v) in request_headers {
+                req = req.header(n, v);
+            }
+            req.call()
+        }
+        (m, Some(b)) if m == "POST" || m == "PUT" || m == "PATCH" => {
+            let mut req = match m {
+                "POST" => agent.post(url),
+                "PUT" => agent.put(url),
+                _ => agent.patch(url),
+            };
+            if !has_content_type {
+                req = req.header("Content-Type", "application/json");
+            }
+            for (n, v) in request_headers {
+                req = req.header(n, v);
+            }
+            req.send(b.as_bytes())
+        }
+        _ => return None,
+    };
+
+    match req_result {
+        Ok(resp) => {
+            let status = resp.status().as_u16() as i32;
+            let mut headers: Vec<(String, String)> = Vec::new();
+            for (name, val) in resp.headers().iter() {
+                if let Ok(v) = val.to_str() {
+                    headers.push((name.as_str().to_string(), v.to_string()));
+                }
+            }
+            let mut body = resp.into_body();
+            let raw = body
+                .with_config()
+                .limit(max_bytes.saturating_add(1))
+                .read_to_vec()
+                .unwrap_or_default();
+            let (bytes, truncated) = if raw.len() as u64 > max_bytes {
+                (&raw[..max_bytes as usize], true)
+            } else {
+                (&raw[..], false)
+            };
+            let mut text = String::from_utf8_lossy(bytes).into_owned();
+            if truncated {
+                text.push_str(&format!("\n[truncated at {} bytes]", max_bytes));
+            }
+            Some(build_http_response_value(status, &text, &headers))
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(feature = "http-client"))]
+fn do_guarded_request(
+    _method: &str,
+    _url: &str,
+    _body: Option<&str>,
+    _request_headers: &[(String, String)],
+    _options_json: &str,
+) -> Option<serde_json::Value> {
+    None
+}
+
 #[cfg(feature = "http-client")]
 fn build_http_response_value(
     status: i32,
@@ -563,6 +819,70 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.http_request_guarded(method,len, url,len, body,len, headers_val,
+    // options_ptr,options_len) -> i64 (Response Dict or null).
+    linker
+        .func_wrap(
+            "env",
+            "http_request_guarded",
+            |mut caller: Caller<'_, ()>,
+             method_ptr: i32,
+             method_len: i32,
+             url_ptr: i32,
+             url_len: i32,
+             body_ptr: i32,
+             body_len: i32,
+             headers_val: i64,
+             options_ptr: i32,
+             options_len: i32|
+             -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let method = read_str(&mem, &caller, method_ptr, method_len);
+                let url = read_str(&mem, &caller, url_ptr, url_len);
+                let body = read_str(&mem, &caller, body_ptr, body_len);
+                let options = read_str(&mem, &caller, options_ptr, options_len);
+                let headers = match read_headers_arg(&mem, &mut caller, headers_val) {
+                    Ok(headers) => headers,
+                    Err(msg) => return signal_host_error(&mut caller, "secrets", &msg),
+                };
+                let method_upper = method.to_ascii_uppercase();
+                let body_opt = if matches!(method_upper.as_str(), "POST" | "PUT" | "PATCH") {
+                    Some(body.as_str())
+                } else {
+                    None
+                };
+                match do_guarded_request(&method_upper, &url, body_opt, &headers, &options) {
+                    Some(value) => build_value(&mut caller, &mem, &value),
+                    None => VAL_NULL,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
+    // env.url_encode(ptr, len) -> i64 / env.url_decode(ptr, len) -> i64.
+    linker
+        .func_wrap(
+            "env",
+            "url_encode",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let value = read_str(&mem, &caller, ptr, len);
+                super::super::heap::wasm_alloc_str(&mut caller, &mem, &percent_encode_component(&value))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+    linker
+        .func_wrap(
+            "env",
+            "url_decode",
+            |mut caller: Caller<'_, ()>, ptr: i32, len: i32| -> i64 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let value = read_str(&mem, &caller, ptr, len);
+                super::super::heap::wasm_alloc_str(&mut caller, &mem, &percent_decode(&value))
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.net_available() -> i32 (1/0). Native wasmtime always reports
     // networking available; the browser host linker stubs this to 0.
     linker
@@ -857,4 +1177,61 @@ fn rpc_request_owned(
     _hash: String,
 ) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Null)
+}
+
+#[cfg(all(test, feature = "http-client"))]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn percent_encode_leaves_unreserved_and_escapes_rest() {
+        assert_eq!(percent_encode_component("aZ0-._~"), "aZ0-._~");
+        assert_eq!(percent_encode_component("a b&c=d"), "a%20b%26c%3Dd");
+        assert_eq!(percent_encode_component("/"), "%2F");
+    }
+
+    #[test]
+    fn percent_decode_round_trips_and_handles_plus() {
+        assert_eq!(percent_decode("a%20b%26c%3Dd"), "a b&c=d");
+        assert_eq!(percent_decode("a+b"), "a b");
+        // Malformed escape passes through literally.
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn ip_guard_blocks_private_and_loopback() {
+        for s in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "172.16.5.5", "169.254.1.1", "0.0.0.0", "100.64.0.1"] {
+            assert!(ip_is_blocked(s.parse::<IpAddr>().unwrap()), "should block {}", s);
+        }
+        assert!(ip_is_blocked("::1".parse::<IpAddr>().unwrap()));
+        assert!(ip_is_blocked("fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(ip_is_blocked("fc00::1".parse::<IpAddr>().unwrap()));
+        // IPv4-mapped loopback.
+        assert!(ip_is_blocked("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn ip_guard_allows_public() {
+        for s in ["8.8.8.8", "1.1.1.1", "93.184.216.34"] {
+            assert!(!ip_is_blocked(s.parse::<IpAddr>().unwrap()), "should allow {}", s);
+        }
+        assert!(!ip_is_blocked("2606:4700:4700::1111".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn host_port_parses_scheme_default_and_explicit() {
+        assert_eq!(host_port_from_url("https://api.linear.app/graphql"), Some(("api.linear.app".to_string(), 443)));
+        assert_eq!(host_port_from_url("http://example.com/x?y=1"), Some(("example.com".to_string(), 80)));
+        assert_eq!(host_port_from_url("https://h.example:8443/p"), Some(("h.example".to_string(), 8443)));
+        assert_eq!(host_port_from_url("https://[2606:4700::1]:8443/p"), Some(("2606:4700::1".to_string(), 8443)));
+    }
+
+    #[test]
+    fn guard_refuses_localhost_and_allows_resolvable_public() {
+        // Loopback name resolves to 127.0.0.1 → refused.
+        assert!(guard_host_public("http://localhost:3040/x").is_err());
+        // Literal private IP → refused without DNS.
+        assert!(guard_host_public("http://10.0.0.5/x").is_err());
+    }
 }

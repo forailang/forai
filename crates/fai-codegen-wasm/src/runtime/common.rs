@@ -216,6 +216,10 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
             avail[IMPORT_CRYPTO_BASE64URL_DECODE as usize] = false;
             avail[IMPORT_CRYPTO_AES_GCM_ENCRYPT as usize] = false;
             avail[IMPORT_CRYPTO_AES_GCM_DECRYPT as usize] = false;
+            // Server-only outbound hardening + URL codec (native host).
+            avail[IMPORT_HTTP_REQUEST_GUARDED as usize] = false;
+            avail[IMPORT_URL_ENCODE as usize] = false;
+            avail[IMPORT_URL_DECODE as usize] = false;
             // FFI is native-only; an extern call reached on the browser
             // compiles to `unreachable` like the other stripped imports.
             avail[IMPORT_FFI_BEGIN as usize] = false;

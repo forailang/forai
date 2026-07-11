@@ -47,8 +47,29 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         b,
         "httpRequestDelete",
         &[p("url", Type::String), pd("headers", Type::Dictionary)],
+        &[response_type.clone()],
+    );
+    // Hardened outbound request for the credential proxy: blocks private/
+    // loopback resolved IPs, does not follow redirects unless opted in, and
+    // size-caps the body. `optionsJson` is a JSON object with optional keys
+    // blockPrivateIps (bool), followRedirects (bool), maxRedirects (int),
+    // maxBytes (int).
+    ins(
+        b,
+        "httpRequestGuarded",
+        &[
+            p("method", Type::String),
+            p("url", Type::String),
+            p("body", Type::String),
+            p("headers", Type::Dictionary),
+            p("optionsJson", Type::String),
+        ],
         &[response_type],
     );
+
+    // URL percent-encoding for form bodies / query components.
+    ins(b, "urlEncode", &[p("value", Type::String)], &[Type::String]);
+    ins(b, "urlDecode", &[p("value", Type::String)], &[Type::String]);
 
     // HTTP server — response builders. All return HttpResponse so
     // every routing path settles on the same wire shape.
@@ -155,6 +176,9 @@ mod tests {
             "httpRequestPut",
             "httpRequestPatch",
             "httpRequestDelete",
+            "httpRequestGuarded",
+            "urlEncode",
+            "urlDecode",
         ] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }

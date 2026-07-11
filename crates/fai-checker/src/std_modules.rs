@@ -315,10 +315,19 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("put", "httpRequestPut"),
             ("patch", "httpRequestPatch"),
             ("delete", "httpRequestDelete"),
+            ("guarded", "httpRequestGuarded"),
         ]
         .into_iter()
         .map(|(a, b)| (a.into(), b.into()))
         .collect(),
+    );
+
+    m.insert(
+        "std.url".into(),
+        vec![("encode", "urlEncode"), ("decode", "urlDecode")]
+            .into_iter()
+            .map(|(a, b)| (a.into(), b.into()))
+            .collect(),
     );
 
     m.insert(

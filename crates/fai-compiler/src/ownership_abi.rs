@@ -1180,6 +1180,27 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         doc: "fresh string via wasm_alloc_str",
     },
     HostImportRow {
+        canon: "std.http.request",
+        method: "guarded",
+        import: "http_request_guarded",
+        ret: ROwn,
+        doc: "fresh Response dict via build_value",
+    },
+    HostImportRow {
+        canon: "std.url",
+        method: "encode",
+        import: "url_encode",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
+        canon: "std.url",
+        method: "decode",
+        import: "url_decode",
+        ret: ROwn,
+        doc: "fresh string via wasm_alloc_str",
+    },
+    HostImportRow {
         canon: "std.crypto",
         method: "sha256Base64Url",
         import: "crypto_sha256_base64url",
