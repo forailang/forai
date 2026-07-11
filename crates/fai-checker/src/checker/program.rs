@@ -307,6 +307,10 @@ impl Checker {
         http_request_fields.insert("path".to_string(), Type::String);
         http_request_fields.insert("body".to_string(), Type::String);
         http_request_fields.insert("headers".to_string(), Type::Dictionary);
+        // Parsed query-string parameters. The host already populates this dict
+        // in build_request_into_guest; expose it so route handlers (e.g. the
+        // OAuth callback) can read state/code without parsing the raw path.
+        http_request_fields.insert("query".to_string(), Type::Dictionary);
         self.type_fields
             .insert("HttpRequest".to_string(), http_request_fields);
 
