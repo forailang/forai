@@ -47,6 +47,27 @@ fn watchdog_engine() -> &'static Engine {
     })
 }
 
+/// Source for a test run's module: raw wasm (JIT-compiled on load) or an
+/// already-compiled artifact from [`serialize_test_module`] (plan 135
+/// compile-once — workers `deserialize` the parent's native code instead of
+/// each re-running cranelift on the same wasm).
+pub enum TestModule<'a> {
+    Wasm(&'a [u8]),
+    Precompiled(&'a [u8]),
+}
+
+/// JIT-compile `wasm_bytes` with the shared test engine and return wasmtime's
+/// serialized native artifact. Feed it to [`TestModule::Precompiled`] in a
+/// worker to skip the compile. Both sides use `shared_engine()`, so the same
+/// fai binary always produces a loadable artifact.
+pub fn serialize_test_module(wasm_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let engine = shared_engine();
+    let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
+    module
+        .serialize()
+        .map_err(|e| fmt_err("WASM serialize error", e))
+}
+
 /// Per-run execution options.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RunOptions {
@@ -507,6 +528,13 @@ pub struct TestRunOptions {
     /// not substring). An allowed case with a delta reports as leaked-
     /// allowed and still passes.
     pub allow_leaks: Vec<String>,
+    /// Run only the suites at these indices into the `tests` slice (plan
+    /// 135). `None` runs every suite. Used by incremental selection (dirty
+    /// files → dirty suite indices) and sharding (`idx % N == i`). The full
+    /// `tests` slice is always passed so indices stay aligned with the
+    /// compiled wasm's test dispatch table; skipped suites are simply not
+    /// invoked and don't count toward the summary.
+    pub only_suites: Option<std::collections::HashSet<usize>>,
 }
 
 impl TestRunOptions {
@@ -561,7 +589,7 @@ pub fn run_wasm_tests(
     on_case: impl FnMut(&CaseOutcome),
 ) -> Result<TestSummary, String> {
     run_wasm_tests_with_externs(
-        wasm_bytes,
+        TestModule::Wasm(wasm_bytes),
         tests,
         Vec::new(),
         &TestRunOptions::default(),
@@ -709,7 +737,7 @@ impl EngineCaseRunner {
 /// the host's `call_ffi` import reads. Pass an empty `Vec` when the
 /// guest has no `extern` blocks.
 pub fn run_wasm_tests_with_externs(
-    wasm_bytes: &[u8],
+    module_src: TestModule<'_>,
     tests: &[crate::test_meta::TestSuiteMeta],
     externs: Vec<ExternInfo>,
     opts: &TestRunOptions,
@@ -722,12 +750,15 @@ pub fn run_wasm_tests_with_externs(
     let leaks = opts.check_leaks || std::env::var_os("FAI_CHECK_LEAKS").is_some();
     let ownership = opts.check_ownership || std::env::var_os("FAI_OWNERSHIP_CHECK").is_some();
     let debug_env = std::env::var_os("FAI_HEAP_VERIFY").is_some() || leaks || ownership;
-    let dbg = if debug_env {
-        Some(std::rc::Rc::new(debug_table::DbgTable::from_wasm(
-            wasm_bytes,
-        )))
-    } else {
-        None
+    // The debug table needs raw wasm; it's only built for debug runs, which
+    // never use the precompiled (parallel) path.
+    let wasm_for_dbg = match &module_src {
+        TestModule::Wasm(w) => Some(*w),
+        TestModule::Precompiled(_) => None,
+    };
+    let dbg = match (debug_env, wasm_for_dbg) {
+        (true, Some(w)) => Some(std::rc::Rc::new(debug_table::DbgTable::from_wasm(w))),
+        _ => None,
     };
     if let Some(dbg) = &dbg {
         host::util::set_bucket_base(dbg.heap_buckets.map(|(b, _)| b).unwrap_or(0));
@@ -742,7 +773,15 @@ pub fn run_wasm_tests_with_externs(
     }
     ownership_balance::reset(ownership, if ownership { dbg.clone() } else { None });
     let engine = shared_engine();
-    let module = Module::new(engine, wasm_bytes).map_err(|e| fmt_err("WASM load error", e))?;
+    let module = match module_src {
+        TestModule::Wasm(w) => Module::new(engine, w).map_err(|e| fmt_err("WASM load error", e))?,
+        // SAFETY: the bytes come from `serialize_test_module` on this same fai
+        // binary's `shared_engine()`, so they match the engine/version wasmtime
+        // requires for `deserialize`.
+        TestModule::Precompiled(p) => {
+            unsafe { Module::deserialize(engine, p) }.map_err(|e| fmt_err("WASM load error", e))?
+        }
+    };
     let mut store = Store::new(engine, ());
     let mut linker = Linker::new(engine);
     host::install_all(&mut linker)?;
@@ -826,8 +865,22 @@ pub fn run_wasm_tests_with_externs(
         None
     };
 
-    summary.total = tests.iter().map(|t| t.case_descriptions.len()).sum();
+    let run_suite = |i: usize| -> bool {
+        match &opts.only_suites {
+            Some(set) => set.contains(&i),
+            None => true,
+        }
+    };
+    summary.total = tests
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| run_suite(*i))
+        .map(|(_, t)| t.case_descriptions.len())
+        .sum();
     for (suite_i, test) in tests.iter().enumerate() {
+        if !run_suite(suite_i) {
+            continue;
+        }
         let mut suite_report = SuiteReport {
             suite_name: test.suite_name.clone(),
             cases: Vec::with_capacity(test.case_descriptions.len()),

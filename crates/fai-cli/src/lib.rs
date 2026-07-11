@@ -30,6 +30,7 @@ mod rpc_codegen;
 mod rpc_surface;
 mod scaffold;
 mod templates;
+mod test_cache;
 mod test_meta;
 mod wasm_runner;
 mod web_assets;
@@ -115,9 +116,11 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  fmt [path] [--check]    fmt");
     eprintln!("  check [file]            fmt → check");
-    eprintln!("  test [file] [--checked] [--check-leaks] [--check-ownership]");
-    eprintln!("                          fmt → check → test");
+    eprintln!("  test [file] [--checked] [--check-leaks] [--check-ownership] [-j N] [--shard=I/N]");
+    eprintln!("                          fmt → check → test (full suite + 100% coverage)");
     eprintln!("  run [file]              fmt → check → test → run");
+    eprintln!("                          test step is INCREMENTAL: only files changed since");
+    eprintln!("                          the last green run are retested (nothing if none)");
     eprintln!("  build [target]          fmt → check → test → build");
     eprintln!("  new <name>              Create a new project");
     eprintln!("  doc [query]             Look up documentation");
@@ -128,6 +131,8 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p, --project <name>    Select a project in a workspace");
+    eprintln!("  test -j N               Parallel workers (project-mode default ≈ min(4,cores); -j 1 = serial)");
+    eprintln!("  test --shard=I/N        Run only shard I of N, 1-based (worker unit; used by -j)");
     eprintln!("  build --html            Emit browser HTML runtime with wasm output");
     eprintln!("  build -o <path>         Write build output to a specific path");
     eprintln!("  run --watchdog[=secs]   Kill a hung run after secs (default 10) with a");
@@ -273,6 +278,7 @@ fn cmd_test(args: &[String]) {
         check_leaks,
         check_ownership,
         allow_leaks,
+        only_suites: None,
     };
     let (args, project) = extract_project_flag(&args);
     let (args, project) = lift_target_name_positional(args, project);
@@ -313,9 +319,62 @@ fn cmd_test(args: &[String]) {
     if checked {
         fai_codegen_wasm::set_checked(true);
     }
+    // Parallel workers (plan 135): fan the suite out across N `fai test
+    // --shard=k/N` child processes. `-j N` sets N explicitly; otherwise
+    // project-mode `fai test` auto-parallelizes to ~cpus/2 workers (the slow
+    // case). Single-file `fai test x.fai` stays serial unless -j is given, so
+    // its output is stable. `-j 1` forces serial anywhere. Each worker runs in
+    // its own process (separate `:memory:` DB → automatic isolation).
+    let (args, jobs_flag) = extract_jobs_flag(&args);
+
+    // Compile-once worker: the parent built the wasm and staged a bundle. Load
+    // it and run just this shard — no fmt, no check, no recompile.
+    if let Some((wasm_path, meta_path)) = pipeline::prebuilt_paths(&args) {
+        let code = pipeline::run_prebuilt_shard(
+            &wasm_path,
+            &meta_path,
+            pipeline::parse_shard(&args),
+            &test_opts,
+            &reporter,
+        );
+        std::process::exit(code);
+    }
+
+    // A direct `fai test --shard=I/N` (no parent/prebuilt) recompiles and runs
+    // that one shard serially — an advanced/manual entry; the normal parallel
+    // path goes through the compile-once parent below.
+    if pipeline::parse_shard(&args).is_some() {
+        step_fmt(&args, &reporter);
+        step_test_with_opts(&args, &reporter, &test_opts, 1);
+        return;
+    }
+
+    // Format, then run tests. The test step type-checks once (plan 135) and
+    // emits the `check` step itself — no separate `step_check` pass re-parsing
+    // and re-checking the whole project.
+    //
+    // Parallelism: project-mode `fai test` defaults to a few workers
+    // (`default_test_jobs`, compile-once + shard) — it roughly halves wall time
+    // and passes on isolated suites. Single-file `fai test x.fai` stays serial
+    // (stable output, tiny). `-j N` overrides; `-j 1` forces serial.
     step_fmt(&args, &reporter);
-    step_check(&args, &reporter);
-    step_test_with_opts(&args, &reporter, &test_opts);
+    let jobs = jobs_flag.unwrap_or(if is_project_mode {
+        default_test_jobs()
+    } else {
+        1
+    });
+    step_test_with_opts(&args, &reporter, &test_opts, jobs);
+}
+
+/// Default worker count for project-mode `fai test` (plan 135). A small,
+/// conservative number: enough to roughly halve wall time, few enough to limit
+/// per-worker memory (each worker instantiates the app + its own `:memory:` DB)
+/// and the chance that sharding separates non-isolated tests. Clamped to
+/// available cores. `-j N` overrides; `-j 1` forces serial.
+fn default_test_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(4).max(1))
+        .unwrap_or(1)
 }
 
 fn cmd_run(args: &[String]) {
@@ -390,8 +449,8 @@ fn cmd_run(args: &[String]) {
             // compile-and-run path. fmt/check/test happen here so
             // ad-hoc scripts behave the same as before.
             let target_args = scoped_pipeline_args(&args, project.as_deref());
+            // step_test type-checks once (plan 135); no separate step_check.
             step_fmt(&target_args, &reporter);
-            step_check(&target_args, &reporter);
             step_test(&target_args, &reporter);
         }
     }
@@ -464,8 +523,8 @@ fn cmd_build(args: &[String]) {
             let ctx = pipeline_enter_project(project.as_deref());
             if ctx.has_project() {
                 print_project_header(&reporter);
+                // step_test type-checks once (plan 135); no separate step_check.
                 step_fmt(&args, &reporter);
-                step_check(&args, &reporter);
                 step_test(&args, &reporter);
             }
         } else {
@@ -473,7 +532,6 @@ fn cmd_build(args: &[String]) {
             // Per-target recursion lands here, under the `▶ building
             // target 'X'` header that step_build emitted before calling.
             step_fmt(&args, &reporter);
-            step_check(&args, &reporter);
             step_test(&args, &reporter);
         }
     }
@@ -595,6 +653,41 @@ fn print_project_header(reporter: &Reporter) {
 }
 
 /// Extract -p/--project <name> from args, returning (remaining_args, project_name).
+/// Pull `-j [N]` / `--jobs [N]` / `-jN` / `--jobs=N` out of args, returning the
+/// remaining args and the requested worker count (plan 135, parallel `fai
+/// test`). A bare `-j` (no numeric operand) means "auto" = `default_test_jobs()`.
+/// Absent → `None` → serial. Parallel is opt-in, not the default: it needs
+/// compile-once to not regress on large projects and per-test isolation to be
+/// correct, so `fai test` stays serial unless asked.
+fn extract_jobs_flag(args: &[String]) -> (Vec<String>, Option<usize>) {
+    let mut remaining = Vec::new();
+    let mut jobs = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-j" || a == "--jobs" {
+            // Optional numeric operand; bare `-j` = auto.
+            if i + 1 < args.len() {
+                if let Ok(v) = args[i + 1].parse::<usize>() {
+                    jobs = Some(v);
+                    i += 2;
+                    continue;
+                }
+            }
+            jobs = Some(default_test_jobs());
+            i += 1;
+            continue;
+        } else if let Some(n) = a.strip_prefix("--jobs=").or_else(|| a.strip_prefix("-j")) {
+            jobs = Some(n.parse().unwrap_or_else(|_| default_test_jobs()));
+            i += 1;
+            continue;
+        }
+        remaining.push(args[i].clone());
+        i += 1;
+    }
+    (remaining, jobs)
+}
+
 fn extract_project_flag(args: &[String]) -> (Vec<String>, Option<String>) {
     let mut remaining = Vec::new();
     let mut project = None;
