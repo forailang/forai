@@ -1,0 +1,44 @@
+# expect: ok
+# Regression: a `mock()` call wrapped inside a helper `def` (not written
+# directly in a test block) must still register its target as a spy fn_id, so
+# the mocked function gets its interception preamble. Before the fix, the
+# spy-target scan only walked test blocks, so a helper-wrapped mock was
+# silently ignored and the real function body ran.
+
+# The function under test — returns its real value unless mocked.
+def realValue
+    @return Int
+do
+    7
+end
+
+# A helper that mocks realValue. The mock() lives here, not in the test block.
+def mockRealValueTo
+    @param n Int
+    @return Void
+do
+    mock(realValue, n)
+end
+
+test realValue
+    it 'honours a mock applied through a helper def'
+        assert.equals(realValue(), 7)
+        mockRealValueTo(42)
+        assert.equals(realValue(), 42)
+    end
+    afterEach
+        mockReset(realValue)
+    end
+end
+
+test mockRealValueTo
+    it 'is exercised by the realValue test'
+        assert.isTrue(true)
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

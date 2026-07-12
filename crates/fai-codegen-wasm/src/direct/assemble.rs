@@ -1427,6 +1427,15 @@ pub(super) fn collect_spy_targets(
                         scan_test_stmts(e, fbn, aliases, imports, out, next_std_fn_id);
                     }
                 }
+                Statement::FunctionDeclaration(fd) => {
+                    // Also scan `def` bodies, not just test blocks: a test may
+                    // call a helper (e.g. `mockWrite`) that wraps `mock(...)`,
+                    // and the wrapped target must still register a spy fn_id so
+                    // the callee gets its preamble. Without this, a `mock()`
+                    // hidden inside a helper is silently ignored unless the same
+                    // target is also mocked directly in some test block.
+                    scan_test_stmts(&fd.body, fbn, aliases, imports, out, next_std_fn_id);
+                }
                 Statement::TestDeclaration(td) => {
                     scan_test_stmts(&td.setup, fbn, aliases, imports, out, next_std_fn_id);
                     if let Some(b) = &td.before_all {
