@@ -344,6 +344,17 @@ fn parse_pass_count(output: &str) -> usize {
 }
 
 pub(crate) fn step_test(args: &[String], reporter: &Reporter) {
+    // Escape hatch: FAI_SKIP_TESTS lets the run/build pipeline skip its test
+    // gate (e.g. to build an artifact when a known-flaky suite would otherwise
+    // block it). Does NOT affect `fai test`, which runs the full suite via
+    // step_test_with_opts. Off by default; set FAI_SKIP_TESTS=1 to enable.
+    if matches!(
+        std::env::var("FAI_SKIP_TESTS").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    ) {
+        reporter.step(crate::report::StepStatus::Warn, "test", "skipped (FAI_SKIP_TESTS set)");
+        return;
+    }
     // Called from the run/build pipeline (`fai run`, "start"): incremental —
     // only files that changed since the last green run are retested (plan 135).
     let mode = TestMode {
