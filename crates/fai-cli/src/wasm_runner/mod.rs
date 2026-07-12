@@ -460,6 +460,20 @@ fn reset_retained_host_state(
     instance: &wasmtime::Instance,
     store: &mut wasmtime::Store<()>,
 ) -> Result<(), String> {
+    // Clear the error channel between cases. The whole run shares one
+    // instance, and an error thrown deep in a called function propagates
+    // upward by setting `__error_flag`; when it reaches the fatal test-case
+    // wrapper the codegen traps WITHOUT clearing the flag. Left set, the next
+    // case's first post-call check reads the stale flag and re-traps with the
+    // stale `__error_value` — so one genuine failure cascades into every
+    // following case (pure functions included). Resetting here, exactly where
+    // spy/mock state is already reset, guarantees each case starts clean.
+    if let Some(flag) = instance.get_global(&mut *store, "__error_flag") {
+        let _ = flag.set(&mut *store, wasmtime::Val::I32(0));
+    }
+    if let Some(value) = instance.get_global(&mut *store, "__error_value") {
+        let _ = value.set(&mut *store, wasmtime::Val::I64(0));
+    }
     let mut retained = host::drain_spy_retained_values();
     retained.extend(host::drain_router_retained_values());
     if retained.is_empty() {
