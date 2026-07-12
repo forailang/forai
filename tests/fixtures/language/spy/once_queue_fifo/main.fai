@@ -1,0 +1,43 @@
+# expect: ok
+# Regression: successive `mockOnce` calls on the same target must QUEUE and be
+# consumed FIFO — one per later call — not overwrite a single pending slot.
+# A function that issues several calls in one invocation (create-then-read-back,
+# or a DB helper mocked per query) relies on each `mockOnce` lining up with its
+# own call in order. Before the fix the runtime kept a single once slot, so only
+# the last `mockOnce` survived and earlier calls fell through to the real body.
+
+# The function under test — returns 0 unless mocked.
+def val
+    @return Int
+do
+    0
+end
+
+test val
+    it 'consumes queued once-mocks in FIFO order, then falls through'
+        mockOnce(val, 1)
+        mockOnce(val, 2)
+        mockOnce(val, 3)
+        assert.equals(val(), 1)
+        assert.equals(val(), 2)
+        assert.equals(val(), 3)
+        # queue drained -> the real body runs again
+        assert.equals(val(), 0)
+    end
+    it 'lets a persistent mock take over once the queue is empty'
+        mockOnce(val, 7)
+        mock(val, 9)
+        # setting a persistent mock clears the pending queue
+        assert.equals(val(), 9)
+        assert.equals(val(), 9)
+    end
+    afterEach
+        mockReset(val)
+    end
+end
+
+def main
+    @return Void
+do
+    print('ok')
+end

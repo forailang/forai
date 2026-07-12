@@ -61,9 +61,13 @@ fn extract_string(val: i64, data: &[u8]) -> Option<&[u8]> {
 #[derive(Debug, Clone, Default)]
 struct SpyEntry {
     mock_value: Option<i64>,
-    once_value: Option<i64>,
+    // Queued once-mocks, consumed FIFO by successive calls. A single pending
+    // slot would only serve one call; a function that issues several calls in
+    // one invocation (e.g. a create-then-read-back) needs each `mockOnce` to
+    // line up with its own call in order.
+    once_values: std::collections::VecDeque<i64>,
     // Call records are borrowed snapshots for same-test assertions. They do not
-    // own guest retain credits; only mock_value/once_value are host-retained.
+    // own guest retain credits; only mock_value/once_values are host-retained.
     calls: Vec<Vec<i64>>,
 }
 
@@ -105,12 +109,13 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             |mut caller: Caller<'_, ()>, fn_id: i32, value: i64| {
                 host_retain_value(&mut caller, value);
                 let old = with_entry(fn_id, |e| {
-                    let old = [e.mock_value.take(), e.once_value.take()];
+                    // Setting a persistent mock clears any queued once-mocks.
+                    let mut old: Vec<i64> = e.mock_value.take().into_iter().collect();
+                    old.extend(e.once_values.drain(..));
                     e.mock_value = Some(value);
-                    e.once_value = None;
                     old
                 });
-                host_release_values(&mut caller, old.into_iter().flatten());
+                host_release_values(&mut caller, old);
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -121,12 +126,11 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
             "spy_set_mock_once",
             |mut caller: Caller<'_, ()>, fn_id: i32, value: i64| {
                 host_retain_value(&mut caller, value);
-                let old = with_entry(fn_id, |e| {
-                    let old = e.once_value.take();
-                    e.once_value = Some(value);
-                    old
+                // Queue this once-mock behind any already pending; each is
+                // consumed by one later call, in the order they were set.
+                with_entry(fn_id, |e| {
+                    e.once_values.push_back(value);
                 });
-                host_release_values(&mut caller, old);
             },
         )
         .map_err(|e| format!("linker error: {}", e))?;
@@ -167,7 +171,7 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 };
                 let mocked = with_entry(fn_id, |e| {
                     e.calls.push(args);
-                    if let Some(v) = e.once_value.take() {
+                    if let Some(v) = e.once_values.pop_front() {
                         Some((v, true))
                     } else {
                         e.mock_value.map(|v| (v, false))
@@ -300,10 +304,9 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
 }
 
 fn retained_values(entry: &mut SpyEntry) -> Vec<i64> {
-    [entry.mock_value.take(), entry.once_value.take()]
-        .into_iter()
-        .flatten()
-        .collect()
+    let mut out: Vec<i64> = entry.mock_value.take().into_iter().collect();
+    out.extend(entry.once_values.drain(..));
+    out
 }
 
 /// Drain host-retained spy/mock values between test runs. The CLI test runner
@@ -334,12 +337,13 @@ mod tests {
         clear_state();
         with_entry(2, |e| {
             e.mock_value = Some(11);
-            e.once_value = Some(22);
+            e.once_values.push_back(22);
+            e.once_values.push_back(44);
             e.calls.push(vec![33]);
         });
 
         let retained = drain_retained_values();
-        assert_eq!(retained, vec![11, 22]);
+        assert_eq!(retained, vec![11, 22, 44]);
 
         let retained_again = drain_retained_values();
         assert!(retained_again.is_empty());
