@@ -261,6 +261,12 @@ fn run_parallel_compiled(
             .arg(format!("--shard={}/{}", k, jobs))
             .arg(format!("--prebuilt-wasm={}", artifact_path.display()))
             .arg(format!("--prebuilt-meta={}", bundle_path.display()))
+            // Stable per-worker identifier (1-based). Concurrent shards share
+            // one working directory, so a program that writes to disk during
+            // tests can key a per-worker path off this to avoid cross-shard
+            // collisions. Only set for the parallel fan-out; a single/direct
+            // shard run leaves it unset.
+            .env("FAI_TEST_SHARD", k.to_string())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         match cmd.spawn() {
