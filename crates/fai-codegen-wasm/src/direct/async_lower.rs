@@ -952,29 +952,50 @@ fn collect_spawn_targets(
 
 /// Max child-id slots a statement (and its nested bodies) need across a
 /// suspension: `all(...)` → its arg count, a single await → 1, else 0.
+///
+/// The statement forms inspected here MUST mirror the CFG's suspension
+/// lowering (see the `value` match in the async-statement detector and
+/// `CfgBuilder::lower_seq`): any statement position whose expression can
+/// lower to an awaited child (`let`/`var`, assignment, bare expression,
+/// `return`, `throw`, `nowait`, and hoisted `if`/`while` conditions)
+/// consumes a pending slot at that suspension. Under-counting sizes the
+/// frame without the pending region and the child-id store overflows into
+/// the adjacent heap block — the resumed task then reads a clobbered
+/// pending id and `task_result` returns another block's bytes. This is
+/// exactly what corrupted concurrent RPC responses on the brain server
+/// (the `resultJson = dispatch(...)` ASSIGNMENT in
+/// `Forui.rpc.handleRpcRequest` was not counted) and the same class that
+/// earlier lost `children()`'s captured locals in forui.
 fn stmt_pending_count(
     stmt: &Statement,
     fns: &AsyncResolve<'_>,
     params: &std::collections::HashSet<String>,
 ) -> usize {
+    let expr_pending = |v: &Expression| -> usize {
+        if let Some(children) = all_call(v, fns) {
+            children.len()
+        } else if user_callee(v, fns).is_some() {
+            1
+        // A closure-parameter / computed-callee call lowers to `Term::AwaitClosure`,
+        // which (in both its sync and async sub-paths) writes a child/synth task id
+        // to `frame[pending_off]`.
+        } else if indirect_closure_call(v, params, fns).is_some() {
+            1
+        } else {
+            0
+        }
+    };
     let value = match stmt {
         Statement::LetStatement(ls) => Some(&ls.value),
         Statement::VarStatement(vs) => Some(&vs.value),
+        Statement::AssignmentStatement(a) => Some(&a.value),
         Statement::ExpressionStatement(es) => Some(&es.expression),
         Statement::ReturnStatement(rs) => rs.value.as_ref(),
+        Statement::ThrowStatement(ts) => Some(&ts.expression),
+        Statement::NowaitStatement(nw) => Some(&nw.expression),
         _ => None,
     };
-    let mut m = match value {
-        Some(v) if all_call(v, fns).is_some() => all_call(v, fns).unwrap().len(),
-        Some(v) if user_callee(v, fns).is_some() => 1,
-        // A closure-parameter / computed-callee call lowers to `Term::AwaitClosure`,
-        // which (in both its sync and async sub-paths) writes a child/synth task id
-        // to `frame[pending_off]`. Without counting it the pending region is unsized
-        // and that write overflows the frame into the adjacent heap object. (This is
-        // what silently lost `children()`'s captured locals in forui.)
-        Some(v) if indirect_closure_call(v, params, fns).is_some() => 1,
-        _ => 0,
-    };
+    let mut m = value.map_or(0, expr_pending);
     let recur = |stmts: &[Statement], m: &mut usize| {
         for s in stmts {
             *m = (*m).max(stmt_pending_count(s, fns, params));
@@ -983,13 +1004,20 @@ fn stmt_pending_count(
     match stmt {
         Statement::IfStatement(is) => {
             for branch in &is.branches {
+                // A branch condition with an async call is hoisted into a
+                // preceding binding by the ANF pass — it still consumes a
+                // pending slot at that suspension.
+                m = m.max(expr_pending(&branch.condition));
                 recur(&branch.body, &mut m);
             }
             if let Some(e) = &is.else_branch {
                 recur(e, &mut m);
             }
         }
-        Statement::WhileStatement(ws) => recur(&ws.body, &mut m),
+        Statement::WhileStatement(ws) => {
+            m = m.max(expr_pending(&ws.condition));
+            recur(&ws.body, &mut m);
+        }
         Statement::ForStatement(fs) => recur(&fs.body, &mut m),
         Statement::TryStatement(ts) => {
             recur(&ts.try_body, &mut m);
@@ -2556,6 +2584,12 @@ pub(super) fn build_resume_fn(
             b.emit(Instruction::I32Add);
             b.emit(Instruction::I32Load(mem_off(crate::async_engine::O_STATUS)));
             b.emit(Instruction::LocalSet(st));
+            if let Some(trace) = layout.sched_trace {
+                b.emit(Instruction::I32Const(6));
+                b.emit(Instruction::LocalGet(pend));
+                b.emit(Instruction::LocalGet(st));
+                b.emit(Instruction::Call(trace));
+            }
             // if status == COMPLETE || status == FAILED:
             b.emit(Instruction::LocalGet(st));
             b.emit(Instruction::I32Const(crate::async_engine::ST_COMPLETE));
@@ -3082,6 +3116,12 @@ pub(super) fn build_resume_fn(
                 b.emit(Instruction::LocalGet(frame_ptr_l));
                 b.emit(Instruction::LocalGet(synth_id_l));
                 b.emit(Instruction::I32Store(mem_off(frame.pending_off)));
+                if let Some(trace) = layout.sched_trace {
+                    b.emit(Instruction::I32Const(9));
+                    b.emit(Instruction::LocalGet(synth_id_l));
+                    b.emit(Instruction::I32Const(*next as i32));
+                    b.emit(Instruction::Call(trace));
+                }
                 // Re-dispatch to `next` without suspending (locals stay live).
                 emit_store_current_rstate(&mut b, layout, *next as i32);
                 b.emit(Instruction::Br(loop_depth + 1));
@@ -4368,6 +4408,10 @@ pub fn try_codegen_async_engine(
             .get(crate::runtime::IMPORT_TRAP_REPORT as usize)
             .copied()
             .flatten(),
+        sched_trace: import_remap
+            .get(crate::runtime::IMPORT_SCHED_TRACE as usize)
+            .copied()
+            .flatten(),
         // Test builds spawn cases individually via `_fai_spawn_test`.
         spawn_root: !is_test,
     };
@@ -5111,4 +5155,117 @@ pub fn try_codegen_async_engine(
         return None;
     }
     Some(bytes)
+}
+
+#[cfg(test)]
+mod frame_layout_tests {
+    use super::*;
+
+    fn layout_for(src: &str, fn_name: &str) -> AsyncFrame {
+        let prepared = fai_compiler::prepare_source(src, None).expect("prepare");
+        let cfd = prepared
+            .serde_ast
+            .statements
+            .iter()
+            .find_map(|s| match s {
+                Statement::FunctionDeclaration(fd) if fd.name == fn_name => Some(fd),
+                _ => None,
+            })
+            .expect("compiler fn");
+        let async_set = std::collections::HashSet::new();
+        let all_fns = std::collections::HashSet::new();
+        let aliases = std::collections::HashMap::new();
+        let named_imports = std::collections::HashMap::new();
+        let ufcs_calls = std::collections::HashSet::new();
+        let r = AsyncResolve {
+            async_set: &async_set,
+            all_fns: &all_fns,
+            aliases: &aliases,
+            named_imports: &named_imports,
+            module_context: None,
+            ufcs_calls: &ufcs_calls,
+            module_key: "",
+        };
+        async_frame_layout(cfd, &r, false)
+    }
+
+    /// A closure-param call awaited through an ASSIGNMENT must reserve a
+    /// pending slot. Before the fix `stmt_pending_count` only looked at
+    /// let/var/expression/return statements, so `out = cb()` sized the
+    /// frame WITHOUT the pending region and the child-id store overflowed
+    /// into the adjacent heap block (the brain concurrent-RPC corruption:
+    /// `resultJson = dispatch(...)` in Forui.rpc.handleRpcRequest).
+    #[test]
+    fn assignment_awaited_closure_call_reserves_a_pending_slot() {
+        let src = "\
+# Run a callback, binding via assignment inside try/catch.
+def run
+    @param cb Loader
+    @return String
+do
+    var out = ''
+    try
+        out = cb()
+    catch e
+        out = 'err'
+    end
+    out
+end
+";
+        let frame = layout_for(src, "run");
+        assert!(
+            (frame.size as u64) >= frame.pending_off + 4,
+            "frame must include the pending region: size={} pending_off={}",
+            frame.size,
+            frame.pending_off
+        );
+    }
+
+    /// Control: the let-bound form was already counted.
+    #[test]
+    fn let_awaited_closure_call_reserves_a_pending_slot() {
+        let src = "\
+# Run a callback, binding via let.
+def run
+    @param cb Loader
+    @return String
+do
+    let out = cb()
+    out
+end
+";
+        let frame = layout_for(src, "run");
+        assert!(
+            (frame.size as u64) >= frame.pending_off + 4,
+            "frame must include the pending region: size={} pending_off={}",
+            frame.size,
+            frame.pending_off
+        );
+    }
+
+    /// An if-condition closure call is hoisted by ANF into a binding that
+    /// still consumes a pending slot at the suspension.
+    #[test]
+    fn condition_awaited_closure_call_reserves_a_pending_slot() {
+        let src = "\
+# Branch on a callback result.
+def run
+    @param cb Check
+    @return String
+do
+    if cb()
+        'yes'
+    else
+        'no'
+    end
+end
+";
+        let frame = layout_for(src, "run");
+        assert!(
+            (frame.size as u64) >= frame.pending_off + 4,
+            "frame must include the pending region: size={} pending_off={}",
+            frame.size,
+            frame.pending_off
+        );
+    }
 }

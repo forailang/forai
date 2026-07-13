@@ -702,7 +702,11 @@ pub const IMPORT_HTTP_REQUEST_GUARDED: u32 = 144;
 pub const IMPORT_URL_ENCODE: u32 = 145;
 /// `env.url_decode(ptr, len) -> i64` — percent-decode; `+` becomes space.
 pub const IMPORT_URL_DECODE: u32 = 146;
-pub const IMPORT_COUNT: u32 = 147;
+/// `env.__fai_sched_trace(op, a, b) -> void` — scheduler event trace
+/// (FAI_SCHED_TRACE). op: 1=spawn 2=complete 3=fail 4=await 5=task_result
+/// 6=free_pending 7=free_task 8=resume 9=synth-sync-slot.
+pub const IMPORT_SCHED_TRACE: u32 = 147;
+pub const IMPORT_COUNT: u32 = 148;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -785,6 +789,15 @@ pub const TRAP_DICT_CAP_INSANE: i32 = 13;
 /// before it grows memory toward the 4 GB ceiling. `a` = requested
 /// logical size, `b` = rounded block size.
 pub const TRAP_ALLOC_TOO_BIG: i32 = 14;
+/// FAI_SCHED_CHECK: `task_result` was asked for a task that is not in a
+/// terminal (COMPLETE/FAILED) state — the caller is reading a slot that was
+/// recycled, never completed, or belongs to a different task. `a` = task id,
+/// `b` = its status word.
+pub const TRAP_TASK_RESULT_NOT_DONE: i32 = 15;
+/// FAI_SCHED_CHECK: `spawn` popped a free-list slot whose status is not
+/// ST_FREED — the slot was pushed onto `g_free_head` twice or freed while
+/// live. `a` = task id, `b` = its status word.
+pub const TRAP_TASK_SLOT_REUSED: i32 = 16;
 
 /// Return the WASM type signatures needed for runtime functions.
 /// Each entry is (params, results).
@@ -1670,6 +1683,12 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             "url_decode",
             vec![ValType::I32, ValType::I32],
             vec![ValType::I64],
+        ),
+        // IMPORT_SCHED_TRACE: (op, a, b) -> void. FAI_SCHED_TRACE only.
+        (
+            "__fai_sched_trace",
+            vec![ValType::I32, ValType::I32, ValType::I32],
+            vec![],
         ),
     ]
 }

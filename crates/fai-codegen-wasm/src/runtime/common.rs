@@ -171,6 +171,10 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
     if std::env::var_os("FAI_MEM_WATCH").is_none() {
         avail[IMPORT_MEM_WATCH as usize] = false;
     }
+    // Same for the scheduler event trace / FAI_SCHED_TRACE.
+    if std::env::var_os("FAI_SCHED_TRACE").is_none() {
+        avail[IMPORT_SCHED_TRACE as usize] = false;
+    }
     avail[IMPORT_RESERVED_17 as usize] = false;
     // Ownership helper events are opt-in, matching the helper-call emission
     // gate. Default/native/browser builds keep their old import surface.

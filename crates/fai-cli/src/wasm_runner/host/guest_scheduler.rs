@@ -38,7 +38,11 @@ impl GuestScheduler {
             return 0;
         };
         let mut out = [Val::I32(0)];
-        if f.call(&mut *caller, &[], &mut out).is_err() {
+        if let Err(e) = f.call(&mut *caller, &[], &mut out) {
+            let detail = super::io::take_trap_msg()
+                .map(|m| format!(" — {m}"))
+                .unwrap_or_default();
+            super::super::output::stderr_line(&format!("[sched] poll trapped: {e}{detail}"));
             return 0;
         }
         match out[0] {
@@ -49,7 +53,14 @@ impl GuestScheduler {
 
     pub(super) fn resume_task(&self, caller: &mut Caller<'_, ()>, id: i32) {
         if let Some(f) = &self.resume_task {
-            let _ = f.call(&mut *caller, &[Val::I32(id)], &mut [Val::I32(0)]);
+            if let Err(e) = f.call(&mut *caller, &[Val::I32(id)], &mut [Val::I32(0)]) {
+                let detail = super::io::take_trap_msg()
+                    .map(|m| format!(" — {m}"))
+                    .unwrap_or_default();
+                super::super::output::stderr_line(&format!(
+                    "[sched] resume_task(t{id}) trapped: {e}{detail}"
+                ));
+            }
         }
     }
 

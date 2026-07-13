@@ -171,6 +171,8 @@ pub struct SchedLayout {
     /// When set, scheduler guards report a structured reason before
     /// trapping (plan 116); `None` → bare `unreachable`.
     pub trap_report: Option<u32>,
+    /// Optional `__fai_sched_trace(op, a, b)` import index (FAI_SCHED_TRACE).
+    pub sched_trace: Option<u32>,
 }
 
 /// Number of scheduler helper functions emitted by [`emit_scheduler_functions`],
@@ -203,6 +205,23 @@ fn rec_addr_global(f: &mut Function, l: &SchedLayout, global: u32) {
     f.instruction(&Instruction::I32Const(REC_SIZE));
     f.instruction(&Instruction::I32Mul);
     f.instruction(&Instruction::I32Add);
+}
+
+
+/// Emit `__fai_sched_trace(op, a, b)` when the layout carries the trace
+/// import (FAI_SCHED_TRACE builds only). `push_args` pushes the two i32
+/// payload words.
+fn emit_sched_trace(
+    f: &mut Function,
+    l: &SchedLayout,
+    op: i32,
+    push_args: impl FnOnce(&mut Function),
+) {
+    if let Some(trace) = l.sched_trace {
+        f.instruction(&Instruction::I32Const(op));
+        push_args(f);
+        f.instruction(&Instruction::Call(trace));
+    }
 }
 
 fn emit_ready_push(l: &SchedLayout) -> Function {
@@ -321,6 +340,30 @@ fn emit_spawn(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(-1));
     f.instruction(&Instruction::I32Ne);
     f.instruction(&Instruction::If(BlockType::Empty));
+    if std::env::var_os("FAI_SCHED_CHECK").is_some() {
+        // FAI_SCHED_CHECK: a slot handed out by the free list must be
+        // ST_FREED. Anything else means the slot was pushed onto
+        // `g_free_head` twice or freed while live — the next spawn would
+        // alias a live task's record. Trap with the id + status.
+        rec_addr_local(&mut f, l, 2);
+        f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+        f.instruction(&Instruction::I32Const(ST_FREED));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        if let Some(trap_report) = l.trap_report {
+            f.instruction(&Instruction::I32Const(
+                crate::runtime::TRAP_TASK_SLOT_REUSED,
+            ));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::I64ExtendI32S);
+            rec_addr_local(&mut f, l, 2);
+            f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+            f.instruction(&Instruction::I64ExtendI32S);
+            f.instruction(&Instruction::Call(trap_report));
+        }
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
     // free-list pop: g_free_head = freed[id].next  (id already in local 2)
     rec_addr_local(&mut f, l, 2);
     f.instruction(&Instruction::I32Load(ma(O_NEXT)));
@@ -396,6 +439,10 @@ fn emit_spawn(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(1));
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::GlobalSet(l.g_live));
+    emit_sched_trace(&mut f, l, 1, |f| {
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(1));
+    });
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::Call(l.ready_push));
     f.instruction(&Instruction::LocalGet(2));
@@ -408,6 +455,11 @@ fn emit_complete_or_fail(l: &SchedLayout, status: i32, value_off: u64) -> Functi
     let mut f = Function::new([(1, ValType::I32)]);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::LocalSet(2));
+    emit_sched_trace(&mut f, l, if status == ST_COMPLETE { 2 } else { 3 }, |f| {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Load(ma(O_WAITER)));
+    });
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Const(status));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
@@ -422,6 +474,12 @@ fn emit_complete_or_fail(l: &SchedLayout, status: i32, value_off: u64) -> Functi
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Load(ma(O_FRAME_SIZE)));
     f.instruction(&Instruction::If(BlockType::Empty)); // size != 0
+    emit_sched_trace(&mut f, l, 10, |f| {
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Load(ma(O_FRAME)));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Load(ma(O_FRAME_SIZE)));
+    });
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I32Load(ma(O_FRAME))); // frame ptr
     f.instruction(&Instruction::LocalGet(2));
@@ -678,6 +736,11 @@ fn emit_poll(l: &SchedLayout) -> Function {
     }
     f.instruction(&Instruction::Unreachable);
     f.instruction(&Instruction::End);
+    emit_sched_trace(&mut f, l, 8, |f| {
+        f.instruction(&Instruction::LocalGet(1));
+        rec_addr_local(f, l, 1);
+        f.instruction(&Instruction::I32Load(ma(O_RSTATE)));
+    });
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::I32Const(ST_RUNNING));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
@@ -734,6 +797,10 @@ fn emit_start_async(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Const(l.capacity * REC_SIZE));
     f.instruction(&Instruction::Call(l.alloc));
     f.instruction(&Instruction::GlobalSet(l.g_table_base));
+    emit_sched_trace(&mut f, l, 11, |f| {
+        f.instruction(&Instruction::GlobalGet(l.g_table_base));
+        f.instruction(&Instruction::I32Const(l.capacity * REC_SIZE));
+    });
     f.instruction(&Instruction::I32Const(l.root_frame_size));
     f.instruction(&Instruction::Call(l.alloc));
     f.instruction(&Instruction::LocalSet(0));
@@ -833,6 +900,16 @@ pub fn emit_spawn_test(l: &SchedLayout, cases: &[SpawnTestCase]) -> Function {
 
 fn emit_resume_task(l: &SchedLayout) -> Function {
     // param: id = 0; -> i32
+    //
+    // Host-driven wakeup (`__fai_resume_task`): only a WAITING task may be
+    // readied. The host can deliver duplicate or stale wakeups — a browser
+    // `remote_begin` error path calling `done()` after the value path already
+    // resumed, an offload completion racing another wake source — and an
+    // unguarded push would queue the task twice (or re-ready a RUNNING /
+    // READY / COMPLETE / FREED slot). A double-queued task resumes a second
+    // time at a stale resume-state and reads pending-child frame slots that
+    // were never written for that state — the "task_result of a zeroed slot"
+    // corruption class. Mirrors `notify_waiter`'s WAITING-only discipline.
     let mut f = Function::new([(1, ValType::I32)]);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::LocalSet(1));
@@ -851,20 +928,83 @@ fn emit_resume_task(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Sub);
     f.instruction(&Instruction::GlobalSet(l.g_timer_waiting));
     f.instruction(&Instruction::End);
-    f.instruction(&Instruction::End);
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I32Const(ST_READY));
     f.instruction(&Instruction::I32Store(ma(O_STATUS)));
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::Call(l.ready_push));
+    f.instruction(&Instruction::End);
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::End);
     f
 }
 
 fn emit_task_result(l: &SchedLayout) -> Function {
-    // param: id = 0; -> i64
-    let mut f = Function::new([]);
+    // param: id = 0; locals: status = 1 (only under FAI_SCHED_CHECK); -> i64
+    let sched_check = std::env::var_os("FAI_SCHED_CHECK").is_some();
+    let mut f = Function::new([(1, ValType::I32)]);
+    emit_sched_trace(&mut f, l, 5, |f| {
+        f.instruction(&Instruction::LocalGet(0));
+        rec_addr_local(f, l, 0);
+        f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    });
+    if sched_check {
+        // FAI_SCHED_CHECK: reading a result off a task that is not in a
+        // terminal state means the caller's child id is stale — the slot was
+        // recycled by another spawn (status READY/RUNNING/WAITING) or already
+        // freed (ST_FREED). Trap with the id + status so the report lands at
+        // the misread instead of surfacing later as a corrupted value.
+        rec_addr_local(&mut f, l, 0);
+        f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(ST_COMPLETE));
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(ST_FAILED));
+        f.instruction(&Instruction::I32GtS);
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        if let Some(trap_report) = l.trap_report {
+            f.instruction(&Instruction::I32Const(
+                crate::runtime::TRAP_TASK_RESULT_NOT_DONE,
+            ));
+            // a = id | current_task << 32 — who is reading, and what.
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64ExtendI32S);
+            f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
+            f.instruction(&Instruction::I64And);
+            f.instruction(&Instruction::GlobalGet(l.g_current));
+            f.instruction(&Instruction::I64ExtendI32S);
+            f.instruction(&Instruction::I64Const(32));
+            f.instruction(&Instruction::I64Shl);
+            f.instruction(&Instruction::I64Or);
+            // b = status(16) | rstate(16) | reader O_FRAME(32) — where in the
+            // state machine the misread happened, and which frame the reader
+            // task record points at.
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I64ExtendI32S);
+            f.instruction(&Instruction::I64Const(0xFFFF));
+            f.instruction(&Instruction::I64And);
+            rec_addr_global(&mut f, l, l.g_current);
+            f.instruction(&Instruction::I32Load(ma(O_RSTATE)));
+            f.instruction(&Instruction::I64ExtendI32S);
+            f.instruction(&Instruction::I64Const(0xFFFF));
+            f.instruction(&Instruction::I64And);
+            f.instruction(&Instruction::I64Const(16));
+            f.instruction(&Instruction::I64Shl);
+            f.instruction(&Instruction::I64Or);
+            rec_addr_global(&mut f, l, l.g_current);
+            f.instruction(&Instruction::I32Load(ma(O_FRAME)));
+            f.instruction(&Instruction::I64ExtendI32U);
+            f.instruction(&Instruction::I64Const(32));
+            f.instruction(&Instruction::I64Shl);
+            f.instruction(&Instruction::I64Or);
+            f.instruction(&Instruction::Call(trap_report));
+        }
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
     rec_addr_local(&mut f, l, 0);
     f.instruction(&Instruction::I64Load(ma(O_RESULT)));
     // Transfer a +1 to the caller. The scheduler record keeps its own stored
@@ -877,6 +1017,10 @@ fn emit_task_result(l: &SchedLayout) -> Function {
 fn emit_await(l: &SchedLayout) -> Function {
     // params: parent = 0, child = 1; local: parent_addr = 2
     let mut f = Function::new([(1, ValType::I32)]);
+    emit_sched_trace(&mut f, l, 4, |f| {
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(1));
+    });
     // child.waiter = parent
     rec_addr_local(&mut f, l, 1);
     f.instruction(&Instruction::LocalGet(0));
@@ -1054,6 +1198,11 @@ fn emit_drive_closure(l: &SchedLayout) -> Function {
     f.instruction(&Instruction::I32Store(ma(O_NEXT)));
     f.instruction(&Instruction::LocalGet(4));
     f.instruction(&Instruction::GlobalSet(l.g_free_head));
+    // Stamp ST_FREED so a stray second free of this slot is a no-op and a
+    // later spawn's free-list pop sees the expected state (see ST_FREED docs).
+    rec_addr_local(&mut f, l, 4);
+    f.instruction(&Instruction::I32Const(ST_FREED));
+    f.instruction(&Instruction::I32Store(ma(O_STATUS)));
     f.instruction(&Instruction::LocalGet(result));
     f.instruction(&Instruction::Else);
     f.instruction(&Instruction::I64Const(crate::runtime::VAL_VOID));
@@ -1152,8 +1301,31 @@ pub fn emit_task_status(l: &SchedLayout) -> Function {
 /// first, then calls this to release the slot, exactly as `__fai_drive_closure`
 /// does inline. Without it the slot table would grow one entry per request.
 pub fn emit_free_task(l: &SchedLayout) -> Function {
-    // param: id = 0 (i32)
-    let mut f = Function::new([]);
+    // param: id = 0 (i32); local 1 = status
+    let mut f = Function::new([(1, ValType::I32)]);
+    emit_sched_trace(&mut f, l, 7, |f| {
+        f.instruction(&Instruction::LocalGet(0));
+        rec_addr_local(f, l, 0);
+        f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    });
+    // IDEMPOTENT free, mirroring the guest-side `free_pending`: only a slot
+    // still in a terminal (COMPLETE/FAILED) state is freed, and freeing stamps
+    // ST_FREED — a slot must never be pushed onto `g_free_head` twice, or
+    // `spawn` would hand the same slot to two live tasks and the second task's
+    // record init would stomp the first's pending state (see ST_FREED docs).
+    // A slot already freed, or live again because `spawn` reused it, is
+    // skipped.
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I32Load(ma(O_STATUS)));
+    f.instruction(&Instruction::LocalSet(1));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I32Const(ST_COMPLETE));
+    f.instruction(&Instruction::I32GeS);
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I32Const(ST_FAILED));
+    f.instruction(&Instruction::I32LeS);
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::If(BlockType::Empty));
     // Release the scheduler record's stored result before recycling the slot.
     // `emit_task_result` transfers a +1 to the host caller and the record keeps
     // its own +1 on O_RESULT (the ownership +1-transfer convention); the host
@@ -1173,6 +1345,11 @@ pub fn emit_free_task(l: &SchedLayout) -> Function {
     // g_free_head = id
     f.instruction(&Instruction::LocalGet(0));
     f.instruction(&Instruction::GlobalSet(l.g_free_head));
+    // task[id].status = ST_FREED
+    rec_addr_local(&mut f, l, 0);
+    f.instruction(&Instruction::I32Const(ST_FREED));
+    f.instruction(&Instruction::I32Store(ma(O_STATUS)));
+    f.instruction(&Instruction::End);
     f.instruction(&Instruction::End);
     f
 }
@@ -1277,6 +1454,7 @@ mod tests {
             set_timer_hint: None,
             spawn_root: true,
             trap_report: None,
+            sched_trace: None,
         };
 
         let mut module = Module::new();
@@ -1694,10 +1872,11 @@ mod tests {
         // onto the ready queue, so the poll loop never quiesces. Without
         // the stall guard this spins at 100% CPU until killed (plan 116
         // phase 2); with it, poll traps after STALL_GUARD_LIMIT resumes.
+        // Uses the raw `ready_push` — `resume_task` now ignores a task
+        // that is not WAITING, so it can no longer build this livelock.
         let mut body = Function::new([]);
         body.instruction(&Instruction::GlobalGet(layout.g_current));
-        body.instruction(&Instruction::Call(layout.resume_task));
-        body.instruction(&Instruction::Drop);
+        body.instruction(&Instruction::Call(layout.ready_push));
         body.instruction(&Instruction::End);
         let wasm = test_module(vec![body]).0;
         let (mut store, inst) = instantiate(&wasm);
@@ -1713,6 +1892,39 @@ mod tests {
         assert!(
             format!("{:#}", err).contains("unreachable"),
             "unexpected trap: {err:#}",
+        );
+    }
+
+    #[test]
+    fn resume_task_ignores_a_task_that_is_not_waiting() {
+        CLOCK_MS.with(|c| c.set(0.0));
+        let (_, layout) = test_module(vec![Function::new([])]);
+        // A duplicate / stale host wakeup (`__fai_resume_task`) must not
+        // re-queue a task that is not WAITING. A RUNNING task calling
+        // resume_task on itself would previously re-enter the ready queue
+        // and resume a second time at a stale resume-state, reading
+        // pending-child frame slots that were never written for that
+        // state. With the guard the call is a no-op and the task simply
+        // completes.
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::GlobalGet(layout.g_current));
+        body.instruction(&Instruction::Call(layout.resume_task));
+        body.instruction(&Instruction::Drop);
+        // Complete normally — with the guard, the stray self-resume above
+        // must not have queued a second run.
+        body.instruction(&Instruction::GlobalGet(layout.g_current));
+        body.instruction(&Instruction::I64Const(7));
+        body.instruction(&Instruction::Call(layout.complete));
+        body.instruction(&Instruction::End);
+        let wasm = test_module(vec![body]).0;
+        let (mut store, inst) = instantiate(&wasm);
+        let start = inst
+            .get_typed_func::<(), i32>(&mut store, "_start_async")
+            .unwrap();
+        assert_eq!(
+            start.call(&mut store, ()).unwrap(),
+            2,
+            "a self-resume of a RUNNING task must be ignored and the program complete",
         );
     }
 }

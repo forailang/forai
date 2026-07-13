@@ -781,6 +781,34 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
     // not just an object's refcount. Poll granularity: the change is
     // reported at the first RC op / allocation after the write, so the
     // backtrace lands within a statement or two of the writer.
+    // __fai_sched_trace(op, a, b) — FAI_SCHED_TRACE scheduler event stream.
+    // op: 1=spawn(id,frame) 2=complete(id,waiter) 3=fail(id,waiter)
+    // 4=await(parent,child) 5=task_result(id,status) 6=free_pending(id,status)
+    // 7=free_task(id,status) 8=resume(id,rstate) 9=synth-sync-slot(id,next).
+    linker
+        .func_wrap(
+            "env",
+            "__fai_sched_trace",
+            |_caller: Caller<'_, ()>, op: i32, a: i32, b: i32| {
+                let name = match op {
+                    1 => "spawn",
+                    2 => "complete",
+                    3 => "fail",
+                    4 => "await",
+                    5 => "result",
+                    6 => "free_p",
+                    7 => "free_h",
+                    8 => "resume",
+                    9 => "synth",
+                    10 => "framefree",
+                    11 => "table",
+                    _ => "?",
+                };
+                eprintln!("[st] {name} {a} {b}");
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     linker
         .func_wrap("env", "__fai_mem_watch", |mut caller: Caller<'_, ()>| {
             let want = match std::env::var("FAI_MEM_WATCH").ok().and_then(|s| {
@@ -1003,6 +1031,32 @@ fn format_trap_report(code: i32, a: i64, b: i64, data: &[u8]) -> String {
         c if c == cg::TRAP_SCHED_STALL => format!(
             "scheduler stall: poll resumed {} tasks without quiescing (livelock; \
              task t{} was about to run again)",
+            a, b,
+        ),
+        c if c == cg::TRAP_TASK_RESULT_NOT_DONE => {
+            let frame = (b as u64) >> 32;
+            let mut msg = format!(
+                "sched-check: task_result(t{}) read while status={} (not COMPLETE/FAILED) — \
+                 reader task t{} at resume-state {} frame=0x{:x} holds a stale child id \
+                 (slot recycled, freed, or pending slot never written)",
+                (a as u64) & 0xFFFF_FFFF,
+                (b as u64) & 0xFFFF,
+                (a as u64) >> 32,
+                ((b as u64) >> 16) & 0xFFFF,
+                frame,
+            );
+            // Under --check-leaks the ledger names the frame block's CURRENT
+            // owner — if it isn't "frame-like", the block was double-allocated.
+            if let Some(desc) = super::super::leak_ledger::describe_block(frame as u32) {
+                msg.push_str(&format!(" — frame block: {}", desc));
+            } else {
+                msg.push_str(" — frame block: NOT LIVE in leak ledger (freed!)");
+            }
+            msg
+        }
+        c if c == cg::TRAP_TASK_SLOT_REUSED => format!(
+            "sched-check: spawn popped free-list slot t{} whose status={} (not FREED) — \
+             the slot was double-freed or freed while live",
             a, b,
         ),
         c if c == cg::TRAP_FREELIST_CORRUPT => {

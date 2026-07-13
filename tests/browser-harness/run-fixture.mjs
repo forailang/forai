@@ -63,6 +63,27 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
       if (fn === 'fixture.fail') {
         res.end('{"ok":false,"error":"fixture failed"}');
+      } else if (fn === 'fixture.records') {
+        // Return an array of records for exercising RPC array-of-records decode.
+        // args = [numRecords, numFields]; each record has fields f0..f{n-1}
+        // (even = string, odd = int) so the client can read any field.
+        let args = [];
+        try {
+          args = JSON.parse(body).args ?? [];
+        } catch {
+          args = [];
+        }
+        const numRecords = Number(args[0] ?? 1);
+        const numFields = Number(args[1] ?? 11);
+        const recs = [];
+        for (let r = 0; r < numRecords; r++) {
+          const o = {};
+          for (let f = 0; f < numFields; f++) {
+            o[`f${f}`] = f % 2 === 0 ? `r${r}f${f}` : 1000 + f;
+          }
+          recs.push(o);
+        }
+        res.end(JSON.stringify({ ok: true, value: recs }));
       } else {
         res.end('{"ok":true,"value":null}');
       }
