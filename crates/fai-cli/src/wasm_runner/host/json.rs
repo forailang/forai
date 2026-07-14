@@ -168,11 +168,10 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
                     return VAL_NULL;
                 };
-                let Some(matches) = eval_json_path(&root, &path) else {
-                    return VAL_NULL; // malformed path, same convention as bad JSON
+                let Ok(matches) = eval_query(&root, &path) else {
+                    return VAL_NULL; // unparseable query, same convention as bad JSON
                 };
-                let arr =
-                    serde_json::Value::Array(matches.into_iter().cloned().collect());
+                let arr = serde_json::Value::Array(matches);
                 build_value(&mut caller, &mem, &arr)
             },
         )
@@ -209,17 +208,26 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
                 let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
                     return VAL_NULL;
                 };
-                let Some(matches) = eval_json_path(&root, &path) else {
-                    return VAL_NULL; // malformed path, same convention as bad JSON
+                // A query that parses in neither engine returns a page carrying
+                // an `error` field (not VAL_NULL) so the caller can distinguish
+                // "bad query" from "valid query, zero matches" and surface a
+                // loud message instead of silently retrying variants.
+                let matches = match eval_query(&root, &path) {
+                    Ok(matches) => matches,
+                    Err(msg) => {
+                        let page = serde_json::json!({
+                            "total": 0,
+                            "items": [],
+                            "error": msg,
+                        });
+                        return build_value(&mut caller, &mem, &page);
+                    }
                 };
                 let total = matches.len();
                 let start = (offset.max(0) as usize).min(total);
                 let take = limit.max(0) as usize;
-                let items: Vec<serde_json::Value> = matches[start..]
-                    .iter()
-                    .take(take)
-                    .map(|v| (*v).clone())
-                    .collect();
+                let items: Vec<serde_json::Value> =
+                    matches.into_iter().skip(start).take(take).collect();
                 let page = serde_json::json!({
                     "total": total,
                     "items": items,
@@ -325,6 +333,65 @@ fn read_guest_str(data: &[u8], ptr: i32, len: i32) -> String {
     match data.get(ptr..ptr + len) {
         Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         None => String::new(),
+    }
+}
+
+/// Evaluate `query` against `root` into the flat match list that the
+/// `json_query` / `json_query_page` pagination model expects.
+///
+/// Dual-dialect, JMESPath-first: JMESPath is a strict superset in power
+/// (multi-select `[].{a: x}`, filters `[?flag]`, functions `length(@)`)
+/// but NOT in syntax — it has no recursive descent, no `|` pipe spelled
+/// jq-style, and rejects a leading `.`. So we try JMESPath first, and a
+/// JMESPath *compile* error falls through to the legacy jq-selection
+/// engine (`parse_json_path`/`eval_json_path`). Because every jq signature
+/// (leading `.`, `..`, `|`, trailing `?`) is a JMESPath syntax error, the
+/// existing selection paths route deterministically to the legacy engine
+/// with byte-identical behavior, while bare expressions gain JMESPath.
+///
+/// `Err` only when the query parses in *neither* engine — a genuine syntax
+/// error the caller should surface, distinct from a valid query that
+/// matched nothing.
+fn eval_query(root: &serde_json::Value, query: &str) -> Result<Vec<serde_json::Value>, String> {
+    match jmespath::compile(query) {
+        Ok(expr) => {
+            let found = expr
+                .search(root)
+                .map_err(|e| format!("jmespath evaluation failed: {e}"))?;
+            let value = serde_json::to_value(&*found)
+                .map_err(|e| format!("jmespath result not representable as JSON: {e}"))?;
+            Ok(flatten_query_result(value))
+        }
+        Err(jmespath_err) => match eval_json_path(root, query) {
+            Some(matches) => Ok(matches.into_iter().cloned().collect()),
+            None => {
+                // Collapse the JMESPath parser's multi-line caret diagram to a
+                // single line: the message flows through a raw-concatenated RPC
+                // error envelope, where an embedded newline would produce
+                // malformed JSON the client can't parse.
+                let reason = jmespath_err
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Err(format!(
+                    "query is neither valid JMESPath ({reason}) nor a valid \
+                     jq-style selection path"
+                ))
+            }
+        },
+    }
+}
+
+/// Map a single JMESPath result value into the flat match list: `null`
+/// (JMESPath's "no match") → no matches; an array → its elements, so a
+/// projection like `[].name` pages element-by-element like the legacy
+/// engine's fan-out; any other value → a single match.
+fn flatten_query_result(value: serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(items) => items,
+        other => vec![other],
     }
 }
 
@@ -648,6 +715,100 @@ mod eval_json_path_tests {
                 bad
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod eval_query_tests {
+    use super::eval_query;
+    use serde_json::json;
+
+    // ── JMESPath dialect (the new power) ──
+
+    #[test]
+    fn multi_select_hash_projects_several_fields_per_record() {
+        // The exact shape conversation 131 needed: one query, all fields.
+        let doc = json!([
+            {"name": "a", "full_name": "o/a", "private": false},
+            {"name": "b", "full_name": "o/b", "private": true},
+        ]);
+        let out = eval_query(&doc, "[].{n: name, p: private}").unwrap();
+        assert_eq!(
+            out,
+            vec![json!({"n": "a", "p": false}), json!({"n": "b", "p": true})]
+        );
+    }
+
+    #[test]
+    fn bare_field_projection_pages_element_by_element() {
+        let doc = json!([{"full_name": "o/a"}, {"full_name": "o/b"}]);
+        // An array result flattens into the match list (2 matches, not 1).
+        assert_eq!(
+            eval_query(&doc, "[].full_name").unwrap(),
+            vec![json!("o/a"), json!("o/b")]
+        );
+    }
+
+    #[test]
+    fn filters_and_functions_are_available() {
+        let doc = json!([{"n": "a", "on": true}, {"n": "b", "on": false}]);
+        assert_eq!(
+            eval_query(&doc, "[?on].n").unwrap(),
+            vec![json!("a")]
+        );
+        assert_eq!(eval_query(&doc, "length(@)").unwrap(), vec![json!(2)]);
+    }
+
+    #[test]
+    fn scalar_result_is_a_single_match() {
+        let doc = json!({"a": {"b": 7}});
+        assert_eq!(eval_query(&doc, "a.b").unwrap(), vec![json!(7)]);
+    }
+
+    #[test]
+    fn jmespath_no_match_is_empty_not_error() {
+        let doc = json!({"a": 1});
+        assert!(eval_query(&doc, "missing").unwrap().is_empty());
+    }
+
+    // ── Legacy jq-selection fallback (unchanged behavior) ──
+
+    #[test]
+    fn leading_dot_paths_route_to_legacy_engine() {
+        let doc = json!({"items": [{"s": "x"}, {"s": "y"}]});
+        // Leading `.` is a JMESPath syntax error → legacy engine handles it.
+        assert_eq!(
+            eval_query(&doc, ".items[].s").unwrap(),
+            vec![json!("x"), json!("y")]
+        );
+    }
+
+    #[test]
+    fn recursive_descent_still_works_via_fallback() {
+        // JMESPath has no recursive descent; the legacy engine keeps `..`.
+        let doc = json!({"a": {"status": "plan", "sub": {"status": "done"}}});
+        assert_eq!(
+            eval_query(&doc, ".. | .status?").unwrap(),
+            vec![json!("plan"), json!("done")]
+        );
+    }
+
+    #[test]
+    fn pipes_and_optional_markers_route_to_legacy() {
+        let doc = json!({"a": {"items": [1, 2]}});
+        assert_eq!(
+            eval_query(&doc, ".a | .items | .[]").unwrap(),
+            vec![json!(1), json!(2)]
+        );
+    }
+
+    // ── Both engines reject → loud error ──
+
+    #[test]
+    fn a_query_valid_in_neither_engine_errors() {
+        let doc = json!({"a": 1});
+        // Unclosed bracket: not JMESPath, not a legal selection path.
+        assert!(eval_query(&doc, "a[").is_err());
     }
 }
 
