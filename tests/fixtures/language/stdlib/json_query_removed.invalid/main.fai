@@ -1,0 +1,12 @@
+# expect: check_error
+# error: query
+
+use std.json
+
+def main
+    @return Void
+do
+    # json.query was removed from the stdlib (querying moved to the
+    # native-only forjq library). The checker must reject it.
+    let _ = json.query('{}', '.a')
+end

@@ -814,6 +814,13 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         ret: RPrim,
         doc: "encoded bool; host copies path string",
     },
+    HostImportRow {
+        canon: "std.file",
+        method: "delete",
+        import: "file_delete",
+        ret: RPrim,
+        doc: "encoded bool; host copies path string",
+    },
     // std.process — every method returns a fresh status/output string.
     HostImportRow {
         canon: "std.process",
@@ -1097,20 +1104,6 @@ pub const HOST_IMPORTS: &[HostImportRow] = &[
         import: "json_parse",
         ret: ROwn,
         doc: "fresh graph via heap::build_value; null on parse error",
-    },
-    HostImportRow {
-        canon: "std.json",
-        method: "query",
-        import: "json_query",
-        ret: ROwn,
-        doc: "fresh match array via heap::build_value; null on parse error",
-    },
-    HostImportRow {
-        canon: "std.json",
-        method: "queryPage",
-        import: "json_query_page",
-        ret: ROwn,
-        doc: "fresh {total, items} dict via heap::build_value; null on parse error",
     },
     HostImportRow {
         canon: "std.json",
@@ -2010,7 +2003,7 @@ mod tests {
         // ownership conventions; plan 101 adds async offload results. The count pin fails
         // when a host import lands without a row — extend the table after
         // reading the host code.
-        assert_eq!(HOST_IMPORTS.len(), 117, "host import surface changed");
+        assert_eq!(HOST_IMPORTS.len(), 126, "host import surface changed");
         for row in HOST_IMPORTS {
             assert!(!row.import.is_empty());
             assert!(

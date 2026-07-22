@@ -597,19 +597,13 @@ pub const IMPORT_CRYPTO_RS256_SIGN_BASE64_URL: u32 = 119;
 /// Event 0 is START; event 1 is END. Declared only when
 /// FAI_DEBUG_FUNCTION_CALLS is enabled.
 pub const IMPORT_DEBUG_FUNCTION_CALL: u32 = 120;
-/// `env.json_query(json_ptr, json_len, path_ptr, path_len) -> i64` —
-/// host-side JSON selection: parse natively, evaluate a jq-style
-/// selection path (`.a.b[].c`, indexes `[0]`/`[-1]`, quoted keys, pipes,
-/// `..` descent; empty path selects the root), and materialize ONLY the
-/// matched values as a guest Array. Null on invalid JSON or a malformed
-/// path. Large documents never build a full guest tree.
-pub const IMPORT_JSON_QUERY: u32 = 121;
-/// `env.json_query_page(json_ptr, json_len, path_ptr, path_len, offset,
-/// limit) -> i64` — windowed variant returning a Dict
-/// `{ total: Int, items: Array }` so callers can page a big match set
-/// without materializing it. Null on invalid JSON; offset/limit are
-/// clamped host-side.
-pub const IMPORT_JSON_QUERY_PAGE: u32 = 122;
+/// Reserved slots kept to preserve canonical import indices after removing
+/// the host-side `json.query` / `json.queryPage` selection engine (querying
+/// moved out of the runtime to the native-only `forjq` library, which shells
+/// out to real jq). Always marked unavailable, so compiled modules never
+/// declare them.
+pub const IMPORT_RESERVED_121: u32 = 121;
+pub const IMPORT_RESERVED_122: u32 = 122;
 /// `env.json_format(ptr, len) -> i64` — reserialize a JSON string
 /// pretty-printed (2-space indent, one attribute per line). Null on
 /// invalid JSON. Native normalizes object key order (serde map);
@@ -706,7 +700,11 @@ pub const IMPORT_URL_DECODE: u32 = 146;
 /// (FAI_SCHED_TRACE). op: 1=spawn 2=complete 3=fail 4=await 5=task_result
 /// 6=free_pending 7=free_task 8=resume 9=synth-sync-slot.
 pub const IMPORT_SCHED_TRACE: u32 = 147;
-pub const IMPORT_COUNT: u32 = 148;
+/// `env.file_delete(path_ptr, path_len) -> i32` — unlink a file; returns 1
+/// on success (or already-absent), 0 on failure. Native-only; stubbed in
+/// browser (always 0).
+pub const IMPORT_FILE_DELETE: u32 = 148;
+pub const IMPORT_COUNT: u32 = 149;
 
 /// Internal proof operation for the generic async host-op ABI. It echoes the
 /// first boxed argument and is not exposed as a user-facing stdlib operation.
@@ -1510,26 +1508,10 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             vec![ValType::I32, ValType::I32, ValType::I32],
             vec![],
         ),
-        // IMPORT_JSON_QUERY: (json_ptr, json_len, path_ptr, path_len) -> i64.
-        (
-            "json_query",
-            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-            vec![ValType::I64],
-        ),
-        // IMPORT_JSON_QUERY_PAGE:
-        // (json_ptr, json_len, path_ptr, path_len, offset, limit) -> i64.
-        (
-            "json_query_page",
-            vec![
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-            ],
-            vec![ValType::I64],
-        ),
+        // IMPORT_RESERVED_121 / _122: removed host-side json.query /
+        // json.queryPage. Slots kept (always unavailable) for index stability.
+        ("reserved_121", vec![], vec![]),
+        ("reserved_122", vec![], vec![]),
         // IMPORT_JSON_FORMAT: (ptr, len) -> i64 (NaN-boxed String or null).
         (
             "json_format",
@@ -1689,6 +1671,12 @@ pub fn import_signatures() -> Vec<(&'static str, Vec<ValType>, Vec<ValType>)> {
             "__fai_sched_trace",
             vec![ValType::I32, ValType::I32, ValType::I32],
             vec![],
+        ),
+        // IMPORT_FILE_DELETE: (path_ptr, path_len) -> i32 (1 = deleted, 0 = fail)
+        (
+            "file_delete",
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
         ),
     ]
 }

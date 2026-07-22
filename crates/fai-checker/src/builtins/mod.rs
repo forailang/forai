@@ -179,8 +179,6 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.json", name: "parse",         builtin_name: "jsonParse",         doc: "Parse a JSON string into a value." },
         BuiltinDoc { module: "std.json", name: "stringify",     builtin_name: "jsonStringify",     doc: "Serialize a value to a JSON string." },
         BuiltinDoc { module: "std.json", name: "requireString", builtin_name: "jsonRequireString", doc: "Extract a required string field from a JSON object." },
-        BuiltinDoc { module: "std.json", name: "query",         builtin_name: "jsonQuery",         doc: "Select values from a JSON string with a jq-style path: '.a.b[].c', array indexes '[0]'/'[-1]', quoted keys, pipes '.a | .b', and '..' recursive descent. Parses host-side and materializes only the matches — use it instead of parse for large documents. Null on invalid JSON or a malformed path." },
-        BuiltinDoc { module: "std.json", name: "queryPage",     builtin_name: "jsonQueryPage",     doc: "Like query, but returns one window of matches with the total count as { total: Int, items: [...] }. Offset/limit are clamped. Null on invalid JSON or a malformed path." },
         BuiltinDoc { module: "std.json", name: "format",          builtin_name: "jsonFormat",          doc: "Pretty-print a JSON string with 2-space indent, one attribute per line. Returns String?; null on invalid JSON." },
         BuiltinDoc { module: "std.json", name: "minify",          builtin_name: "jsonMinify",          doc: "Reserialize a JSON string compactly, stripping insignificant whitespace. Returns String?; null on invalid JSON." },
         BuiltinDoc { module: "std.json", name: "valid",           builtin_name: "jsonValid",           doc: "Return true when the string parses as JSON. Cheap: nothing is materialized." },
@@ -201,6 +199,7 @@ pub fn all_builtin_docs() -> &'static [BuiltinDoc] {
         BuiltinDoc { module: "std.file", name: "read",   builtin_name: "fileRead",   doc: "Read the entire contents of a file as a string." },
         BuiltinDoc { module: "std.file", name: "write",  builtin_name: "fileWrite",  doc: "Write text to a file. Returns true on success." },
         BuiltinDoc { module: "std.file", name: "exists", builtin_name: "fileExists", doc: "Return true if the file exists." },
+        BuiltinDoc { module: "std.file", name: "delete", builtin_name: "fileDelete", doc: "Delete a file. Returns true on success (or if already absent). Native-only." },
         BuiltinDoc { module: "std.file", name: "list",   builtin_name: "fileList",   doc: "List all file names in a directory." },
 
         // std.process

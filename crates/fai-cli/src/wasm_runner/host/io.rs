@@ -331,6 +331,30 @@ pub(super) fn install(linker: &mut Linker<()>) -> Result<(), String> {
         )
         .map_err(|e| format!("linker error: {}", e))?;
 
+    // env.file_delete(path_ptr, path_len) -> i32 (1 = deleted or already
+    // absent, 0 = failure). Removing a missing file is success, so callers
+    // (e.g. forjq's temp-file cleanup) are idempotent.
+    linker
+        .func_wrap(
+            "env",
+            "file_delete",
+            |mut caller: Caller<'_, ()>, path_ptr: i32, path_len: i32| -> i32 {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = mem.data(&caller);
+                let end = (path_ptr + path_len) as usize;
+                if end > data.len() {
+                    return 0;
+                }
+                let path = std::str::from_utf8(&data[path_ptr as usize..end]).unwrap_or("");
+                match std::fs::remove_file(path) {
+                    Ok(()) => 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
+                    Err(_) => 0,
+                }
+            },
+        )
+        .map_err(|e| format!("linker error: {}", e))?;
+
     // env.write_file(path_ptr, path_len, content_ptr, content_len) -> 1 success, 0 failure
     //
     // Returns a 0/1 flag matching forai's `Bool` convention so the

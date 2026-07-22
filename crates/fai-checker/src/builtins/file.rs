@@ -14,6 +14,7 @@ pub(super) fn install(b: &mut HashMap<String, Type>) {
         &[Type::Bool],
     );
     ins(b, "fileExists", &[p("path", Type::String)], &[Type::Bool]);
+    ins(b, "fileDelete", &[p("path", Type::String)], &[Type::Bool]);
     ins(
         b,
         "fileList",
@@ -61,7 +62,7 @@ mod tests {
     #[test]
     fn test_file_builtins() {
         let b = fresh();
-        for name in &["fileRead", "fileWrite", "fileExists", "fileList"] {
+        for name in &["fileRead", "fileWrite", "fileExists", "fileDelete", "fileList"] {
             assert!(b.contains_key(*name), "missing: {}", name);
         }
     }

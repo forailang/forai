@@ -1,12 +1,12 @@
 # Ownership passes through `!`: force-unwrapping an owned-returning optional
-# call (`json.requireString(...)!`, `json.query(...)!`) must transfer the
+# call (`json.requireString(...)!`, `json.minify(...)!`) must transfer the
 # callee's +1 to the binding instead of classifying it borrowed — which
 # retained on bind and leaked the host-allocated result forever. Borrowed
 # sources unwrapped with `!` keep their retain-on-bind behavior.
 # expect: ok
 # stdout:
 #   hello
-#   2
+#   12
 #   hi
 # leak: flat
 # ownership: balanced
@@ -18,8 +18,8 @@ def main
 do
     let name = json.requireString(json.parse('{"a":"hello"}'), 'a')!
     print(name)
-    let matches = json.query('{"ns":[1,2]}', 'ns[]')!
-    print(length(matches))
+    let compact = json.minify('{ "ns": [1, 2] }')!
+    print(length(compact))
     let maybe String? = 'hi'
     let kept = maybe!
     print(kept)

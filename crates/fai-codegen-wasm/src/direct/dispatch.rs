@@ -298,6 +298,7 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         ("std.file", "read") => (IMPORT_FILE_READ_STR, &[AS::String], RS::Boxed),
         ("std.file", "write") => (IMPORT_WRITE_FILE, &[AS::String, AS::String], RS::MakeBool),
         ("std.file", "exists") => (IMPORT_FILE_EXISTS, &[AS::String], RS::MakeBool),
+        ("std.file", "delete") => (IMPORT_FILE_DELETE, &[AS::String], RS::MakeBool),
         ("std.file", "list") => (IMPORT_FILE_LIST, &[AS::String], RS::Boxed),
 
         // std.process — command/session helpers return JSON strings.
@@ -378,14 +379,7 @@ pub(super) fn resolve_module_call(module: &str, method: &str) -> Option<ModuleCa
         ("std.json", "stringify") => (IMPORT_JSON_STRINGIFY, &[AS::Boxed], RS::Boxed),
         // Host-side JSON selection: parse natively, walk the dot-path, and
         // materialize only the matches (query) or one window of them with a
-        // total count (queryPage). Large artifacts never build a full guest
         // tree the way `parse` does.
-        ("std.json", "query") => (IMPORT_JSON_QUERY, &[AS::String, AS::String], RS::Boxed),
-        ("std.json", "queryPage") => (
-            IMPORT_JSON_QUERY_PAGE,
-            &[AS::String, AS::String, AS::Int, AS::Int],
-            RS::Boxed,
-        ),
         // Text-level formatting helpers — reserialize host-side without
         // materializing guest values. `valid` is a cheap probe.
         ("std.json", "format") => (IMPORT_JSON_FORMAT, &[AS::String], RS::Boxed),
@@ -714,7 +708,7 @@ pub(crate) fn stdlib_scheduling(module: &str, method: &str) -> Option<StdlibSche
             | "base64Decode" | "rs256SignBase64Url",
         ) => Some(CpuBoundDirect),
 
-        ("std.file", "exists")
+        ("std.file", "exists" | "delete")
         | ("std.env", "get")
         | ("std.net", "available")
         | ("std.process", "available" | "start" | "read" | "stop")

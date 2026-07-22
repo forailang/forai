@@ -1,0 +1,41 @@
+# expect: ok
+# stdout:
+#   exists-before: true
+#   deleted: true
+#   exists-after: false
+#   delete-missing: true
+
+use std.file
+
+use std.string
+
+# Render a Bool as text.
+def boolText
+    @param value Bool
+    @return String
+do
+    if value
+        'true'
+    else
+        'false'
+    end
+end
+
+test boolText
+    it 'renders booleans'
+        assert.equal(boolText(true), 'true')
+        assert.equal(boolText(false), 'false')
+    end
+end
+
+def main
+    @return Void
+do
+    let path = '/tmp/fai-fixture-delete.txt'
+    let _ = file.write(path, 'scratch')
+    print('exists-before: ' + boolText(file.exists(path)))
+    print('deleted: ' + boolText(file.delete(path)))
+    print('exists-after: ' + boolText(file.exists(path)))
+    # Deleting an already-absent file is success (idempotent cleanup).
+    print('delete-missing: ' + boolText(file.delete(path)))
+end

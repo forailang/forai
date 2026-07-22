@@ -176,6 +176,10 @@ pub fn available_imports_with_test_flag(target: Option<&str>, is_test: bool) -> 
         avail[IMPORT_SCHED_TRACE as usize] = false;
     }
     avail[IMPORT_RESERVED_17 as usize] = false;
+    // json.query / json.queryPage removed from the runtime (moved to the
+    // native-only forjq library). Slots reserved; never available.
+    avail[IMPORT_RESERVED_121 as usize] = false;
+    avail[IMPORT_RESERVED_122 as usize] = false;
     // Ownership helper events are opt-in, matching the helper-call emission
     // gate. Default/native/browser builds keep their old import surface.
     if !ownership_check_enabled() {

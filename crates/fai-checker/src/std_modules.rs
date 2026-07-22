@@ -130,8 +130,6 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("parse", "jsonParse"),
             ("stringify", "jsonStringify"),
             ("requireString", "jsonRequireString"),
-            ("query", "jsonQuery"),
-            ("queryPage", "jsonQueryPage"),
             ("format", "jsonFormat"),
             ("minify", "jsonMinify"),
             ("valid", "jsonValid"),
@@ -171,6 +169,7 @@ pub fn std_module_exports() -> HashMap<String, Vec<(String, String)>> {
             ("read", "fileRead"),
             ("write", "fileWrite"),
             ("exists", "fileExists"),
+            ("delete", "fileDelete"),
             ("list", "fileList"),
         ]
         .into_iter()

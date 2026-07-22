@@ -38,7 +38,6 @@ flate2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-jmespath = "0.5"
 k256 = "0.13.4"
 aes-gcm = "0.10"
 hkdf = "0.12"
