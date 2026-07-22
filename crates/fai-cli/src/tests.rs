@@ -2044,6 +2044,13 @@
                 "    @return String\n",
                 "do\n",
                 "  ''\n",
+                "end\n\n",
+                "# Stub args parser: never parses.\n",
+                "def rpcArgsOrNull\n",
+                "    @param argsJson String\n",
+                "    @return Unknown\n",
+                "do\n",
+                "  null\n",
                 "end\n",
             ),
         )
