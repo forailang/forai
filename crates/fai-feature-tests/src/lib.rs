@@ -197,6 +197,26 @@ pub fn fai_binary() -> PathBuf {
     bin
 }
 
+/// Locate a forui checkout for tests whose generated projects depend on the
+/// real `Forui` package (RPC dispatch imports Forui.rpc). `FAI_FORUI_DIR`
+/// wins (CI checks forui out inside the workspace and sets it); otherwise
+/// fall back to the multi-repo layout where forui is a sibling of this repo.
+pub fn forui_dir() -> PathBuf {
+    let dir = match std::env::var_os("FAI_FORUI_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => workspace_root()
+            .parent()
+            .expect("workspace root has a parent")
+            .join("forui"),
+    };
+    assert!(
+        dir.join("fai.toml").exists(),
+        "forui checkout not found at {} — clone forailang/forui there or set FAI_FORUI_DIR",
+        dir.display()
+    );
+    dir
+}
+
 pub fn discover_fixtures() -> Vec<Fixture> {
     let root = fixtures_root();
     let mut out = Vec::new();

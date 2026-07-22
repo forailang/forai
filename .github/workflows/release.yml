@@ -18,6 +18,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # rpc_auth/rpc_context/rpc_host_io generate projects that depend on
+      # the real Forui package; forui_dir() finds this checkout via
+      # FAI_FORUI_DIR (locally it falls back to the sibling ../forui).
+      - uses: actions/checkout@v4
+        with:
+          repository: forailang/forui
+          path: .ci-deps/forui
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
@@ -35,6 +42,8 @@ jobs:
       # forsqlite is referenced relatively or fetched as a sibling checkout.
       - name: run tests
         run: cargo test --workspace --locked -- --skip ffi::forsqlite_
+        env:
+          FAI_FORUI_DIR: ${{ github.workspace }}/.ci-deps/forui
 
   build:
     name: build (${{ matrix.target }})

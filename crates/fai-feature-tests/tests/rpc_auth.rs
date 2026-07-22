@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fai_feature_tests::{fai_binary, workspace_root};
+use fai_feature_tests::{fai_binary, forui_dir, workspace_root};
 
 const SERVER_SOURCE: &str = r#"use std.http.server
 
@@ -173,9 +173,12 @@ fn boot_server(port: u16) -> ServerProc {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("fai.toml"),
-        "[project]\nname = \"RpcAuth\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
-         [project.server]\ntarget = \"wasm\"\nmain = \"src/main.fai\"\nrpc_server = true\n\n\
-         [dependencies]\nForui = \"file:///home/bal/forai/forui\"\n",
+        format!(
+            "[project]\nname = \"RpcAuth\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n\
+             [project.server]\ntarget = \"wasm\"\nmain = \"src/main.fai\"\nrpc_server = true\n\n\
+             [dependencies]\nForui = \"file://{}\"\n",
+            forui_dir().display()
+        ),
     )
     .unwrap();
     std::fs::write(
